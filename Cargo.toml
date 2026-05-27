@@ -2,5 +2,140 @@
 name = "saml"
 version = "0.1.0"
 edition = "2024"
+description = "Stateless, async-native SAML 2.0 toolkit with no libxml2/xmlsec C build chain"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
+quick-xml = "0.36"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+base64 = "0.22"
+rsa = { version = "0.9", features = ["sha2"] }
+ecdsa = "0.16"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem"] }
+sha1 = { version = "0.10", optional = true, features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+rand = "0.9"
+x509-cert = { version = "0.2", features = ["pem"] }
+spki = "0.7"
+const-oid = "0.9"
+pkcs8 = { version = "0.10", features = ["pem"] }
+pkcs1 = { version = "0.7", features = ["pem"] }
+aes = "0.8"
+cbc = "0.1"
+aes-gcm = "0.10"
+ctr = "0.9"
+hmac = "0.12"
+digest = "0.10"
+signature = "2"
+thiserror = "2"
+http = "1"
+url = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+percent-encoding = "2"
+zeroize = { version = "1", features = ["derive"] }
+
+[features]
+default = ["reqwest-client", "rsa-sha", "ecdsa-sha", "xmlenc", "slo", "metadata-emit"]
+reqwest-client = ["dep:reqwest"]
+rsa-sha = []
+ecdsa-sha = []
+xmlenc = []
+slo = []
+metadata-emit = []
+artifact-binding = []
+weak-algos = ["dep:sha1"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+proptest = "1"
+hex = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+# Categories
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# Pedantic carve-outs (opinionated style nits, not bug classes)
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+similar_names = "allow"
+single_match_else = "allow"
+unreadable_literal = "allow"
+too_many_lines = "allow"
+struct_field_names = "allow"
+items_after_statements = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+
+# Restriction: don't panic
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+unchecked_time_subtraction = "deny"
+
+# Restriction: don't fail silently
+let_underscore_future = "deny"
+let_underscore_must_use = "deny"
+unused_result_ok = "deny"
+map_err_ignore = "deny"
+assertions_on_result_states = "deny"
+
+# Restriction: numeric correctness
+arithmetic_side_effects = "deny"
+float_cmp = "deny"
+float_cmp_const = "deny"
+lossy_float_literal = "deny"
+cast_sign_loss = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+invalid_upcast_comparisons = "deny"
+
+# Restriction: memory / unsafe hygiene
+mem_forget = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_safety_comment = "deny"
+
+# Restriction: async footguns
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+if_let_mutex = "deny"
+large_futures = "deny"
+
+# Restriction: misc footguns
+rc_mutex = "deny"
+debug_assert_with_mut_call = "deny"
+iter_not_returning_iterator = "deny"
+expl_impl_clone_on_copy = "deny"
+infallible_try_from = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Force documented suppressions
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
