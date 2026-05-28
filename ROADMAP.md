@@ -50,27 +50,6 @@ before running the test. No vendored binary needed.
 
 ---
 
-## Replay cache opt-out
-
-**Motivation.** `ReplayCache` rejects every assertion ID it has seen
-before. For load-balanced deployments backed by an external store, or
-for embedders who want their own dedup layer, the in-memory default is
-the wrong tool. A typed opt-out makes the trade-off explicit instead
-of forcing embedders to wrap the SP in glue code.
-
-**Sketch.** Add `pub enum ReplayMode { All, OneTimeUseOnly, Off }` to
-`src/replay.rs` and route SP/IdP config through it: `All` is current
-behaviour, `OneTimeUseOnly` only enforces dedup when
-`<OneTimeUse>` appears in the assertion's `<Conditions>`, `Off`
-disables the cache entirely. Document the security implication of
-`Off` in rustdoc and the README security section.
-
-**Complexity.** Small.
-
-**Target release.** `0.0.2-alpha`.
-
----
-
 ## Inclusive C14N
 
 **Motivation.** We emit exclusive c14n only
