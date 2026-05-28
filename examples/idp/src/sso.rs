@@ -22,8 +22,6 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -148,19 +146,7 @@ pub async fn handle_sso_get(
         }
     };
 
-    // `DetachedSignature::signature` is the base64-encoded string per
-    // SAML 2.0 Bindings §3.4.4.1; `decode_wire` already base64-decoded it
-    // into `detached_signature: Vec<u8>`. Re-encode for the role API.
-    let signature_b64 = decoded.detached_signature.as_deref().map(b64_encode);
-    let detached = signature_b64
-        .as_deref()
-        .zip(decoded.detached_sig_alg.as_deref())
-        .zip(decoded.signed_query_string.as_deref())
-        .map(|((sig, alg), qs)| DetachedSignature {
-            signature: sig,
-            sig_alg: alg,
-            raw_query_string: qs,
-        });
+    let detached = decoded.as_detached_signature();
 
     handle_sso_xml(
         &state,
@@ -598,16 +584,7 @@ pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): 
     // so the IdP role can verify it; otherwise a Redirect-bound signed
     // request would be rejected as unsigned when `logout_want_signed.requests`
     // is on.
-    let slo_sig_b64 = decoded.detached_signature.as_deref().map(b64_encode);
-    let slo_detached = slo_sig_b64
-        .as_deref()
-        .zip(decoded.detached_sig_alg.as_deref())
-        .zip(decoded.signed_query_string.as_deref())
-        .map(|((sig, alg), qs)| DetachedSignature {
-            signature: sig,
-            sig_alg: alg,
-            raw_query_string: qs,
-        });
+    let slo_detached = decoded.as_detached_signature();
 
     let expected_destination = format!("{}/saml/slo", state.config.idp_base_url);
     let parsed = match state.idp.consume_logout_request(
@@ -830,14 +807,6 @@ fn finalize_logout_dispatch(dispatch: Dispatch, sp_label: &str, clear_cookie: bo
     }
 }
 
-/// Re-encode raw signature bytes as standard-alphabet base64. The crate's
-/// `decode_wire` surfaces the detached Redirect-binding signature as raw
-/// decoded bytes, but `DetachedSignature::signature` is documented to be the
-/// base64-encoded form (SAML 2.0 Bindings §3.4.4.1).
-fn b64_encode(bytes: &[u8]) -> String {
-    BASE64_STD.encode(bytes)
-}
-
 fn read_request_id_query_param(raw_query: &str) -> Option<&str> {
     for pair in raw_query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -951,10 +920,7 @@ mod tests {
 
     #[test]
     fn decode_wire_round_trips_unsigned_redirect() {
-        // Synthesize an XML payload and DEFLATE+base64 it the same way
-        // the SP demo does. Sanity-check the crate's `decode_wire` pulls
-        // it back out — this replaces the old hand-rolled
-        // `parse_redirect_query` helper.
+        use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD as B64;
         use flate2::Compression;
         use flate2::write::DeflateEncoder;
@@ -981,14 +947,6 @@ mod tests {
         assert_eq!(decoded.relay_state.as_deref(), Some("hello"));
         assert!(decoded.detached_signature.is_none());
         assert!(decoded.signed_query_string.is_none());
-    }
-
-    #[test]
-    fn b64_encode_matches_standard_alphabet() {
-        // `b64_encode` re-wraps raw signature bytes for `DetachedSignature`.
-        assert_eq!(b64_encode(b""), "");
-        assert_eq!(b64_encode(b"A"), "QQ==");
-        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

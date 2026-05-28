@@ -245,9 +245,10 @@ pub struct ConsumeAuthnRequest<'a> {
 /// Detached signature payload extracted from an HTTP-Redirect query string.
 /// See SAML 2.0 Bindings §3.4.4.1.
 pub struct DetachedSignature<'a> {
-    /// Base64-encoded signature bytes as received in the `Signature=` query
-    /// parameter.
-    pub signature: &'a str,
+    /// Raw signature bytes (already base64-decoded from the `Signature=`
+    /// query parameter). Use [`crate::DecodedWire::as_detached_signature`]
+    /// to skip the manual wire-decoding.
+    pub signature: &'a [u8],
     /// `SigAlg=` algorithm URI.
     pub sig_alg: &'a str,
     /// The canonical signed query string per spec §3.4.4.1.
@@ -337,13 +338,10 @@ fn verify_redirect_request_signature(
         None if required => Err(Error::SignatureMissing),
         None => Ok(()),
         Some(d) => {
-            let sig_bytes = BASE64
-                .decode(d.signature.as_bytes())
-                .map_err(|_err| Error::Base64Decode)?;
             let sig_alg = SignatureAlgorithm::from_uri(d.sig_alg)?;
             verify_detached_signature(
                 d.raw_query_string.as_bytes(),
-                &sig_bytes,
+                d.signature,
                 sig_alg,
                 candidate_certs,
                 allowed_algorithms,
@@ -1709,7 +1707,7 @@ mod tests {
     #[cfg(feature = "slo")]
     fn build_signed_redirect_logout_request(
         id: &str,
-    ) -> (Vec<u8>, String, String, String) {
+    ) -> (Vec<u8>, String, Vec<u8>, String) {
         use crate::binding::redirect::{
             RedirectDirection, decode as redirect_decode, encode_signed,
         };
@@ -1763,19 +1761,19 @@ mod tests {
             .signed_query_string
             .expect("decoder returned canonical signed query string");
 
-        // Percent-decode the Signature parameter — `DetachedSignature::signature`
-        // is documented as the base64-encoded signature bytes (not the
-        // percent-encoded form value).
-        let signature_decoded = percent_encoding::percent_decode_str(&signature_raw)
+        // Percent-decode + base64-decode the Signature parameter —
+        // `DetachedSignature::signature` carries raw signature bytes.
+        let signature_b64 = percent_encoding::percent_decode_str(&signature_raw)
             .decode_utf8()
             .unwrap()
             .into_owned();
+        let signature_bytes = BASE64.decode(signature_b64.as_bytes()).unwrap();
         let sig_alg_decoded = percent_encoding::percent_decode_str(&sig_alg_raw)
             .decode_utf8()
             .unwrap()
             .into_owned();
 
-        (decoded.xml, signed_query_string, signature_decoded, sig_alg_decoded)
+        (decoded.xml, signed_query_string, signature_bytes, sig_alg_decoded)
     }
 
     #[cfg(feature = "slo")]

@@ -306,6 +306,23 @@ pub struct DecodedWire {
     pub signed_query_string: Option<String>,
 }
 
+impl DecodedWire {
+    /// Borrow the Redirect-binding detached signature material as a
+    /// [`crate::idp::DetachedSignature`] view, ready to pass into the
+    /// IdP-side `consume_*` entry points. Returns `None` when any of the
+    /// three required pieces (signature, sig_alg, signed query string) is
+    /// missing — i.e. for unsigned Redirect requests and for every POST /
+    /// SOAP request.
+    #[must_use]
+    pub fn as_detached_signature(&self) -> Option<crate::idp::DetachedSignature<'_>> {
+        Some(crate::idp::DetachedSignature {
+            signature: self.detached_signature.as_deref()?,
+            sig_alg: self.detached_sig_alg.as_deref()?,
+            raw_query_string: self.signed_query_string.as_deref()?,
+        })
+    }
+}
+
 /// Decode the binding wire bytes of an inbound SAML message into XML plus
 /// any Redirect-binding detached signature material.
 ///

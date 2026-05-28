@@ -68,8 +68,21 @@ async fn rust_idp_loop_with_demo_sp() {
     // SP next, then both halves resolve each other on first request.
     let sp_handle = boot_sp(sp_port, &idp_base).await.expect("SP boots");
 
-    // Wait briefly for both to come up.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..40 {
+        if reqwest::get(format!("{sp_base}/healthz"))
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let entries = idp::fetch_all_sps(&idp_handle.sps_file).await;
+    assert!(
+        !entries.is_empty(),
+        "IdP must register the SP descriptor before driving the flow",
+    );
+    idp_handle.state.replace_sps(entries);
 
     let client = Client::builder()
         .redirect(Policy::none())
@@ -476,7 +489,19 @@ impl ServerHandle {
     }
 }
 
-async fn boot_idp(port: u16, idp_base: &str, sp_base: &str) -> Result<ServerHandle, String> {
+struct IdpHandle {
+    handle: tokio::task::JoinHandle<()>,
+    state: idp::AppState,
+    sps_file: idp::SpsFile,
+}
+
+impl IdpHandle {
+    fn shutdown(self) {
+        self.handle.abort();
+    }
+}
+
+async fn boot_idp(port: u16, idp_base: &str, sp_base: &str) -> Result<IdpHandle, String> {
     // Build the IdP config in-process. The AppState's `by_entity_id`
     // map uses interior mutability so we can populate it once the SP
     // listener comes up.
@@ -514,22 +539,11 @@ async fn boot_idp(port: u16, idp_base: &str, sp_base: &str) -> Result<ServerHand
         let _ = axum::serve(listener, app).await;
     });
 
-    tokio::spawn(refresh_idp_sps(state, sps_file));
-
-    Ok(ServerHandle {
+    Ok(IdpHandle {
         handle: serve_handle,
+        state,
+        sps_file,
     })
-}
-
-async fn refresh_idp_sps(state: idp::AppState, sps_file: idp::SpsFile) {
-    for _ in 0..30 {
-        let entries = idp::fetch_all_sps(&sps_file).await;
-        if !entries.is_empty() {
-            state.replace_sps(entries);
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 }
 
 async fn boot_sp(port: u16, idp_base: &str) -> Result<ServerHandle, String> {
