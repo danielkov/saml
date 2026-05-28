@@ -385,12 +385,14 @@ pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};
 pub use crate::binding::artifact::ArtifactResolveRequest;
 
 pub use crate::idp::{
-    AcsSelection, ConsumeAuthnRequest, DetachedSignature, IdentityProvider,
-    IdentityProviderConfig, IdpAssertionSigning, IssueErrorResponse, IssueResponse,
-    ParsedAuthnRequest,
+    AcsSelection, ConsumeAuthnRequest, ConsumeAuthnRequestWire, DetachedSignature,
+    IdentityProvider, IdentityProviderConfig, IdpAssertionSigning, IssueErrorResponse,
+    IssueResponse, ParsedAuthnRequest,
 };
 #[cfg(feature = "slo")]
-pub use crate::idp::{IdpLogoutSigning, IdpLogoutWantSigned};
+pub use crate::idp::{
+    ConsumeLogoutRequestWire, ConsumeLogoutResponseWire, IdpLogoutSigning, IdpLogoutWantSigned,
+};
 
 pub use crate::proxy::{
     Aes256GcmCodec, AttributeReleasePolicy, AuthnContextComparator, BounceResult,

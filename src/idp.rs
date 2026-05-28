@@ -325,6 +325,110 @@ impl IdentityProvider {
         parsed.relay_state = input.relay_state.map(str::to_owned);
         Ok(parsed)
     }
+
+    /// Convenience wrapper around [`IdentityProvider::consume_authn_request`]
+    /// that takes the raw binding wire payload (Redirect query string or POST
+    /// `SAMLRequest` form value) instead of pre-decoded XML.
+    ///
+    /// Internally this delegates to [`crate::decode_wire`] with
+    /// [`crate::WireDirection::Request`], extracts any Redirect-binding
+    /// detached signature via [`crate::DecodedWire::as_detached_signature`],
+    /// and dispatches to [`IdentityProvider::consume_authn_request`]. For
+    /// HTTP-POST the `RelayState` rides a separate form field and the decoder
+    /// cannot see it; callers MUST set [`ConsumeAuthnRequestWire::relay_state`]
+    /// from that form value. For HTTP-Redirect the decoder pulls `RelayState`
+    /// from the query string; setting `relay_state` to `Some` overrides the
+    /// decoded value, `None` preserves it.
+    ///
+    /// `input.wire_body` is what would be passed to [`crate::decode_wire`]:
+    ///
+    /// - HTTP-Redirect: the raw, percent-encoded query string (everything
+    ///   after `?`, before `#`).
+    /// - HTTP-POST: the base64 `SAMLRequest` form value, already
+    ///   form-URL-decoded.
+    /// - SOAP / Artifact: rejected as [`Error::UnsupportedByPeer`] — those
+    ///   bindings carry richer envelopes and need the explicit
+    ///   [`IdentityProvider::consume_authn_request`] path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::decode_wire`] failures verbatim, then anything
+    /// [`IdentityProvider::consume_authn_request`] surfaces.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::{Duration, SystemTime};
+    /// use saml::{
+    ///     Binding, ConsumeAuthnRequestWire, IdentityProvider, SpDescriptor,
+    /// };
+    ///
+    /// # fn run(idp: &IdentityProvider, sp: &SpDescriptor, raw_query: &str)
+    /// #     -> Result<(), saml::Error> {
+    /// let parsed = idp.consume_authn_request_wire(ConsumeAuthnRequestWire {
+    ///     sp,
+    ///     peer_crypto_policy: None,
+    ///     wire_body: raw_query.as_bytes(),
+    ///     binding: Binding::HttpRedirect,
+    ///     relay_state: None,
+    ///     expected_destination: "https://idp.example.com/sso",
+    ///     now: SystemTime::now(),
+    ///     clock_skew: Duration::from_secs(60),
+    /// })?;
+    /// let _ = parsed.id;
+    /// # Ok(()) }
+    /// ```
+    pub fn consume_authn_request_wire(
+        &self,
+        input: ConsumeAuthnRequestWire<'_>,
+    ) -> Result<ParsedAuthnRequest, Error> {
+        let decoded = crate::binding::decode_wire(
+            input.wire_body,
+            input.binding,
+            crate::binding::WireDirection::Request,
+        )?;
+        let detached_signature = decoded.as_detached_signature();
+        let resolved_relay_state = input.relay_state.or(decoded.relay_state.as_deref());
+        self.consume_authn_request(ConsumeAuthnRequest {
+            sp: input.sp,
+            peer_crypto_policy: input.peer_crypto_policy,
+            saml_request: &decoded.xml,
+            binding: input.binding,
+            relay_state: resolved_relay_state,
+            detached_signature,
+            expected_destination: input.expected_destination,
+            now: input.now,
+            clock_skew: input.clock_skew,
+        })
+    }
+}
+
+/// Inputs to [`IdentityProvider::consume_authn_request_wire`] — the wire-level
+/// counterpart to [`ConsumeAuthnRequest`] that absorbs the binding-layer
+/// decode internally.
+pub struct ConsumeAuthnRequestWire<'a> {
+    pub sp: &'a SpDescriptor,
+    /// Per-peer inbound crypto policy. `None` falls back to the IdP's
+    /// `default_peer_crypto_policy`.
+    pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Raw binding wire payload — query string for HTTP-Redirect, base64
+    /// form value for HTTP-POST. See
+    /// [`IdentityProvider::consume_authn_request_wire`] for binding-by-
+    /// binding details.
+    pub wire_body: &'a [u8],
+    pub binding: Binding,
+    /// Override the `RelayState` value extracted by the wire decoder. For
+    /// HTTP-POST the decoder cannot see `RelayState` (it rides a separate
+    /// form field); callers MUST set this from that field. For HTTP-Redirect
+    /// the decoder pulls `RelayState` from the query string when present;
+    /// setting `Some` here overrides it, `None` preserves it.
+    pub relay_state: Option<&'a str>,
+    /// The IdP SSO endpoint URL that received this request. Used to validate
+    /// `AuthnRequest/@Destination`. MUST resolve to one of the URLs in
+    /// `self.config.sso`.
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
 }
 
 /// Verify the detached query-string signature on a Redirect AuthnRequest.
@@ -790,6 +894,130 @@ impl IdentityProvider {
         Ok(parsed.to_outcome())
     }
 
+    /// Convenience wrapper around [`IdentityProvider::consume_logout_request`]
+    /// that takes the raw binding wire payload instead of pre-decoded XML.
+    ///
+    /// Internally this delegates to [`crate::decode_wire`] with
+    /// [`crate::WireDirection::Request`] (a `<samlp:LogoutRequest>` rides the
+    /// `SAMLRequest=…` parameter on Redirect / POST), extracts any
+    /// Redirect-binding detached signature via
+    /// [`crate::DecodedWire::as_detached_signature`], and dispatches to
+    /// [`IdentityProvider::consume_logout_request`].
+    ///
+    /// See [`IdentityProvider::consume_authn_request_wire`] for the details on
+    /// what `wire_body` should contain per binding.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::{Duration, SystemTime};
+    /// use saml::{
+    ///     Binding, ConsumeLogoutRequestWire, IdentityProvider, SpDescriptor,
+    /// };
+    ///
+    /// # fn run(idp: &IdentityProvider, sp: &SpDescriptor, raw_query: &str)
+    /// #     -> Result<(), saml::Error> {
+    /// let parsed = idp.consume_logout_request_wire(ConsumeLogoutRequestWire {
+    ///     sp,
+    ///     peer_crypto_policy: None,
+    ///     wire_body: raw_query.as_bytes(),
+    ///     binding: Binding::HttpRedirect,
+    ///     expected_destination: "https://idp.example.com/slo",
+    ///     now: SystemTime::now(),
+    ///     clock_skew: Duration::from_secs(60),
+    /// })?;
+    /// let _ = parsed.id;
+    /// # Ok(()) }
+    /// ```
+    pub fn consume_logout_request_wire(
+        &self,
+        input: ConsumeLogoutRequestWire<'_>,
+    ) -> Result<ParsedLogoutRequest, Error> {
+        let decoded = crate::binding::decode_wire(
+            input.wire_body,
+            input.binding,
+            crate::binding::WireDirection::Request,
+        )?;
+        let detached_signature = decoded.as_detached_signature();
+        self.consume_logout_request(
+            input.sp,
+            ConsumeLogoutRequest {
+                peer_crypto_policy: input.peer_crypto_policy,
+                body: &decoded.xml,
+                binding: input.binding,
+                detached_signature,
+                expected_destination: input.expected_destination,
+                now: input.now,
+                clock_skew: input.clock_skew,
+            },
+        )
+    }
+
+    /// Convenience wrapper around [`IdentityProvider::consume_logout_response`]
+    /// that takes the raw binding wire payload instead of pre-decoded XML.
+    ///
+    /// Internally this delegates to [`crate::decode_wire`] with
+    /// [`crate::WireDirection::Response`] (a `<samlp:LogoutResponse>` rides
+    /// the `SAMLResponse=…` parameter on Redirect / POST), extracts any
+    /// Redirect-binding detached signature via
+    /// [`crate::DecodedWire::as_detached_signature`], and dispatches to
+    /// [`IdentityProvider::consume_logout_response`].
+    ///
+    /// See [`IdentityProvider::consume_authn_request_wire`] for the details on
+    /// what `wire_body` should contain per binding.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::{Duration, SystemTime};
+    /// use saml::{
+    ///     Binding, ConsumeLogoutResponseWire, IdentityProvider, LogoutTracker, SpDescriptor,
+    /// };
+    ///
+    /// # fn run(
+    /// #     idp: &IdentityProvider,
+    /// #     sp: &SpDescriptor,
+    /// #     tracker: &LogoutTracker,
+    /// #     raw_query: &str,
+    /// # ) -> Result<(), saml::Error> {
+    /// let outcome = idp.consume_logout_response_wire(ConsumeLogoutResponseWire {
+    ///     sp,
+    ///     peer_crypto_policy: None,
+    ///     wire_body: raw_query.as_bytes(),
+    ///     binding: Binding::HttpRedirect,
+    ///     tracker,
+    ///     expected_destination: "https://idp.example.com/slo",
+    ///     now: SystemTime::now(),
+    ///     clock_skew: Duration::from_secs(60),
+    /// })?;
+    /// let _ = outcome;
+    /// # Ok(()) }
+    /// ```
+    pub fn consume_logout_response_wire(
+        &self,
+        input: ConsumeLogoutResponseWire<'_>,
+    ) -> Result<LogoutOutcome, Error> {
+        let decoded = crate::binding::decode_wire(
+            input.wire_body,
+            input.binding,
+            crate::binding::WireDirection::Response,
+        )?;
+        let detached_signature = decoded.as_detached_signature();
+        self.consume_logout_response(
+            input.sp,
+            ConsumeLogoutResponse {
+                peer_crypto_policy: input.peer_crypto_policy,
+                body: &decoded.xml,
+                binding: input.binding,
+                detached_signature,
+                tracker: input.tracker,
+                expected_destination: input.expected_destination,
+                now: input.now,
+                clock_skew: input.clock_skew,
+            },
+        )
+    }
+
     /// Back-channel SOAP-bound SLO toward an SP. Sends the outbound
     /// `<samlp:LogoutRequest>` and consumes the synchronous SOAP
     /// `<samlp:LogoutResponse>` reply. See RFC-007 §6.
@@ -898,6 +1126,49 @@ impl IdentityProvider {
             },
         )
     }
+}
+
+/// Inputs to [`IdentityProvider::consume_logout_request_wire`] — the wire-level
+/// counterpart to [`ConsumeLogoutRequest`] that absorbs the binding-layer
+/// decode internally.
+#[cfg(feature = "slo")]
+pub struct ConsumeLogoutRequestWire<'a> {
+    pub sp: &'a SpDescriptor,
+    /// Per-peer inbound crypto policy. `None` falls back to the IdP's
+    /// `default_peer_crypto_policy`.
+    pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Raw binding wire payload — query string for HTTP-Redirect, base64
+    /// form value for HTTP-POST. See
+    /// [`IdentityProvider::consume_authn_request_wire`] for binding-by-
+    /// binding details.
+    pub wire_body: &'a [u8],
+    pub binding: Binding,
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+}
+
+/// Inputs to [`IdentityProvider::consume_logout_response_wire`] — the
+/// wire-level counterpart to [`ConsumeLogoutResponse`] that absorbs the
+/// binding-layer decode internally.
+#[cfg(feature = "slo")]
+pub struct ConsumeLogoutResponseWire<'a> {
+    pub sp: &'a SpDescriptor,
+    /// Per-peer inbound crypto policy. `None` falls back to the IdP's
+    /// `default_peer_crypto_policy`.
+    pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Raw binding wire payload — query string for HTTP-Redirect, base64
+    /// form value for HTTP-POST. See
+    /// [`IdentityProvider::consume_authn_request_wire`] for binding-by-
+    /// binding details.
+    pub wire_body: &'a [u8],
+    pub binding: Binding,
+    /// The tracker recorded when the matching `<samlp:LogoutRequest>` was
+    /// sent — provides the `InResponseTo` anchor (RFC-007 §5.2 step 6).
+    pub tracker: &'a LogoutTracker,
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
 }
 
 /// Verify the signature on an inbound SLO message. POST/SOAP get the embedded
@@ -1182,7 +1453,7 @@ mod tests {
     #[cfg(feature = "slo")]
     use crate::logout::request_build::BuildLogoutRequest;
     #[cfg(feature = "slo")]
-    use crate::logout::{LogoutStatus, StartLogout};
+    use crate::logout::{LogoutOutcome, LogoutStatus, StartLogout};
     use crate::nameid::{NameId, NameIdFormat};
     use crate::response::issue::SamlStatusCode;
     use crate::xml::parse::Node;
@@ -2000,6 +2271,409 @@ mod tests {
             NameIdFormat::Persistent
         );
         assert_eq!(pick_name_id_format(None, &supported, &default), NameIdFormat::Persistent);
+    }
+
+    // -------------------------------------------------------------------------
+    // wire-level helpers (consume_*_wire)
+    // -------------------------------------------------------------------------
+
+    /// Encode an unsigned AuthnRequest as a Redirect-binding raw query string.
+    fn build_unsigned_redirect_authn_request_raw_query(id: &str) -> String {
+        use crate::binding::redirect::{RedirectDirection, encode_unsigned};
+
+        let xml = build_unsigned_authn_request(id, true);
+        let dest = url::Url::parse("https://idp.example.com/sso").unwrap();
+        let dispatch = encode_unsigned(
+            &dest,
+            RedirectDirection::Request,
+            &xml,
+            Some("rs-wire-authn"),
+        )
+        .unwrap();
+        let url = match dispatch {
+            Dispatch::Redirect(u) => u,
+            other @ Dispatch::Post(_) => panic!("expected Redirect dispatch, got {other:?}"),
+        };
+        url.query().unwrap().to_owned()
+    }
+
+    /// Encode a signed AuthnRequest as a Redirect-binding raw query string —
+    /// what the IdP would see after `?` in the inbound URL.
+    fn build_signed_redirect_authn_request_raw_query(id: &str) -> String {
+        use crate::binding::redirect::{RedirectDirection, encode_signed};
+
+        let xml = build_unsigned_authn_request(id, true);
+        let kp = rsa_keypair_with_cert();
+        let sig_alg = SignatureAlgorithm::RsaSha256;
+        let dest = url::Url::parse("https://idp.example.com/sso").unwrap();
+        let dispatch = encode_signed(
+            &dest,
+            RedirectDirection::Request,
+            &xml,
+            Some("rs-wire-authn"),
+            sig_alg.uri(),
+            |to_sign| crate::dsig::sign::sign_detached_query(to_sign, &kp, sig_alg),
+        )
+        .unwrap();
+        let url = match dispatch {
+            Dispatch::Redirect(u) => u,
+            other @ Dispatch::Post(_) => panic!("expected Redirect dispatch, got {other:?}"),
+        };
+        url.query().unwrap().to_owned()
+    }
+
+    #[test]
+    fn consume_authn_request_wire_matches_two_step_for_signed_redirect() {
+        // The wire helper must produce the same `ParsedAuthnRequest` as the
+        // explicit `decode_wire` + `consume_authn_request` two-step path.
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_authn_request_raw_query("_wire-authn-1");
+
+        // Two-step path.
+        let decoded = crate::binding::decode_wire(
+            raw_query.as_bytes(),
+            Binding::HttpRedirect,
+            crate::binding::WireDirection::Request,
+        )
+        .expect("decode_wire");
+        let two_step = idp
+            .consume_authn_request(ConsumeAuthnRequest {
+                sp: &sp,
+                peer_crypto_policy: None,
+                saml_request: &decoded.xml,
+                binding: Binding::HttpRedirect,
+                relay_state: decoded.relay_state.as_deref(),
+                detached_signature: decoded.as_detached_signature(),
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect("two-step consume must succeed");
+
+        // Wire-helper path.
+        let one_call = idp
+            .consume_authn_request_wire(ConsumeAuthnRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                relay_state: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect("wire helper must succeed");
+
+        assert_eq!(one_call.id, two_step.id);
+        assert_eq!(one_call.issuer, two_step.issuer);
+        assert_eq!(one_call.relay_state, two_step.relay_state);
+        assert_eq!(one_call.relay_state.as_deref(), Some("rs-wire-authn"));
+        assert_eq!(
+            one_call.assertion_consumer_service.url,
+            two_step.assertion_consumer_service.url
+        );
+    }
+
+    #[test]
+    fn consume_authn_request_wire_unsigned_redirect_when_not_required() {
+        // The wire path must accept unsigned Redirect requests when the IdP
+        // does not require signing — mirroring the two-step API.
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+        let raw_query = build_unsigned_redirect_authn_request_raw_query("_wire-authn-unsigned");
+        let parsed = idp
+            .consume_authn_request_wire(ConsumeAuthnRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                relay_state: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect("unsigned wire consume must succeed");
+        assert_eq!(parsed.id, "_wire-authn-unsigned");
+        assert_eq!(parsed.relay_state.as_deref(), Some("rs-wire-authn"));
+    }
+
+    /// Replace the `Signature=...` parameter value in a Redirect-bound raw
+    /// query string with garbage that still parses as a valid base64 string
+    /// but does not verify against the signer's key. The XML payload and the
+    /// canonical signed-slice are left intact so the failure surfaces from
+    /// the verifier, not the decoder.
+    fn tamper_redirect_signature_param(raw_query: &str) -> String {
+        let mut pieces: Vec<String> = Vec::new();
+        for pair in raw_query.split('&') {
+            if pair.starts_with("Signature=") {
+                // Replace with an obviously-bogus but well-formed base64 blob
+                // of the same shape (256 chars → 192-byte signature, same as
+                // RSA-2048 RsaSha256). Any well-formed but wrong signature
+                // suffices to drive the verifier to reject.
+                let bogus = "A".repeat(256);
+                pieces.push(format!("Signature={bogus}"));
+            } else {
+                pieces.push(pair.to_owned());
+            }
+        }
+        pieces.join("&")
+    }
+
+    #[test]
+    fn consume_authn_request_wire_signed_redirect_rejects_tampered_signature() {
+        // Swap the detached signature bytes for a bogus blob: the wire helper
+        // must surface a signature-verification failure, matching the
+        // two-step path's behavior.
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(false);
+        let raw_query =
+            build_signed_redirect_authn_request_raw_query("_wire-authn-tamper");
+        let tampered = tamper_redirect_signature_param(&raw_query);
+        let err = idp
+            .consume_authn_request_wire(ConsumeAuthnRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: tampered.as_bytes(),
+                binding: Binding::HttpRedirect,
+                relay_state: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::SignatureVerification { .. }));
+    }
+
+    #[cfg(feature = "slo")]
+    fn build_signed_redirect_logout_request_raw_query(id: &str) -> String {
+        use crate::binding::redirect::{RedirectDirection, encode_signed};
+
+        let nid = NameId::email("alice@example.com");
+        let xml = crate::logout::request_build::build_logout_request_xml(&BuildLogoutRequest {
+            id,
+            issue_instant: fixed_now(),
+            issuer_entity_id: "https://sp.example.com/saml",
+            destination: Some("https://idp.example.com/slo"),
+            not_on_or_after: None,
+            reason: None,
+            name_id: &nid,
+            session_index: Some("sess-1"),
+        })
+        .unwrap();
+        let kp = rsa_keypair_with_cert();
+        let sig_alg = SignatureAlgorithm::RsaSha256;
+        let dest = url::Url::parse("https://idp.example.com/slo").unwrap();
+        let dispatch = encode_signed(
+            &dest,
+            RedirectDirection::Request,
+            &xml,
+            None,
+            sig_alg.uri(),
+            |to_sign| crate::dsig::sign::sign_detached_query(to_sign, &kp, sig_alg),
+        )
+        .unwrap();
+        let url = match dispatch {
+            Dispatch::Redirect(u) => u,
+            other @ Dispatch::Post(_) => panic!("expected Redirect dispatch, got {other:?}"),
+        };
+        url.query().unwrap().to_owned()
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn consume_logout_request_wire_matches_two_step_for_signed_redirect() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.requests = true;
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_logout_request_raw_query("_wire-lo-req-1");
+
+        // Two-step path: reuse the existing helper that returns the
+        // post-decode pieces, then feed them to `consume_logout_request`.
+        let (xml, signed_qs, signature, sig_alg) =
+            build_signed_redirect_logout_request("_wire-lo-req-1");
+        let two_step = idp
+            .consume_logout_request(
+                &sp,
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &xml,
+                    binding: Binding::HttpRedirect,
+                    detached_signature: Some(DetachedSignature {
+                        signature: &signature,
+                        sig_alg: &sig_alg,
+                        raw_query_string: &signed_qs,
+                    }),
+                    expected_destination: "https://idp.example.com/slo",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_mins(1),
+                },
+            )
+            .expect("two-step consume must succeed");
+
+        // Wire-helper path.
+        let one_call = idp
+            .consume_logout_request_wire(ConsumeLogoutRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect("wire helper must succeed");
+
+        assert_eq!(one_call.id, two_step.id);
+        assert_eq!(one_call.issuer, two_step.issuer);
+        assert_eq!(one_call.name_id.value, two_step.name_id.value);
+        assert_eq!(one_call.session_index, two_step.session_index);
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn consume_logout_request_wire_rejects_tampered_signed_redirect() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.requests = true;
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_logout_request_raw_query("_wire-lo-req-2");
+        let tampered = tamper_redirect_signature_param(&raw_query);
+        let err = idp
+            .consume_logout_request_wire(ConsumeLogoutRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: tampered.as_bytes(),
+                binding: Binding::HttpRedirect,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::SignatureVerification { .. }));
+    }
+
+    #[cfg(feature = "slo")]
+    fn build_signed_redirect_logout_response_raw_query(
+        id: &str,
+        in_response_to: &str,
+    ) -> String {
+        use crate::binding::redirect::{RedirectDirection, encode_signed};
+
+        let xml = crate::logout::response_build::build_logout_response_xml(&BuildLogoutResponse {
+            id,
+            issue_instant: fixed_now(),
+            issuer_entity_id: "https://sp.example.com/saml",
+            destination: Some("https://idp.example.com/slo"),
+            in_response_to,
+            status: LogoutStatus::Success,
+            status_message: None,
+        })
+        .unwrap();
+        let kp = rsa_keypair_with_cert();
+        let sig_alg = SignatureAlgorithm::RsaSha256;
+        let dest = url::Url::parse("https://idp.example.com/slo").unwrap();
+        let dispatch = encode_signed(
+            &dest,
+            RedirectDirection::Response,
+            &xml,
+            None,
+            sig_alg.uri(),
+            |to_sign| crate::dsig::sign::sign_detached_query(to_sign, &kp, sig_alg),
+        )
+        .unwrap();
+        let url = match dispatch {
+            Dispatch::Redirect(u) => u,
+            other @ Dispatch::Post(_) => panic!("expected Redirect dispatch, got {other:?}"),
+        };
+        url.query().unwrap().to_owned()
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn consume_logout_response_wire_matches_two_step_for_signed_redirect() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.responses = true;
+        let sp = sp_descriptor(false);
+        let in_response_to = "_wire-lo-resp-anchor";
+        let tracker = LogoutTracker {
+            request_id: in_response_to.to_owned(),
+            issued_at: fixed_now(),
+            peer_entity_id: sp.entity_id.clone(),
+        };
+        let raw_query =
+            build_signed_redirect_logout_response_raw_query("_wire-lo-resp-1", in_response_to);
+
+        // Two-step path: decode wire, then call consume_logout_response.
+        let decoded = crate::binding::decode_wire(
+            raw_query.as_bytes(),
+            Binding::HttpRedirect,
+            crate::binding::WireDirection::Response,
+        )
+        .expect("decode_wire response");
+        let two_step = idp
+            .consume_logout_response(
+                &sp,
+                ConsumeLogoutResponse {
+                    peer_crypto_policy: None,
+                    body: &decoded.xml,
+                    binding: Binding::HttpRedirect,
+                    detached_signature: decoded.as_detached_signature(),
+                    tracker: &tracker,
+                    expected_destination: "https://idp.example.com/slo",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_mins(1),
+                },
+            )
+            .expect("two-step consume_logout_response must succeed");
+
+        // Wire-helper path.
+        let one_call = idp
+            .consume_logout_response_wire(ConsumeLogoutResponseWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                tracker: &tracker,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect("wire helper must succeed");
+
+        assert!(matches!(one_call, LogoutOutcome::Success));
+        assert!(matches!(two_step, LogoutOutcome::Success));
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn consume_logout_response_wire_rejects_tampered_signed_redirect() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.responses = true;
+        let sp = sp_descriptor(false);
+        let in_response_to = "_wire-lo-resp-tamper-anchor";
+        let tracker = LogoutTracker {
+            request_id: in_response_to.to_owned(),
+            issued_at: fixed_now(),
+            peer_entity_id: sp.entity_id.clone(),
+        };
+        let raw_query = build_signed_redirect_logout_response_raw_query(
+            "_wire-lo-resp-tamper",
+            in_response_to,
+        );
+        let tampered = tamper_redirect_signature_param(&raw_query);
+        let err = idp
+            .consume_logout_response_wire(ConsumeLogoutResponseWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: tampered.as_bytes(),
+                binding: Binding::HttpRedirect,
+                tracker: &tracker,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::SignatureVerification { .. }));
     }
 
     #[cfg(feature = "slo")]
