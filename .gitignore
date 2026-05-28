@@ -12,3 +12,6 @@ examples/*/.env
 
 # Ad-hoc debug artifacts (screenshots, response dumps, etc.).
 .tmp/
+
+# macOS Finder metadata.
+.DS_Store

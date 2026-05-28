@@ -14,6 +14,15 @@ documentation = "https://docs.rs/saml"
 readme = "README.md"
 keywords = ["saml", "sso", "auth", "xml", "security"]
 categories = ["authentication", "cryptography"]
+exclude = [
+    ".DS_Store",
+    "**/.DS_Store",
+    ".github/",
+    ".claude/",
+    ".tmp/",
+    "examples/idps/",
+    "fuzz/",
+]
 
 [dependencies]
 quick-xml = "0.36"
