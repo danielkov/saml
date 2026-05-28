@@ -43,6 +43,18 @@ See [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-001-architecture.md) §1
 
 The protocol layer compiles for any target `rustc` supports, including `wasm32-unknown-unknown` with `default-features = false`.
 
+## Install
+
+```sh
+cargo add saml
+```
+
+Minimal build, opt out of the bundled `reqwest` HTTP client:
+
+```sh
+cargo add saml --no-default-features --features rsa-sha,ecdsa-sha,xmlenc,slo,metadata-emit,xsd-validate
+```
+
 ## Quick example — Service Provider
 
 ```rust
@@ -104,6 +116,8 @@ The full SP, IdP, and proxy quickstarts live in [`src/lib.rs`](src/lib.rs) crate
 ## End-to-end multi-IdP demo
 
 A runnable Axum SP wired up to seven IdPs (Keycloak, Authentik, FusionAuth locally; Zitadel, Auth0, Descope, Asgardeo in the cloud) behind one `/saml/acs` lives under [`examples/demo/`](examples/demo/). See [`examples/demo/README.md`](examples/demo/README.md) for the setup steps, and [`examples/idps/`](examples/idps/) for the merged docker-compose stack for the three local IdPs.
+
+A standalone Rust IdP built on top of `saml::IdentityProvider` lives at [`examples/idp/`](examples/idp/) — pair it with the Axum SP in `examples/demo/` to exercise the SP and IdP sides of the crate against each other without any third-party software in the loop.
 
 ## Replay protection
 
