@@ -4,10 +4,10 @@
 //!
 //! Two entry points:
 //!
-//! - [`sign_element`] — embeds an enveloped `<ds:Signature>` inside a SAML
+//! - `sign_element` — embeds an enveloped `<ds:Signature>` inside a SAML
 //!   protocol element (typically `<samlp:Response>`, `<saml:Assertion>`,
 //!   `<samlp:AuthnRequest>`, or `<samlp:LogoutRequest>`).
-//! - [`sign_detached_query`] — computes the raw signature bytes for the
+//! - `sign_detached_query` — computes the raw signature bytes for the
 //!   HTTP-Redirect binding (SAML 2.0 §3.4.4.1); the caller is responsible for
 //!   base64-encoding the result into the `Signature=` query parameter.
 //!

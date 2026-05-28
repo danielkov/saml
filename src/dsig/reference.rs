@@ -4,7 +4,7 @@
 //!
 //! Design notes
 //! ------------
-//! - The transforms accepted by [`AllowedTransform`] form a hard whitelist;
+//! - The transforms accepted by `AllowedTransform` form a hard whitelist;
 //!   any other URI is rejected at verification time with
 //!   `Error::DisallowedTransform`. This is the structural defense against
 //!   XSLT/XPath/base64-transform escalation vectors (RFC-002 §8).

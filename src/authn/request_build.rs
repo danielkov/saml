@@ -1,8 +1,8 @@
 //! Build outbound `<samlp:AuthnRequest>` per SAML 2.0 Core §3.4.1.
 //!
 //! Used by `ServiceProvider::start_login` (RFC-003 §3). The output of
-//! [`build_authn_request_element`] is an [`Element`] ready to be wrapped in a
-//! [`Document`] (and optionally signed via `dsig::sign::sign_element`) before
+//! `build_authn_request_element` is an `Element` ready to be wrapped in a
+//! `Document` (and optionally signed via `dsig::sign::sign_element`) before
 //! being handed to the binding layer.
 //!
 //! The XML shape produced is intentionally minimal: only the attributes /
@@ -13,7 +13,7 @@
 //! as a request shape change. Defaults are quiet.
 //!
 //! `AssertionConsumerServiceIndex` and `AssertionConsumerServiceURL` are
-//! mutually exclusive by SAML schema; the [`AcsRequest`] enum makes that
+//! mutually exclusive by SAML schema; the `AcsRequest` enum makes that
 //! mutual exclusion structural.
 
 use crate::authn::{SAML_NS, SAMLP_NS, saml_qname, samlp_qname};

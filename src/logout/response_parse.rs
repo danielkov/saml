@@ -3,11 +3,11 @@
 //! Used by `ServiceProvider::consume_logout_response` /
 //! `IdentityProvider::consume_logout_response` (RFC-007 §2 / §3 / §5.2) after
 //! the binding layer has decoded the wire envelope and the XML hardening pass
-//! (RFC-002 §1) has parsed the body into a [`Document`].
+//! (RFC-002 §1) has parsed the body into a `Document`.
 //!
 //! This module produces a `ParsedLogoutResponse` that exposes the two-level
 //! `<samlp:StatusCode>` chain verbatim; the public [`LogoutOutcome`] view is
-//! derived via [`ParsedLogoutResponse::to_outcome`] so callers can branch on
+//! derived via `ParsedLogoutResponse::to_outcome` so callers can branch on
 //! Success / PartialLogout / Failure without learning the SAML status URIs.
 //!
 //! Like `request_parse`, this module does NOT validate Issuer / Destination /

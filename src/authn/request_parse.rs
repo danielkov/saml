@@ -2,7 +2,7 @@
 //!
 //! Used by `IdentityProvider::consume_authn_request` (RFC-004 §2).
 //!
-//! This module produces a [`RawParsedAuthnRequest`] — a faithful view of the
+//! This module produces a `RawParsedAuthnRequest` — a faithful view of the
 //! wire-format attributes and children, without cross-checking against any SP
 //! metadata. The cross-checks (Issuer match, Destination registry, ACS
 //! resolution, binding consistency) live in [`super::request_validate`]; the

@@ -149,7 +149,7 @@ impl LogoutStatus {
     /// when emitting them the top-level code is `Responder` / `Requester`
     /// respectively, and the second-level code is the specific URI below.
     /// [`Self::uri`] returns the *most specific* URI — emitters select the
-    /// top-level code separately via [`Self::top_level_uri`].
+    /// top-level code separately via `Self::top_level_uri`.
     pub fn uri(self) -> &'static str {
         match self {
             LogoutStatus::Success => "urn:oasis:names:tc:SAML:2.0:status:Success",

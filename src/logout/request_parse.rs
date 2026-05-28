@@ -3,7 +3,7 @@
 //! Used by `ServiceProvider::consume_logout_request` /
 //! `IdentityProvider::consume_logout_request` (RFC-007 §2 / §3) after the
 //! binding layer has decoded the wire envelope and the XML hardening pass
-//! (RFC-002 §1) has parsed the body into a [`Document`].
+//! (RFC-002 §1) has parsed the body into a `Document`.
 //!
 //! This module is intentionally a pure XML-to-struct translator: it does NOT
 //! perform Issuer / Destination / signature / clock validation. Those are

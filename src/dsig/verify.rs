@@ -2,7 +2,7 @@
 //!
 //! See `docs/rfcs/RFC-002-xml-crypto-core.md` §3 and §3.3.
 //!
-//! The verification entry point [`verify_signature`] returns a
+//! The verification entry point `verify_signature` returns a
 //! [`VerifiedSignature`] handle whose `signed_element` field is the **only**
 //! supported way to extract the validated payload. Callers must always pass
 //! that [`ElementId`] to `Document::element(...)` — never re-resolve by name
@@ -21,7 +21,7 @@ use crate::dsig::reference::{
 use crate::error::Error;
 use crate::xml::parse::{Document, Element, ElementId};
 
-/// Verified-signature handle returned by [`verify_signature`]. Caller MUST use
+/// Verified-signature handle returned by `verify_signature`. Caller MUST use
 /// `signed_element` (not name-lookup, not re-parse) to extract the validated
 /// payload — that is the structural XSW defense. See RFC-002 §3.2.
 #[derive(Debug, Clone)]

@@ -6,8 +6,8 @@
 //!   maintain our own namespace stack rather than using `NsReader` because c14n
 //!   needs to see *exactly which namespace declarations are recorded on which
 //!   element*, not just the resolved bindings.
-//! - Each [`Element`] owns its children inline (`Vec<Node>` where `Node` may be
-//!   `Element`, `Text`, or `Comment`). The [`Document`] additionally stores a
+//! - Each `Element` owns its children inline (`Vec<Node>` where `Node` may be
+//!   `Element`, `Text`, or `Comment`). The `Document` additionally stores a
 //!   per-element *path* (a sequence of child indices from the root) keyed by
 //!   [`ElementId`], so the opaque handle issued at parse time resolves to a
 //!   borrow without any unsafe pointer aliasing.
@@ -33,7 +33,7 @@ use crate::error::Error;
 ///
 /// Equality and hashing are based on the namespace URI and local name only;
 /// the *prefix* used in the source document is recorded separately on each
-/// [`Element`] under `namespaces_declared_here` (so canonicalization can
+/// `Element` under `namespaces_declared_here` (so canonicalization can
 /// reconstruct the exact in-scope namespace declarations).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QName {
@@ -95,9 +95,9 @@ impl Default for XmlLimits {
 // Element / Node / ElementId
 // =============================================================================
 
-/// Opaque, stable handle to an [`Element`] within a [`Document`].
+/// Opaque, stable handle to an `Element` within a `Document`.
 ///
-/// Issued by [`Document::parse`] (or [`Document::new`] for documents built
+/// Issued by `Document::parse` (or `Document::new` for documents built
 /// programmatically); remains valid for the lifetime of the owning document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ElementId(pub(crate) u32);
