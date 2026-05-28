@@ -91,7 +91,9 @@
             "logout": {
               "behavior": "AllParticipants",
               "singleLogout": {
-                "enabled": false
+                "enabled": true,
+                "url": "http://localhost:3000/saml/slo",
+                "xmlSignatureC14nMethod": "exclusive_with_comments"
               }
             }
           },

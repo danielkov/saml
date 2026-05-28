@@ -76,9 +76,12 @@
     <div class="logout-row">
       <a class="btn btn-ghost" href="/">Try a different IdP</a>
       <form method="post" action="/logout">
-        <button class="btn btn-ghost" type="submit">Sign out</button>
+        <button class="btn btn-ghost" type="submit">{{logout_label}}</button>
       </form>
     </div>
+    <p class="logout-hint" style="margin: 8px 0 0; font-size: 12px; color: var(--text-soft);">
+      {{logout_hint}}
+    </p>
 
     <footer class="meta">
       <span>SP entity: <code>{{sp_entity_id}}</code></span>

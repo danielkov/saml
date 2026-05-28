@@ -15,11 +15,28 @@ const DASHBOARD_TMPL: &str = include_str!("../static/dashboard.html.tmpl");
 
 /// Render the landing page with one card per provider. Each card links to
 /// `/login/<provider_id>` and is colour-themed with the provider's accent.
-pub fn render_index(sp_entity_id: &str, providers: &[&ProviderConfig]) -> String {
+///
+/// `banner` is an optional one-line notice rendered above the provider
+/// grid — used to surface the outcome of the logout flow (signed-out,
+/// signed-out-locally, etc.).
+pub fn render_index(
+    sp_entity_id: &str,
+    providers: &[&ProviderConfig],
+    banner: Option<&str>,
+) -> String {
     let mut vars: BTreeMap<&str, String> = BTreeMap::new();
     vars.insert("sp_entity_id", escape(sp_entity_id));
     vars.insert("provider_count", providers.len().to_string());
     vars.insert("provider_cards", render_provider_cards(providers));
+    vars.insert(
+        "banner",
+        banner.map_or_else(String::new, |text| {
+            format!(
+                "<aside class=\"banner\" role=\"status\">{}</aside>",
+                escape(text),
+            )
+        }),
+    );
     render(INDEX_TMPL, &vars)
 }
 
@@ -71,6 +88,10 @@ pub struct DashboardView<'a> {
     pub provider_id: &'a str,
     pub provider_label: &'a str,
     pub provider_accent: &'a str,
+    /// True if the IdP advertises a `<SingleLogoutService>` endpoint, so the
+    /// dashboard can label the Sign out button as a real SLO action rather
+    /// than a local-only clear.
+    pub supports_slo: bool,
     pub attributes: &'a [AttributeRow<'a>],
 }
 
@@ -91,6 +112,25 @@ pub fn render_dashboard(view: &DashboardView<'_>) -> String {
     vars.insert("provider_accent", escape(view.provider_accent));
     vars.insert("attribute_count", view.attributes.len().to_string());
     vars.insert("attribute_rows", render_attribute_rows(view.attributes));
+    let (logout_label, logout_hint) = if view.supports_slo {
+        (
+            format!("Sign out of {}", view.provider_label),
+            format!(
+                "Posts a signed SAML <code>LogoutRequest</code> to {} so the IdP session ends too.",
+                escape(view.provider_label),
+            ),
+        )
+    } else {
+        (
+            "Sign out (local only)".to_owned(),
+            format!(
+                "{} does not advertise a SingleLogoutService endpoint, so only the SP-side session cookie is cleared.",
+                escape(view.provider_label),
+            ),
+        )
+    };
+    vars.insert("logout_label", escape(&logout_label));
+    vars.insert("logout_hint", logout_hint);
     render(DASHBOARD_TMPL, &vars)
 }
 
@@ -242,7 +282,9 @@ mod tests {
             metadata_url: "http://example".to_owned(),
             sso_url_override: None,
             idp_entity_id_override: None,
+            slo_url_override: None,
             extra_signing_cert_paths: vec![],
+            prefer_slo_binding: None,
             accent_color: accent.to_owned(),
             brand_initial: "X".to_owned(),
             requested_name_id_format: Some(NameIdFormat::EmailAddress),
@@ -277,7 +319,7 @@ mod tests {
     fn render_index_emits_one_card_per_provider() {
         let kc = p("keycloak", "#cd0000", "Keycloak");
         let z = p("zitadel", "#5469d4", "Zitadel");
-        let html = render_index("saml-axum-demo", &[&kc, &z]);
+        let html = render_index("saml-axum-demo", &[&kc, &z], None);
         assert!(html.contains("/login/keycloak"));
         assert!(html.contains("/login/zitadel"));
         assert!(html.contains("#cd0000"));
@@ -307,6 +349,7 @@ mod tests {
             provider_id: "keycloak",
             provider_label: "Keycloak",
             provider_accent: "#cd0000",
+            supports_slo: true,
             attributes: &attrs,
         };
         let html = render_dashboard(&view);

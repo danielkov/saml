@@ -46,11 +46,26 @@ pub struct ProviderConfig {
     /// to make routing match.
     #[serde(default)]
     pub idp_entity_id_override: Option<String>,
+    /// Override the IdP `SingleLogoutService` URL discovered from metadata.
+    /// Symmetric to `sso_url_override`: some IdPs advertise an SLO URL in
+    /// metadata that differs from the URL they actually expect to receive a
+    /// `<samlp:LogoutRequest>` at (or don't advertise one at all even though
+    /// they support SLO). Setting this rewrites every `idp.slo_endpoints[*].url`
+    /// at startup.
+    #[serde(default)]
+    pub slo_url_override: Option<String>,
     /// Extra IdP signing certs (PEM file paths) to trust alongside whatever
     /// was parsed from metadata. Needed for IdPs like FusionAuth that don't
     /// publish a `<KeyDescriptor>` in their metadata XML.
     #[serde(default)]
     pub extra_signing_cert_paths: Vec<String>,
+    /// Preferred binding for the SP-initiated `<LogoutRequest>`. Accepts
+    /// "Redirect" or "POST" (case-insensitive). Defaults to Redirect, which
+    /// works for spec-compliant IdPs. FusionAuth needs POST because its
+    /// `/samlv2/logout/{id}` endpoint doesn't DEFLATE-decompress the
+    /// Redirect-binding payload and rejects with a UTF-8 decode error.
+    #[serde(default)]
+    pub prefer_slo_binding: Option<String>,
     /// Hex accent color used in the brand mark + the login card border.
     pub accent_color: String,
     /// Single character or short glyph rendered inside the brand mark on

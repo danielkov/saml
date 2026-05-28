@@ -63,6 +63,13 @@ metadata_url = "http://localhost:9011/samlv2/metadata/e9fdb985-9173-4e01-9d73-ac
 # IdP-initiated entry point. SP-initiated AuthnRequests must hit the tenant URL
 # instead; otherwise FA returns "AuthnRequest contained an invalid issuer".
 sso_url_override = "http://localhost:9011/samlv2/login/d7d09513-a3f5-401c-9685-34ab6c552453"
+# Same routing quirk applies to logout: SP-init LogoutRequest must hit
+# /samlv2/logout/{tenantId}, not the {applicationId} URL the metadata
+# advertises.
+slo_url_override = "http://localhost:9011/samlv2/logout/d7d09513-a3f5-401c-9685-34ab6c552453"
+# FA's logout endpoint doesn't DEFLATE-decompress Redirect-binding payloads
+# and rejects them with "Invalid byte 1 of 1-byte UTF-8 sequence". POST works.
+prefer_slo_binding = "POST"
 # FA's Response <Issuer> uses tenantId, but the metadata's entityID uses
 # applicationId. ACS routing needs the runtime value, not the metadata one.
 idp_entity_id_override = "http://localhost:9011/samlv2/d7d09513-a3f5-401c-9685-34ab6c552453"
