@@ -5,7 +5,7 @@
 //!
 //! Implementation notes
 //! --------------------
-//! Canonicalization is a pure function of the parsed [`Document`] tree — no
+//! Canonicalization is a pure function of the parsed `Document` tree — no
 //! source-byte slicing, no re-parse. Both algorithms walk the element subtree
 //! in document order, threading an explicit ancestor stack so that:
 //!

@@ -2,8 +2,8 @@
 //!
 //! Used by both `ServiceProvider::start_logout` and
 //! `IdentityProvider::start_logout` (RFC-007 §2 / §3). The output of
-//! [`build_logout_request_element`] is an [`Element`] ready to be wrapped in
-//! a [`Document`] (and optionally signed via `dsig::sign::sign_element`)
+//! `build_logout_request_element` is an `Element` ready to be wrapped in
+//! a `Document` (and optionally signed via `dsig::sign::sign_element`)
 //! before being handed to the binding layer.
 //!
 //! The XML shape produced is intentionally minimal: only the schema-required

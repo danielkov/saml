@@ -1,7 +1,7 @@
 //! XML-Encryption decryption per W3C XML-Encryption (TR/2002/REC-xmlenc-core-).
 //! See `docs/rfcs/RFC-002-xml-crypto-core.md` §7.
 //!
-//! The entry point [`decrypt_encrypted_assertion`] unwraps a
+//! The entry point `decrypt_encrypted_assertion` unwraps a
 //! `<saml:EncryptedAssertion>` element into the cleartext `<saml:Assertion>`,
 //! returning the freshly-parsed element root. Algorithm acceptance is gated
 //! by caller-supplied allow-lists (sourced from the peer's

@@ -2,14 +2,14 @@
 //!
 //! Used by both `ServiceProvider::build_logout_response` and
 //! `IdentityProvider::build_logout_response` (RFC-007 §2 / §3). The output of
-//! [`build_logout_response_element`] is an [`Element`] ready to be wrapped in
-//! a [`Document`] (and optionally signed via `dsig::sign::sign_element`)
+//! `build_logout_response_element` is an `Element` ready to be wrapped in
+//! a `Document` (and optionally signed via `dsig::sign::sign_element`)
 //! before being handed to the binding layer.
 //!
 //! The `<samlp:Status>` element is the protocol-defining payload. SAML uses a
 //! two-level status code chain — top-level (`Success` / `Requester` /
 //! `Responder`) optionally nested with a second-level code such as
-//! `PartialLogout` or `RequestDenied`. [`LogoutStatus`] collapses both layers
+//! `PartialLogout` or `RequestDenied`. `LogoutStatus` collapses both layers
 //! into a flat enum; this module expands it back into the schema-correct
 //! nested form on emit so callers don't have to know the SAML two-level dance.
 

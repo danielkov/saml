@@ -1,7 +1,7 @@
 //! XML-Encryption encryption per W3C XML-Encryption.
 //! See `docs/rfcs/RFC-002-xml-crypto-core.md` §7.
 //!
-//! The entry point is [`encrypt_assertion`]: it serializes the input
+//! The entry point is `encrypt_assertion`: it serializes the input
 //! `<saml:Assertion>`, encrypts it under a freshly-minted symmetric session
 //! key (`data_algorithm`), wraps the session key under the recipient's RSA
 //! public key (`key_transport_algorithm`), and emits the resulting

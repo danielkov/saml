@@ -996,7 +996,7 @@ impl ServiceProvider {
         self.emit_metadata(sign, None)
     }
 
-    /// Same as [`metadata_xml`], plus `<md:Organization>` and
+    /// Same as [`Self::metadata_xml`], plus `<md:Organization>` and
     /// `<md:ContactPerson>` content from `extras`.
     pub fn metadata_xml_with_extras(
         &self,

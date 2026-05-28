@@ -1,10 +1,10 @@
-//! Minimal serializer for [`Document`] / [`Element`] trees, plus a builder
+//! Minimal serializer for `Document` / `Element` trees, plus a builder
 //! API for constructing documents programmatically (used by metadata and
 //! protocol emission paths).
 //!
 //! This module is *not* a canonicalizer. Canonicalization (Exclusive /
 //! Inclusive C14N) is a separate transform performed by `dsig::c14n`. The
-//! output of [`emit_document`] is well-formed XML suitable for the wire,
+//! output of `emit_document` is well-formed XML suitable for the wire,
 //! but its byte representation is not guaranteed to be canonical — that
 //! guarantee is provided by c14n applied on top of the same parsed tree.
 //!

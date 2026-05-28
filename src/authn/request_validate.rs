@@ -47,7 +47,7 @@ pub struct ParsedAuthnRequest {
     pub requested_authn_context: Option<RequestedAuthnContext>,
     /// RelayState forwarded from the binding layer (Redirect query string, or
     /// POST form). Optional. Set by the caller (sp/idp role), not here —
-    /// [`validate_authn_request`] initializes this to `None`; the caller
+    /// `validate_authn_request` initializes this to `None`; the caller
     /// overwrites it after a successful validate.
     pub relay_state: Option<String>,
 }
