@@ -88,6 +88,7 @@
             "requireSignedRequests": true,
             "xmlSignatureC14nMethod": "exclusive_with_comments",
             "xmlSignatureLocation": "Assertion",
+            "logoutURL": "http://localhost:3000/saml/slo",
             "logout": {
               "behavior": "AllParticipants",
               "singleLogout": {
