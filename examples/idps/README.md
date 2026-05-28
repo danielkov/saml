@@ -49,3 +49,15 @@ docker compose -f examples/idps/docker-compose.yml down -v
 
 The `-v` flag removes all the named volumes, so the next `up -d`
 re-applies the bootstrap files cleanly.
+
+## Rotating the FusionAuth IdP keypair
+
+`fusionauth/idp/cert.pem` and `fusionauth/idp/key.pem` are committed
+fixtures the kickstart bootstrap reads on first boot. To rotate
+locally (cert expiry, key compromise during testing, regenerating
+after switching openssl versions) run
+`./fusionauth/regen_cert.sh` — it writes a fresh RSA-2048 self-signed
+keypair with the same `CN=saml-axum-demo-fa-idp` subject and a
+10-year validity window. Don't commit the regenerated files; they
+exist only so a clean clone can `docker compose up` without extra
+setup.
