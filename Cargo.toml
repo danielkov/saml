@@ -8,6 +8,12 @@ edition = "2024"
 rust-version = "1.91.0"
 description = "Stateless, async-native SAML 2.0 toolkit with no libxml2/xmlsec C build chain"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/danielkov/saml"
+homepage = "https://github.com/danielkov/saml"
+documentation = "https://docs.rs/saml"
+readme = "README.md"
+keywords = ["saml", "sso", "auth", "xml", "security"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 quick-xml = "0.36"
