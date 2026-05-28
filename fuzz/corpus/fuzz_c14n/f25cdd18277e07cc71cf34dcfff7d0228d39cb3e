@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:xs="http://www.w3.org/2001/XMLSchema" Destination="https://example.hello.com/access/saml" ID="jVFQbyEpSfUwqhZtJtarIaGoshwuAQMDwLoiMhzJXsv" InResponseTo="cfeooghajnhofcmogakmlhpkohnmikicnfhdnjlc" IssueInstant="2011-06-21T13:54:38.661Z" Version="2.0">
+  <saml2:Issuer xmlns:saml2="urnKCAQEAse8rnep4qL2GmhH10pMQyJ2Jae+AQHyfgVjaQZ7Z
+0QQog5jX91vcJRSMi0XWJnUtOr6lF0dq1+yckjZ92wyLrH+7fvngNO1aV4Mjk9sT
+gf+iqMrae6y6fRxDt9PXrEFVjvd3vv7QTJf2FuIPy4vVP06Dt8EMkQIr8rmLmU0m
+Tr1k2DkrdtdlCuNFTXuAu3QqfvNCRrRwfNObn9MP6JeOUdcGLJsBjEF8exfcN1SF
+zRF0JFr3dmOlx761zK5liD0T1sYWnDquatj/JD9fZMbKecBKni1NglH/LVd+b6aJ
+UAr5LulERULUjLqYJRKW31u91/4Qazdo9tbvwqyFxaoUrwIDAQABo4HUMIHRMAwG
+A1UdEwEB/wQCMAAwHQYDVR0OBBYEFPWcXvQSlTXnzZD2xziuoUvrrDedMIGRBgNV
+HSMEgYkwgYaAFPWcXvQSlTXnzZD2xziuoUvrrDedoWukaTBnMQswCQYDVQQGEwJV
+UzETMBEGA1UECAwKQ2FsaWZvcm5pYTEVMBMGA1UEBwwMU2FudGEgTW9uaWNhMREw
+DwYDVQQKDAhPbmVMb2dpbjEZMBcGA1UEAwwQYXBwLm9uZWxvZ2luLmNvbYIBATAO
+BgNVHQ8BAf8EBAMCBPAwDQYJKoZIhvcNAQEFBQADggEBAB/8xe3rzqXQVxzHyAHu
+AuPa73ClDoL1cko0Fp8CGcqEIyj6Te9gx5z6wyfv+Lo8RFvBLlnB1lXqbC+fTGcV
+gG/4oKLJ5UwRFxInqpZPnOAudVNnd0PYOO      <saml2:Attribute Name="FirstName">
+        <saml2:AttributeValue xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="xs:string">      <saml2:AuthnContext>
+        <saml2:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml2:AuthnContextClassRef>
+      </saml2:AuthnContext>
+    </saml2:AuthnStatement>
+    <saml2:AttributeStatement>
+      <saml2:Attribute Name="FirstName">
+        <saml2:AttributeValue xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="xs:string">Someone</saml2:AttributeValue>
+      </saml2:Attribute>
+      <saml2:Attribute Name="Laindings:HTTP-POST" Location="https://app.onelogin.com/trust/saml2/http-post/sso:oasis:names:tc:SAML:2.0:assertion">https://idm.orademo.com</saml2:Issuer>
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha0"/>
+      <ds:Reference URI="#jVFQbyEpSfUwqhZtJtarIaGoshwuAQMDwLoiMhzJXsv">
+        <ds:Transforms>
+          <ds:Transform Algorithm="http://www.w3.org/20<?xml version="1.0"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_0263a07b-205f-479c-90fc-7495715ecbbf" Version="2.0" IssueInstant="2011-06-22T12:49:30.348Z" Destination="https://someone.example.com/endpoint" Consent="urn:oasis:names:tc:SAML:2.0:consent:unspecified" InResponseTo="_fc4a34b0-7efb-012e-caae-782bcb13bb38">
+  <Issuer xmlns="urn:oasis:names:tc:SAML:2.0:assertion">http://login.example.com/issuer</Issuer>
+  <samlp:Status>
+    <samlp:StatusCode Value="urn:oasis:names:tcta.com/k7xkhq0jUHUPQAXVMUAN</saml2:Issuer><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:Canonicalizatio00/09/xmldsig#enveloped-signature"/>
+          <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#">
+            <ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="xs"/>
+          </ds:Transform>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+        <ds:DigestValue>uHuSry39P16Yh7srS32xESmj4Lw=</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>fdghdfggfd=</ds:SignatureValue>
+    <ds:KeyInfo>
+      <ds:X509Data>
+        <ds:X509Certificate>dfgnMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rca-sha1"/><ds:Reference URI="#id8132302868541019755414121"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="xs"/></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="hhjkl<ttp://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>4G+uveKmtiB1EkY5BAt+8lmQwjI=</ds:Diges/ds

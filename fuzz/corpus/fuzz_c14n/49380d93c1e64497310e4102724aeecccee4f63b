@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_6b02a2b5-496b-4acc-a3c5-c86d0e9a3825" Version="2.0" IssueInstant="2012-04-04T07:33:10.921Z" Destination="https://example.com/endpoint">
+  <saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">idp.example.com</saml:Issuer>
+  <samlp:Status>
+    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+  </samlp:Status>
+  <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" Version="2.0" ID="_cc084213-c9df-45ef-87a0-263f4da4f79b" IssueInstant="2012-04-04T07:33:10.923Z">
+    <saml:Issuer>idp.myexample.org</saml:Issuer>
+    <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+      <SignedInfo>
+        <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+        <SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>
+        <Reference URI="#_cc084213-c9df-45ef-87a0-263f4da4f79b">
+          <Transforms>
+            <Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+            <Transform Algorithm="http://www.13.org/2001/10/xml-exc-c14n#">
+              <InclusiveNamespaces xmlns="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="#default saml ds xs xsi"/>
+            </Transform>,
+          </Transforms>
+          <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+          <DigestValue>WFNjs7vC+IquRrJ7v7Q2YGGa7R0=</DigestValue>
+        </Reference>
+      </SignedInfo>
+      <SignatureValue>MmuXQdjutiuP7soIaB7nk9wSR8OGkmyH5n9aelMTOrV7gTVNDazgQ/GXMmYXTTrhdvGN65duLO0oYdsYGxwNIjlA1lBS0JnTlZCQWdUQTA1VFZ6RVBNQTBHQTFVRUJ4TUdVM2xrYm1WNU1Rd3dDZ;lEVlFRS0RBtlj0DgrK9m0A=</SignatureValue>
+      <KeyInbo>
+        <X509Data>
+      <X509Certificate>LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUQwRENDQXptZ0F3SUJBZ0lCQVRBTkJna3Foa2,HOXcwQkFRVUZBRENCaGpFTE1Ba0dBMVVFQmhNQ1FWVXgKRERBS0JnTlZCQWdUQTA1VFZ6RVBNQTBHQTFVRUJ4TUdVM2xrYm1WNU1Rd3dDZ;lEVlFRS0RBTlFTVlF4Q1RBSApCZ05WQkFzTUFERVlNQllHQTFVRUF3d1BiR0YzY21WdVkyVndhWFF1WTI5dE1TVXdJd1lKS29aSWh2Y05BUWtCCkRCWnNZWGR5Wlc1alpTNXdhWFJBWjIxaGFXd3VZMjl0TUI0WERURXlNRFF4T0RBMU1qVTFPVm9YRFRNeU1EUXgKTXpBMU1qVTFPVm93Z1lZeEN6QUpCZ05WQkFZVEFrRlZNUXd3Q2dZRFZRUUlFd05PVTFjeER6QU5CZ05WQkFjVApCbE41Wkc1bGVURU1NQW9HQTFVRUNnd0RVRWxVTVFrd0J3WURWUVFMREFBeEdEQVdCZ05WQkFNTUQyeGhkM0psCmJtTmxjR2wwTG1OdmJURWxNQ01HQ1NxR1NJYjNEUUVKQVF3V2JHRjNjbVZ1WTJVdWNHbDBRR2R0WVdsc0xtTnYKYlRDQm56QU5CZ2txaGtpRzl3MEJBUUVGQUFPQmpRQXdnWWtDZ1lFQW9mR3p4NFZvQzZDSENYdFJPdkVLSFRzRAppNkFBWCtoVWpiSVloeERsZUxMZUNVemZDaVVXOFkwbTVrWkVKbjJXSmt5Si8wRFdPZmE5b0c1ZUg1eXNKSWpVCnpTUjVkMGJldmJZMEV1OHJDTmh3S001UzdYaXltTzBGc09mcnh6TkJxbVRBblE2VFJYT25nY1BYTitXRWd4cmQKZDVoV1V5ZXh2dkQ2d05McWdVRUNBd0VBQWFPQ0FVb3dnZ0ZHTUFrR0ExVWRFd1FDTUFBd0N3WURWUjBQQkFRRApBZ1VnTUIwR0ExVWREZ1FXQ>
+      </saml:AuthnContext>
+    </saml:AuthnStatement>
+  </saml:Assertion>
+</samlp:Response>

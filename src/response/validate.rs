@@ -11,8 +11,11 @@
 use std::time::{Duration, SystemTime};
 
 use crate::authn_context::{
-    AuthnContextClassRef, AuthnContextComparison, RequestedAuthnContext,
+    ComparatorOutcome, RequestedAuthnContext, StandardComparator,
 };
+#[cfg(test)]
+use crate::authn_context::{AuthnContextClassRef, AuthnContextComparison};
+#[cfg(any(test, feature = "xmlenc"))]
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::IdpDescriptor;
 use crate::dsig::algorithms::PeerCryptoPolicy;
@@ -32,6 +35,7 @@ pub(crate) struct ValidateResponse<'a> {
     pub idp: &'a IdpDescriptor,
     pub peer_crypto_policy: &'a PeerCryptoPolicy,
     /// SP's signing/decryption keypair(s) (for EncryptedAssertion unwrap).
+    #[cfg(feature = "xmlenc")]
     pub decryption_keys: &'a [&'a KeyPair],
     /// SP entity ID (for AudienceRestriction).
     pub sp_entity_id: &'a str,
@@ -58,6 +62,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         parsed,
         idp,
         peer_crypto_policy,
+        #[cfg(feature = "xmlenc")]
         decryption_keys,
         sp_entity_id,
         expected_destination,
@@ -112,6 +117,20 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // strict equality after verification is the XSW defense (RFC-002 §3.2).
     let response_root_element_id = document.root().id();
 
+    // --- Structural XSW defense: reject `<ds:Signature>` in unexpected places.
+    //
+    // The SAML 2.0 profile only places `<ds:Signature>` as a direct child of
+    // `<samlp:Response>` or `<saml:Assertion>` (and `<saml:EncryptedAssertion>`
+    // for the encrypted path). A `<ds:Signature>` anywhere else — e.g. buried
+    // inside `<samlp:Status>` so that name-based lookup at the canonical
+    // position returns `None` — is a signature-wrapping attempt: the attacker
+    // moved a valid signature to a location the SP doesn't inspect, so the SP
+    // sees no signature at the canonical position while a cryptographically
+    // valid signature exists elsewhere. We refuse to consume any Response
+    // whose tree carries a `<ds:Signature>` outside the allowed positions,
+    // regardless of whether `want_*_signed` is set.
+    enforce_signature_positions(document)?;
+
     // --- Step 7: exactly one assertion (already enforced as ≤1 at parse) ----
     let assertion_wrapper = parsed
         .assertion
@@ -136,19 +155,26 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
                     reason: "verified assertion element id not resolvable",
                 })?
                 .clone();
-            (verified.verifying_cert_fingerprint, assertion_elem, None)
+            (verified.verifying_cert_fingerprint, assertion_elem, None::<Document>)
         }
+        #[cfg(feature = "xmlenc")]
         AssertionWrapper::Encrypted(enc_id) => {
-            handle_encrypted(
+            handle_encrypted(HandleEncryptedParams {
                 document,
-                response_root_element_id,
-                *enc_id,
+                response_root_id: response_root_element_id,
+                encrypted_assertion_id: *enc_id,
                 idp,
-                peer_crypto_policy,
+                policy: peer_crypto_policy,
                 decryption_keys,
                 want_response_signed,
                 want_assertions_signed,
-            )?
+            })?
+        }
+        #[cfg(not(feature = "xmlenc"))]
+        AssertionWrapper::Encrypted(_enc_id) => {
+            return Err(Error::InvalidConfiguration {
+                reason: "EncryptedAssertion requires the `xmlenc` feature",
+            });
         }
     };
 
@@ -164,14 +190,20 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // --- Steps 12/13: time windows on Conditions -----------------------------
     if let Some(nb) = assertion.conditions.not_before {
         // Reject if NotBefore is in the future beyond clock_skew.
-        if nb > now + clock_skew {
+        let now_plus_skew = now.checked_add(clock_skew).ok_or_else(|| {
+            Error::XmlParse("now + clock_skew overflows SystemTime".to_string())
+        })?;
+        if nb > now_plus_skew {
             return Err(Error::NotYetValid);
         }
     }
     let conditions_not_on_or_after = assertion.conditions.not_on_or_after.ok_or(
         Error::XmlParse("Conditions missing NotOnOrAfter".to_string()),
     )?;
-    if conditions_not_on_or_after <= now - clock_skew {
+    let now_minus_skew = now.checked_sub(clock_skew).ok_or_else(|| {
+        Error::XmlParse("now - clock_skew underflows SystemTime".to_string())
+    })?;
+    if conditions_not_on_or_after <= now_minus_skew {
         return Err(Error::Expired);
     }
 
@@ -224,6 +256,11 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
             None => (None, assertion.issue_instant, None, None),
         };
 
+    // `<saml:OneTimeUse>` (SAML 2.0 Core §2.5.1.5) is a deduplication
+    // directive, not a time bound — distinct from `NotOnOrAfter`. The library
+    // surfaces the parsed flag here and leaves enforcement (replay cache
+    // keyed on `assertion_id`) to the caller. See `Identity::is_one_time_use`
+    // for the contract.
     Ok(Identity {
         name_id: assertion.subject_name_id,
         session_index,
@@ -234,7 +271,64 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         assertion_id: assertion.id,
         not_on_or_after: conditions_not_on_or_after,
         verifying_cert_fingerprint: verified_cert_fingerprint,
+        is_one_time_use: assertion.conditions.one_time_use,
     })
+}
+
+// =============================================================================
+// Structural defense: `<ds:Signature>` must only appear in profile-allowed
+// positions.
+// =============================================================================
+
+/// SAML protocol namespace URI (`samlp:`).
+const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+/// SAML assertion namespace URI (`saml:`).
+const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+
+/// Recursively scan the document for `<ds:Signature>` elements. Each one MUST
+/// be a direct child of either `<samlp:Response>`, `<saml:Assertion>`, or
+/// `<saml:EncryptedAssertion>`. Any other location is treated as a signature-
+/// wrapping attempt and rejected.
+///
+/// The check runs before any signature verification so that a maliciously
+/// placed signature cannot influence the outcome — not even by being silently
+/// ignored.
+fn enforce_signature_positions(document: &Document) -> Result<(), Error> {
+    fn walk(
+        element: &Element,
+        parent: Option<&Element>,
+    ) -> Result<(), Error> {
+        if element.qname().namespace() == Some(DS_NS) && element.qname().local() == "Signature" {
+            // The implicit `<ds:Signature>` inside another `<ds:Signature>`'s
+            // `<ds:KeyInfo>` is not legal SAML; we forbid it too by requiring
+            // an explicit allowed parent.
+            let allowed = parent.is_some_and(|p| {
+                let ns = p.qname().namespace();
+                let local = p.qname().local();
+                matches!(
+                    (ns, local),
+                    (Some(SAMLP_NS), "Response")
+                        | (Some(SAML_NS), "Assertion" | "EncryptedAssertion")
+                )
+            });
+            if !allowed {
+                return Err(Error::SignatureVerification {
+                    reason: "ds:Signature in disallowed position",
+                });
+            }
+            // Do NOT descend into a (validly placed) Signature's own subtree:
+            // `<ds:KeyInfo>` may legitimately contain further `<ds:Signature>`
+            // descendants in exotic shapes (e.g. countersignatures), but our
+            // SAML profile never relies on them — and we don't want to
+            // double-count a Signature element as both signature and target.
+            return Ok(());
+        }
+        for child in element.child_elements() {
+            walk(child, Some(element))?;
+        }
+        Ok(())
+    }
+    walk(document.root(), None)
 }
 
 // =============================================================================
@@ -336,18 +430,36 @@ fn verify_response_and_or_assertion(
 // Encrypted assertion handling
 // =============================================================================
 
+/// Inputs for [`handle_encrypted`]. Only exists under `xmlenc`: when the
+/// feature is off the encrypted-assertion code path collapses to a single
+/// `Error::InvalidConfiguration` at the call site, with no need for a
+/// per-field params struct.
 #[cfg(feature = "xmlenc")]
-#[allow(clippy::too_many_arguments)]
-fn handle_encrypted(
-    document: &Document,
+struct HandleEncryptedParams<'a> {
+    document: &'a Document,
     response_root_id: ElementId,
     encrypted_assertion_id: ElementId,
-    idp: &IdpDescriptor,
-    policy: &PeerCryptoPolicy,
-    decryption_keys: &[&KeyPair],
+    idp: &'a IdpDescriptor,
+    policy: &'a PeerCryptoPolicy,
+    decryption_keys: &'a [&'a KeyPair],
     want_response_signed: bool,
     want_assertions_signed: bool,
+}
+
+#[cfg(feature = "xmlenc")]
+fn handle_encrypted(
+    params: HandleEncryptedParams<'_>,
 ) -> Result<([u8; 32], Element, Option<Document>), Error> {
+    let HandleEncryptedParams {
+        document,
+        response_root_id,
+        encrypted_assertion_id,
+        idp,
+        policy,
+        decryption_keys,
+        want_response_signed,
+        want_assertions_signed,
+    } = params;
     use crate::xmlenc::decrypt::decrypt_encrypted_assertion;
 
     // ---- Optional: verify the Response root signature first ----------------
@@ -442,22 +554,6 @@ fn handle_encrypted(
     Err(Error::SignatureMissing)
 }
 
-#[cfg(not(feature = "xmlenc"))]
-#[allow(clippy::too_many_arguments)]
-fn handle_encrypted(
-    _document: &Document,
-    _response_root_id: ElementId,
-    _encrypted_assertion_id: ElementId,
-    _idp: &IdpDescriptor,
-    _policy: &PeerCryptoPolicy,
-    _decryption_keys: &[&KeyPair],
-    _want_response_signed: bool,
-    _want_assertions_signed: bool,
-) -> Result<([u8; 32], Element, Option<Document>), Error> {
-    Err(Error::InvalidConfiguration {
-        reason: "EncryptedAssertion requires the `xmlenc` feature",
-    })
-}
 
 // =============================================================================
 // SubjectConfirmation + AuthnContext checks
@@ -489,6 +585,12 @@ fn find_valid_bearer_subject_confirmation<'a>(
     // that mismatches on a non-recipient axis so the caller's error code is
     // informative.
     let mut last_err: Option<Error> = None;
+    let now_minus_skew = now.checked_sub(clock_skew).ok_or_else(|| {
+        Error::XmlParse("now - clock_skew underflows SystemTime".to_string())
+    })?;
+    let now_plus_skew = now.checked_add(clock_skew).ok_or_else(|| {
+        Error::XmlParse("now + clock_skew overflows SystemTime".to_string())
+    })?;
     for sc in &bearers {
         // Recipient must match the expected destination.
         match sc.recipient.as_deref() {
@@ -500,7 +602,7 @@ fn find_valid_bearer_subject_confirmation<'a>(
         }
         // NotOnOrAfter must be present and in the future (within clock_skew).
         match sc.not_on_or_after {
-            Some(nooa) if nooa > now - clock_skew => {}
+            Some(nooa) if nooa > now_minus_skew => {}
             _ => {
                 last_err = Some(Error::Expired);
                 continue;
@@ -508,7 +610,7 @@ fn find_valid_bearer_subject_confirmation<'a>(
         }
         // NotBefore: tolerated if absent; if present, must be ≤ now+skew.
         if let Some(nb) = sc.not_before
-            && nb > now + clock_skew
+            && nb > now_plus_skew
         {
             last_err = Some(Error::NotYetValid);
             continue;
@@ -532,60 +634,23 @@ fn find_valid_bearer_subject_confirmation<'a>(
     Err(last_err.unwrap_or(Error::RecipientMismatch))
 }
 
+/// Enforce non-downgrade against the requested AuthnContext per SAML 2.0
+/// §3.3.2.2.1 (`exact` / `minimum` / `maximum` / `better`). All comparator
+/// semantics — including the set-aggregating "stronger than each" rule for
+/// `Better` — live in
+/// [`crate::authn_context::StandardComparator`]; this function adapts its
+/// tri-valued [`ComparatorOutcome`] onto the SP pipeline's binary
+/// `Result<(), Error>` surface by collapsing both `NotSatisfied` and
+/// `NotComparable` to [`Error::AuthnContextDowngrade`] (fail-closed).
 fn check_authn_context(
     requested: &RequestedAuthnContext,
     actual_uri: &str,
 ) -> Result<(), Error> {
-    let actual = AuthnContextClassRef::from_uri(actual_uri);
-
-    // For Exact comparison we don't need strength ordering — URI equality is
-    // authoritative and works for `Custom` refs too.
-    if matches!(requested.comparison, AuthnContextComparison::Exact) {
-        return requested
-            .class_refs
-            .iter()
-            .any(|c| c.as_uri() == actual.as_uri())
-            .then_some(())
-            .ok_or(Error::AuthnContextDowngrade);
-    }
-
-    // Strength-ordered comparisons: both sides must be rankable.
-    let actual_strength = strength_of(&actual).ok_or(Error::AuthnContextDowngrade)?;
-    let requested_strengths = requested.class_refs.iter().filter_map(strength_of);
-    let ok = match requested.comparison {
-        AuthnContextComparison::Exact => unreachable!("handled above"),
-        AuthnContextComparison::Minimum => {
-            let weakest = requested_strengths.min().ok_or(Error::AuthnContextDowngrade)?;
-            actual_strength >= weakest
+    match StandardComparator.evaluate(requested, actual_uri) {
+        ComparatorOutcome::Satisfied => Ok(()),
+        ComparatorOutcome::NotSatisfied | ComparatorOutcome::NotComparable => {
+            Err(Error::AuthnContextDowngrade)
         }
-        AuthnContextComparison::Maximum => {
-            let strongest = requested_strengths.max().ok_or(Error::AuthnContextDowngrade)?;
-            actual_strength <= strongest
-        }
-        AuthnContextComparison::Better => {
-            let strongest = requested_strengths.max().ok_or(Error::AuthnContextDowngrade)?;
-            actual_strength > strongest
-        }
-    };
-    ok.then_some(()).ok_or(Error::AuthnContextDowngrade)
-}
-
-/// Coarse strength ranking of the standard AuthnContextClassRefs. Returns
-/// `None` for `Custom`/`Unspecified` — the caller can't meaningfully order
-/// those, so any comparison other than exact-by-URI degrades to "downgrade".
-fn strength_of(cr: &AuthnContextClassRef) -> Option<u8> {
-    match cr {
-        AuthnContextClassRef::Unspecified => Some(0),
-        AuthnContextClassRef::PreviousSession => Some(1),
-        AuthnContextClassRef::Password => Some(2),
-        AuthnContextClassRef::PasswordProtectedTransport => Some(3),
-        AuthnContextClassRef::TimeSyncToken => Some(4),
-        AuthnContextClassRef::Kerberos => Some(5),
-        AuthnContextClassRef::TlsClient => Some(5),
-        AuthnContextClassRef::Smartcard => Some(6),
-        AuthnContextClassRef::SmartcardPki => Some(7),
-        AuthnContextClassRef::MultiFactorAuth => Some(8),
-        AuthnContextClassRef::Custom(_) => None,
     }
 }
 
@@ -602,7 +667,7 @@ mod tests {
     use crate::dsig::algorithms::{
         C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm,
     };
-    use crate::dsig::sign::sign_element;
+    use crate::dsig::sign::{SignOptions, sign_element};
     use crate::nameid::NameIdFormat;
     use crate::response::parse::parse_response;
     use crate::response::{SAML_NS, SAMLP_NS, saml_qname, samlp_qname};
@@ -614,7 +679,9 @@ mod tests {
 
     fn fixed_now() -> SystemTime {
         // 2026-05-26T12:00:30Z
-        UNIX_EPOCH + Duration::from_secs(1_779_796_830)
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_779_796_830))
+            .expect("UNIX_EPOCH + small duration fits in SystemTime")
     }
 
     fn fixture_idp() -> IdpDescriptor {
@@ -642,21 +709,37 @@ mod tests {
         PeerCryptoPolicy::strong_defaults()
     }
 
+    /// Inputs for [`build_assertion`] test fixture.
+    struct BuildAssertionFixture<'a> {
+        id: &'a str,
+        issuer: &'a str,
+        recipient: &'a str,
+        in_response_to: Option<&'a str>,
+        audience: &'a str,
+        not_before: &'a str,
+        not_on_or_after: &'a str,
+        sc_not_on_or_after: &'a str,
+        authn_context: &'a str,
+        name_id_value: &'a str,
+        name_id_format_uri: &'a str,
+    }
+
     /// Build a complete `<saml:Assertion>` Element parameterized by the
     /// most-commonly-tweaked fields.
-    fn build_assertion(
-        id: &str,
-        issuer: &str,
-        recipient: &str,
-        in_response_to: Option<&str>,
-        audience: &str,
-        not_before: &str,
-        not_on_or_after: &str,
-        sc_not_on_or_after: &str,
-        authn_context: &str,
-        name_id_value: &str,
-        name_id_format_uri: &str,
-    ) -> Element {
+    fn build_assertion(p: &BuildAssertionFixture<'_>) -> Element {
+        let &BuildAssertionFixture {
+            id,
+            issuer,
+            recipient,
+            in_response_to,
+            audience,
+            not_before,
+            not_on_or_after,
+            sc_not_on_or_after,
+            authn_context,
+            name_id_value,
+            name_id_format_uri,
+        } = p;
         let name_id = Element::build(saml_qname("NameID"))
             .with_attribute(QName::new(None, "Format"), name_id_format_uri.to_owned())
             .with_text(name_id_value.to_owned())
@@ -775,43 +858,58 @@ mod tests {
             .finish()
     }
 
-    /// Build a typical `<samlp:Response>` with an assertion signed by the test
-    /// IdP key. Returns the assembled XML bytes.
-    fn build_and_sign_response(
-        kp: &KeyPair,
+    /// Inputs for [`build_and_sign_response`] test fixture.
+    struct BuildAndSignResponseFixture<'a> {
+        kp: &'a KeyPair,
         sign_response: bool,
         sign_assertion: bool,
-        in_response_to: Option<&str>,
-        audience: &str,
-        recipient: &str,
-        not_before: &str,
-        not_on_or_after: &str,
-    ) -> Vec<u8> {
-        let mut assertion = build_assertion(
-            "_a1",
-            "https://idp.example.com",
+        in_response_to: Option<&'a str>,
+        audience: &'a str,
+        recipient: &'a str,
+        not_before: &'a str,
+        not_on_or_after: &'a str,
+    }
+
+    /// Build a typical `<samlp:Response>` with an assertion signed by the test
+    /// IdP key. Returns the assembled XML bytes.
+    fn build_and_sign_response(p: &BuildAndSignResponseFixture<'_>) -> Vec<u8> {
+        let &BuildAndSignResponseFixture {
+            kp,
+            sign_response,
+            sign_assertion,
+            in_response_to,
+            audience,
+            recipient,
+            not_before,
+            not_on_or_after,
+        } = p;
+        let mut assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a1",
+            issuer: "https://idp.example.com",
             recipient,
             in_response_to,
             audience,
             not_before,
             not_on_or_after,
-            "2026-05-26T12:05:00Z",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
-            "alice@example.com",
-            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-        );
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
 
         if sign_assertion {
             let stash_doc = Document::new(assertion.clone()).unwrap();
             assertion = sign_element(
                 stash_doc.root().clone(),
                 &stash_doc,
-                kp,
-                SignatureAlgorithm::RsaSha256,
-                DigestAlgorithm::Sha256,
-                C14nAlgorithm::ExclusiveCanonical,
-                &[],
-                true,
+                SignOptions {
+                    signing_key: kp,
+                    sig_alg: SignatureAlgorithm::RsaSha256,
+                    digest_alg: DigestAlgorithm::Sha256,
+                    c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    inclusive_namespaces: &[],
+                    include_x509_cert: true,
+                },
             )
             .unwrap();
         }
@@ -830,12 +928,14 @@ mod tests {
             response = sign_element(
                 stash_doc.root().clone(),
                 &stash_doc,
-                kp,
-                SignatureAlgorithm::RsaSha256,
-                DigestAlgorithm::Sha256,
-                C14nAlgorithm::ExclusiveCanonical,
-                &[],
-                true,
+                SignOptions {
+                    signing_key: kp,
+                    sig_alg: SignatureAlgorithm::RsaSha256,
+                    digest_alg: DigestAlgorithm::Sha256,
+                    c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    inclusive_namespaces: &[],
+                    include_x509_cert: true,
+                },
             )
             .unwrap();
         }
@@ -855,6 +955,7 @@ mod tests {
             parsed,
             idp,
             peer_crypto_policy: policy,
+            #[cfg(feature = "xmlenc")]
             decryption_keys: &[],
             sp_entity_id: "https://sp.example.com",
             expected_destination: "https://sp.example.com/acs",
@@ -873,16 +974,16 @@ mod tests {
     #[test]
     fn happy_path_validates_signed_assertion() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_req1"),
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).expect("re-parse");
         let (parsed, _) = parse_response(&doc).expect("parse");
         let idp = fixture_idp();
@@ -906,16 +1007,16 @@ mod tests {
     #[test]
     fn rejects_issuer_mismatch() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_req1"),
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let mut idp = fixture_idp();
@@ -928,19 +1029,19 @@ mod tests {
     #[test]
     fn rejects_status_not_success() {
         // Build a Response whose StatusCode is Responder.
-        let assertion = build_assertion(
-            "_a1",
-            "https://idp.example.com",
-            "https://sp.example.com/acs",
-            Some("_req1"),
-            "https://sp.example.com",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-            "2026-05-26T12:05:00Z",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
-            "alice@example.com",
-            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-        );
+        let assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a1",
+            issuer: "https://idp.example.com",
+            recipient: "https://sp.example.com/acs",
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
         let response = build_response_with_assertion(
             "_r",
             Some("_req1"),
@@ -965,16 +1066,16 @@ mod tests {
     #[test]
     fn rejects_in_response_to_mismatch() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_wrong-id"),
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_wrong-id"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -988,16 +1089,16 @@ mod tests {
         // Build a response with no InResponseTo. With tracker=None and
         // allow_unsolicited=false, this rejects.
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            None,
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: None,
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -1012,16 +1113,16 @@ mod tests {
     #[test]
     fn unsolicited_response_accepted_when_allow_flag_set() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            None,
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: None,
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -1036,16 +1137,16 @@ mod tests {
     #[test]
     fn rejects_audience_mismatch() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_req1"),
-            "https://other.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://other.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -1061,30 +1162,32 @@ mod tests {
         // whose inner SubjectConfirmationData/Recipient does not. This
         // exercises step 16's recipient check independently of step 3's
         // destination check.
-        let assertion = build_assertion(
-            "_a1",
-            "https://idp.example.com",
-            "https://wrong.example.com/acs",
-            Some("_req1"),
-            "https://sp.example.com",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-            "2026-05-26T12:05:00Z",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
-            "alice@example.com",
-            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-        );
+        let assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a1",
+            issuer: "https://idp.example.com",
+            recipient: "https://wrong.example.com/acs",
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
         let signed_assertion = {
             let d = Document::new(assertion).unwrap();
             sign_element(
                 d.root().clone(),
                 &d,
-                &kp,
-                SignatureAlgorithm::RsaSha256,
-                DigestAlgorithm::Sha256,
-                C14nAlgorithm::ExclusiveCanonical,
-                &[],
-                true,
+                SignOptions {
+                    signing_key: &kp,
+                    sig_alg: SignatureAlgorithm::RsaSha256,
+                    digest_alg: DigestAlgorithm::Sha256,
+                    c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    inclusive_namespaces: &[],
+                    include_x509_cert: true,
+                },
             )
             .unwrap()
         };
@@ -1107,16 +1210,16 @@ mod tests {
     #[test]
     fn rejects_not_yet_valid() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_req1"),
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T13:00:00Z", // NotBefore far in the future
-            "2026-05-26T14:00:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T13:00:00Z", // NotBefore far in the future
+            not_on_or_after: "2026-05-26T14:00:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -1128,16 +1231,16 @@ mod tests {
     #[test]
     fn rejects_expired() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_req1"),
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2025-01-01T00:00:00Z",
-            "2025-12-31T23:59:59Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2025-01-01T00:00:00Z",
+            not_on_or_after: "2025-12-31T23:59:59Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -1149,19 +1252,19 @@ mod tests {
     #[test]
     fn rejects_when_no_signature_present() {
         // Build a response with no signatures, want_response_signed=true.
-        let assertion = build_assertion(
-            "_a1",
-            "https://idp.example.com",
-            "https://sp.example.com/acs",
-            Some("_req1"),
-            "https://sp.example.com",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-            "2026-05-26T12:05:00Z",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
-            "alice@example.com",
-            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-        );
+        let assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a1",
+            issuer: "https://idp.example.com",
+            recipient: "https://sp.example.com/acs",
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
         let response = build_response_with_assertion(
             "_resp1",
             Some("_req1"),
@@ -1253,12 +1356,14 @@ mod tests {
         let signed_assertion = sign_element(
             d.root().clone(),
             &d,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            true,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )
         .unwrap();
         let response = build_response_with_assertion(
@@ -1285,16 +1390,16 @@ mod tests {
     #[test]
     fn rejects_authn_context_downgrade() {
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_req1"),
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -1309,21 +1414,128 @@ mod tests {
         assert!(matches!(err, Error::AuthnContextDowngrade));
     }
 
+    /// SAML 2.0 Core §2.5.1.5: when `<saml:OneTimeUse>` is present inside
+    /// `<saml:Conditions>`, the relying party MUST refuse to consume the
+    /// assertion more than once. The library itself does not implement the
+    /// replay cache — that's the caller's responsibility — but the parsed
+    /// flag MUST surface on `Identity` so the caller can act on it.
+    /// Enforcement (rejecting a repeat) is exercised by the replay-cache
+    /// layer; this test only nails down the flag-plumbing contract.
+    #[test]
+    fn one_time_use_flag_surfaces_on_identity() {
+        // Build a standard assertion, then splice <saml:OneTimeUse/> into its
+        // <saml:Conditions> child before signing. Doing the splice pre-signing
+        // is important: the assertion signature MUST cover the OneTimeUse
+        // element, otherwise an attacker could strip it (RFC-002 §3.2 XSW
+        // family).
+        let kp = rsa_signing_key();
+        let mut assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a-one-time",
+            issuer: "https://idp.example.com",
+            recipient: "https://sp.example.com/acs",
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
+        // Locate <saml:Conditions> and append <saml:OneTimeUse/>.
+        let conditions_idx = assertion
+            .children
+            .iter()
+            .position(|n| match n {
+                Node::Element(e) => {
+                    e.qname().namespace() == Some(SAML_NS)
+                        && e.qname().local() == "Conditions"
+                }
+                _ => false,
+            })
+            .expect("assertion has <saml:Conditions>");
+        let Node::Element(conditions) = &mut assertion.children[conditions_idx] else {
+            panic!("expected Conditions element node");
+        };
+        let one_time_use = Element::build(saml_qname("OneTimeUse")).finish();
+        conditions.children.push(Node::Element(one_time_use));
+
+        // Now sign the modified assertion so the signature covers OneTimeUse.
+        let stash_doc = Document::new(assertion).unwrap();
+        let signed_assertion = sign_element(
+            stash_doc.root().clone(),
+            &stash_doc,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .unwrap();
+
+        let response = build_response_with_assertion(
+            "_resp-one-time",
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://idp.example.com",
+            signed_assertion,
+            STATUS_SUCCESS,
+        );
+        let doc = Document::new(response).unwrap();
+        let xml = emit_document(&doc).unwrap().into_bytes();
+        let doc = Document::parse(&xml).expect("re-parse");
+        let (parsed, _) = parse_response(&doc).expect("parse_response");
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        let identity =
+            validate_response(default_input(&doc, parsed, &idp, &policy)).expect("validate");
+
+        assert_eq!(identity.assertion_id, "_a-one-time");
+        assert!(
+            identity.is_one_time_use,
+            "Identity.is_one_time_use must surface when <saml:OneTimeUse/> is present in Conditions"
+        );
+
+        // Sanity: when the flag is absent, the default fixture leaves it
+        // false. Guards against accidental "always true" plumbing.
+        let xml2 = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
+        let doc2 = Document::parse(&xml2).expect("re-parse");
+        let (parsed2, _) = parse_response(&doc2).expect("parse");
+        let identity2 =
+            validate_response(default_input(&doc2, parsed2, &idp, &policy)).expect("validate");
+        assert!(
+            !identity2.is_one_time_use,
+            "Identity.is_one_time_use must be false when <saml:OneTimeUse/> is absent"
+        );
+    }
+
     #[test]
     fn accepts_authn_context_minimum_when_actual_is_stronger() {
         // Default fixture emits Password (strength 2). Minimum-of-Password
         // should pass.
         let kp = rsa_signing_key();
-        let xml = build_and_sign_response(
-            &kp,
-            false,
-            true,
-            Some("_req1"),
-            "https://sp.example.com",
-            "https://sp.example.com/acs",
-            "2026-05-26T11:59:00Z",
-            "2026-05-26T12:10:00Z",
-        );
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
         let doc = Document::parse(&xml).unwrap();
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
@@ -1336,5 +1548,372 @@ mod tests {
         input.requested_authn_context = Some(&req);
         let identity = validate_response(input).expect("validate");
         assert_eq!(identity.assertion_id, "_a1");
+    }
+
+    // -------------------------------------------------------------------------
+    // RequestedAuthnContext comparator wiring — full SAML 2.0 §3.3.2.2.1
+    // matrix exercised through the validate_response pipeline.
+    //
+    // The shared assertion fixture emits AuthnContext = Password (strength 2).
+    // We hold the assertion constant and vary the RequestedAuthnContext to
+    // confirm each comparator branch is reached from the SP-side validator.
+    //
+    // The unit-level coverage of comparator logic lives in
+    // `crate::authn_context::tests::*`; this block proves the wiring (the
+    // `check_authn_context` adapter and the Step-17 call site).
+    // -------------------------------------------------------------------------
+
+    /// Build, sign, parse, and return `(doc, parsed)` for an assertion whose
+    /// `AuthnContextClassRef` is `Password`. All comparator tests below share
+    /// this fixture so the only variable is the comparator side.
+    fn signed_password_response_doc() -> (Document, ParsedResponse) {
+        let kp = rsa_signing_key();
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        (doc, parsed)
+    }
+
+    /// Run `validate_response` against the shared Password fixture under
+    /// `req`. Returns the validation outcome so callers can pattern-match.
+    fn validate_with_requested(
+        req: &RequestedAuthnContext,
+    ) -> Result<crate::response::Identity, Error> {
+        let (doc, parsed) = signed_password_response_doc();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        let mut input = default_input(&doc, parsed, &idp, &policy);
+        input.requested_authn_context = Some(req);
+        validate_response(input)
+    }
+
+    // ---- Exact ----
+
+    #[test]
+    fn comparator_exact_accepts_matching_class_ref() {
+        // Actual = Password; requested = {Password} Exact → satisfied.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::Password],
+            comparison: AuthnContextComparison::Exact,
+        };
+        let identity = validate_with_requested(&req).expect("validate");
+        assert_eq!(identity.assertion_id, "_a1");
+    }
+
+    #[test]
+    fn comparator_exact_accepts_when_actual_is_any_of_requested() {
+        // Multi-ref Exact: passes if actual matches ANY listed URI.
+        let req = RequestedAuthnContext {
+            class_refs: vec![
+                AuthnContextClassRef::Password,
+                AuthnContextClassRef::MultiFactorAuth,
+            ],
+            comparison: AuthnContextComparison::Exact,
+        };
+        validate_with_requested(&req).expect("validate");
+    }
+
+    #[test]
+    fn comparator_exact_rejects_when_actual_is_not_in_set() {
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::MultiFactorAuth],
+            comparison: AuthnContextComparison::Exact,
+        };
+        let err = validate_with_requested(&req).unwrap_err();
+        assert!(matches!(err, Error::AuthnContextDowngrade));
+    }
+
+    // ---- Minimum ----
+
+    #[test]
+    fn comparator_minimum_accepts_when_actual_equals_floor() {
+        // Actual Password(2), requested Password(2) Minimum → satisfied.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::Password],
+            comparison: AuthnContextComparison::Minimum,
+        };
+        validate_with_requested(&req).expect("validate");
+    }
+
+    #[test]
+    fn comparator_minimum_rejects_weaker_actual() {
+        // Actual Password(2), requested PPT(3) Minimum → downgrade.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::PasswordProtectedTransport],
+            comparison: AuthnContextComparison::Minimum,
+        };
+        let err = validate_with_requested(&req).unwrap_err();
+        assert!(matches!(err, Error::AuthnContextDowngrade));
+    }
+
+    #[test]
+    fn comparator_minimum_uses_weakest_among_multiple_requested() {
+        // Floor is the *weakest* requested ref. With {PreviousSession(1),
+        // MultiFactorAuth(8)} the floor is 1, so Password(2) passes.
+        let req = RequestedAuthnContext {
+            class_refs: vec![
+                AuthnContextClassRef::PreviousSession,
+                AuthnContextClassRef::MultiFactorAuth,
+            ],
+            comparison: AuthnContextComparison::Minimum,
+        };
+        validate_with_requested(&req).expect("validate");
+    }
+
+    // ---- Maximum ----
+
+    #[test]
+    fn comparator_maximum_accepts_when_actual_is_weaker_or_equal() {
+        // Ceiling Smartcard(6); actual Password(2) → 2 ≤ 6 → satisfied.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::Smartcard],
+            comparison: AuthnContextComparison::Maximum,
+        };
+        validate_with_requested(&req).expect("validate");
+    }
+
+    #[test]
+    fn comparator_maximum_rejects_stronger_actual() {
+        // Ceiling PreviousSession(1); actual Password(2) → 2 > 1 → reject.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::PreviousSession],
+            comparison: AuthnContextComparison::Maximum,
+        };
+        let err = validate_with_requested(&req).unwrap_err();
+        assert!(matches!(err, Error::AuthnContextDowngrade));
+    }
+
+    #[test]
+    fn comparator_maximum_uses_strongest_among_multiple_requested() {
+        // Ceiling = max(Password(2), Smartcard(6)) = 6. Password(2) ≤ 6 → pass.
+        let req = RequestedAuthnContext {
+            class_refs: vec![
+                AuthnContextClassRef::Password,
+                AuthnContextClassRef::Smartcard,
+            ],
+            comparison: AuthnContextComparison::Maximum,
+        };
+        validate_with_requested(&req).expect("validate");
+    }
+
+    // ---- Better ----
+
+    #[test]
+    fn comparator_better_rejects_equal_strength() {
+        // Better requires strict >. Equal Password(2) vs Password(2) → reject.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::Password],
+            comparison: AuthnContextComparison::Better,
+        };
+        let err = validate_with_requested(&req).unwrap_err();
+        assert!(matches!(err, Error::AuthnContextDowngrade));
+    }
+
+    #[test]
+    fn comparator_better_accepts_strictly_stronger_actual() {
+        // Actual Password(2) > PreviousSession(1) → satisfied.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::PreviousSession],
+            comparison: AuthnContextComparison::Better,
+        };
+        validate_with_requested(&req).expect("validate");
+    }
+
+    #[test]
+    fn comparator_better_requires_exceeding_every_requested() {
+        // Spec §3.3.2.2.1: "better than the specified authentication
+        // contexts" — i.e. strictly stronger than EACH. With
+        // requested = {PreviousSession(1), Smartcard(6)}, ceiling = 6;
+        // Password(2) is only > PreviousSession, not > Smartcard, so the
+        // request MUST be rejected.
+        let req = RequestedAuthnContext {
+            class_refs: vec![
+                AuthnContextClassRef::PreviousSession,
+                AuthnContextClassRef::Smartcard,
+            ],
+            comparison: AuthnContextComparison::Better,
+        };
+        let err = validate_with_requested(&req).unwrap_err();
+        assert!(matches!(err, Error::AuthnContextDowngrade));
+    }
+
+    // ---- Non-rankable Custom URIs ----
+
+    #[test]
+    fn comparator_minimum_with_unknown_requested_uri_fails_closed() {
+        // All requested refs are Custom (non-rankable) → comparator returns
+        // NotComparable, which the SP path collapses to AuthnContextDowngrade.
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::Custom(
+                "urn:example:vendor:strong".into(),
+            )],
+            comparison: AuthnContextComparison::Minimum,
+        };
+        let err = validate_with_requested(&req).unwrap_err();
+        assert!(matches!(err, Error::AuthnContextDowngrade));
+    }
+
+    #[test]
+    fn comparator_exact_works_with_custom_uri_match() {
+        // Build an assertion that emits a Custom URI; Exact match should pass.
+        let kp = rsa_signing_key();
+        let custom = "urn:example:vendor:strong";
+        let assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a1",
+            issuer: "https://idp.example.com",
+            recipient: "https://sp.example.com/acs",
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: custom,
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
+        let stash_doc = Document::new(assertion).unwrap();
+        let signed = sign_element(
+            stash_doc.root().clone(),
+            &stash_doc,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .unwrap();
+        let response = build_response_with_assertion(
+            "_resp1",
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://idp.example.com",
+            signed,
+            STATUS_SUCCESS,
+        );
+        let doc = Document::new(response).unwrap();
+        let xml = emit_document(&doc).unwrap().into_bytes();
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        let mut input = default_input(&doc, parsed, &idp, &policy);
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::Custom(custom.into())],
+            comparison: AuthnContextComparison::Exact,
+        };
+        input.requested_authn_context = Some(&req);
+        validate_response(input).expect("validate");
+    }
+
+    #[test]
+    fn comparator_rejects_when_actual_authn_context_class_ref_missing() {
+        // If the AuthnStatement has no ClassRef but the SP supplied a
+        // RequestedAuthnContext, validation must fail (per RFC-003 §4.1 step
+        // 17). This is enforced by validate_response before
+        // check_authn_context is even called.
+        //
+        // The OASIS XSD requires `<saml:AuthnContext>` as a child of
+        // `<saml:AuthnStatement>` (minOccurs=1), so we cannot just strip the
+        // whole AuthnContext — the structural schema gate (RFC-002 §0,
+        // `crate::schema`) would reject the message before validate_response
+        // ever ran. Instead we keep an empty `<saml:AuthnContext/>` (no
+        // ClassRef child) — schema-valid per OASIS (all children of
+        // AuthnContext are minOccurs=0), but the parser yields
+        // `authn_context_class_ref = None`, which is the condition the
+        // downgrade check is designed to surface.
+        let kp = rsa_signing_key();
+        let mut assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a1",
+            issuer: "https://idp.example.com",
+            recipient: "https://sp.example.com/acs",
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
+        // Locate the <saml:AuthnStatement> and strip every child element of
+        // its inner <saml:AuthnContext> so the parser's lookup for
+        // <AuthnContextClassRef> yields None.
+        let astmt_idx = assertion
+            .children
+            .iter()
+            .position(|n| match n {
+                Node::Element(e) => {
+                    e.qname().namespace() == Some(SAML_NS)
+                        && e.qname().local() == "AuthnStatement"
+                }
+                _ => false,
+            })
+            .expect("assertion has <saml:AuthnStatement>");
+        let Node::Element(astmt) = &mut assertion.children[astmt_idx] else {
+            panic!("expected AuthnStatement element node");
+        };
+        let actx_idx = astmt
+            .children
+            .iter()
+            .position(|n| match n {
+                Node::Element(e) => {
+                    e.qname().namespace() == Some(SAML_NS)
+                        && e.qname().local() == "AuthnContext"
+                }
+                _ => false,
+            })
+            .expect("AuthnStatement has <saml:AuthnContext>");
+        let Node::Element(actx) = &mut astmt.children[actx_idx] else {
+            panic!("expected AuthnContext element node");
+        };
+        actx.children.clear();
+        let stash_doc = Document::new(assertion).unwrap();
+        let signed = sign_element(
+            stash_doc.root().clone(),
+            &stash_doc,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .unwrap();
+        let response = build_response_with_assertion(
+            "_resp1",
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://idp.example.com",
+            signed,
+            STATUS_SUCCESS,
+        );
+        let doc = Document::new(response).unwrap();
+        let xml = emit_document(&doc).unwrap().into_bytes();
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        let mut input = default_input(&doc, parsed, &idp, &policy);
+        let req = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::Password],
+            comparison: AuthnContextComparison::Exact,
+        };
+        input.requested_authn_context = Some(&req);
+        let err = validate_response(input).unwrap_err();
+        assert!(matches!(err, Error::AuthnContextDowngrade));
     }
 }

@@ -32,10 +32,11 @@ const USER_DISPLAY_NAME: &str = "Alice Example";
 /// Walk an SP through a full IdP-issued Response and assert the identity.
 #[test]
 fn sp_consumes_real_idp_response() {
-    let sp = common::make_sp(SP_ENTITY_ID, SP_ACS_URL, false);
-    let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL);
-    let idp_descriptor = common::idp_descriptor(&idp);
-    let sp_descriptor = common::sp_descriptor(&sp);
+    let sp = common::make_sp(SP_ENTITY_ID, SP_ACS_URL, false).expect("sp builds");
+    let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL).expect("idp builds");
+    let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
+    let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
+    let now = common::fixed_now().expect("fixed_now");
 
     // 1. Kick off SP-side login.
     let start = sp
@@ -76,8 +77,8 @@ fn sp_consumes_real_idp_response() {
             relay_state: Some("sp-flow-relay"),
             detached_signature: None,
             expected_destination: IDP_SSO_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
         })
         .expect("idp consume_authn_request");
 
@@ -91,19 +92,22 @@ fn sp_consumes_real_idp_response() {
                 Attribute::email(USER_EMAIL),
                 Attribute::display_name(USER_DISPLAY_NAME),
             ],
-            authn_instant: common::fixed_now(),
+            authn_instant: now,
             session_index: "sess-sp-flow-1".to_owned(),
-            session_not_on_or_after: Some(common::fixed_now() + Duration::from_secs(3600)),
+            session_not_on_or_after: Some(
+                now.checked_add(Duration::from_hours(1))
+                    .expect("session_not_on_or_after fits"),
+            ),
             authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
             force_encrypt_assertion: None,
-            now: common::fixed_now(),
-            assertion_lifetime: Duration::from_secs(600),
-            subject_confirmation_lifetime: Duration::from_secs(300),
+            now,
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
         })
         .expect("idp issue_response");
 
     // 5. Extract the SAMLResponse XML from the POST dispatch.
-    let response_xml = extract_response_xml(dispatch);
+    let response_xml = extract_response_xml(dispatch).expect("extract response xml");
 
     // 6. SP consumes the Response.
     let identity = sp
@@ -115,8 +119,9 @@ fn sp_consumes_real_idp_response() {
             relay_state: Some("sp-flow-relay"),
             tracker: Some(&start.tracker),
             expected_destination: SP_ACS_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
+            replay_cache: None,
         })
         .expect("sp consume_response");
 
@@ -144,10 +149,11 @@ fn sp_consumes_real_idp_response() {
 /// verifier. This is the SP-side XSW-style negative path.
 #[test]
 fn sp_rejects_tampered_response() {
-    let sp = common::make_sp(SP_ENTITY_ID, SP_ACS_URL, false);
-    let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL);
-    let idp_descriptor = common::idp_descriptor(&idp);
-    let sp_descriptor = common::sp_descriptor(&sp);
+    let sp = common::make_sp(SP_ENTITY_ID, SP_ACS_URL, false).expect("sp builds");
+    let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL).expect("idp builds");
+    let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
+    let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
+    let now = common::fixed_now().expect("fixed_now");
 
     let start = sp
         .start_login(
@@ -182,8 +188,8 @@ fn sp_rejects_tampered_response() {
             relay_state: None,
             detached_signature: None,
             expected_destination: IDP_SSO_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
         })
         .expect("idp consume_authn_request");
 
@@ -193,18 +199,21 @@ fn sp_rejects_tampered_response() {
             in_response_to: &parsed,
             name_id: NameId::email(USER_EMAIL),
             attributes: vec![Attribute::email(USER_EMAIL)],
-            authn_instant: common::fixed_now(),
+            authn_instant: now,
             session_index: "sess-tamper".to_owned(),
-            session_not_on_or_after: Some(common::fixed_now() + Duration::from_secs(3600)),
+            session_not_on_or_after: Some(
+                now.checked_add(Duration::from_hours(1))
+                    .expect("session_not_on_or_after fits"),
+            ),
             authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
             force_encrypt_assertion: None,
-            now: common::fixed_now(),
-            assertion_lifetime: Duration::from_secs(600),
-            subject_confirmation_lifetime: Duration::from_secs(300),
+            now,
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
         })
         .expect("idp issue_response");
 
-    let mut response_xml = extract_response_xml(dispatch);
+    let mut response_xml = extract_response_xml(dispatch).expect("extract response xml");
 
     // Flip a byte inside the signed assertion content. We target the email
     // attribute value (`alice@example.com`) so the mutation lands in
@@ -226,8 +235,9 @@ fn sp_rejects_tampered_response() {
             relay_state: None,
             tracker: Some(&start.tracker),
             expected_destination: SP_ACS_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
+            replay_cache: None,
         })
         .expect_err("tampered response must fail");
 
@@ -238,13 +248,13 @@ fn sp_rejects_tampered_response() {
 }
 
 /// Pull the base64-decoded SAML XML out of a POST SsoResponseDispatch.
-fn extract_response_xml(dispatch: SsoResponseDispatch) -> Vec<u8> {
+fn extract_response_xml(dispatch: SsoResponseDispatch) -> Result<Vec<u8>, String> {
     match dispatch {
         SsoResponseDispatch::Post(form) => BASE64
             .decode(form.saml_response.as_bytes())
-            .expect("base64 valid"),
+            .map_err(|e| format!("base64 decode failed: {e}")),
         SsoResponseDispatch::Artifact(_) => {
-            panic!("expected POST dispatch for SSO Response, got Artifact")
+            Err("expected POST dispatch for SSO Response, got Artifact".to_owned())
         }
     }
 }

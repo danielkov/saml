@@ -88,8 +88,11 @@ impl EntitiesDescriptor {
     pub fn find_idp(&self, entity_id: &str) -> Option<&IdpDescriptor> {
         for entry in &self.entities {
             match entry {
-                MetadataEntry::Idp(idp) if idp.entity_id == entity_id => return Some(idp),
-                MetadataEntry::Dual(idp, _) if idp.entity_id == entity_id => return Some(idp),
+                MetadataEntry::Idp(idp) | MetadataEntry::Dual(idp, _)
+                    if idp.entity_id == entity_id =>
+                {
+                    return Some(idp);
+                }
                 _ => {}
             }
         }
@@ -100,8 +103,11 @@ impl EntitiesDescriptor {
     pub fn find_sp(&self, entity_id: &str) -> Option<&SpDescriptor> {
         for entry in &self.entities {
             match entry {
-                MetadataEntry::Sp(sp) if sp.entity_id == entity_id => return Some(sp),
-                MetadataEntry::Dual(_, sp) if sp.entity_id == entity_id => return Some(sp),
+                MetadataEntry::Sp(sp) | MetadataEntry::Dual(_, sp)
+                    if sp.entity_id == entity_id =>
+                {
+                    return Some(sp);
+                }
                 _ => {}
             }
         }
@@ -111,8 +117,7 @@ impl EntitiesDescriptor {
     /// Iterate over all IdP descriptors (including the IdP half of Dual entries).
     pub fn iter_idps(&self) -> impl Iterator<Item = &IdpDescriptor> {
         self.entities.iter().filter_map(|e| match e {
-            MetadataEntry::Idp(idp) => Some(idp),
-            MetadataEntry::Dual(idp, _) => Some(idp),
+            MetadataEntry::Idp(idp) | MetadataEntry::Dual(idp, _) => Some(idp),
             _ => None,
         })
     }
@@ -120,8 +125,7 @@ impl EntitiesDescriptor {
     /// Iterate over all SP descriptors (including the SP half of Dual entries).
     pub fn iter_sps(&self) -> impl Iterator<Item = &SpDescriptor> {
         self.entities.iter().filter_map(|e| match e {
-            MetadataEntry::Sp(sp) => Some(sp),
-            MetadataEntry::Dual(_, sp) => Some(sp),
+            MetadataEntry::Sp(sp) | MetadataEntry::Dual(_, sp) => Some(sp),
             _ => None,
         })
     }
@@ -199,7 +203,7 @@ fn verify_metadata_signature_on_document(
     let verified = verify_signature(
         doc,
         signature_elem,
-        &[trusted_signing_cert.clone()],
+        std::slice::from_ref(trusted_signing_cert),
         SignatureAlgorithm::DEFAULTS,
     )?;
     if verified.signed_element != doc.root().id() {
@@ -268,7 +272,7 @@ pub(crate) fn is_md_element(element: &Element, local: &str) -> bool {
 ///
 /// For aggregates the search is in document order, flattening any nested
 /// `<md:EntitiesDescriptor>` blocks (RFC-006 §3).
-pub(crate) fn find_entity_descriptor<'a, F>(root: &'a Element, pred: F) -> Option<&'a Element>
+pub(crate) fn find_entity_descriptor<F>(root: &Element, pred: F) -> Option<&Element>
 where
     F: Fn(&Element) -> bool + Copy,
 {
@@ -285,10 +289,10 @@ where
                 if pred(elem) {
                     return Some(elem);
                 }
-            } else if is_md_element(elem, "EntitiesDescriptor") {
-                if let Some(found) = find_entity_descriptor(elem, pred) {
-                    return Some(found);
-                }
+            } else if is_md_element(elem, "EntitiesDescriptor")
+                && let Some(found) = find_entity_descriptor(elem, pred)
+            {
+                return Some(found);
             }
         }
     }
@@ -310,8 +314,10 @@ pub(crate) fn parse_endpoint(element: &Element) -> Result<crate::binding::Endpoi
         })?
         .to_owned();
     let index = match element.attribute(None, "index") {
-        Some(s) => Some(s.parse::<u16>().map_err(|_| Error::InvalidConfiguration {
-            reason: "endpoint index is not a u16",
+        Some(s) => Some(s.parse::<u16>().map_err(|_parse_err| {
+            Error::InvalidConfiguration {
+                reason: "endpoint index is not a u16",
+            }
         })?),
         None => None,
     };
@@ -340,12 +346,13 @@ pub(crate) fn parse_key_descriptors(
 
         // Reject explicit but unrecognized `use` values to surface metadata
         // typos rather than silently dropping the cert from both lists.
-        if let Some(value) = use_attr {
-            if value != "signing" && value != "encryption" {
-                return Err(Error::InvalidConfiguration {
-                    reason: "KeyDescriptor use attribute must be signing or encryption",
-                });
-            }
+        if let Some(value) = use_attr
+            && value != "signing"
+            && value != "encryption"
+        {
+            return Err(Error::InvalidConfiguration {
+                reason: "KeyDescriptor use attribute must be signing or encryption",
+            });
         }
 
         let key_info = kd
@@ -418,8 +425,8 @@ fn parse_optional_bool_value(value: Option<&str>) -> Result<Option<bool>, Error>
     match value {
         None => Ok(None),
         // xs:boolean lexical space.
-        Some("true") | Some("1") => Ok(Some(true)),
-        Some("false") | Some("0") => Ok(Some(false)),
+        Some("true" | "1") => Ok(Some(true)),
+        Some("false" | "0") => Ok(Some(false)),
         Some(_) => Err(Error::InvalidConfiguration {
             reason: "invalid xs:boolean attribute",
         }),
@@ -443,7 +450,7 @@ pub(crate) fn parse_xs_duration(s: &str) -> Result<Duration, Error> {
     };
 
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'P' {
+    if bytes.first() != Some(&b'P') {
         return Err(unsupported());
     }
     // We require at least one component (P alone, PT alone are invalid).
@@ -471,14 +478,13 @@ pub(crate) fn parse_xs_duration(s: &str) -> Result<Duration, Error> {
     let mut seconds: u64 = 0;
     let mut saw_any = false;
 
-    while i < bytes.len() {
-        let b = bytes[i];
+    while let Some(&b) = bytes.get(i) {
         if b == b'T' {
             if after_t {
                 return Err(unsupported());
             }
             after_t = true;
-            i += 1;
+            i = i.checked_add(1).ok_or_else(unsupported)?;
             // After T we require at least one designator.
             if i >= bytes.len() {
                 return Err(unsupported());
@@ -489,38 +495,37 @@ pub(crate) fn parse_xs_duration(s: &str) -> Result<Duration, Error> {
             return Err(unsupported());
         }
         let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
+        while let Some(byte) = bytes.get(i)
+            && byte.is_ascii_digit()
+        {
+            i = i.checked_add(1).ok_or_else(unsupported)?;
         }
-        if i >= bytes.len() {
-            return Err(unsupported());
-        }
-        let designator = bytes[i];
-        let value: u64 = std::str::from_utf8(&bytes[start..i])
-            .map_err(|_| unsupported())?
+        let designator = *bytes.get(i).ok_or_else(unsupported)?;
+        let digit_slice = bytes.get(start..i).ok_or_else(unsupported)?;
+        let value: u64 = std::str::from_utf8(digit_slice)
+            .map_err(|_utf8_err| unsupported())?
             .parse::<u64>()
-            .map_err(|_| unsupported())?;
+            .map_err(|_parse_err| unsupported())?;
 
         let (slot, target) = match (after_t, designator) {
-            // Years / months are not fixed-length; rejected.
-            (false, b'Y') | (false, b'M') => return Err(unsupported()),
             (false, b'D') => (Slot::Days, &mut days),
             (true, b'H') => (Slot::Hours, &mut hours),
             (true, b'M') => (Slot::Minutes, &mut minutes),
             (true, b'S') => (Slot::Seconds, &mut seconds),
+            // Years / months (before T) and anything else are rejected.
             _ => return Err(unsupported()),
         };
 
         // Designators must appear at most once, and in canonical order.
-        if let Some(prev) = last_slot {
-            if slot <= prev {
-                return Err(unsupported());
-            }
+        if let Some(prev) = last_slot
+            && slot <= prev
+        {
+            return Err(unsupported());
         }
         last_slot = Some(slot);
         *target = value;
         saw_any = true;
-        i += 1;
+        i = i.checked_add(1).ok_or_else(unsupported)?;
     }
 
     if !saw_any {
@@ -570,28 +575,22 @@ mod tests {
 
     #[test]
     fn duration_pt1h() {
-        assert_eq!(parse_xs_duration("PT1H").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_xs_duration("PT1H").unwrap(), Duration::from_hours(1));
     }
 
     #[test]
     fn duration_pt15m() {
-        assert_eq!(
-            parse_xs_duration("PT15M").unwrap(),
-            Duration::from_secs(15 * 60)
-        );
+        assert_eq!(parse_xs_duration("PT15M").unwrap(), Duration::from_mins(15));
     }
 
     #[test]
     fn duration_p1d() {
-        assert_eq!(parse_xs_duration("P1D").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(parse_xs_duration("P1D").unwrap(), Duration::from_hours(24));
     }
 
     #[test]
     fn duration_pt3600s() {
-        assert_eq!(
-            parse_xs_duration("PT3600S").unwrap(),
-            Duration::from_secs(3600)
-        );
+        assert_eq!(parse_xs_duration("PT3600S").unwrap(), Duration::from_hours(1));
     }
 
     #[test]
@@ -606,7 +605,7 @@ mod tests {
     fn duration_p1d_pt1h() {
         assert_eq!(
             parse_xs_duration("P1DT1H").unwrap(),
-            Duration::from_secs(86_400 + 3600)
+            Duration::from_hours(25)
         );
     }
 
@@ -674,7 +673,7 @@ mod tests {
 
     fn sp_entity_xml(entity_id: &str) -> String {
         format!(
-            r#"<md:EntityDescriptor entityID="{eid}">
+            r#"<md:EntityDescriptor entityID="{entity_id}">
               <md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"
                                   AuthnRequestsSigned="true"
                                   WantAssertionsSigned="true">
@@ -685,8 +684,7 @@ mod tests {
                     Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
                     Location="https://sp.example.com/slo"/>
               </md:SPSSODescriptor>
-            </md:EntityDescriptor>"#,
-            eid = entity_id
+            </md:EntityDescriptor>"#
         )
     }
 
@@ -838,7 +836,7 @@ mod tests {
         let sig_alg = SignatureAlgorithm::RsaSha256;
 
         let stage_1_xml = format!(
-            r##"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body_xml}</md:EntitiesDescriptor>"##
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body_xml}</md:EntitiesDescriptor>"#
         );
         let stage_1_doc = Document::parse(stage_1_xml.as_bytes()).unwrap();
         let chain_1 = ancestor_chain(&stage_1_doc, stage_1_doc.root().id()).unwrap();
@@ -855,8 +853,7 @@ mod tests {
             digest = digest_b64,
         );
         let signed_info_xml = format!(
-            r##"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{}</ds:SignedInfo>"##,
-            signed_info_inner
+            r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{signed_info_inner}</ds:SignedInfo>"#,
         );
         let signed_info_doc = Document::parse(signed_info_xml.as_bytes()).unwrap();
         let si_chain = ancestor_chain(&signed_info_doc, signed_info_doc.root().id()).unwrap();
@@ -872,13 +869,12 @@ mod tests {
         let sig_b64 = BASE64_STANDARD.encode(&sig_bytes);
 
         let cert_b64 = cert.to_base64_x509();
+        let body = body_xml;
+        let si_inner = signed_info_inner.as_str();
+        let sig = sig_b64.as_str();
+        let cert_text = cert_b64.as_str();
         let final_xml = format!(
-            r##"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body}<ds:Signature><ds:SignedInfo>{si_inner}</ds:SignedInfo><ds:SignatureValue>{sig}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature></md:EntitiesDescriptor>"##,
-            target_id = target_id,
-            body = body_xml,
-            si_inner = signed_info_inner,
-            sig = sig_b64,
-            cert = cert_b64,
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body}<ds:Signature><ds:SignedInfo>{si_inner}</ds:SignedInfo><ds:SignatureValue>{sig}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert_text}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature></md:EntitiesDescriptor>"#,
         );
         (final_xml, cert)
     }

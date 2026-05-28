@@ -79,16 +79,25 @@ const SAML_ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 /// element's `ID` is preserved; no other content is altered. Callers that
 /// need a fresh `ElementId` index should re-wrap the returned element with
 /// `Document::new`.
+///
+/// Cryptographic and serialization options are bundled into [`SignOptions`]
+/// so the call signature stays focused on the two structural inputs (target
+/// element, document context). See [`SignOptions`] for the field-level
+/// documentation.
 pub(crate) fn sign_element(
     element: Element,
     document_context: &Document,
-    signing_key: &KeyPair,
-    signature_algorithm: SignatureAlgorithm,
-    digest: DigestAlgorithm,
-    c14n: C14nAlgorithm,
-    inclusive_namespace_prefixes: &[&str],
-    include_x509_cert: bool,
+    opts: SignOptions<'_>,
 ) -> Result<Element, Error> {
+    let SignOptions {
+        signing_key,
+        sig_alg,
+        digest_alg,
+        c14n_alg,
+        inclusive_namespaces,
+        include_x509_cert,
+    } = opts;
+
     // ---- Step 0: locate the element's ID attribute. -----------------------
     let id_value = element
         .attribute(None, "ID")
@@ -114,10 +123,10 @@ pub(crate) fn sign_element(
         document_context,
         &element,
         &[],
-        c14n,
-        inclusive_namespace_prefixes,
+        c14n_alg,
+        inclusive_namespaces,
     )?;
-    let digest_bytes = digest.digest(&target_canonical);
+    let digest_bytes = digest_alg.digest(&target_canonical);
     let digest_b64 = BASE64_STANDARD.encode(&digest_bytes);
 
     // ---- Step 2/3: build the <ds:SignedInfo> subtree. ---------------------
@@ -127,12 +136,12 @@ pub(crate) fn sign_element(
     // SignedInfo in step 4 we synthesize a transient document whose root
     // *does* declare `xmlns:ds`, so the c14n pass sees an in-scope binding.
     let signed_info = build_signed_info(
-        signature_algorithm,
-        digest,
-        c14n,
+        sig_alg,
+        digest_alg,
+        c14n_alg,
         &id_value,
         &digest_b64,
-        inclusive_namespace_prefixes,
+        inclusive_namespaces,
     );
 
     // ---- Step 4: canonicalize <ds:SignedInfo>. ----------------------------
@@ -149,12 +158,12 @@ pub(crate) fn sign_element(
         &signed_info_doc,
         signed_info_doc.root(),
         &[],
-        c14n,
-        inclusive_namespace_prefixes,
+        c14n_alg,
+        inclusive_namespaces,
     )?;
 
     // ---- Step 5: produce the signature bytes. -----------------------------
-    let signature_bytes = signing_key.sign(signature_algorithm, &signed_info_canonical)?;
+    let signature_bytes = signing_key.sign(sig_alg, &signed_info_canonical)?;
     let signature_b64 = BASE64_STANDARD.encode(&signature_bytes);
 
     // ---- Step 6: assemble the <ds:Signature> element. ---------------------
@@ -170,6 +179,35 @@ pub(crate) fn sign_element(
     let mut element = element;
     element.insert_child(position, Node::Element(signature_element));
     Ok(element)
+}
+
+/// Bundle of cryptographic + canonicalization options consumed by
+/// [`sign_element`].
+///
+/// Grouping these into a single struct keeps the call signature focused on
+/// the two structural inputs (target element + document context). Every
+/// field is load-bearing — there are intentionally no defaults — so callers
+/// must spell out exactly which algorithms the signature uses.
+pub(crate) struct SignOptions<'a> {
+    /// Private key (with optional certificate) used to produce the signature
+    /// bytes over `<ds:SignedInfo>`.
+    pub signing_key: &'a KeyPair,
+    /// Signature algorithm advertised in `<ds:SignatureMethod Algorithm="…">`
+    /// and used for the actual sign operation.
+    pub sig_alg: SignatureAlgorithm,
+    /// Digest algorithm advertised in `<ds:DigestMethod Algorithm="…">` and
+    /// used to hash the canonicalized target element.
+    pub digest_alg: DigestAlgorithm,
+    /// C14N algorithm applied both to the target element (for the digest)
+    /// and to `<ds:SignedInfo>` (for the signature input).
+    pub c14n_alg: C14nAlgorithm,
+    /// PrefixList for `<ec:InclusiveNamespaces>` when `c14n_alg` is
+    /// Exclusive. Empty means no `<ec:InclusiveNamespaces>` child is
+    /// attached to the C14N transform.
+    pub inclusive_namespaces: &'a [&'a str],
+    /// When true, attach `<ds:KeyInfo>/<ds:X509Data>/<ds:X509Certificate>`
+    /// carrying `signing_key`'s certificate. Errors if the key has no cert.
+    pub include_x509_cert: bool,
 }
 
 /// Sign a detached query-string payload per HTTP-Redirect binding spec
@@ -325,7 +363,13 @@ fn signature_insertion_index(element: &Element) -> usize {
             && child_elem.qname().local() == "Issuer"
             && child_elem.qname().namespace() == Some(SAML_ASSERTION_NS)
         {
-            return idx + 1;
+            // `enumerate` yields a usize bounded by the child count and never
+            // overflows in practice; the checked add satisfies the
+            // `arithmetic_side_effects` restriction. Falling back to `idx`
+            // would still place the signature inside the element (just at the
+            // Issuer's index instead of after it) on the impossible-in-practice
+            // overflow path.
+            return idx.checked_add(1).unwrap_or(idx);
         }
     }
     0
@@ -399,7 +443,7 @@ mod tests {
     }
 
     /// Locate `<ds:SignedInfo>` inside `<ds:Signature>`.
-    fn signed_info_of<'a>(signature: &'a Element) -> &'a Element {
+    fn signed_info_of(signature: &Element) -> &Element {
         signature
             .child_element(Some(DSIG_NS), "SignedInfo")
             .expect("SignedInfo present")
@@ -426,12 +470,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            true,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )
         .expect("sign");
 
@@ -491,12 +537,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::EcdsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::EcdsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: false,
+            },
         )
         .expect("sign");
 
@@ -540,12 +588,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: false,
+            },
         )
         .unwrap();
 
@@ -566,12 +616,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: false,
+            },
         )
         .unwrap();
 
@@ -595,12 +647,14 @@ mod tests {
         let err = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: false,
+            },
         )
         .unwrap_err();
         match err {
@@ -622,12 +676,14 @@ mod tests {
         let err = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            /* include_x509_cert */ true,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )
         .unwrap_err();
         match err {
@@ -668,12 +724,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha512,
-            DigestAlgorithm::Sha512,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha512,
+                digest_alg: DigestAlgorithm::Sha512,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: false,
+            },
         )
         .unwrap();
         let signature = find_signature(&signed).unwrap();
@@ -706,12 +764,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: false,
+            },
         )
         .unwrap();
         let signature = find_signature(&signed).unwrap();
@@ -732,12 +792,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: false,
+            },
         )
         .unwrap();
         let signature = find_signature(&signed).unwrap();
@@ -772,12 +834,14 @@ mod tests {
         let signed = sign_element(
             target,
             &doc,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &["samlp", "saml"],
-            false,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &["samlp", "saml"],
+                include_x509_cert: false,
+            },
         )
         .unwrap();
         let signature = find_signature(&signed).unwrap();

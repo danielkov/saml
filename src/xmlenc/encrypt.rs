@@ -109,7 +109,9 @@ pub(crate) fn encrypt_assertion(
 /// inner `x509_cert::Certificate` (which is private). The cert was already
 /// validated to be RSA in [`encrypt_assertion`].
 fn rsa_public_key_from_cert(cert: &X509Certificate) -> Result<RsaPublicKey, Error> {
-    let parsed = Certificate::from_der(cert.to_der()).map_err(|_| Error::X509Parse)?;
+    // Discarded intentionally: the cert was already validated to be RSA by
+    // the caller; surfacing the DER-level reason here adds no useful detail.
+    let parsed = Certificate::from_der(cert.to_der()).map_err(|_err| Error::X509Parse)?;
     let key_bytes = parsed
         .tbs_certificate
         .subject_public_key_info
@@ -117,7 +119,8 @@ fn rsa_public_key_from_cert(cert: &X509Certificate) -> Result<RsaPublicKey, Erro
         .as_bytes()
         .ok_or(Error::X509Parse)?;
     // The SPKI BIT STRING for RSA wraps a DER-encoded PKCS#1 RSAPublicKey.
-    RsaPublicKey::from_pkcs1_der(key_bytes).map_err(|_| Error::X509Parse)
+    // Discarded intentionally: collapse all DER-level reasons into X509Parse.
+    RsaPublicKey::from_pkcs1_der(key_bytes).map_err(|_err| Error::X509Parse)
 }
 
 /// Fill a buffer with cryptographically random bytes. We use the OS RNG
@@ -126,7 +129,9 @@ fn rsa_public_key_from_cert(cert: &X509Certificate) -> Result<RsaPublicKey, Erro
 /// against a single entropy source.
 fn fill_random(buf: &mut [u8]) -> Result<(), Error> {
     let mut rng = OsRng;
-    rng.try_fill_bytes(buf).map_err(|_| Error::DecryptFailed {
+    // Discarded intentionally: RNG failure detail is platform-specific and
+    // not useful to callers; collapse to a generic reason.
+    rng.try_fill_bytes(buf).map_err(|_err| Error::DecryptFailed {
         reason: "rng",
     })
 }
@@ -165,7 +170,8 @@ where
 {
     let mut nonce = vec![0u8; 12];
     fill_random(&mut nonce)?;
-    let cipher = C::new_from_slice(session_key).map_err(|_| Error::DecryptFailed {
+    // Discarded intentionally: cipher-init detail would leak key shape.
+    let cipher = C::new_from_slice(session_key).map_err(|_err| Error::DecryptFailed {
         reason: "key size mismatch",
     })?;
     let ct = cipher
@@ -176,7 +182,9 @@ where
                 aad: &[],
             },
         )
-        .map_err(|_| Error::DecryptFailed { reason: "data" })?;
+        // Discarded intentionally: AEAD encrypt should not fail for valid
+        // inputs; surface the generic reason.
+        .map_err(|_err| Error::DecryptFailed { reason: "data" })?;
     Ok((nonce, ct))
 }
 
@@ -184,17 +192,25 @@ fn encrypt_cbc<C>(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Er
 where
     C: aes::cipher::BlockCipher + aes::cipher::BlockEncrypt + aes::cipher::KeyInit,
 {
-    let encryptor = cbc::Encryptor::<C>::new_from_slices(key, iv).map_err(|_| {
+    // Discarded intentionally: cipher-init detail would leak key shape.
+    let encryptor = cbc::Encryptor::<C>::new_from_slices(key, iv).map_err(|_err| {
         Error::DecryptFailed {
             reason: "key size mismatch",
         }
     })?;
     // Allocate enough room for the plaintext + one full padding block (PKCS#7
     // always appends 1..=block_size padding bytes). Block size is 16 for AES.
-    let mut out = vec![0u8; plaintext.len() + 16];
+    let mut out = vec![
+        0u8;
+        plaintext
+            .len()
+            .checked_add(16)
+            .ok_or(Error::DecryptFailed { reason: "data" })?
+    ];
     let written = encryptor
         .encrypt_padded_b2b_mut::<Pkcs7>(plaintext, &mut out)
-        .map_err(|_| Error::DecryptFailed { reason: "data" })?
+        // Discarded intentionally: padding-error detail is not actionable.
+        .map_err(|_err| Error::DecryptFailed { reason: "data" })?
         .len();
     out.truncate(written);
     Ok(out)
@@ -228,7 +244,9 @@ fn wrap_session_key(
             let padding = rsa::Oaep::new::<Sha256>();
             public
                 .encrypt(&mut rng, padding, session_key)
-                .map_err(|_| Error::DecryptFailed {
+                // Discarded intentionally: RSA encrypt failure detail must not
+                // be surfaced for Bleichenbacher safety; collapse to generic.
+                .map_err(|_err| Error::DecryptFailed {
                     reason: "key transport",
                 })
         }
@@ -242,7 +260,8 @@ fn wrap_session_key(
                 let padding = rsa::Oaep::new::<Sha1>();
                 public
                     .encrypt(&mut rng, padding, session_key)
-                    .map_err(|_| Error::DecryptFailed {
+                    // Discarded intentionally: see RsaOaep arm above.
+                    .map_err(|_err| Error::DecryptFailed {
                         reason: "key transport",
                     })
             }

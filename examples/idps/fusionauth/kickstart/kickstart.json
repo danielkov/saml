@@ -1,0 +1,148 @@
+{
+  "variables": {
+    "apiKey": "33052c8a-c283-4e96-9d2a-eb1215c69f8f-not-for-prod",
+    "tenantId": "d7d09513-a3f5-401c-9685-34ab6c552453",
+    "applicationId": "e9fdb985-9173-4e01-9d73-ac2d60d1dc8e",
+    "samlSigningKeyId": "8c1b3df8-9024-4f86-b73e-1e9b27a83de1",
+    "samlSpVerifyKeyId": "f7c2dbe3-2a3a-4eef-89f5-8a8c5b5e2741",
+    "samlLambdaId": "5e4a8e6e-1f23-4baf-9c66-04fb1cd2c63d",
+    "adminEmail": "admin@saml-demo.local",
+    "adminPassword": "password",
+    "userEmail": "alice@saml-demo.local",
+    "userPassword": "password"
+  },
+
+  "apiKeys": [
+    {
+      "key": "#{apiKey}",
+      "description": "saml-axum-demo bootstrap key (not for production)"
+    }
+  ],
+
+  "requests": [
+    {
+      "method": "POST",
+      "url": "/api/key/generate/#{samlSigningKeyId}",
+      "body": {
+        "key": {
+          "algorithm": "RS256",
+          "name": "saml-axum-demo IdP signing key",
+          "length": 2048
+        }
+      }
+    },
+
+    {
+      "method": "POST",
+      "url": "/api/key/import/#{samlSpVerifyKeyId}",
+      "body": {
+        "key": {
+          "name": "saml-axum-demo SP verification certificate",
+          "certificate": "-----BEGIN CERTIFICATE-----\nMIIDEzCCAfugAwIBAgIUTfhpA0maJrRIF9RjS6fjhKqEKX0wDQYJKoZIhvcNAQEL\nBQAwGTEXMBUGA1UEAwwOc2FtbC1heHVtLWRlbW8wHhcNMjYwNTI3MTkxODUzWhcN\nMzYwNTI0MTkxODUzWjAZMRcwFQYDVQQDDA5zYW1sLWF4dW0tZGVtbzCCASIwDQYJ\nKoZIhvcNAQEBBQADggEPADCCAQoCggEBAJbM3HcO7+PduWeQLcJsCWqPdoeJjOSY\nxp6wz3iH4WWWQhjOy2BQ0ljBvbiL/MtVynjj1S+L0cb93+O9We304npqIbhmGpIP\nHeeGK6YIwlnmvLChCvYR/Q2DrPxI7Oy+sIwjFd8nsaIOyWD8SrcDsqEuLVE+9lEt\nV1O2Ksl1ldpYma/rLP+TV1rV4vn/atWqrMXZzQdLdaWedZijg5lThnjJm/FrWb4d\nqReUpvu9X2OuiblZKciqXKFngr6DhGKyzo5JyLL0oPQlW+jBe5bSz5lcmBLp/FAB\n/mpPVD9p2PmQJOAtSEn2J4btwQjmLjSzEQ8eZRc0pLJOwpzeBMcw6bECAwEAAaNT\nMFEwHQYDVR0OBBYEFD/Fe8h7Ktoa66UIudR19QtxRQDWMB8GA1UdIwQYMBaAFD/F\ne8h7Ktoa66UIudR19QtxRQDWMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL\nBQADggEBADeMOCs3wNDrpL2TxMy6cru6gmSijSawtrfsghz+Srvvr8CrZi1llZDx\nE4XOBUPrc6w1ZZNX2T44tk9evPBNxU9sBl1yYO5yqAYA+vshR4T5E+8bMtdexJI8\nlh4eHON32RHaQlaJcltJUCWB4qh5wKme+pp6yzmTYLr3QtP98b4YNhHU3oW+WWyZ\nM5L+WtnDMxo2VSi/Dit1bVGjdf+kgumWIGuli0nxQL1ehGqoXdX4xi3nEEbSyM+7\ntcv/bkA4NTwEvm57JOxNuKxwmwW/s3uXXMx83LsUbdnMhzNH9hiiQVoeA0Rd9fag\n7xMD9Z/T0lZfn0OGTaTPG11UGG5hdgk=\n-----END CERTIFICATE-----\n"
+        }
+      }
+    },
+
+    {
+      "method": "POST",
+      "url": "/api/lambda/#{samlLambdaId}",
+      "body": {
+        "lambda": {
+          "name": "saml-axum-demo SAML response populate",
+          "type": "SAMLv2Populate",
+          "enabled": true,
+          "body": "function populate(samlResponse, user, registration) {\n  samlResponse.assertion.attributes['email'] = [user.email];\n  if (user.fullName) { samlResponse.assertion.attributes['displayName'] = [user.fullName]; }\n  if (user.firstName) { samlResponse.assertion.attributes['givenName'] = [user.firstName]; }\n  if (user.lastName) { samlResponse.assertion.attributes['sn'] = [user.lastName]; }\n  if (user.data && user.data.department) { samlResponse.assertion.attributes['department'] = [user.data.department]; }\n}\n"
+        }
+      }
+    },
+
+    {
+      "method": "POST",
+      "url": "/api/tenant/#{tenantId}",
+      "body": {
+        "tenant": {
+          "name": "saml-demo",
+          "issuer": "http://localhost:9011"
+        }
+      }
+    },
+
+    {
+      "method": "POST",
+      "url": "/api/application/#{applicationId}",
+      "tenantId": "#{tenantId}",
+      "body": {
+        "application": {
+          "name": "saml-axum-demo",
+          "samlv2Configuration": {
+            "enabled": true,
+            "issuer": "http://localhost:9011/samlv2/idp/#{applicationId}",
+            "audience": "saml-axum-demo",
+            "authorizedRedirectURLs": [
+              "http://localhost:3000/saml/acs"
+            ],
+            "callbackURL": "http://localhost:3000/saml/acs",
+            "keyId": "#{samlSigningKeyId}",
+            "defaultVerificationKeyId": "#{samlSpVerifyKeyId}",
+            "requireSignedRequests": true,
+            "xmlSignatureC14nMethod": "exclusive_with_comments",
+            "xmlSignatureLocation": "Assertion",
+            "logout": {
+              "behavior": "AllParticipants",
+              "singleLogout": {
+                "enabled": false
+              }
+            }
+          },
+          "lambdaConfiguration": {
+            "samlv2PopulateId": "#{samlLambdaId}"
+          },
+          "loginConfiguration": {
+            "allowTokenRefresh": false,
+            "generateRefreshTokens": false,
+            "requireAuthentication": true
+          }
+        }
+      }
+    },
+
+    {
+      "method": "POST",
+      "url": "/api/user/registration",
+      "body": {
+        "user": {
+          "email": "#{adminEmail}",
+          "password": "#{adminPassword}",
+          "firstName": "Admin",
+          "lastName": "User"
+        },
+        "registration": {
+          "applicationId": "#{FUSIONAUTH_APPLICATION_ID}",
+          "roles": ["admin"]
+        }
+      }
+    },
+
+    {
+      "method": "POST",
+      "url": "/api/user/registration",
+      "tenantId": "#{tenantId}",
+      "body": {
+        "user": {
+          "email": "#{userEmail}",
+          "password": "#{userPassword}",
+          "firstName": "Alice",
+          "lastName": "Anderson",
+          "fullName": "Alice Anderson",
+          "data": {
+            "department": "platform"
+          }
+        },
+        "registration": {
+          "applicationId": "#{applicationId}",
+          "username": "alice"
+        }
+      }
+    }
+  ]
+}

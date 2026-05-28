@@ -1,0 +1,220 @@
+# Merged docker-compose stack for the three local IdPs the saml-demo
+# binary drives (Keycloak, FusionAuth, Authentik). Each IdP keeps its
+# own database/redis on a dedicated bridge network so the services
+# never see each other; only the IdP HTTP ports (8080, 9011, 9000) are
+# exposed on the host.
+#
+# Usage:
+#   docker compose -f examples/idps/docker-compose.yml up -d
+#   # Wait ~60-90s for migrations + blueprint/realm/kickstart to settle:
+#   docker compose -f examples/idps/docker-compose.yml ps
+#   cargo run -p saml-demo
+#   # Open http://localhost:3000
+#
+# Admin consoles:
+#   Keycloak:    http://localhost:8080   (admin / admin)
+#   FusionAuth:  http://localhost:9011   (admin@saml-demo.local / password)
+#   Authentik:   http://localhost:9000   (akadmin / AuthentikDemo!42)
+#
+# Tear down (and wipe DB state):
+#   docker compose -f examples/idps/docker-compose.yml down -v
+
+services:
+  # ─── Keycloak (port 8080) ──────────────────────────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: saml-demo-keycloak
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=8080
+      - --hostname-strict=false
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_HTTP_RELATIVE_PATH: "/"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/saml-demo/protocol/saml/descriptor HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q 200 <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - kc-net
+
+  # ─── FusionAuth (port 9011) ────────────────────────────────────────
+  fa-postgres:
+    image: postgres:16
+    container_name: saml-demo-fusionauth-db
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: fusionauth
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - fa-db-data:/var/lib/postgresql/data
+    networks:
+      - fa-net
+
+  fusionauth:
+    image: fusionauth/fusionauth-app:latest
+    container_name: saml-demo-fusionauth
+    depends_on:
+      fa-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: jdbc:postgresql://fa-postgres:5432/fusionauth
+      DATABASE_ROOT_USERNAME: postgres
+      DATABASE_ROOT_PASSWORD: postgres
+      DATABASE_USERNAME: fusionauth
+      DATABASE_PASSWORD: fusionauth
+      FUSIONAUTH_APP_MEMORY: 512M
+      FUSIONAUTH_APP_RUNTIME_MODE: development
+      FUSIONAUTH_APP_URL: http://fusionauth:9011
+      FUSIONAUTH_APP_KICKSTART_FILE: /usr/local/fusionauth/kickstart/kickstart.json
+      SEARCH_TYPE: database
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl --silent --fail http://localhost:9011/api/status -o /dev/null"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    ports:
+      - "9011:9011"
+    volumes:
+      - fa-config:/usr/local/fusionauth/config
+      - ./fusionauth/kickstart:/usr/local/fusionauth/kickstart:ro
+    networks:
+      - fa-net
+
+  # ─── Authentik (port 9000) ─────────────────────────────────────────
+  ak-postgres:
+    image: docker.io/library/postgres:16-alpine
+    container_name: saml-demo-authentik-postgres
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: AuthentikDemoPg!
+    volumes:
+      - ak-db:/var/lib/postgresql/data
+    networks:
+      - ak-net
+
+  ak-redis:
+    image: docker.io/library/redis:alpine
+    container_name: saml-demo-authentik-redis
+    restart: unless-stopped
+    command: --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - ak-redis-data:/data
+    networks:
+      - ak-net
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2026.5.0
+    container_name: saml-demo-authentik-server
+    restart: unless-stopped
+    command: server
+    depends_on:
+      ak-postgres:
+        condition: service_healthy
+      ak-redis:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_REDIS__HOST: ak-redis
+      AUTHENTIK_POSTGRESQL__HOST: ak-postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: AuthentikDemoPg!
+      AUTHENTIK_SECRET_KEY: "saml-axum-demo-do-not-use-in-prod-0123456789abcdef0123456789abcdef"
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_BOOTSTRAP_PASSWORD: "AuthentikDemo!42"
+      AUTHENTIK_BOOTSTRAP_TOKEN: "saml-axum-demo-bootstrap-token-0123456789abcdef"
+      AUTHENTIK_BOOTSTRAP_EMAIL: "akadmin@saml-demo.local"
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    shm_size: 512mb
+    volumes:
+      - ak-media:/media
+      - ak-templates:/templates
+      - ./authentik/blueprints:/blueprints/local:ro
+    networks:
+      - ak-net
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2026.5.0
+    container_name: saml-demo-authentik-worker
+    restart: unless-stopped
+    command: worker
+    depends_on:
+      ak-postgres:
+        condition: service_healthy
+      ak-redis:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_REDIS__HOST: ak-redis
+      AUTHENTIK_POSTGRESQL__HOST: ak-postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: AuthentikDemoPg!
+      AUTHENTIK_SECRET_KEY: "saml-axum-demo-do-not-use-in-prod-0123456789abcdef0123456789abcdef"
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_BOOTSTRAP_PASSWORD: "AuthentikDemo!42"
+      AUTHENTIK_BOOTSTRAP_TOKEN: "saml-axum-demo-bootstrap-token-0123456789abcdef"
+      AUTHENTIK_BOOTSTRAP_EMAIL: "akadmin@saml-demo.local"
+    shm_size: 512mb
+    volumes:
+      - ak-media:/media
+      - ak-templates:/templates
+      - ak-certs:/certs
+      - ./authentik/blueprints:/blueprints/local:ro
+    networks:
+      - ak-net
+
+networks:
+  kc-net:
+    driver: bridge
+  fa-net:
+    driver: bridge
+  ak-net:
+    driver: bridge
+
+volumes:
+  fa-db-data:
+  fa-config:
+  ak-db:
+  ak-redis-data:
+  ak-media:
+  ak-templates:
+  ak-certs:

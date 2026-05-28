@@ -1,0 +1,190 @@
+version: 1
+metadata:
+  name: saml-axum-demo SAML provider
+  labels:
+    blueprints.goauthentik.io/description: |
+      Provisions everything the saml-axum-demo SP needs: SAML property
+      mappings, a signing keypair (the SP cert for verifying inbound
+      AuthnRequests), a SAML provider, an application binding, and one
+      test user `alice@saml-demo.local`.
+
+entries:
+  # ─── Property mappings ─────────────────────────────────────────────────
+  # Authentik's "property mappings" are the equivalent of Keycloak's
+  # protocol mappers: short Python expressions that pull values out of the
+  # authenticated user object and emit them as SAML <AttributeStatement>
+  # entries. The `friendly_name` shows up as `FriendlyName` on the wire
+  # alongside the formal `saml_name` URI.
+
+  - id: mapping-email
+    model: authentik_providers_saml.samlpropertymapping
+    identifiers:
+      name: "saml-axum-demo: email"
+    attrs:
+      friendly_name: mail
+      saml_name: urn:oid:0.9.2342.19200300.100.1.3
+      expression: |
+        return request.user.email
+
+  - id: mapping-display-name
+    model: authentik_providers_saml.samlpropertymapping
+    identifiers:
+      name: "saml-axum-demo: displayName"
+    attrs:
+      friendly_name: displayName
+      saml_name: urn:oid:2.16.840.1.113730.3.1.241
+      expression: |
+        return request.user.name
+
+  - id: mapping-given-name
+    model: authentik_providers_saml.samlpropertymapping
+    identifiers:
+      name: "saml-axum-demo: givenName"
+    attrs:
+      friendly_name: givenName
+      saml_name: urn:oid:2.5.4.42
+      expression: |
+        # Authentik stores the full name in `name`. Split off the first
+        # whitespace-delimited token as the given name.
+        return (request.user.name or "").split(" ", 1)[0]
+
+  - id: mapping-surname
+    model: authentik_providers_saml.samlpropertymapping
+    identifiers:
+      name: "saml-axum-demo: sn"
+    attrs:
+      friendly_name: sn
+      saml_name: urn:oid:2.5.4.4
+      expression: |
+        parts = (request.user.name or "").split(" ", 1)
+        return parts[1] if len(parts) > 1 else ""
+
+  - id: mapping-department
+    model: authentik_providers_saml.samlpropertymapping
+    identifiers:
+      name: "saml-axum-demo: department"
+    attrs:
+      friendly_name: department
+      saml_name: department
+      expression: |
+        return request.user.attributes.get("department", "")
+
+  # NameID mapping: assert the user's email as the SAML NameID value.
+  # The `saml_name` is unused when the mapping is referenced via
+  # `provider.name_id_mapping` (Authentik takes the value from the
+  # expression directly), but the serializer rejects an empty string,
+  # so we set it to the NameID format URI as a self-documenting marker.
+  - id: mapping-name-id
+    model: authentik_providers_saml.samlpropertymapping
+    identifiers:
+      name: "saml-axum-demo: NameID (email)"
+    attrs:
+      saml_name: urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress
+      expression: |
+        return request.user.email
+
+  # ─── SP signing certificate (verification_kp) ──────────────────────────
+  # Authentik calls this object a "CertificateKeyPair". For the SP cert we
+  # only need the certificate half — the private key stays in the Axum
+  # process. Setting `key_data: ""` is fine; Authentik treats it as a
+  # verification-only certificate.
+  - id: sp-verification-cert
+    model: authentik_crypto.certificatekeypair
+    identifiers:
+      name: saml-axum-demo SP signing cert
+    attrs:
+      certificate_data: |
+        -----BEGIN CERTIFICATE-----
+        MIIDEzCCAfugAwIBAgIUTfhpA0maJrRIF9RjS6fjhKqEKX0wDQYJKoZIhvcNAQEL
+        BQAwGTEXMBUGA1UEAwwOc2FtbC1heHVtLWRlbW8wHhcNMjYwNTI3MTkxODUzWhcN
+        MzYwNTI0MTkxODUzWjAZMRcwFQYDVQQDDA5zYW1sLWF4dW0tZGVtbzCCASIwDQYJ
+        KoZIhvcNAQEBBQADggEPADCCAQoCggEBAJbM3HcO7+PduWeQLcJsCWqPdoeJjOSY
+        xp6wz3iH4WWWQhjOy2BQ0ljBvbiL/MtVynjj1S+L0cb93+O9We304npqIbhmGpIP
+        HeeGK6YIwlnmvLChCvYR/Q2DrPxI7Oy+sIwjFd8nsaIOyWD8SrcDsqEuLVE+9lEt
+        V1O2Ksl1ldpYma/rLP+TV1rV4vn/atWqrMXZzQdLdaWedZijg5lThnjJm/FrWb4d
+        qReUpvu9X2OuiblZKciqXKFngr6DhGKyzo5JyLL0oPQlW+jBe5bSz5lcmBLp/FAB
+        /mpPVD9p2PmQJOAtSEn2J4btwQjmLjSzEQ8eZRc0pLJOwpzeBMcw6bECAwEAAaNT
+        MFEwHQYDVR0OBBYEFD/Fe8h7Ktoa66UIudR19QtxRQDWMB8GA1UdIwQYMBaAFD/F
+        e8h7Ktoa66UIudR19QtxRQDWMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL
+        BQADggEBADeMOCs3wNDrpL2TxMy6cru6gmSijSawtrfsghz+Srvvr8CrZi1llZDx
+        E4XOBUPrc6w1ZZNX2T44tk9evPBNxU9sBl1yYO5yqAYA+vshR4T5E+8bMtdexJI8
+        lh4eHON32RHaQlaJcltJUCWB4qh5wKme+pp6yzmTYLr3QtP98b4YNhHU3oW+WWyZ
+        M5L+WtnDMxo2VSi/Dit1bVGjdf+kgumWIGuli0nxQL1ehGqoXdX4xi3nEEbSyM+7
+        tcv/bkA4NTwEvm57JOxNuKxwmwW/s3uXXMx83LsUbdnMhzNH9hiiQVoeA0Rd9fag
+        7xMD9Z/T0lZfn0OGTaTPG11UGG5hdgk=
+        -----END CERTIFICATE-----
+
+  # ─── SAML provider ─────────────────────────────────────────────────────
+  - id: provider
+    model: authentik_providers_saml.samlprovider
+    identifiers:
+      name: saml-axum-demo
+    attrs:
+      acs_url: http://localhost:3000/saml/acs
+      sls_url: http://localhost:3000/saml/slo
+      audience: saml-axum-demo
+      # Without an issuer override, Authentik uses the metadata URL as the
+      # EntityID — that's what the SP will see in <Issuer>.
+      issuer_override: ""
+      sp_binding: post
+      sls_binding: post
+      sign_assertion: true
+      sign_response: true
+      sign_logout_request: true
+      sign_logout_response: true
+      digest_algorithm: http://www.w3.org/2001/04/xmlenc#sha256
+      signature_algorithm: http://www.w3.org/2001/04/xmldsig-more#rsa-sha256
+      # IdP signing keypair — use Authentik's auto-generated self-signed
+      # cert. The SP fetches the IdP metadata at startup, which embeds the
+      # matching public cert, so we never need to copy it manually.
+      signing_kp:
+        !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      # Verification keypair — the SP signs AuthnRequests, and we pin its
+      # cert here so Authentik verifies the signature instead of accepting
+      # an unsigned request.
+      verification_kp: !KeyOf sp-verification-cert
+      name_id_mapping: !KeyOf mapping-name-id
+      property_mappings:
+        - !KeyOf mapping-email
+        - !KeyOf mapping-display-name
+        - !KeyOf mapping-given-name
+        - !KeyOf mapping-surname
+        - !KeyOf mapping-department
+      # Hook the provider into the stock authorization + invalidation
+      # flows so users don't see a consent screen on every login.
+      authorization_flow:
+        !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow:
+        !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+
+  # ─── Application ───────────────────────────────────────────────────────
+  - id: application
+    model: authentik_core.application
+    identifiers:
+      slug: saml-axum-demo
+    attrs:
+      name: saml-axum-demo
+      provider: !KeyOf provider
+      meta_launch_url: http://localhost:3000/
+      meta_description: Axum-based Service Provider demo for the saml crate.
+      meta_publisher: saml-axum-demo
+      open_in_new_tab: false
+      policy_engine_mode: any
+
+  # ─── Test user ─────────────────────────────────────────────────────────
+  # `password` on the user model hashes + stores the supplied plaintext
+  # via Authentik's password backend. `attributes` is a free-form JSON
+  # blob that property mappings can read with `request.user.attributes`.
+  - id: user-alice
+    model: authentik_core.user
+    identifiers:
+      username: alice
+    attrs:
+      name: Alice Anderson
+      email: alice@saml-demo.local
+      password: password
+      is_active: true
+      path: users
+      type: internal
+      attributes:
+        department: platform

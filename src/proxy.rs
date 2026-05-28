@@ -17,8 +17,12 @@ use sha2::Sha256;
 use crate::attribute::Attribute;
 use crate::authn::request_validate::{AcsSelection, ParsedAuthnRequest};
 use crate::authn_context::{
-    AuthnContextClassRef, AuthnContextComparison, RequestedAuthnContext,
+    AuthnContextClassRef, AuthnContextComparison, ComparatorOutcome, RequestedAuthnContext,
 };
+// Re-export the canonical comparator under `crate::proxy::StandardComparator`
+// so the historical `saml::StandardComparator` re-export path (lib.rs) keeps
+// resolving without the proxy carrying its own (now-deleted) implementation.
+pub use crate::authn_context::StandardComparator;
 use crate::binding::{
     Binding, Dispatch, Endpoint, PostForm, SsoResponseDispatch, SsoResponseEndpoint,
 };
@@ -26,7 +30,7 @@ use crate::descriptor::{IdpDescriptor, SpDescriptor};
 use crate::error::Error;
 use crate::idp::{IdentityProvider, IssueResponse};
 #[cfg(feature = "slo")]
-use crate::logout::{LogoutOutcome, LogoutTracker, StartLogout};
+use crate::logout::{ConsumeLogoutResponse, LogoutOutcome, LogoutTracker, StartLogout};
 use crate::nameid::{NameId, NameIdFormat};
 use crate::response::Identity;
 use crate::sp::{LoginTracker, ServiceProvider, StartLogin};
@@ -121,7 +125,7 @@ impl Aes256GcmCodec {
     pub fn new(key: [u8; 32]) -> Self {
         Self {
             key,
-            max_age: Duration::from_secs(600),
+            max_age: Duration::from_mins(10),
         }
     }
 
@@ -134,11 +138,11 @@ impl Aes256GcmCodec {
 
 impl ProxyContextCodec for Aes256GcmCodec {
     fn encode(&self, context: &ProxyContext) -> Result<String, Error> {
-        let plaintext = bincode::serialize(context).map_err(|_| Error::InvalidConfiguration {
+        let plaintext = bincode::serialize(context).map_err(|_err| Error::InvalidConfiguration {
             reason: "proxy context serialize",
         })?;
 
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| {
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_err| {
             Error::InvalidConfiguration {
                 reason: "AES-256-GCM key size mismatch",
             }
@@ -157,11 +161,11 @@ impl ProxyContextCodec for Aes256GcmCodec {
                     aad: &[],
                 },
             )
-            .map_err(|_| Error::DecryptFailed {
+            .map_err(|_err| Error::DecryptFailed {
                 reason: "proxy context",
             })?;
 
-        let mut buf = Vec::with_capacity(12 + ct_with_tag.len());
+        let mut buf = Vec::with_capacity(12usize.saturating_add(ct_with_tag.len()));
         buf.extend_from_slice(&nonce_bytes);
         buf.extend_from_slice(&ct_with_tag);
         Ok(URL_SAFE_NO_PAD.encode(&buf))
@@ -170,7 +174,7 @@ impl ProxyContextCodec for Aes256GcmCodec {
     fn decode(&self, blob: &str) -> Result<ProxyContext, Error> {
         let bytes = URL_SAFE_NO_PAD
             .decode(blob.as_bytes())
-            .map_err(|_| Error::DecryptFailed {
+            .map_err(|_err| Error::DecryptFailed {
                 reason: "proxy context",
             })?;
         if bytes.len() < 12 + 16 {
@@ -180,7 +184,7 @@ impl ProxyContextCodec for Aes256GcmCodec {
         }
         let (nonce_bytes, ct_with_tag) = bytes.split_at(12);
 
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| {
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_err| {
             Error::InvalidConfiguration {
                 reason: "AES-256-GCM key size mismatch",
             }
@@ -193,12 +197,12 @@ impl ProxyContextCodec for Aes256GcmCodec {
                     aad: &[],
                 },
             )
-            .map_err(|_| Error::DecryptFailed {
+            .map_err(|_err| Error::DecryptFailed {
                 reason: "proxy context",
             })?;
 
         let context: ProxyContext =
-            bincode::deserialize(&plaintext).map_err(|_| Error::InvalidConfiguration {
+            bincode::deserialize(&plaintext).map_err(|_err| Error::InvalidConfiguration {
                 reason: "proxy context deserialize",
             })?;
 
@@ -300,7 +304,7 @@ pub struct RelayToDownstream<'a> {
     pub subject_confirmation_lifetime: Duration,
 }
 
-impl<'a> Proxy<'a> {
+impl Proxy<'_> {
     /// Build an upstream AuthnRequest from the downstream one, stash the
     /// downstream-round-trip state in `RelayState`, and return the dispatch.
     /// See RFC-005 §4.1.
@@ -363,7 +367,7 @@ impl<'a> Proxy<'a> {
         //    upstream with `OpaqueHandleCodec` (small handle) and a signed
         //    binding that re-signs the canonical query string at the wire
         //    layer.
-        let dispatch = inject_relay_state(result.dispatch, &upstream_relay_state)?;
+        let dispatch = inject_relay_state(result.dispatch, &upstream_relay_state);
 
         Ok(BounceResult {
             dispatch,
@@ -378,19 +382,24 @@ impl<'a> Proxy<'a> {
         &self,
         input: RelayToDownstream<'_>,
     ) -> Result<SsoResponseDispatch, Error> {
-        // 1. Enforce AuthnContext non-downgrade (§7).
+        // 1. Enforce AuthnContext non-downgrade (§7). The set-aggregating
+        //    semantics — in particular, `Better` requires the actual class ref
+        //    to be strictly stronger than the *max* of the requested set, per
+        //    SAML 2.0 Core §3.3.2.2.1 — live in
+        //    [`crate::authn_context::StandardComparator`]. We collapse both
+        //    `NotSatisfied` and `NotComparable` to `AuthnContextDowngrade`
+        //    (fail-closed), matching the SP-side response validator.
         if let Some(requested) = &input.context.requested_authn_context {
             let actual = input
                 .upstream_identity
                 .authn_context_class_ref
                 .as_deref()
                 .ok_or(Error::AuthnContextDowngrade)?;
-            let comparator = StandardComparator;
-            let satisfied = requested.class_refs.iter().any(|class_ref| {
-                comparator.compare(&requested.comparison, class_ref.as_uri(), actual)
-            });
-            if !satisfied {
-                return Err(Error::AuthnContextDowngrade);
+            match StandardComparator.evaluate(requested, actual) {
+                ComparatorOutcome::Satisfied => {}
+                ComparatorOutcome::NotSatisfied | ComparatorOutcome::NotComparable => {
+                    return Err(Error::AuthnContextDowngrade);
+                }
             }
         }
 
@@ -413,8 +422,10 @@ impl<'a> Proxy<'a> {
                 .upstream_identity
                 .authn_context_class_ref
                 .as_deref()
-                .map(AuthnContextClassRef::from_uri)
-                .unwrap_or(AuthnContextClassRef::PasswordProtectedTransport)
+                .map_or(
+                    AuthnContextClassRef::PasswordProtectedTransport,
+                    AuthnContextClassRef::from_uri,
+                )
         } else {
             AuthnContextClassRef::PasswordProtectedTransport
         };
@@ -443,6 +454,12 @@ impl<'a> Proxy<'a> {
 
         // 6. Hand off to the IdP role for `<samlp:Response>` issuance.
         let session_index = make_session_index();
+        let session_not_on_or_after = input
+            .now
+            .checked_add(input.session_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "session_not_on_or_after overflow",
+            })?;
         self.idp.issue_response(IssueResponse {
             sp: input.downstream_sp,
             in_response_to: &synthetic,
@@ -450,7 +467,7 @@ impl<'a> Proxy<'a> {
             attributes,
             authn_instant: input.upstream_identity.authn_instant,
             session_index,
-            session_not_on_or_after: Some(input.now + input.session_lifetime),
+            session_not_on_or_after: Some(session_not_on_or_after),
             authn_context_class_ref: downstream_class_ref,
             force_encrypt_assertion: None,
             now: input.now,
@@ -463,14 +480,14 @@ impl<'a> Proxy<'a> {
 /// Replace the `RelayState` slot on a `Dispatch` with a freshly-encoded value.
 /// For POST we mutate the form field; for Redirect we append to the URL
 /// query.
-fn inject_relay_state(dispatch: Dispatch, relay_state: &str) -> Result<Dispatch, Error> {
+fn inject_relay_state(dispatch: Dispatch, relay_state: &str) -> Dispatch {
     match dispatch {
-        Dispatch::Post(form) => Ok(Dispatch::Post(PostForm {
+        Dispatch::Post(form) => Dispatch::Post(PostForm {
             action: form.action,
             saml_request: form.saml_request,
             saml_response: form.saml_response,
             relay_state: Some(relay_state.to_string()),
-        })),
+        }),
         Dispatch::Redirect(mut url) => {
             // Use `url::form_urlencoded` to percent-encode the value
             // consistently with the binding layer.
@@ -486,7 +503,7 @@ fn inject_relay_state(dispatch: Dispatch, relay_state: &str) -> Result<Dispatch,
                 format!("{existing}&RelayState={encoded}")
             };
             url.set_query(Some(&new_query));
-            Ok(Dispatch::Redirect(url))
+            Dispatch::Redirect(url)
         }
     }
 }
@@ -499,12 +516,17 @@ fn make_session_index() -> String {
     rand::rng().fill_bytes(&mut bytes);
     let mut out = String::with_capacity(33);
     out.push('_');
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+        out.push(hex_nibble(b >> 4));
+        out.push(hex_nibble(b & 0x0f));
     }
     out
+}
+
+/// Convert a 0..=15 nibble to its lowercase hex character. Callers always
+/// pass a masked nibble; values out of range fall back to `'0'`.
+fn hex_nibble(nibble: u8) -> char {
+    core::char::from_digit(u32::from(nibble), 16).unwrap_or('0')
 }
 
 // =============================================================================
@@ -604,7 +626,7 @@ impl NameIdTransform for PersistentPerSpHmac {
         _upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
     ) -> Result<NameId, Error> {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).map_err(|_| {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).map_err(|_err| {
             Error::InvalidConfiguration {
                 reason: "HMAC-SHA256 key size mismatch",
             }
@@ -701,67 +723,28 @@ impl NameIdTransform for PerSpFormat {
 
 /// Compare a requested AuthnContextClassRef URI against an actual one under a
 /// given comparison strategy.
+///
+/// This trait is a caller-supplied extension point for non-standard
+/// AuthnContext hierarchies (e.g. enterprise IdPs with custom class refs); the
+/// proxy's spec-conformant evaluation uses
+/// [`crate::authn_context::StandardComparator::evaluate`] directly, which
+/// honors the full set-aggregating SAML 2.0 §3.3.2.2.1 semantics that a
+/// per-URI predicate cannot express.
 pub trait AuthnContextComparator: Send + Sync {
     fn satisfies(&self, requested: &str, actual: &str) -> bool;
 }
 
-/// SAML 2.0 §3.3.2.2.1 comparator: exact + strength-ordered (minimum, maximum,
-/// better) per the standard hierarchy.
-pub struct StandardComparator;
-
-impl StandardComparator {
-    /// Compare for a specific comparison strategy. Unknown URIs fall back to
-    /// URI equality for `Exact`; for ordered comparisons unknown URIs are
-    /// considered non-comparable and the predicate returns `false`.
-    pub fn compare(
-        &self,
-        comparison: &AuthnContextComparison,
-        requested_uri: &str,
-        actual_uri: &str,
-    ) -> bool {
-        match comparison {
-            AuthnContextComparison::Exact => requested_uri == actual_uri,
-            ordered => {
-                let req = AuthnContextClassRef::from_uri(requested_uri);
-                let act = AuthnContextClassRef::from_uri(actual_uri);
-                let (Some(req_strength), Some(act_strength)) =
-                    (strength_of(&req), strength_of(&act))
-                else {
-                    return false;
-                };
-                match ordered {
-                    AuthnContextComparison::Minimum => act_strength >= req_strength,
-                    AuthnContextComparison::Maximum => act_strength <= req_strength,
-                    AuthnContextComparison::Better => act_strength > req_strength,
-                    AuthnContextComparison::Exact => unreachable!(),
-                }
-            }
-        }
-    }
-}
-
 impl AuthnContextComparator for StandardComparator {
     fn satisfies(&self, requested: &str, actual: &str) -> bool {
-        // Default to Exact when called via the trait surface.
-        self.compare(&AuthnContextComparison::Exact, requested, actual)
-    }
-}
-
-/// Coarse strength ranking of the standard AuthnContextClassRefs. Mirrors
-/// `response::validate::strength_of` so the proxy and SP comparators agree.
-fn strength_of(cr: &AuthnContextClassRef) -> Option<u8> {
-    match cr {
-        AuthnContextClassRef::Unspecified => Some(0),
-        AuthnContextClassRef::PreviousSession => Some(1),
-        AuthnContextClassRef::Password => Some(2),
-        AuthnContextClassRef::PasswordProtectedTransport => Some(3),
-        AuthnContextClassRef::TimeSyncToken => Some(4),
-        AuthnContextClassRef::Kerberos => Some(5),
-        AuthnContextClassRef::TlsClient => Some(5),
-        AuthnContextClassRef::Smartcard => Some(6),
-        AuthnContextClassRef::SmartcardPki => Some(7),
-        AuthnContextClassRef::MultiFactorAuth => Some(8),
-        AuthnContextClassRef::Custom(_) => None,
+        // Single-URI surface: degenerate to `Exact` against a one-element
+        // requested set. Set-aggregating comparisons (`Minimum` / `Maximum` /
+        // `Better`) require the full `RequestedAuthnContext` and route through
+        // `StandardComparator::evaluate` instead.
+        let requested_set = RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::from_uri(requested)],
+            comparison: AuthnContextComparison::Exact,
+        };
+        self.is_satisfied(&requested_set, actual)
     }
 }
 
@@ -795,7 +778,7 @@ pub struct FrontChannelTarget {
 pub enum FrontChannelState {
     NextTarget {
         index: usize,
-        next_dispatch: Dispatch,
+        next_dispatch: Box<Dispatch>,
         tracker: LogoutTracker,
     },
     Done {
@@ -818,7 +801,9 @@ impl FrontChannelChain {
                 pending_outcomes: vec![],
             });
         }
-        let first = &targets[0];
+        let first = targets.first().ok_or(Error::InvalidConfiguration {
+            reason: "FrontChannelChain: targets unexpectedly empty",
+        })?;
         let logout = idp.start_logout(
             &first.sp,
             StartLogout {
@@ -833,7 +818,7 @@ impl FrontChannelChain {
             targets,
             state: FrontChannelState::NextTarget {
                 index: 0,
-                next_dispatch: logout.dispatch,
+                next_dispatch: Box::new(logout.dispatch),
                 tracker: logout.tracker,
             },
             pending_outcomes: Vec::new(),
@@ -859,7 +844,9 @@ impl FrontChannelChain {
             }
         };
 
-        let target = &self.targets[index];
+        let target = self.targets.get(index).ok_or(Error::InvalidConfiguration {
+            reason: "FrontChannelChain: target index out of range",
+        })?;
         let expected_destination = idp
             .config()
             .slo
@@ -873,17 +860,21 @@ impl FrontChannelChain {
         // caller still gets a parallel-shaped `outcomes` vector at Done).
         let outcome = idp.consume_logout_response(
             &target.sp,
-            target.peer_crypto_policy.as_ref(),
-            logout_response_body,
-            binding,
-            &tracker,
-            &expected_destination,
-            now,
-            clock_skew,
+            ConsumeLogoutResponse {
+                peer_crypto_policy: target.peer_crypto_policy.as_ref(),
+                body: logout_response_body,
+                binding,
+                tracker: &tracker,
+                expected_destination: &expected_destination,
+                now,
+                clock_skew,
+            },
         );
         self.pending_outcomes.push(outcome);
 
-        let next_index = index + 1;
+        let next_index = index.checked_add(1).ok_or(Error::InvalidConfiguration {
+            reason: "FrontChannelChain: target index overflow",
+        })?;
         if next_index >= self.targets.len() {
             self.state = FrontChannelState::Done {
                 outcomes: std::mem::take(&mut self.pending_outcomes),
@@ -891,7 +882,9 @@ impl FrontChannelChain {
             return Ok(());
         }
 
-        let next = &self.targets[next_index];
+        let next = self.targets.get(next_index).ok_or(Error::InvalidConfiguration {
+            reason: "FrontChannelChain: next target index out of range",
+        })?;
         let logout = idp.start_logout(
             &next.sp,
             StartLogout {
@@ -904,7 +897,7 @@ impl FrontChannelChain {
         )?;
         self.state = FrontChannelState::NextTarget {
             index: next_index,
-            next_dispatch: logout.dispatch,
+            next_dispatch: Box::new(logout.dispatch),
             tracker: logout.tracker,
         };
         Ok(())
@@ -957,17 +950,12 @@ mod tests {
             signing_key: None,
             decryption_key: None,
             sign_authn_requests: false,
-            want_response_signed: false,
-            want_assertions_signed: false,
+            want_signed: crate::sp::SpWantSigned::default(),
             allow_unsolicited: false,
             #[cfg(feature = "slo")]
-            sign_logout_requests: false,
+            logout_signing: crate::sp::SpLogoutSigning::default(),
             #[cfg(feature = "slo")]
-            sign_logout_responses: false,
-            #[cfg(feature = "slo")]
-            want_logout_requests_signed: false,
-            #[cfg(feature = "slo")]
-            want_logout_responses_signed: false,
+            logout_want_signed: crate::sp::SpLogoutWantSigned::default(),
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -990,18 +978,16 @@ mod tests {
             signing_key: rsa_keypair(),
             decryption_key: None,
             want_authn_requests_signed: false,
-            sign_responses: false,
-            sign_assertions: true,
+            assertion_signing: crate::idp::IdpAssertionSigning {
+                sign_responses: false,
+                sign_assertions: true,
+            },
             encrypt_assertions_when_possible: false,
             #[cfg(feature = "slo")]
-            sign_logout_requests: false,
+            logout_signing: crate::idp::IdpLogoutSigning::default(),
             #[cfg(feature = "slo")]
-            sign_logout_responses: false,
-            #[cfg(feature = "slo")]
-            want_logout_requests_signed: false,
-            #[cfg(feature = "slo")]
-            want_logout_responses_signed: false,
-            default_session_duration: Duration::from_secs(3600),
+            logout_want_signed: crate::idp::IdpLogoutWantSigned::default(),
+            default_session_duration: Duration::from_hours(1),
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -1058,6 +1044,9 @@ mod tests {
     }
 
     fn sample_context() -> ProxyContext {
+        let tracker_issued_at = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_hours(494_388))
+            .expect("tracker issued_at within representable range");
         ProxyContext {
             downstream_request_id: "_req-downstream".into(),
             downstream_sp_entity_id: "https://downstream-sp.example.com".into(),
@@ -1074,7 +1063,7 @@ mod tests {
             requested_name_id_format: Some(NameIdFormat::Persistent),
             upstream_tracker: LoginTracker {
                 request_id: "_upstream-1".into(),
-                issued_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_779_796_800),
+                issued_at: tracker_issued_at,
                 idp_entity_id: "https://upstream-idp.example.com".into(),
                 acs_endpoint: SsoResponseEndpoint::post(
                     "https://proxy.example.com/acs",
@@ -1131,12 +1120,14 @@ mod tests {
         let codec = Aes256GcmCodec::new([7u8; 32]).with_max_age(Duration::from_secs(1));
         let mut context = sample_context();
         // Pretend the context was issued 10 minutes ago.
-        context.issued_at = SystemTime::now() - Duration::from_secs(600);
+        context.issued_at = SystemTime::now()
+            .checked_sub(Duration::from_mins(10))
+            .expect("now - 10min within range");
         let blob = codec.encode(&context).unwrap();
         let err = codec.decode(&blob).unwrap_err();
         match err {
             Error::InvalidConfiguration { reason } => {
-                assert_eq!(reason, "proxy context expired")
+                assert_eq!(reason, "proxy context expired");
             }
             other => panic!("expected InvalidConfiguration, got {other:?}"),
         }
@@ -1170,20 +1161,26 @@ mod tests {
             context: &ProxyContext,
             ttl: Duration,
         ) -> Result<(), Error> {
-            let expires_at = SystemTime::now() + ttl;
-            self.inner
-                .lock()
-                .unwrap()
-                .insert(handle.to_string(), (context.clone(), expires_at));
+            let expires_at =
+                SystemTime::now()
+                    .checked_add(ttl)
+                    .ok_or(Error::InvalidConfiguration {
+                        reason: "InMemoryStore: expires_at overflow",
+                    })?;
+            let mut guard = self.inner.lock().map_err(|_err| Error::InvalidConfiguration {
+                reason: "InMemoryStore: lock poisoned",
+            })?;
+            guard.insert(handle.to_string(), (context.clone(), expires_at));
             Ok(())
         }
 
         fn take(&self, handle: &str) -> Result<Option<ProxyContext>, Error> {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock().map_err(|_err| Error::InvalidConfiguration {
+                reason: "InMemoryStore: lock poisoned",
+            })?;
             match guard.remove(handle) {
                 Some((ctx, expires_at)) if expires_at > SystemTime::now() => Ok(Some(ctx)),
-                Some(_) => Ok(None), // expired
-                None => Ok(None),
+                Some(_) | None => Ok(None), // expired or absent
             }
         }
     }
@@ -1193,7 +1190,7 @@ mod tests {
         let codec = OpaqueHandleCodec {
             store: InMemoryStore::new(),
             handle_byte_len: 24,
-            ttl: Duration::from_secs(600),
+            ttl: Duration::from_mins(10),
         };
         let context = sample_context();
         let handle = codec.encode(&context).unwrap();
@@ -1276,7 +1273,7 @@ mod tests {
                 assert!(q.contains("SAMLRequest="), "query: {q}");
                 assert!(q.contains("RelayState="), "query: {q}");
             }
-            other => panic!("expected Redirect, got {other:?}"),
+            other @ Dispatch::Post(_) => panic!("expected Redirect, got {other:?}"),
         }
 
         // The encoded RelayState round-trips through the codec.
@@ -1321,18 +1318,25 @@ mod tests {
                     Some(bounce.upstream_relay_state.as_str()),
                 );
             }
-            other => panic!("expected Post, got {other:?}"),
+            other @ Dispatch::Redirect(_) => panic!("expected Post, got {other:?}"),
         }
     }
 
     // ---------- relay_to_downstream ----------
 
     fn make_upstream_identity(class_ref_uri: &str) -> Identity {
+        let now = SystemTime::now();
+        let session_not_on_or_after = now
+            .checked_add(Duration::from_hours(1))
+            .expect("session_not_on_or_after within range");
+        let not_on_or_after = now
+            .checked_add(Duration::from_mins(5))
+            .expect("not_on_or_after within range");
         Identity {
             name_id: NameId::email("alice@example.com"),
             session_index: Some("upstream-sess-1".into()),
-            authn_instant: SystemTime::now(),
-            session_not_on_or_after: Some(SystemTime::now() + Duration::from_secs(3600)),
+            authn_instant: now,
+            session_not_on_or_after: Some(session_not_on_or_after),
             authn_context_class_ref: Some(class_ref_uri.to_string()),
             attributes: vec![
                 Attribute::email("alice@example.com"),
@@ -1340,8 +1344,9 @@ mod tests {
                 Attribute::single("department", "platform"),
             ],
             assertion_id: "_a-upstream".into(),
-            not_on_or_after: SystemTime::now() + Duration::from_secs(300),
+            not_on_or_after,
             verifying_cert_fingerprint: [0u8; 32],
+            is_one_time_use: false,
         }
     }
 
@@ -1372,8 +1377,8 @@ mod tests {
                 },
                 passthrough_authn_context: true,
                 now: SystemTime::now(),
-                session_lifetime: Duration::from_secs(3600),
-                subject_confirmation_lifetime: Duration::from_secs(300),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
             })
             .expect("relay ok");
 
@@ -1393,7 +1398,9 @@ mod tests {
                 // non-empty here (full parse coverage lives in idp.rs).
                 assert!(!form.saml_response.is_empty());
             }
-            other => panic!("expected Post, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected Post, got {other:?}")
+            }
         }
     }
 
@@ -1420,8 +1427,8 @@ mod tests {
                 name_id_transform: &PassThroughNameId,
                 passthrough_authn_context: true,
                 now: SystemTime::now(),
-                session_lifetime: Duration::from_secs(3600),
-                subject_confirmation_lifetime: Duration::from_secs(300),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
             })
             .unwrap_err();
         assert!(matches!(err, Error::AuthnContextDowngrade));
@@ -1558,65 +1565,138 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
-    // ---------- AuthnContext comparator ----------
+    // ---------- AuthnContext comparator (trait surface only) ----------
+    //
+    // The full set-aggregating semantics of `StandardComparator::evaluate`
+    // are covered in `authn_context::tests`. Here we only verify the
+    // `AuthnContextComparator` trait wrapper that exposes the per-URI shim
+    // used by callers plugging in custom hierarchies.
 
     #[test]
-    fn standard_comparator_exact_eq() {
+    fn authn_context_comparator_trait_satisfies_uses_exact_semantics() {
         let c = StandardComparator;
-        assert!(c.compare(
-            &AuthnContextComparison::Exact,
+        assert!(c.satisfies(
             AuthnContextClassRef::Password.as_uri(),
             AuthnContextClassRef::Password.as_uri(),
         ));
-        assert!(!c.compare(
-            &AuthnContextComparison::Exact,
+        assert!(!c.satisfies(
             AuthnContextClassRef::Password.as_uri(),
             AuthnContextClassRef::PasswordProtectedTransport.as_uri(),
         ));
     }
 
+    // ---------- relay_to_downstream: spec-bug regression for `Better` ----------
+    //
+    // SAML 2.0 Core §3.3.2.2.1 defines `Better` as "stronger than each of the
+    // requested" — i.e. strictly greater than the MAX of the requested set.
+    // The previous in-proxy implementation iterated `requested.class_refs`
+    // with `any()` and short-circuited on the first match, which accepted
+    // `actual > min(requested)` — too permissive. These tests pin the fixed
+    // behavior to the canonical comparator.
+
+    fn context_with_requested(refs: Vec<AuthnContextClassRef>) -> ProxyContext {
+        let mut ctx = sample_context();
+        ctx.requested_authn_context = Some(RequestedAuthnContext {
+            class_refs: refs,
+            comparison: AuthnContextComparison::Better,
+        });
+        ctx
+    }
+
     #[test]
-    fn standard_comparator_minimum_rejects_downgrade() {
-        let c = StandardComparator;
-        // Requested PasswordProtectedTransport (3), actual Password (2) → fail.
-        assert!(!c.compare(
-            &AuthnContextComparison::Minimum,
-            AuthnContextClassRef::PasswordProtectedTransport.as_uri(),
-            AuthnContextClassRef::Password.as_uri(),
-        ));
-        // Requested PasswordProtectedTransport, actual MultiFactorAuth → pass.
-        assert!(c.compare(
-            &AuthnContextComparison::Minimum,
-            AuthnContextClassRef::PasswordProtectedTransport.as_uri(),
+    fn relay_to_downstream_better_rejects_actual_between_requested_set_bounds() {
+        // Requested {Password (2), Smartcard (6)} with `Better`. Spec demands
+        // `actual > max(requested) == 6`. Kerberos has strength 5, so it sits
+        // *between* the min and max — the legacy `any()` fold returned true
+        // because `5 > 2`. Post-fix it must be rejected.
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let codec = Box::new(Aes256GcmCodec::new([5u8; 32]));
+        let proxy = Proxy::new(&sp, &idp, codec);
+
+        let downstream_sp = downstream_sp_descriptor();
+        let context = context_with_requested(vec![
+            AuthnContextClassRef::Password,
+            AuthnContextClassRef::Smartcard,
+        ]);
+        let identity =
+            make_upstream_identity(AuthnContextClassRef::Kerberos.as_uri());
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &context,
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("Better must compare against max(requested), not min");
+        assert!(matches!(err, Error::AuthnContextDowngrade));
+    }
+
+    #[test]
+    fn relay_to_downstream_better_accepts_actual_strictly_above_max() {
+        // Same requested set {Password, Smartcard}; actual MultiFactorAuth (8)
+        // is strictly above the max (6) → satisfied.
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let codec = Box::new(Aes256GcmCodec::new([5u8; 32]));
+        let proxy = Proxy::new(&sp, &idp, codec);
+
+        let downstream_sp = downstream_sp_descriptor();
+        let context = context_with_requested(vec![
+            AuthnContextClassRef::Password,
+            AuthnContextClassRef::Smartcard,
+        ]);
+        let identity = make_upstream_identity(
             AuthnContextClassRef::MultiFactorAuth.as_uri(),
-        ));
+        );
+
+        proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &context,
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect("MultiFactorAuth > max(Password, Smartcard) under Better");
     }
 
     #[test]
-    fn standard_comparator_better_strict_inequality() {
-        let c = StandardComparator;
-        // Equal strengths must fail Better.
-        assert!(!c.compare(
-            &AuthnContextComparison::Better,
-            AuthnContextClassRef::PasswordProtectedTransport.as_uri(),
-            AuthnContextClassRef::PasswordProtectedTransport.as_uri(),
-        ));
-        // Strictly stronger passes.
-        assert!(c.compare(
-            &AuthnContextComparison::Better,
-            AuthnContextClassRef::PasswordProtectedTransport.as_uri(),
-            AuthnContextClassRef::Smartcard.as_uri(),
-        ));
-    }
+    fn relay_to_downstream_custom_actual_under_ordered_comparison_fails_closed() {
+        // Non-rankable actual URI under a strength-ordered comparison must
+        // collapse to AuthnContextDowngrade (NotComparable → fail-closed).
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let codec = Box::new(Aes256GcmCodec::new([5u8; 32]));
+        let proxy = Proxy::new(&sp, &idp, codec);
 
-    #[test]
-    fn standard_comparator_unknown_uri_under_minimum_is_false() {
-        let c = StandardComparator;
-        // Custom URIs are non-rankable.
-        assert!(!c.compare(
-            &AuthnContextComparison::Minimum,
-            "urn:example:custom:strong",
-            AuthnContextClassRef::MultiFactorAuth.as_uri(),
-        ));
+        let downstream_sp = downstream_sp_descriptor();
+        let context = context_with_requested(vec![AuthnContextClassRef::Password]);
+        let identity = make_upstream_identity("urn:example:vendor:opaque");
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &context,
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("non-rankable actual must fail closed under Better");
+        assert!(matches!(err, Error::AuthnContextDowngrade));
     }
 }

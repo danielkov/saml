@@ -9,6 +9,8 @@
 //! or by re-running `URI` lookup. This is the structural XSW defense described
 //! in RFC-002 §3.2.
 
+use subtle::ConstantTimeEq;
+
 use crate::crypto::cert::X509Certificate;
 use crate::crypto::verifier::{DefaultVerifier, KeyInfo, SignatureVerifier, VerifyMatch};
 use crate::dsig::algorithms::{C14nAlgorithm, SignatureAlgorithm};
@@ -73,8 +75,17 @@ pub(crate) fn verify_signature_with(
     let parsed = parse_reference(document, reference_elem)?;
 
     // ---- 4. Compute and compare digest -------------------------------------
-    let computed_digest = compute_reference_digest(document, &parsed)?;
-    if computed_digest != parsed.digest_value {
+    // Pass the enclosing <ds:Signature>'s ElementId so the enveloped-signature
+    // transform strips *only that* signature from the signed subtree — not any
+    // separately-signed inner element (e.g. an Assertion's own ds:Signature on
+    // a double-signed Response).
+    let computed_digest = compute_reference_digest(document, &parsed, signature_element.id())?;
+    // Constant-time compare: the parsed digest is attacker-controlled (it
+    // arrives in the signed XML) and the computed digest is derived from the
+    // canonical bytes. A timing-leaky `==` could in principle reveal the
+    // leading bytes of the expected digest to an attacker probing forged
+    // payloads.
+    if !bool::from(computed_digest.ct_eq(&parsed.digest_value)) {
         return Err(Error::SignatureVerification {
             reason: "digest mismatch",
         });
@@ -216,7 +227,7 @@ fn parse_signature_method(
 
 /// Locate the single `<ds:Reference>` inside `<ds:SignedInfo>`. Multiple
 /// references are an XSW vector (RFC-002 §3.2) and rejected by default.
-fn single_reference<'a>(signed_info: &'a Element) -> Result<&'a Element, Error> {
+fn single_reference(signed_info: &Element) -> Result<&Element, Error> {
     let mut iter = signed_info.all_child_elements(Some(DS_NS), "Reference");
     let first = iter.next().ok_or(Error::SignatureVerification {
         reason: "SignedInfo has no Reference",
@@ -253,11 +264,11 @@ fn extract_key_info(signature_element: &Element) -> KeyInfo {
         for serial in x509_data.all_child_elements(Some(DS_NS), "X509IssuerSerial") {
             let issuer = serial
                 .child_element(Some(DS_NS), "X509IssuerName")
-                .map(|e| e.text_content())
+                .map(Element::text_content)
                 .unwrap_or_default();
             let serial_number = serial
                 .child_element(Some(DS_NS), "X509SerialNumber")
-                .map(|e| e.text_content())
+                .map(Element::text_content)
                 .unwrap_or_default();
             out.x509_issuer_serials.push((issuer, serial_number));
         }
@@ -315,7 +326,7 @@ mod tests {
         // haven't added the Signature yet, canonicalizing now yields exactly
         // that.
         let stage_1_xml = format!(
-            r##"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body_xml}</Root>"##
+            r#"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body_xml}</Root>"#
         );
         let stage_1_doc = Document::parse(stage_1_xml.as_bytes()).unwrap();
         let chain_1 = ancestor_chain(&stage_1_doc, stage_1_doc.root().id()).unwrap();
@@ -335,8 +346,7 @@ mod tests {
         // To canonicalize <ds:SignedInfo>, parse it inside a wrapping element
         // so it has its `ds:` namespace declaration in scope.
         let signed_info_xml = format!(
-            r##"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{}</ds:SignedInfo>"##,
-            signed_info_inner
+            r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{signed_info_inner}</ds:SignedInfo>"#
         );
         let signed_info_doc = Document::parse(signed_info_xml.as_bytes()).unwrap();
         let signed_info_chain =
@@ -354,13 +364,12 @@ mod tests {
 
         // ---- Stage 3: assemble the final document.
         let cert_b64 = cert.to_base64_x509();
+        let body = body_xml;
+        let si_inner = &signed_info_inner;
+        let sig = &sig_b64;
+        let cert_text = &cert_b64;
         let final_xml = format!(
-            r##"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body}<ds:Signature><ds:SignedInfo>{si_inner}</ds:SignedInfo><ds:SignatureValue>{sig}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature></Root>"##,
-            target_id = target_id,
-            body = body_xml,
-            si_inner = signed_info_inner,
-            sig = sig_b64,
-            cert = cert_b64,
+            r#"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body}<ds:Signature><ds:SignedInfo>{si_inner}</ds:SignedInfo><ds:SignatureValue>{sig}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert_text}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature></Root>"#
         );
         (final_xml, cert)
     }
@@ -381,7 +390,7 @@ mod tests {
         let verified = verify_signature(
             &doc,
             sig_elem,
-            &[cert.clone()],
+            std::slice::from_ref(&cert),
             &[SignatureAlgorithm::RsaSha256],
         )
         .expect("should verify");
@@ -517,7 +526,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_signed_info() {
-        let xml = r##"<Root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Signature/></Root>"##;
+        let xml = r#"<Root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Signature/></Root>"#;
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
         let err = verify_signature(&doc, sig_elem, &[], &[SignatureAlgorithm::RsaSha256])
@@ -532,7 +541,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_signature_method() {
-        let xml = r##"<Root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r#"<Root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:Signature>
                 <ds:SignedInfo>
                     <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
@@ -541,7 +550,7 @@ mod tests {
                 </ds:SignedInfo>
                 <ds:SignatureValue>AAAA</ds:SignatureValue>
             </ds:Signature>
-        </Root>"##;
+        </Root>"#;
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
         let err = verify_signature(&doc, sig_elem, &[], &[SignatureAlgorithm::RsaSha256])
@@ -567,7 +576,7 @@ mod tests {
         assert_eq!(key_info.x509_certificates_base64.len(), 1);
         // The fingerprint pin gates the inline cert before it can verify
         // anything — test that gate directly via `trusted_inline_certs`.
-        let trusted = key_info.trusted_inline_certs(&[cert.clone()]);
+        let trusted = key_info.trusted_inline_certs(std::slice::from_ref(&cert));
         assert_eq!(trusted.len(), 1);
         assert_eq!(trusted[0], cert);
     }
@@ -585,7 +594,7 @@ mod tests {
             qs,
             &sig,
             SignatureAlgorithm::RsaSha256,
-            &[cert.clone()],
+            std::slice::from_ref(&cert),
             &[SignatureAlgorithm::RsaSha256],
         )
         .expect("detached signature should verify");

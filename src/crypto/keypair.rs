@@ -93,7 +93,7 @@ impl KeyPair {
     /// KEY (i.e. PKCS#8) is decoded here, with the inner algorithm OID picking
     /// the variant.
     pub fn from_pkcs8_pem(pem: &[u8]) -> Result<Self, Error> {
-        let pem_str = str::from_utf8(pem).map_err(|_| Error::InvalidConfiguration {
+        let pem_str = str::from_utf8(pem).map_err(|_e| Error::InvalidConfiguration {
             reason: "private key PEM is not valid UTF-8",
         })?;
         // We try each algorithm in order. PKCS#8's PrivateKeyInfo encodes the
@@ -119,10 +119,10 @@ impl KeyPair {
     /// constructor is RSA-only by definition.
     pub fn from_pkcs1_pem(pem: &[u8]) -> Result<Self, Error> {
         use rsa::pkcs1::DecodeRsaPrivateKey as _;
-        let pem_str = str::from_utf8(pem).map_err(|_| Error::InvalidConfiguration {
+        let pem_str = str::from_utf8(pem).map_err(|_e| Error::InvalidConfiguration {
             reason: "private key PEM is not valid UTF-8",
         })?;
-        let key = RsaPrivateKey::from_pkcs1_pem(pem_str).map_err(|_| {
+        let key = RsaPrivateKey::from_pkcs1_pem(pem_str).map_err(|_e| {
             Error::InvalidConfiguration {
                 reason: "PKCS#1 PEM parse failed",
             }
@@ -154,7 +154,7 @@ impl KeyPair {
         let pub_der = key
             .to_public_key()
             .to_public_key_der()
-            .map_err(|_| Error::InvalidConfiguration {
+            .map_err(|_e| Error::InvalidConfiguration {
                 reason: "failed to derive public key from RSA private key",
             })?;
         let public_key = PublicKey::from_spki_der(pub_der.as_bytes())?;
@@ -170,7 +170,7 @@ impl KeyPair {
         let vk = key.verifying_key();
         let pub_der =
             vk.to_public_key_der()
-                .map_err(|_| Error::InvalidConfiguration {
+                .map_err(|_e| Error::InvalidConfiguration {
                     reason: "failed to derive P-256 public key",
                 })?;
         let public_key = PublicKey::from_spki_der(pub_der.as_bytes())?;
@@ -186,7 +186,7 @@ impl KeyPair {
         let vk = key.verifying_key();
         let pub_der =
             vk.to_public_key_der()
-                .map_err(|_| Error::InvalidConfiguration {
+                .map_err(|_e| Error::InvalidConfiguration {
                     reason: "failed to derive P-384 public key",
                 })?;
         let public_key = PublicKey::from_spki_der(pub_der.as_bytes())?;
@@ -253,7 +253,7 @@ impl KeyPair {
             (KeyPairInner::EcdsaP256(secret), SignatureAlgorithm::EcdsaSha256) => {
                 use signature::Signer as _;
                 let sig: p256::ecdsa::Signature =
-                    secret.key.try_sign(signed_bytes).map_err(|_| {
+                    secret.key.try_sign(signed_bytes).map_err(|_e| {
                         Error::SignatureVerification {
                             reason: "ecdsa-p256 sign failed",
                         }
@@ -263,7 +263,7 @@ impl KeyPair {
             (KeyPairInner::EcdsaP384(secret), SignatureAlgorithm::EcdsaSha384) => {
                 use signature::Signer as _;
                 let sig: p384::ecdsa::Signature =
-                    secret.key.try_sign(signed_bytes).map_err(|_| {
+                    secret.key.try_sign(signed_bytes).map_err(|_e| {
                         Error::SignatureVerification {
                             reason: "ecdsa-p384 sign failed",
                         }
@@ -295,13 +295,10 @@ impl KeyPair {
         ciphertext: &[u8],
         oaep_digest: OaepDigest,
     ) -> Result<Vec<u8>, Error> {
-        let secret = match &self.inner {
-            KeyPairInner::Rsa(s) => s,
-            _ => {
-                return Err(Error::DecryptFailed {
-                    reason: "key transport",
-                });
-            }
+        let KeyPairInner::Rsa(secret) = &self.inner else {
+            return Err(Error::DecryptFailed {
+                reason: "key transport",
+            });
         };
         let padding = match oaep_digest {
             OaepDigest::Sha1 => {
@@ -323,7 +320,7 @@ impl KeyPair {
         secret
             .key
             .decrypt(padding, ciphertext)
-            .map_err(|_| Error::DecryptFailed {
+            .map_err(|_e| Error::DecryptFailed {
                 reason: "key transport",
             })
     }
@@ -343,18 +340,15 @@ impl KeyPair {
     /// callers from accidentally surfacing a side-channel.
     #[cfg(all(feature = "xmlenc", feature = "weak-algos"))]
     pub fn decrypt_rsa_pkcs1v15(&self, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
-        let secret = match &self.inner {
-            KeyPairInner::Rsa(s) => s,
-            _ => {
-                return Err(Error::DecryptFailed {
-                    reason: "key transport",
-                });
-            }
+        let KeyPairInner::Rsa(secret) = &self.inner else {
+            return Err(Error::DecryptFailed {
+                reason: "key transport",
+            });
         };
         secret
             .key
             .decrypt(rsa::Pkcs1v15Encrypt, ciphertext)
-            .map_err(|_| Error::DecryptFailed {
+            .map_err(|_e| Error::DecryptFailed {
                 reason: "key transport",
             })
     }
@@ -370,7 +364,7 @@ where
     let sig: rsa::pkcs1v15::Signature =
         signer
             .try_sign(signed_bytes)
-            .map_err(|_| Error::SignatureVerification {
+            .map_err(|_e| Error::SignatureVerification {
                 reason: "rsa sign failed",
             })?;
     Ok(sig.to_bytes().into_vec())

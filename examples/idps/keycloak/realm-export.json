@@ -1,0 +1,138 @@
+{
+  "id": "saml-demo",
+  "realm": "saml-demo",
+  "enabled": true,
+  "displayName": "SAML Demo Realm",
+  "displayNameHtml": "<span>SAML Demo Realm</span>",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "permanentLockout": false,
+  "sslRequired": "none",
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "alice@saml-demo.test",
+      "firstName": "Alice",
+      "lastName": "Anderson",
+      "attributes": {
+        "displayName": ["Alice Anderson"],
+        "department": ["platform"]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-saml-demo"
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "saml-axum-demo",
+      "name": "saml-axum-demo",
+      "description": "Axum-based Service Provider demo for the saml crate.",
+      "enabled": true,
+      "protocol": "saml",
+      "publicClient": false,
+      "frontchannelLogout": true,
+      "baseUrl": "http://localhost:3000/",
+      "redirectUris": [
+        "http://localhost:3000/saml/acs",
+        "http://localhost:3000/*"
+      ],
+      "adminUrl": "http://localhost:3000/",
+      "attributes": {
+        "saml.assertion.signature": "true",
+        "saml.server.signature": "false",
+        "saml.client.signature": "true",
+        "saml.authnstatement": "true",
+        "saml.force.post.binding": "true",
+        "saml.encrypt": "false",
+        "saml.signature.algorithm": "RSA_SHA256",
+        "saml_signature_canonicalization_method": "http://www.w3.org/2001/10/xml-exc-c14n#",
+        "saml_assertion_consumer_url_post": "http://localhost:3000/saml/acs",
+        "saml_assertion_consumer_url_redirect": "http://localhost:3000/saml/acs",
+        "saml_single_logout_service_url_post": "http://localhost:3000/saml/slo",
+        "saml_name_id_format": "email",
+        "saml.signing.certificate": "MIIDEzCCAfugAwIBAgIUTfhpA0maJrRIF9RjS6fjhKqEKX0wDQYJKoZIhvcNAQELBQAwGTEXMBUGA1UEAwwOc2FtbC1heHVtLWRlbW8wHhcNMjYwNTI3MTkxODUzWhcNMzYwNTI0MTkxODUzWjAZMRcwFQYDVQQDDA5zYW1sLWF4dW0tZGVtbzCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAJbM3HcO7+PduWeQLcJsCWqPdoeJjOSYxp6wz3iH4WWWQhjOy2BQ0ljBvbiL/MtVynjj1S+L0cb93+O9We304npqIbhmGpIPHeeGK6YIwlnmvLChCvYR/Q2DrPxI7Oy+sIwjFd8nsaIOyWD8SrcDsqEuLVE+9lEtV1O2Ksl1ldpYma/rLP+TV1rV4vn/atWqrMXZzQdLdaWedZijg5lThnjJm/FrWb4dqReUpvu9X2OuiblZKciqXKFngr6DhGKyzo5JyLL0oPQlW+jBe5bSz5lcmBLp/FAB/mpPVD9p2PmQJOAtSEn2J4btwQjmLjSzEQ8eZRc0pLJOwpzeBMcw6bECAwEAAaNTMFEwHQYDVR0OBBYEFD/Fe8h7Ktoa66UIudR19QtxRQDWMB8GA1UdIwQYMBaAFD/Fe8h7Ktoa66UIudR19QtxRQDWMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBADeMOCs3wNDrpL2TxMy6cru6gmSijSawtrfsghz+Srvvr8CrZi1llZDxE4XOBUPrc6w1ZZNX2T44tk9evPBNxU9sBl1yYO5yqAYA+vshR4T5E+8bMtdexJI8lh4eHON32RHaQlaJcltJUCWB4qh5wKme+pp6yzmTYLr3QtP98b4YNhHU3oW+WWyZM5L+WtnDMxo2VSi/Dit1bVGjdf+kgumWIGuli0nxQL1ehGqoXdX4xi3nEEbSyM+7tcv/bkA4NTwEvm57JOxNuKxwmwW/s3uXXMx83LsUbdnMhzNH9hiiQVoeA0Rd9fag7xMD9Z/T0lZfn0OGTaTPG11UGG5hdgk="
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "email",
+            "friendly.name": "mail",
+            "attribute.name": "urn:oid:0.9.2342.19200300.100.1.3",
+            "attribute.nameformat": "URI Reference"
+          }
+        },
+        {
+          "name": "displayName",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "displayName",
+            "friendly.name": "displayName",
+            "attribute.name": "urn:oid:2.16.840.1.113730.3.1.241",
+            "attribute.nameformat": "URI Reference"
+          }
+        },
+        {
+          "name": "givenName",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "firstName",
+            "friendly.name": "givenName",
+            "attribute.name": "urn:oid:2.5.4.42",
+            "attribute.nameformat": "URI Reference"
+          }
+        },
+        {
+          "name": "surname",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "lastName",
+            "friendly.name": "sn",
+            "attribute.name": "urn:oid:2.5.4.4",
+            "attribute.nameformat": "URI Reference"
+          }
+        },
+        {
+          "name": "department",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "department",
+            "friendly.name": "department",
+            "attribute.name": "department",
+            "attribute.nameformat": "Basic"
+          }
+        }
+      ]
+    }
+  ]
+}

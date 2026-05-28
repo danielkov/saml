@@ -17,7 +17,7 @@
 use crate::error::Error;
 use crate::logout::{LogoutOutcome, SAML_NS, SAMLP_NS};
 use crate::time::parse_xs_datetime;
-use crate::xml::parse::{Document, ElementId};
+use crate::xml::parse::{Document, Element, ElementId};
 
 /// Raw parsed view of `<samlp:LogoutResponse>`. The status chain is exposed
 /// at full fidelity; [`to_outcome`](Self::to_outcome) collapses it to the
@@ -89,6 +89,10 @@ pub(crate) fn parse_logout_response(
         )));
     }
 
+    // Structural schema gate. See `crate::schema` for the rule set.
+    #[cfg(feature = "xsd-validate")]
+    crate::schema::validate_logout_response(root)?;
+
     let version = root
         .attribute(None, "Version")
         .ok_or_else(|| Error::XmlParse("LogoutResponse missing Version".to_string()))?;
@@ -137,7 +141,7 @@ pub(crate) fn parse_logout_response(
         .and_then(|el| el.attribute(None, "Value").map(str::to_owned));
     let status_message = status_el
         .child_element(Some(SAMLP_NS), "StatusMessage")
-        .map(|el| el.text_content());
+        .map(Element::text_content);
 
     let parsed = ParsedLogoutResponse {
         issuer,
@@ -162,7 +166,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn fixed_instant() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(1_779_798_896)
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_779_798_896))
+            .expect("UNIX_EPOCH + small duration fits in SystemTime")
     }
 
     fn parse(xml: &str) -> Result<(ParsedLogoutResponse, ElementId), Error> {
@@ -339,7 +345,10 @@ mod tests {
         let err = parse(xml).unwrap_err();
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("Status"), "got: {msg}"),
-            other => panic!("expected XmlParse, got {other:?}"),
+            Error::SchemaViolation { reason, .. } => {
+                assert!(reason.contains("Status"), "got: {reason}");
+            }
+            other => panic!("expected XmlParse or SchemaViolation, got {other:?}"),
         }
     }
 
@@ -357,7 +366,10 @@ mod tests {
         let err = parse(xml).unwrap_err();
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("Value"), "got: {msg}"),
-            other => panic!("expected XmlParse, got {other:?}"),
+            Error::SchemaViolation { reason, .. } => {
+                assert!(reason.contains("Value"), "got: {reason}");
+            }
+            other => panic!("expected XmlParse or SchemaViolation, got {other:?}"),
         }
     }
 

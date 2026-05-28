@@ -48,7 +48,7 @@ pub(crate) fn build_logout_response_element(
         .with_attribute(QName::new(None, "Version"), "2.0")
         .with_attribute(
             QName::new(None, "IssueInstant"),
-            format_xs_datetime(input.issue_instant),
+            format_xs_datetime(input.issue_instant)?,
         )
         .with_attribute(
             QName::new(None, "InResponseTo"),
@@ -113,7 +113,9 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     fn fixed_instant() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(1_779_798_896)
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_779_798_896))
+            .expect("UNIX_EPOCH + small duration fits in SystemTime")
     }
 
     fn minimal_input<'a>(status: LogoutStatus) -> BuildLogoutResponse<'a> {

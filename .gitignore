@@ -1,1 +1,14 @@
 /target
+
+# Local environment overrides for the example apps; committed as
+# `.env.example` only.
+examples/*/.env
+
+# Subagent worktrees, memory, task transcripts.
+.claude/
+
+# Playwright MCP browser session state.
+.playwright-mcp/
+
+# Ad-hoc debug screenshots.
+*.png

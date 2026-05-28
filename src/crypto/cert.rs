@@ -63,11 +63,23 @@ pub struct X509Certificate {
 
 impl fmt::Debug for X509Certificate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Intentionally hide `inner`, `public_key`, and `fingerprint` from
+        // Debug output — they're either redundant (derivable from `der`) or
+        // not useful to surface as bytes. `finish_non_exhaustive()` documents
+        // that we are eliding fields on purpose.
+        let Self {
+            inner: _,
+            der,
+            public_key: _,
+            subject_str,
+            issuer_str,
+            fingerprint: _,
+        } = self;
         f.debug_struct("X509Certificate")
-            .field("subject", &self.subject_str)
-            .field("issuer", &self.issuer_str)
-            .field("der_len", &self.der.len())
-            .finish()
+            .field("subject", subject_str)
+            .field("issuer", issuer_str)
+            .field("der_len", &der.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -83,19 +95,22 @@ impl X509Certificate {
     /// Parse from a PEM-armored X.509 certificate (one `-----BEGIN
     /// CERTIFICATE-----` block).
     pub fn from_pem(pem: &[u8]) -> Result<Self, Error> {
-        let cert = Certificate::from_pem(pem).map_err(|_| Error::X509Parse)?;
-        let der = cert.to_der().map_err(|_| Error::X509Parse)?;
+        // The underlying parse error can't be embedded in our flat `X509Parse`
+        // variant (no source field); naming the error with an underscore
+        // prefix documents that this is intentional rather than discarding.
+        let cert = Certificate::from_pem(pem).map_err(|_e| Error::X509Parse)?;
+        let der = cert.to_der().map_err(|_e| Error::X509Parse)?;
         Self::finalize(cert, der)
     }
 
     /// Parse from a DER-encoded X.509 certificate.
     pub fn from_der(der: &[u8]) -> Result<Self, Error> {
-        let cert = Certificate::from_der(der).map_err(|_| Error::X509Parse)?;
+        let cert = Certificate::from_der(der).map_err(|_e| Error::X509Parse)?;
         // Re-encode through x509-cert so the stored bytes are the canonical
         // form (this matters for equality and `<ds:X509Certificate>` emission).
         // For well-formed inputs this is a no-op; for inputs with non-canonical
         // encoding we normalize.
-        let canonical = cert.to_der().map_err(|_| Error::X509Parse)?;
+        let canonical = cert.to_der().map_err(|_e| Error::X509Parse)?;
         Self::finalize(cert, canonical)
     }
 
@@ -107,7 +122,7 @@ impl X509Certificate {
         let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
         let der = BASE64_STANDARD
             .decode(cleaned.as_bytes())
-            .map_err(|_| Error::Base64Decode)?;
+            .map_err(|_e| Error::Base64Decode)?;
         Self::from_der(&der)
     }
 
@@ -116,7 +131,7 @@ impl X509Certificate {
             .tbs_certificate
             .subject_public_key_info
             .to_der()
-            .map_err(|_| Error::X509Parse)?;
+            .map_err(|_e| Error::X509Parse)?;
         let public_key = PublicKey::from_spki_der(&spki_der)?;
         let subject_str = cert.tbs_certificate.subject.to_string();
         let issuer_str = cert.tbs_certificate.issuer.to_string();
@@ -219,7 +234,7 @@ impl PublicKey {
     /// algorithm OID. Unrecognized OIDs map to `Error::X509Parse` so callers
     /// can treat the cert as untrusted rather than panic.
     pub fn from_spki_der(spki: &[u8]) -> Result<Self, Error> {
-        let parsed = SubjectPublicKeyInfoRef::from_der(spki).map_err(|_| Error::X509Parse)?;
+        let parsed = SubjectPublicKeyInfoRef::from_der(spki).map_err(|_e| Error::X509Parse)?;
         let key_bytes = parsed
             .subject_public_key
             .as_bytes()
@@ -229,7 +244,7 @@ impl PublicKey {
         if oid == RSA_ENCRYPTION {
             // The subjectPublicKey BIT STRING for RSA contains a DER-encoded
             // RSAPublicKey (PKCS#1).
-            let rsa = RsaPublicKey::from_pkcs1_der(key_bytes).map_err(|_| Error::X509Parse)?;
+            let rsa = RsaPublicKey::from_pkcs1_der(key_bytes).map_err(|_e| Error::X509Parse)?;
             Ok(Self {
                 inner: PublicKeyInner::Rsa(rsa),
             })
@@ -239,16 +254,16 @@ impl PublicKey {
             let params = parsed.algorithm.parameters.ok_or(Error::X509Parse)?;
             let curve_oid = params
                 .decode_as::<const_oid::ObjectIdentifier>()
-                .map_err(|_| Error::X509Parse)?;
+                .map_err(|_e| Error::X509Parse)?;
             if curve_oid == SECP_256_R_1 {
                 let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key_bytes)
-                    .map_err(|_| Error::X509Parse)?;
+                    .map_err(|_e| Error::X509Parse)?;
                 Ok(Self {
                     inner: PublicKeyInner::EcdsaP256(vk),
                 })
             } else if curve_oid == SECP_384_R_1 {
                 let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(key_bytes)
-                    .map_err(|_| Error::X509Parse)?;
+                    .map_err(|_e| Error::X509Parse)?;
                 Ok(Self {
                     inner: PublicKeyInner::EcdsaP384(vk),
                 })
@@ -290,11 +305,11 @@ impl PublicKey {
                 let vk: RsaPkcs1v15VerifyingKey<Sha256> =
                     RsaPkcs1v15VerifyingKey::new(rsa.clone());
                 let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "signature parse failed",
                     })?;
                 vk.verify(signed_bytes, &sig)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha256 verify failed",
                     })
             }
@@ -302,11 +317,11 @@ impl PublicKey {
                 let vk: RsaPkcs1v15VerifyingKey<Sha384> =
                     RsaPkcs1v15VerifyingKey::new(rsa.clone());
                 let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "signature parse failed",
                     })?;
                 vk.verify(signed_bytes, &sig)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha384 verify failed",
                     })
             }
@@ -314,11 +329,11 @@ impl PublicKey {
                 let vk: RsaPkcs1v15VerifyingKey<Sha512> =
                     RsaPkcs1v15VerifyingKey::new(rsa.clone());
                 let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "signature parse failed",
                     })?;
                 vk.verify(signed_bytes, &sig)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha512 verify failed",
                     })
             }
@@ -327,11 +342,11 @@ impl PublicKey {
                 let vk: RsaPkcs1v15VerifyingKey<sha1::Sha1> =
                     RsaPkcs1v15VerifyingKey::new(rsa.clone());
                 let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "signature parse failed",
                     })?;
                 vk.verify(signed_bytes, &sig)
-                    .map_err(|_| Error::SignatureVerification {
+                    .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha1 verify failed",
                     })
             }
@@ -359,15 +374,15 @@ fn verify_ecdsa_p256(
     signed_bytes: &[u8],
     signature_bytes: &[u8],
 ) -> Result<(), Error> {
-    if let Ok(sig) = p256::ecdsa::Signature::from_slice(signature_bytes) {
-        if vk.verify(signed_bytes, &sig).is_ok() {
-            return Ok(());
-        }
+    if let Ok(sig) = p256::ecdsa::Signature::from_slice(signature_bytes)
+        && vk.verify(signed_bytes, &sig).is_ok()
+    {
+        return Ok(());
     }
-    if let Ok(sig) = p256::ecdsa::DerSignature::try_from(signature_bytes) {
-        if vk.verify(signed_bytes, &sig).is_ok() {
-            return Ok(());
-        }
+    if let Ok(sig) = p256::ecdsa::DerSignature::try_from(signature_bytes)
+        && vk.verify(signed_bytes, &sig).is_ok()
+    {
+        return Ok(());
     }
     Err(Error::SignatureVerification {
         reason: "ecdsa-p256 verify failed",
@@ -379,15 +394,15 @@ fn verify_ecdsa_p384(
     signed_bytes: &[u8],
     signature_bytes: &[u8],
 ) -> Result<(), Error> {
-    if let Ok(sig) = p384::ecdsa::Signature::from_slice(signature_bytes) {
-        if vk.verify(signed_bytes, &sig).is_ok() {
-            return Ok(());
-        }
+    if let Ok(sig) = p384::ecdsa::Signature::from_slice(signature_bytes)
+        && vk.verify(signed_bytes, &sig).is_ok()
+    {
+        return Ok(());
     }
-    if let Ok(sig) = p384::ecdsa::DerSignature::try_from(signature_bytes) {
-        if vk.verify(signed_bytes, &sig).is_ok() {
-            return Ok(());
-        }
+    if let Ok(sig) = p384::ecdsa::DerSignature::try_from(signature_bytes)
+        && vk.verify(signed_bytes, &sig).is_ok()
+    {
+        return Ok(());
     }
     Err(Error::SignatureVerification {
         reason: "ecdsa-p384 verify failed",

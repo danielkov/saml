@@ -67,7 +67,7 @@ impl KeyInfo {
     ) -> Vec<X509Certificate> {
         let trusted_fingerprints: Vec<[u8; 32]> = trusted_candidates
             .iter()
-            .map(|c| c.fingerprint_sha256())
+            .map(X509Certificate::fingerprint_sha256)
             .collect();
         let mut out = Vec::new();
         for blob in &self.x509_certificates_base64 {
@@ -216,7 +216,7 @@ mod tests {
                 SignatureAlgorithm::RsaSha256,
                 &payload,
                 &sig,
-                &[cert.clone()],
+                std::slice::from_ref(&cert),
                 &allowed,
                 &key_info,
             )
@@ -283,7 +283,7 @@ mod tests {
                 SignatureAlgorithm::RsaSha256,
                 &payload,
                 &sig,
-                &[cert.clone()], // trusted set for fingerprint check
+                std::slice::from_ref(&cert), // trusted set for fingerprint check
                 &[SignatureAlgorithm::RsaSha256],
                 &key_info,
             )
@@ -329,7 +329,7 @@ mod tests {
             x509_certificates_base64: vec![cert.to_base64_x509(), other.to_base64_x509()],
             ..KeyInfo::default()
         };
-        let filtered = key_info.trusted_inline_certs(&[cert.clone()]);
+        let filtered = key_info.trusted_inline_certs(std::slice::from_ref(&cert));
         // Only the RSA cert is in the trusted set; the EC cert is filtered.
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0], cert);
@@ -345,7 +345,7 @@ mod tests {
             ],
             ..KeyInfo::default()
         };
-        let filtered = key_info.trusted_inline_certs(&[cert.clone()]);
+        let filtered = key_info.trusted_inline_certs(std::slice::from_ref(&cert));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0], cert);
     }

@@ -70,7 +70,18 @@ pub fn emit_sp_metadata(
         // emit step — `sign_element` keeps every existing attribute (including
         // `ID`) intact so the `Reference URI="#<id>"` resolves on the verifier.
         let unsigned_doc = Document::new(root.clone())?;
-        crate::dsig::sign::sign_element(root, &unsigned_doc, key, sig_alg, digest, c14n, &[], true)?
+        crate::dsig::sign::sign_element(
+            root,
+            &unsigned_doc,
+            crate::dsig::sign::SignOptions {
+                signing_key: key,
+                sig_alg,
+                digest_alg: digest,
+                c14n_alg: c14n,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )?
     } else {
         root
     };
@@ -154,7 +165,7 @@ fn build_sp_entity_descriptor(
     if let Some(valid_until) = inputs.valid_until {
         entity_descriptor = entity_descriptor.with_attribute(
             QName::new(None, "validUntil"),
-            crate::time::format_xs_datetime(valid_until),
+            crate::time::format_xs_datetime(valid_until)?,
         );
     }
     if let Some(cache_duration) = inputs.cache_duration {
@@ -183,7 +194,15 @@ fn build_sp_entity_descriptor(
 pub(super) fn generate_id() -> String {
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(1 + bytes.len() * 2);
+    // Capacity: 1 leading underscore + two hex nibbles per byte. Computed via
+    // checked arithmetic so the strict-lint crate-wide ban on `+`/`*` panics
+    // is honoured; on overflow we fall back to the default `String::new()`.
+    let capacity = bytes
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .unwrap_or(0);
+    let mut out = String::with_capacity(capacity);
     out.push('_');
     for b in bytes {
         // hex, lower-case.
@@ -196,10 +215,15 @@ pub(super) fn generate_id() -> String {
 }
 
 fn hex_nibble(n: u8) -> char {
+    // `n` is always a 4-bit value (0..=15) by construction in `generate_id`,
+    // but we still convert via the standard ASCII offsets without arithmetic
+    // operations that could panic under strict lints.
     match n {
-        0..=9 => (b'0' + n) as char,
-        10..=15 => (b'a' + n - 10) as char,
-        _ => unreachable!(),
+        0..=9 => char::from(b'0'.saturating_add(n)),
+        10..=15 => char::from(b'a'.saturating_add(n.saturating_sub(10))),
+        // 4-bit input precludes any other value; fall back to '0' to keep the
+        // function infallible without invoking `unreachable!`.
+        _ => '0',
     }
 }
 
@@ -380,7 +404,8 @@ fn build_contact_person(contact: &MetadataContact) -> Element {
 // Tests
 // =============================================================================
 
-#[cfg(all(test, feature = "xmlenc"))]
+#[cfg(test)]
+#[cfg(feature = "xmlenc")]
 mod tests {
     use super::*;
     use crate::binding::{Binding, Endpoint, SsoResponseEndpoint};
@@ -494,7 +519,7 @@ mod tests {
         // NameIDFormats — both URIs present, in input order.
         let name_id_formats: Vec<_> = sp_desc
             .all_child_elements(Some(MD_NS), "NameIDFormat")
-            .map(|e| e.text_content())
+            .map(Element::text_content)
             .collect();
         assert_eq!(
             name_id_formats,
@@ -593,7 +618,7 @@ mod tests {
         let valid_until =
             SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000); // 2033-05-18T03:33:20Z
         inputs.valid_until = Some(valid_until);
-        inputs.cache_duration = Some(Duration::from_secs(3600));
+        inputs.cache_duration = Some(Duration::from_hours(1));
 
         let xml = emit_sp_metadata(&inputs, None).unwrap();
         let doc = Document::parse(xml.as_bytes()).unwrap();
@@ -664,31 +689,31 @@ mod tests {
         assert_eq!(
             contact
                 .child_element(Some(MD_NS), "Company")
-                .map(|e| e.text_content()),
+                .map(Element::text_content),
             Some("Example Corp".to_owned())
         );
         assert_eq!(
             contact
                 .child_element(Some(MD_NS), "GivenName")
-                .map(|e| e.text_content()),
+                .map(Element::text_content),
             Some("Alex".to_owned())
         );
         assert_eq!(
             contact
                 .child_element(Some(MD_NS), "SurName")
-                .map(|e| e.text_content()),
+                .map(Element::text_content),
             Some("Operator".to_owned())
         );
         assert_eq!(
             contact
                 .child_element(Some(MD_NS), "EmailAddress")
-                .map(|e| e.text_content()),
+                .map(Element::text_content),
             Some("sso-admin@example.com".to_owned())
         );
         assert_eq!(
             contact
                 .child_element(Some(MD_NS), "TelephoneNumber")
-                .map(|e| e.text_content()),
+                .map(Element::text_content),
             Some("+15551234567".to_owned())
         );
     }

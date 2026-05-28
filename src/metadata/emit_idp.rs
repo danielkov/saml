@@ -65,12 +65,14 @@ pub fn emit_idp_metadata(
         crate::dsig::sign::sign_element(
             root,
             &unsigned_doc,
-            key,
-            sig_alg,
-            digest,
-            c14n,
-            &[],
-            true,
+            crate::dsig::sign::SignOptions {
+                signing_key: key,
+                sig_alg,
+                digest_alg: digest,
+                c14n_alg: c14n,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )?
     } else {
         root
@@ -152,7 +154,7 @@ fn build_idp_entity_descriptor(
     if let Some(valid_until) = inputs.valid_until {
         entity_descriptor = entity_descriptor.with_attribute(
             QName::new(None, "validUntil"),
-            crate::time::format_xs_datetime(valid_until),
+            crate::time::format_xs_datetime(valid_until)?,
         );
     }
     if let Some(cache_duration) = inputs.cache_duration {
@@ -207,7 +209,8 @@ fn build_artifact_resolution_endpoint(endpoint: &Endpoint) -> Element {
 // Tests
 // =============================================================================
 
-#[cfg(all(test, feature = "xmlenc"))]
+#[cfg(test)]
+#[cfg(feature = "xmlenc")]
 mod tests {
     use super::*;
     use crate::binding::{Binding, Endpoint};
@@ -317,7 +320,7 @@ mod tests {
         // NameIDFormats in input order.
         let formats: Vec<_> = idp_desc
             .all_child_elements(Some(MD_NS), "NameIDFormat")
-            .map(|e| e.text_content())
+            .map(Element::text_content)
             .collect();
         assert_eq!(
             formats,
@@ -379,7 +382,7 @@ mod tests {
         let mut inputs = baseline_inputs(&cert, &sso, &[], &[], &formats, &algos);
         let valid_until = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
         inputs.valid_until = Some(valid_until);
-        inputs.cache_duration = Some(Duration::from_secs(7200));
+        inputs.cache_duration = Some(Duration::from_hours(2));
 
         let xml = emit_idp_metadata(&inputs, None).unwrap();
         let doc = Document::parse(xml.as_bytes()).unwrap();
@@ -433,7 +436,7 @@ mod tests {
             .expect("Organization");
         assert_eq!(
             org.child_element(Some(MD_NS), "OrganizationName")
-                .map(|e| e.text_content()),
+                .map(Element::text_content),
             Some("Example IdP Inc".to_owned())
         );
         assert_eq!(
@@ -453,7 +456,7 @@ mod tests {
         // Second contact has two phone numbers, in input order.
         let phones: Vec<_> = contacts[1]
             .all_child_elements(Some(MD_NS), "TelephoneNumber")
-            .map(|e| e.text_content())
+            .map(Element::text_content)
             .collect();
         assert_eq!(phones, vec!["+15550000".to_owned(), "+15550001".to_owned()]);
     }

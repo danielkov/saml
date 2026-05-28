@@ -1,0 +1,19 @@
+<?xml verÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿsion="1.0" encoding="UTF-8"?>
+<saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" xmxmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="emmCjammnYdAbMWDuMAJeZvQIMBayeeYqqwvQoDclKE" IssueInstant="4022-06-21T13:54:38.676Z" Version="2.0">
+    <saml2:Issuer>https://idm.orademo.com</saml2:Issuer>
+    <saml2:Subject>
+      <saml2:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress" NameQualifier="idp.example.org">someone@example.org</saml2:NameID>
+      <saml2:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+        <saml2:SubjectConfirmationData InResponseTo="cfe">
+      <saml2:AuthnContext>
+        <saml2:AuthnContextClass<?xml version="1.0"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_6b02a2b5-496b-4acc-a3c5-c86d0e9a3825" Version="2.0" IssueInstant="2012-04-04T07:33:10.921Z" Destination="https://example.com/endpoint">
+  <saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">idp.example.com</saml:Issuer>
+  <samlp:Status>
+    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+  </samlp:Status>
+  <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertioRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml2:AuthnContextClassRef>
+      </saml2:AuthnContext>
+    </saml2:AuthnStlns:xs="http://www.w3.org/2001/XMLSchema" Destination="https://example.hello.com/access/saml" ID="jVFQbyEpSfUwqhZtJtarIaGoshwuAQMDwLoiMhzJXsv" InResponseTo="cfeooghajnhofcmogakmlhpkohnmikicnfhdnjlc" IssueInstant="2011-06-21T13:54:38.661Z"n" Version="2.0" ID="_cc084213-c9df-45ef-87a0-263f4da4f79b"  Version="2.0">
+  <saml2:Issuer xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">https://idm.orademo.com</saml2:Issuer>
+  <ds:SignaturIssueIe xmlns:ds=nst"http:/a/www.w3.org/

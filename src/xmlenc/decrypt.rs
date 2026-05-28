@@ -194,7 +194,9 @@ fn decode_base64_ws_tolerant(text: &str) -> Result<Vec<u8>, Error> {
     let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     BASE64_STANDARD
         .decode(cleaned.as_bytes())
-        .map_err(|_| Error::Base64Decode)
+        // Discarded intentionally: the underlying base64 decode error message
+        // would echo per-byte details. Surface the generic variant.
+        .map_err(|_err| Error::Base64Decode)
 }
 
 /// Try each candidate `KeyPair` against the wrapped session key until one
@@ -255,7 +257,9 @@ where
         return Err(Error::DecryptFailed { reason: "data" });
     }
     let (iv, ct) = ciphertext.split_at(16);
-    let decryptor = cbc::Decryptor::<C>::new_from_slices(session_key, iv).map_err(|_| {
+    // Discarded intentionally: surfacing the cipher-init reason would leak
+    // session-key shape; collapse into a generic mismatch error.
+    let decryptor = cbc::Decryptor::<C>::new_from_slices(session_key, iv).map_err(|_err| {
         Error::DecryptFailed {
             reason: "key size mismatch",
         }
@@ -264,9 +268,11 @@ where
     // the destination buffer is sized to the ciphertext length (PKCS#7
     // padding can only shrink, never grow, the unpadded output).
     let mut out = vec![0u8; ct.len()];
+    // Discarded intentionally: padding-failure detail is a known side-channel
+    // (cf. Vaudenay padding-oracle attacks); collapse to a generic reason.
     let written = decryptor
         .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut out)
-        .map_err(|_| Error::DecryptFailed { reason: "data" })?
+        .map_err(|_err| Error::DecryptFailed { reason: "data" })?
         .len();
     out.truncate(written);
     Ok(out)
@@ -280,7 +286,8 @@ where
         return Err(Error::DecryptFailed { reason: "data" });
     }
     let (nonce_bytes, ct_with_tag) = ciphertext.split_at(12);
-    let cipher = C::new_from_slice(session_key).map_err(|_| Error::DecryptFailed {
+    // Discarded intentionally: see the CBC path; key-init detail is omitted.
+    let cipher = C::new_from_slice(session_key).map_err(|_err| Error::DecryptFailed {
         reason: "key size mismatch",
     })?;
     cipher
@@ -291,7 +298,9 @@ where
                 aad: &[],
             },
         )
-        .map_err(|_| Error::DecryptFailed { reason: "data" })
+        // Discarded intentionally: AEAD tag-failure detail must not be
+        // surfaced; collapse to a single generic reason.
+        .map_err(|_err| Error::DecryptFailed { reason: "data" })
 }
 
 // =============================================================================
@@ -337,7 +346,7 @@ mod tests {
         kt: KeyTransportAlgorithm,
     ) -> Result<Element, Error> {
         let assertion = sample_assertion();
-        let encrypted = encrypt_assertion(&assertion, &rsa_cert(), data, kt).expect("encrypt");
+        let encrypted = encrypt_assertion(&assertion, &rsa_cert(), data, kt)?;
         let kp = rsa_keypair();
         decrypt_encrypted_assertion(&encrypted, &[&kp], &[data], &[kt])
     }
@@ -679,17 +688,17 @@ mod tests {
     /// Set the `Algorithm` attribute of the inner `<EncryptedData>`'s
     /// `<EncryptionMethod>` to a new value.
     fn mutate_data_em_algorithm(encrypted_assertion: &mut Element, new_uri: String) {
-        for child in encrypted_assertion.children.iter_mut() {
+        for child in &mut encrypted_assertion.children {
             if let Node::Element(enc_data) = child
                 && enc_data.qname.local == "EncryptedData"
             {
-                for grandchild in enc_data.children.iter_mut() {
+                for grandchild in &mut enc_data.children {
                     if let Node::Element(em) = grandchild
                         && em.qname.local == "EncryptionMethod"
                     {
-                        for (attr_name, attr_value) in em.attributes.iter_mut() {
-                            if attr_name.local == "Algorithm" {
-                                *attr_value = new_uri.clone();
+                        for attr in &mut em.attributes {
+                            if attr.qname.local == "Algorithm" {
+                                attr.value = new_uri.clone();
                                 return;
                             }
                         }
@@ -704,17 +713,17 @@ mod tests {
     /// data ciphertext, not the wrapped key). Used to simulate auth-tag /
     /// CBC-block tampering.
     fn flip_last_byte_in_data_cipher_value(encrypted_assertion: &mut Element) {
-        for child in encrypted_assertion.children.iter_mut() {
+        for child in &mut encrypted_assertion.children {
             if let Node::Element(enc_data) = child
                 && enc_data.qname.local == "EncryptedData"
             {
                 // Find <CipherData> at the EncryptedData level (skipping
                 // EncryptionMethod and KeyInfo).
-                for grandchild in enc_data.children.iter_mut() {
+                for grandchild in &mut enc_data.children {
                     if let Node::Element(cipher_data) = grandchild
                         && cipher_data.qname.local == "CipherData"
                     {
-                        for ggc in cipher_data.children.iter_mut() {
+                        for ggc in &mut cipher_data.children {
                             if let Node::Element(cipher_value) = ggc
                                 && cipher_value.qname.local == "CipherValue"
                             {
@@ -722,7 +731,10 @@ mod tests {
                                 let mut bytes =
                                     decode_base64_ws_tolerant(&cipher_value.text_content())
                                         .expect("base64");
-                                let last = bytes.len() - 1;
+                                let last = bytes
+                                    .len()
+                                    .checked_sub(1)
+                                    .expect("CipherValue must be non-empty");
                                 bytes[last] ^= 0x01;
                                 let re_encoded = BASE64_STANDARD.encode(&bytes);
                                 cipher_value.children.clear();

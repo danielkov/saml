@@ -1,0 +1,64 @@
+[package]
+name = "saml-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.91.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+base64 = "0.22"
+
+[dependencies.saml]
+path = ".."
+default-features = true
+
+# Re-publish the saml features the fuzz targets use under `#[cfg(feature = …)]`
+# guards so the generated rustc invocation actually defines them on this crate.
+# (Cargo only inherits a dependency's enabled features into the parent crate's
+# `cfg(feature = "…")` namespace when the parent declares matching features.)
+[features]
+default = ["xmlenc", "slo"]
+xmlenc = ["saml/xmlenc"]
+slo = ["saml/slo"]
+
+# `cargo-fuzz` injects `--cfg fuzzing` when building fuzz targets. Declare it
+# so non-fuzz builds (e.g. `cargo check --all`) don't warn about an unknown
+# cfg name.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# Profile overrides for fuzz binaries live at the workspace root (in
+# `../Cargo.toml`) because cargo refuses to honor `[profile.*]` in non-root
+# members. `cargo fuzz build` injects the sanitizer + debug flags via
+# `--config profile.release.debug=...` on the command line, so we don't need
+# to set them statically here.
+
+# Each binary is wired up explicitly so cargo-fuzz can discover it via the
+# `[[bin]]` table. `test = false` / `doc = false` keeps `cargo test` and
+# `cargo doc` from trying to compile the libfuzzer entry points (which require
+# a sanitizer-linked driver, only present under `cargo fuzz build`).
+
+[[bin]]
+name = "fuzz_xml_parse"
+path = "fuzz_targets/fuzz_xml_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_c14n"
+path = "fuzz_targets/fuzz_c14n.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_base64_response"
+path = "fuzz_targets/fuzz_base64_response.rs"
+test = false
+doc = false
+bench = false

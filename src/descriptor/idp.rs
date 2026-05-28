@@ -196,7 +196,7 @@ mod tests {
 
         assert_eq!(idp.entity_id, "https://idp.example.com/saml");
         assert!(idp.want_authn_requests_signed);
-        assert_eq!(idp.cache_duration, Some(Duration::from_secs(3600)));
+        assert_eq!(idp.cache_duration, Some(Duration::from_hours(1)));
         assert!(idp.valid_until.is_some());
 
         assert_eq!(idp.sso_endpoints.len(), 2);

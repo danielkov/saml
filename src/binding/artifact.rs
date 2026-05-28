@@ -41,11 +41,11 @@ use crate::xml::emit::{emit_document, emit_element};
 use crate::xml::parse::{Document, Element, Node, QName};
 
 /// SAML protocol namespace.
-pub(crate) const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+pub const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 /// SAML assertion namespace.
-pub(crate) const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+pub const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 /// SOAP 1.1 envelope namespace.
-pub(crate) const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+pub const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 
 /// `Status/StatusCode/@Value` for the success case.
 const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
@@ -68,7 +68,7 @@ const ARTIFACT_TYPE_CODE: u16 = 0x0004;
 /// - 20 bytes `MessageHandle` = cryptographically random.
 ///
 /// The result is base64-encoded with the standard alphabet (padded).
-pub(crate) fn make_artifact(
+pub fn make_artifact(
     issuer_entity_id: &str,
     endpoint_index: u16,
 ) -> Result<String, Error> {
@@ -82,11 +82,11 @@ pub(crate) fn make_artifact(
     let source_id = Sha1::digest(issuer_entity_id.as_bytes());
     buf[4..24].copy_from_slice(&source_id);
     // Bytes 24..44: MessageHandle = 20 random bytes.
-    OsRng.try_fill_bytes(&mut buf[24..44]).map_err(|_| {
-        Error::InvalidConfiguration {
+    OsRng
+        .try_fill_bytes(&mut buf[24..44])
+        .map_err(|_err| Error::InvalidConfiguration {
             reason: "RNG failure generating artifact MessageHandle",
-        }
-    })?;
+        })?;
 
     Ok(BASE64.encode(buf))
 }
@@ -98,7 +98,7 @@ pub(crate) fn make_artifact(
 /// the SP resolves the artifact via SOAP — the library does not persist this;
 /// the caller MUST stash it keyed by the returned `artifact` string and serve
 /// it from its `ArtifactResolutionService`.
-pub(crate) fn build_artifact_redirect(
+pub fn build_artifact_redirect(
     sp_acs_url: &Url,
     issuer_entity_id: &str,
     endpoint_index: u16,
@@ -136,13 +136,13 @@ pub(crate) fn build_artifact_redirect(
 /// is sourced from `SystemTime::now()` because this is an outbound-message
 /// construction — fresh-now is fine here; no security check threads a `now`
 /// parameter into this code path.
-pub(crate) fn build_artifact_resolve(
+pub fn build_artifact_resolve(
     issuer_entity_id: &str,
     destination: &str,
     artifact: &str,
 ) -> Result<String, Error> {
-    let id = random_xml_id();
-    let issue_instant = format_xs_datetime(SystemTime::now());
+    let id = random_xml_id()?;
+    let issue_instant = format_xs_datetime(SystemTime::now())?;
 
     // <samlp:Artifact>{artifact}</samlp:Artifact>
     let artifact_elem = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "Artifact"))
@@ -195,7 +195,7 @@ pub(crate) fn build_artifact_resolve(
 /// 3. The `ArtifactResponse` contains a payload protocol message — the first
 ///    `samlp:*` child that is neither `Status` nor `Issuer`. The whole subtree
 ///    of that payload is serialized and returned.
-pub(crate) fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
     let doc = Document::parse(soap_envelope)?;
 
     let envelope = doc.root();
@@ -236,7 +236,7 @@ pub(crate) fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, E
     if code_value != STATUS_SUCCESS {
         let message = status
             .child_element(Some(SAMLP_NS), "StatusMessage")
-            .map(|m| m.text_content());
+            .map(Element::text_content);
         return Err(Error::StatusNotSuccess {
             code: code_value.to_owned(),
             message,
@@ -277,7 +277,7 @@ pub(crate) fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, E
 /// The HTTP request sets `Content-Type: text/xml` and an empty quoted
 /// `SOAPAction: ""` header per SOAP 1.1 binding conventions and SAML 2.0
 /// Bindings §3.2.3.
-pub(crate) async fn resolve_artifact<H: HttpClient>(
+pub async fn resolve_artifact<H: HttpClient>(
     http: &H,
     ars_url: &str,
     issuer_entity_id: &str,
@@ -300,30 +300,158 @@ pub(crate) async fn resolve_artifact<H: HttpClient>(
 }
 
 // =============================================================================
+// IdP-side: parse inbound ArtifactResolve, build outbound ArtifactResponse
+// =============================================================================
+
+/// Inbound `<samlp:ArtifactResolve>` SOAP request, as received at the IdP's
+/// `ArtifactResolutionService` endpoint.
+#[derive(Debug, Clone)]
+pub struct ArtifactResolveRequest {
+    /// `samlp:ArtifactResolve/@ID` — echoed back in the response's
+    /// `InResponseTo`.
+    pub request_id: String,
+    /// `samlp:Issuer` text content — the SP entity ID requesting resolution.
+    pub issuer: String,
+    /// `samlp:Artifact` text content — the opaque token to look up.
+    pub artifact: String,
+}
+
+/// Parse a `<samlp:ArtifactResolve>` SOAP envelope received at the IdP's
+/// `ArtifactResolutionService`. Returns the request ID, requesting SP issuer,
+/// and the artifact value to look up.
+pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveRequest, Error> {
+    let doc = Document::parse(soap_envelope)?;
+
+    let envelope = doc.root();
+    if envelope.qname().namespace() != Some(SOAP_NS) || envelope.qname().local() != "Envelope" {
+        return Err(Error::XmlParse(
+            "ArtifactResolve: SOAP envelope root is not soap:Envelope".to_string(),
+        ));
+    }
+
+    let body = envelope
+        .child_element(Some(SOAP_NS), "Body")
+        .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing soap:Body".to_string()))?;
+
+    let resolve = body
+        .child_element(Some(SAMLP_NS), "ArtifactResolve")
+        .ok_or_else(|| {
+            Error::XmlParse("ArtifactResolve: missing samlp:ArtifactResolve".to_string())
+        })?;
+
+    let request_id = resolve
+        .attribute(None, "ID")
+        .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing @ID".to_string()))?
+        .to_owned();
+
+    let issuer = resolve
+        .child_element(Some(SAML_NS), "Issuer")
+        .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing saml:Issuer".to_string()))?
+        .text_content();
+
+    let artifact = resolve
+        .child_element(Some(SAMLP_NS), "Artifact")
+        .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing samlp:Artifact".to_string()))?
+        .text_content();
+
+    Ok(ArtifactResolveRequest {
+        request_id,
+        issuer,
+        artifact,
+    })
+}
+
+/// Build a `<samlp:ArtifactResponse>` SOAP envelope wrapping the IdP's stashed
+/// SAML protocol message (typically a `<samlp:Response>`).
+///
+/// `idp_entity_id` is the IdP's entity ID (emitted as `saml:Issuer`).
+/// `in_response_to` is the `ArtifactResolve/@ID` from the incoming request.
+/// `payload_xml` is the inner SAML message XML (e.g. the stashed Response).
+pub fn build_artifact_response(
+    idp_entity_id: &str,
+    in_response_to: &str,
+    payload_xml: &str,
+) -> Result<String, Error> {
+    let id = random_xml_id()?;
+    let issue_instant = format_xs_datetime(SystemTime::now())?;
+
+    // Parse the payload XML so we can graft its element subtree into the
+    // ArtifactResponse without re-serializing through string concatenation.
+    let payload_doc = Document::parse(payload_xml.as_bytes())?;
+    let payload_elem = payload_doc.root().clone();
+
+    let issuer_elem = Element::build(QName::new(Some(SAML_NS.to_owned()), "Issuer"))
+        .with_text(idp_entity_id.to_owned())
+        .finish();
+
+    let status_code = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "StatusCode"))
+        .with_attribute(QName::new(None, "Value"), STATUS_SUCCESS.to_owned())
+        .finish();
+    let status = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "Status"))
+        .with_child(Node::Element(status_code))
+        .finish();
+
+    let artifact_response =
+        Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResponse"))
+            .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
+            .with_namespace(Some("saml".to_owned()), SAML_NS)
+            .with_attribute(QName::new(None, "ID"), id)
+            .with_attribute(QName::new(None, "Version"), "2.0")
+            .with_attribute(QName::new(None, "IssueInstant"), issue_instant)
+            .with_attribute(
+                QName::new(None, "InResponseTo"),
+                in_response_to.to_owned(),
+            )
+            .with_child(Node::Element(issuer_elem))
+            .with_child(Node::Element(status))
+            .with_child(Node::Element(payload_elem))
+            .finish();
+
+    let body = Element::build(QName::new(Some(SOAP_NS.to_owned()), "Body"))
+        .with_child(Node::Element(artifact_response))
+        .finish();
+    let envelope = Element::build(QName::new(Some(SOAP_NS.to_owned()), "Envelope"))
+        .with_namespace(Some("soap".to_owned()), SOAP_NS)
+        .with_child(Node::Element(body))
+        .finish();
+
+    let doc = Document::new(envelope)?;
+    emit_document(&doc)
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
 /// Generate a fresh XML `ID` value of the shape `_<32 hex chars>` (16 random
 /// bytes, hex-encoded with a leading underscore so the value is a valid XML
 /// `xs:ID`, which must start with a letter or `_`).
-fn random_xml_id() -> String {
+fn random_xml_id() -> Result<String, Error> {
     let mut bytes = [0u8; 16];
-    // OsRng's try_fill_bytes virtually never fails on production OSes; if it
-    // does, fall back to a deterministic-but-unique string built from the
-    // entropy we managed to get. That fallback is intentionally simple — the
-    // caller's outer flow will likely fail at the HTTP layer too, so we don't
-    // want to invent a second error path just for this.
-    let _ = OsRng.try_fill_bytes(&mut bytes);
+    // Propagate RNG failures so the outer flow can surface a configuration
+    // error rather than emitting an ID built from uninitialized entropy.
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_err| Error::InvalidConfiguration {
+            reason: "RNG failure generating random XML ID",
+        })?;
+
+    // Two-char lowercase hex for each byte, no formatter overhead.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut out = String::with_capacity(1 + 32);
     out.push('_');
     for b in bytes {
-        // Two-char lowercase hex for each byte, no formatter overhead.
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+        let hi = usize::from(b >> 4);
+        let lo = usize::from(b & 0x0f);
+        // hi and lo are both <16, so .get() always returns Some. We avoid
+        // panicking indexing by using .get() + a defensive fallback.
+        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
+            out.push(h as char);
+            out.push(l as char);
+        }
     }
-    out
+    Ok(out)
 }
 
 // =============================================================================
@@ -570,7 +698,7 @@ mod tests {
     #[test]
     fn parse_artifact_response_rejects_missing_envelope() {
         // Wrong root element.
-        let xml = r#"<not-soap/>"#;
+        let xml = r"<not-soap/>";
         let err = parse_artifact_response(xml.as_bytes()).unwrap_err();
         assert!(matches!(err, Error::XmlParse(_)));
     }
@@ -737,7 +865,7 @@ mod tests {
 
     #[test]
     fn random_xml_id_shape_underscore_plus_32_hex_lowercase() {
-        let id = random_xml_id();
+        let id = random_xml_id().unwrap();
         assert_eq!(id.len(), 33);
         assert!(id.starts_with('_'));
         assert!(

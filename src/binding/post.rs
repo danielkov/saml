@@ -9,6 +9,7 @@
 //! See `docs/rfcs/RFC-002-xml-crypto-core.md` §3 (XML-DSig path).
 
 use crate::binding::{Dispatch, PostForm, SsoResponseDispatch, SsoResponsePostForm};
+#[cfg(any(test, feature = "slo"))]
 use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -16,11 +17,13 @@ use url::Url;
 
 /// Hard upper bound on POST-binding base64-decoded payload size. Same 10 MiB
 /// cap as the Redirect binding's inflation guard.
+#[cfg(any(test, feature = "slo"))]
 const MAX_DECODED_BYTES: usize = 10 * 1024 * 1024;
 
 /// Precomputed upper bound on the base64-encoded input length such that the
 /// decoded output cannot exceed `MAX_DECODED_BYTES`. Each base64 char encodes
 /// 6 bits → 3 output bytes per 4 input chars, plus a small slack for padding.
+#[cfg(any(test, feature = "slo"))]
 const MAX_BASE64_INPUT_LEN: usize = MAX_DECODED_BYTES
     .saturating_mul(4)
     .saturating_div(3)
@@ -43,6 +46,7 @@ pub(crate) fn encode_request(
 
 /// Encode an outbound XML payload for the HTTP-POST binding (response side).
 /// `xml` must already contain any enveloped XML-DSig signature.
+#[cfg(any(test, feature = "slo"))]
 pub(crate) fn encode_response(
     destination: &Url,
     xml: &[u8],
@@ -71,6 +75,7 @@ pub(crate) fn encode_sso_response(
     })
 }
 
+#[cfg(any(test, feature = "slo"))]
 #[derive(Debug, Clone)]
 pub struct DecodedPost {
     /// Base64-decoded XML bytes (the SAML message itself).
@@ -81,6 +86,7 @@ pub struct DecodedPost {
 /// Decode an inbound POST-bound payload. The caller provides the
 /// base64-encoded `SAMLRequest` or `SAMLResponse` form value (after form-URL
 /// decoding) and optional `RelayState`.
+#[cfg(any(test, feature = "slo"))]
 pub(crate) fn decode(
     saml_request_or_response_b64: &str,
     relay_state: Option<&str>,
@@ -94,7 +100,7 @@ pub(crate) fn decode(
 
     let xml = BASE64
         .decode(saml_request_or_response_b64.as_bytes())
-        .map_err(|_| Error::Base64Decode)?;
+        .map_err(|_err| Error::Base64Decode)?;
 
     if xml.len() > MAX_DECODED_BYTES {
         return Err(Error::Base64Decode);
@@ -120,9 +126,8 @@ mod tests {
     fn encode_decode_roundtrip_request() {
         let xml = b"<samlp:AuthnRequest ID=\"_a\"/>";
         let dispatch = encode_request(&dest(), xml, None);
-        let form = match dispatch {
-            Dispatch::Post(f) => f,
-            _ => panic!("expected Post"),
+        let Dispatch::Post(form) = dispatch else {
+            panic!("expected Post");
         };
         assert_eq!(form.action, dest());
         let b64 = form.saml_request.unwrap();
@@ -139,9 +144,8 @@ mod tests {
         let xml = b"<samlp:LogoutResponse/>";
         let relay = "opaque-state-blob";
         let dispatch = encode_response(&dest(), xml, Some(relay));
-        let form = match dispatch {
-            Dispatch::Post(f) => f,
-            _ => panic!("expected Post"),
+        let Dispatch::Post(form) = dispatch else {
+            panic!("expected Post");
         };
         let b64 = form.saml_response.unwrap();
         assert!(form.saml_request.is_none());
@@ -156,9 +160,8 @@ mod tests {
     fn encode_sso_response_produces_post_variant() {
         let xml = b"<samlp:Response ID=\"_x\"/>";
         let dispatch = encode_sso_response(&dest(), xml, Some("rs"));
-        let form = match dispatch {
-            SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected Post, got {other:?}"),
+        let SsoResponseDispatch::Post(form) = dispatch else {
+            panic!("expected Post");
         };
         assert_eq!(form.action, dest());
         assert_eq!(form.relay_state.as_deref(), Some("rs"));
@@ -171,9 +174,8 @@ mod tests {
     fn encode_sso_response_without_relay_state() {
         let xml = b"<samlp:Response/>";
         let dispatch = encode_sso_response(&dest(), xml, None);
-        let form = match dispatch {
-            SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected Post, got {other:?}"),
+        let SsoResponseDispatch::Post(form) = dispatch else {
+            panic!("expected Post");
         };
         assert!(form.relay_state.is_none());
         let decoded = decode(&form.saml_response, None).unwrap();
@@ -219,9 +221,8 @@ mod tests {
     fn encode_request_uses_standard_base64_with_padding() {
         // 1 byte input → 4 base64 chars with two `=` padding chars.
         let dispatch = encode_request(&dest(), b"A", None);
-        let form = match dispatch {
-            Dispatch::Post(f) => f,
-            _ => panic!("expected Post"),
+        let Dispatch::Post(form) = dispatch else {
+            panic!("expected Post");
         };
         let b64 = form.saml_request.unwrap();
         assert_eq!(b64, "QQ==");

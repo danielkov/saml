@@ -37,6 +37,10 @@ pub(crate) fn parse_logout_request(
         )));
     }
 
+    // Structural schema gate. See `crate::schema` for the rule set.
+    #[cfg(feature = "xsd-validate")]
+    crate::schema::validate_logout_request(root)?;
+
     // Version: MUST be "2.0" per Core §3.2.2.1 / §3.7.1.
     let version = root
         .attribute(None, "Version")
@@ -88,13 +92,13 @@ pub(crate) fn parse_logout_request(
     let nameid_el = root
         .child_element(Some(SAML_NS), "NameID")
         .ok_or_else(|| Error::XmlParse("LogoutRequest missing <saml:NameID>".to_string()))?;
-    let name_id = parse_name_id(nameid_el)?;
+    let name_id = parse_name_id(nameid_el);
 
     // <samlp:SessionIndex>* — text content, in document order. Schema allows
     // zero, so absence is not an error.
     let session_index: Vec<String> = root
         .all_child_elements(Some(SAMLP_NS), "SessionIndex")
-        .map(|el| el.text_content())
+        .map(Element::text_content)
         .collect();
 
     let parsed = ParsedLogoutRequest {
@@ -113,22 +117,21 @@ pub(crate) fn parse_logout_request(
     Ok((parsed, root.id()))
 }
 
-fn parse_name_id(el: &Element) -> Result<NameId, Error> {
+fn parse_name_id(el: &Element) -> NameId {
     let value = el.text_content();
     let format = el
         .attribute(None, "Format")
-        .map(NameIdFormat::from_uri)
-        .unwrap_or(NameIdFormat::Unspecified);
+        .map_or(NameIdFormat::Unspecified, NameIdFormat::from_uri);
     let name_qualifier = el.attribute(None, "NameQualifier").map(str::to_owned);
     let sp_name_qualifier = el.attribute(None, "SPNameQualifier").map(str::to_owned);
     let sp_provided_id = el.attribute(None, "SPProvidedID").map(str::to_owned);
-    Ok(NameId {
+    NameId {
         value,
         format,
         name_qualifier,
         sp_name_qualifier,
         sp_provided_id,
-    })
+    }
 }
 
 // =============================================================================
@@ -249,7 +252,12 @@ mod tests {
             <saml:NameID>u</saml:NameID>
         </samlp:LogoutRequest>"#;
         let err = parse(xml).unwrap_err();
-        assert!(matches!(err, Error::XmlParse(_)));
+        // Schema gate fires first under default features; xsd-validate-off
+        // falls through to the manual XmlParse check on Version.
+        assert!(matches!(
+            err,
+            Error::XmlParse(_) | Error::SchemaViolation { .. }
+        ));
     }
 
     #[test]

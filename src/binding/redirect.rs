@@ -15,11 +15,15 @@ use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::Compression;
+#[cfg(any(test, feature = "slo"))]
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
-use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use std::fmt::Write as _;
-use std::io::{Read, Write};
+#[cfg(any(test, feature = "slo"))]
+use percent_encoding::percent_decode_str;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+#[cfg(any(test, feature = "slo"))]
+use std::io::Read;
+use std::io::Write;
 use url::Url;
 
 /// Percent-encode set covering everything except unreserved chars
@@ -59,6 +63,7 @@ const ENCODE_SET: &AsciiSet = &CONTROLS
 
 /// Hard upper bound on DEFLATE inflation output. Prevents zip-bomb-style
 /// resource exhaustion where a tiny ciphertext expands to many gigabytes.
+#[cfg(any(test, feature = "slo"))]
 const MAX_INFLATED_BYTES: usize = 10 * 1024 * 1024;
 
 /// One side of a redirect-bound SAML message direction.
@@ -154,12 +159,16 @@ pub(crate) fn encode_signed(
 fn write_pct_pair(out: &mut String, name: &str, value: &str) {
     out.push_str(name);
     out.push('=');
-    // `utf8_percent_encode` is a Display-impl iterator; write directly to
-    // avoid the intermediate `.to_string()` allocation.
-    let _ = write!(out, "{}", utf8_percent_encode(value, ENCODE_SET));
+    // `utf8_percent_encode` is a Display-impl iterator; extend the output
+    // String directly via the iterator API to avoid the intermediate
+    // `.to_string()` allocation and the must-use `write!` Result.
+    for chunk in utf8_percent_encode(value, ENCODE_SET) {
+        out.push_str(chunk);
+    }
 }
 
 /// Decoded fields extracted from an inbound Redirect-bound request.
+#[cfg(any(test, feature = "slo"))]
 #[derive(Debug, Clone)]
 pub struct DecodedRedirect {
     /// DEFLATE-decompressed XML bytes.
@@ -182,6 +191,7 @@ pub struct DecodedRedirect {
 /// function picks out `SAMLRequest` / `SAMLResponse` / `RelayState` /
 /// `Signature` / `SigAlg` and reconstructs the canonical signed-input bytes
 /// per spec.
+#[cfg(any(test, feature = "slo"))]
 pub(crate) fn decode(
     raw_query_string: &str,
     direction: RedirectDirection,
@@ -222,7 +232,7 @@ pub(crate) fn decode(
     let saml_b64 = pct_decode(saml_pct)?;
     let deflated = BASE64
         .decode(saml_b64.as_bytes())
-        .map_err(|_| Error::Base64Decode)?;
+        .map_err(|_err| Error::Base64Decode)?;
     let xml = inflate_capped(&deflated)?;
 
     let relay_state = relay_state_raw.map(pct_decode).transpose()?;
@@ -233,7 +243,7 @@ pub(crate) fn decode(
             let sig_b64 = pct_decode(sig_pct)?;
             let bytes = BASE64
                 .decode(sig_b64.as_bytes())
-                .map_err(|_| Error::Base64Decode)?;
+                .map_err(|_err| Error::Base64Decode)?;
             Some(bytes)
         }
         None => None,
@@ -243,7 +253,7 @@ pub(crate) fn decode(
     // preserve the exact bytes sent for SAMLRequest/SAMLResponse, RelayState,
     // and SigAlg in the spec-mandated order, omitting the Signature pair.
     let signed_query_string = if has_signature_pair {
-        let mut qs = format!("{}={}", param_name, saml_pct);
+        let mut qs = format!("{param_name}={saml_pct}");
         if let Some(rs) = relay_state_raw {
             qs.push_str("&RelayState=");
             qs.push_str(rs);
@@ -272,11 +282,12 @@ pub(crate) fn decode(
 /// UTF-8 decode failures surface as `Error::Base64Decode` (we don't have a
 /// distinct percent-decode error variant, and the caller's next step on these
 /// values is always a base64 decode anyway).
+#[cfg(any(test, feature = "slo"))]
 fn pct_decode(value: &str) -> Result<String, Error> {
     percent_decode_str(value)
         .decode_utf8()
-        .map(|cow| cow.into_owned())
-        .map_err(|_| Error::Base64Decode)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_err| Error::Base64Decode)
 }
 
 /// DEFLATE-compress `xml` (raw deflate, no zlib header) and base64-encode.
@@ -292,15 +303,18 @@ fn deflate_and_base64(xml: &[u8]) -> Result<String, Error> {
 }
 
 /// DEFLATE-decompress, capping the output at `MAX_INFLATED_BYTES`.
+#[cfg(any(test, feature = "slo"))]
 fn inflate_capped(deflated: &[u8]) -> Result<Vec<u8>, Error> {
     let mut decoder = DeflateDecoder::new(deflated);
     // Cap at MAX_INFLATED_BYTES + 1 so we can detect over-limit reads.
     let mut buf = Vec::new();
-    let limit = MAX_INFLATED_BYTES as u64 + 1;
+    let limit = (MAX_INFLATED_BYTES as u64)
+        .checked_add(1)
+        .ok_or(Error::Inflate)?;
     let mut limited = (&mut decoder).take(limit);
     limited
         .read_to_end(&mut buf)
-        .map_err(|_| Error::Inflate)?;
+        .map_err(|_err| Error::Inflate)?;
     if buf.len() > MAX_INFLATED_BYTES {
         return Err(Error::Inflate);
     }
@@ -324,7 +338,7 @@ fn append_query(base: &Url, query: &str) -> Result<Url, Error> {
         s.push('?');
     }
     s.push_str(query);
-    Url::parse(&s).map_err(|_| Error::InvalidConfiguration {
+    Url::parse(&s).map_err(|_err| Error::InvalidConfiguration {
         reason: "destination URL is not a valid base URL",
     })
 }
@@ -343,7 +357,7 @@ mod tests {
     fn extract_query(d: &Dispatch) -> String {
         match d {
             Dispatch::Redirect(url) => url.query().expect("redirect has query").to_string(),
-            _ => panic!("expected Redirect"),
+            Dispatch::Post(_) => panic!("expected Redirect"),
         }
     }
 
@@ -587,9 +601,8 @@ mod tests {
         let base = Url::parse("https://idp.example.com/sso?tenant=foo").unwrap();
         let xml = b"<x/>";
         let dispatch = encode_unsigned(&base, RedirectDirection::Request, xml, None).unwrap();
-        let url = match dispatch {
-            Dispatch::Redirect(u) => u,
-            _ => panic!("expected Redirect"),
+        let Dispatch::Redirect(url) = dispatch else {
+            panic!("expected Redirect");
         };
         let q = url.query().unwrap();
         assert!(q.starts_with("tenant=foo&SAMLRequest="), "got {q}");

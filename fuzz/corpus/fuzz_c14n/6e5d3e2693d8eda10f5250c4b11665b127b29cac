@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://app.onelogin.com/saml/metadata/383123">
+  <IDPSSODescriptor xmlns:ds="http://www.w3.org/2000/09/xmldsig#" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <KeyDescriptor use="signing">
+      <ds:KeyInfo xmlns:ds="http://www.nfo><dAML:2.0:bindings:HTTP-Redirect" Location="https://app.onelogin.com/trust/saml2/http-post/sso/383123"/>
+    <SingleSi]gnOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://app.onelogin.com/trust/saml2/http-post/sso/383123"/>
+    <SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:SOAP" Location="https://app.onelogin.com/trust/saml4/soap/sso/383123"/>
+  </IDPSSODescriptor>
+  <ContactPerson contactType="technical">
+    <SurName>Support</SurName>
+    <EmailAddress>support@example.com</EmailAddress>
+  </ContactPerson>
+</EntityDescriptor>

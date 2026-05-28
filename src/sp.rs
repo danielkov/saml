@@ -28,7 +28,7 @@ use crate::descriptor::IdpDescriptor;
 use crate::dsig::algorithms::{
     C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
 };
-use crate::dsig::sign::{sign_detached_query, sign_element};
+use crate::dsig::sign::{SignOptions, sign_detached_query, sign_element};
 #[cfg(feature = "slo")]
 use crate::dsig::verify::{verify_detached_signature, verify_signature};
 use crate::error::Error;
@@ -48,12 +48,13 @@ use crate::logout::response_build::{
 use crate::logout::response_parse::parse_logout_response;
 #[cfg(feature = "slo")]
 use crate::logout::{
-    LogoutDispatch, LogoutOutcome, LogoutStatus, LogoutTracker, ParsedLogoutRequest,
-    StartLogout,
+    ConsumeLogoutRequest, ConsumeLogoutResponse, LogoutDispatch, LogoutOutcome, LogoutStatus,
+    LogoutTracker, ParsedLogoutRequest, StartLogout,
 };
 use crate::metadata::MetadataExtras;
 use crate::metadata::emit_sp::{SpMetadataInputs, emit_sp_metadata};
 use crate::nameid::NameIdFormat;
+use crate::replay::ReplayCache;
 use crate::response::Identity;
 use crate::response::parse::parse_response;
 use crate::response::validate::{ValidateResponse, validate_response};
@@ -66,6 +67,39 @@ use crate::xmlenc::algorithms::DataEncryptionAlgorithm;
 // =============================================================================
 // Configuration + role struct
 // =============================================================================
+
+/// Which SP-side inbound signature requirements apply to a `<samlp:Response>`.
+/// Grouped into a struct so [`ServiceProviderConfig`] stays under the default
+/// `struct_excessive_bools` threshold; this mirrors the SAML 2.0 distinction
+/// between Response-level and Assertion-level signatures (Core §5).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpWantSigned {
+    /// If true, reject Response unless the Response element itself is signed.
+    /// If false, accept Response-level OR Assertion-level signature.
+    pub response: bool,
+    /// If true, reject Response unless every Assertion is signed.
+    pub assertions: bool,
+}
+
+/// SP-side outbound logout signing flags (RFC-007 §5).
+#[cfg(feature = "slo")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpLogoutSigning {
+    /// If true, outbound LogoutRequest is signed.
+    pub sign_requests: bool,
+    /// If true, outbound LogoutResponse is signed.
+    pub sign_responses: bool,
+}
+
+/// SP-side inbound logout signature requirements (RFC-007 §5).
+#[cfg(feature = "slo")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpLogoutWantSigned {
+    /// If true, reject inbound LogoutRequest unless it carries a valid signature.
+    pub requests: bool,
+    /// If true, reject inbound LogoutResponse unless it carries a valid signature.
+    pub responses: bool,
+}
 
 /// SP-side configuration. See RFC-003 §1.
 #[derive(Debug, Clone)]
@@ -81,33 +115,24 @@ pub struct ServiceProviderConfig {
     /// Accepted NameID formats, advertised in metadata.
     pub name_id_formats: Vec<NameIdFormat>,
     /// Signing key. Required when any of `sign_authn_requests`,
-    /// `sign_logout_requests`, `sign_logout_responses` is true (or when
-    /// signed metadata is emitted).
+    /// `logout_signing.sign_requests`, `logout_signing.sign_responses` is true
+    /// (or when signed metadata is emitted).
     pub signing_key: Option<KeyPair>,
     /// Decryption key. Required when the SP advertises an encryption cert in
     /// metadata and may receive `<saml:EncryptedAssertion>`.
     pub decryption_key: Option<KeyPair>,
     /// If true, outbound AuthnRequest is signed.
     pub sign_authn_requests: bool,
-    /// If true, reject Response unless the Response element itself is signed.
-    /// If false, accept Response-level OR Assertion-level signature.
-    pub want_response_signed: bool,
-    /// If true, reject Response unless every Assertion is signed.
-    pub want_assertions_signed: bool,
+    /// Inbound Response signature requirements.
+    pub want_signed: SpWantSigned,
     /// If true, allow IdP-initiated (unsolicited) Responses.
     pub allow_unsolicited: bool,
-    /// If true, outbound LogoutRequest is signed.
+    /// Outbound logout signing flags (RFC-007 §5).
     #[cfg(feature = "slo")]
-    pub sign_logout_requests: bool,
-    /// If true, outbound LogoutResponse is signed.
+    pub logout_signing: SpLogoutSigning,
+    /// Inbound logout signature requirements (RFC-007 §5).
     #[cfg(feature = "slo")]
-    pub sign_logout_responses: bool,
-    /// If true, reject inbound LogoutRequest unless it carries a valid signature.
-    #[cfg(feature = "slo")]
-    pub want_logout_requests_signed: bool,
-    /// If true, reject inbound LogoutResponse unless it carries a valid signature.
-    #[cfg(feature = "slo")]
-    pub want_logout_responses_signed: bool,
+    pub logout_want_signed: SpLogoutWantSigned,
     /// Default inbound crypto policy when a consume call does not provide a
     /// peer-specific override.
     pub default_peer_crypto_policy: PeerCryptoPolicy,
@@ -125,9 +150,17 @@ pub struct ServiceProvider {
 impl ServiceProvider {
     /// Validate the supplied configuration and construct an SP. See RFC-003 §1.
     pub fn new(config: ServiceProviderConfig) -> Result<Self, Error> {
-        if url::Url::parse(&config.entity_id).is_err() {
+        // SAML 2.0 Core §8.3.6: entityID has type xs:anyURI; URL shape is
+        // RECOMMENDED but not REQUIRED. Real-world IdPs (and the broader
+        // SAML toolkit ecosystem — ruby-saml, python3-saml, etc.) emit and
+        // accept bare identifiers like "example.com" or "saml-sp". Reject
+        // only the cases that would actually break downstream Issuer /
+        // Audience comparison: empty or whitespace-bearing.
+        if config.entity_id.is_empty()
+            || config.entity_id.chars().any(char::is_whitespace)
+        {
             return Err(Error::InvalidConfiguration {
-                reason: "entity_id must be a valid URI",
+                reason: "entity_id must be a non-empty, whitespace-free xs:anyURI",
             });
         }
         if config.acs.is_empty() {
@@ -139,7 +172,7 @@ impl ServiceProvider {
             || {
                 #[cfg(feature = "slo")]
                 {
-                    config.sign_logout_requests || config.sign_logout_responses
+                    config.logout_signing.sign_requests || config.logout_signing.sign_responses
                 }
                 #[cfg(not(feature = "slo"))]
                 {
@@ -220,7 +253,7 @@ impl ServiceProvider {
             .ok_or(Error::UnsupportedByPeer {
                 binding: opts.binding,
             })?;
-        let destination_url = url::Url::parse(&sso_endpoint.url).map_err(|_| {
+        let destination_url = url::Url::parse(&sso_endpoint.url).map_err(|_err| {
             Error::InvalidConfiguration {
                 reason: "IdP SSO endpoint URL is not a valid URL",
             }
@@ -260,8 +293,11 @@ impl ServiceProvider {
                 .acs
                 .iter()
                 .find(|e| e.is_default)
+                .or_else(|| self.config.acs.first())
                 .cloned()
-                .unwrap_or_else(|| self.config.acs[0].clone()),
+                .ok_or(Error::InvalidConfiguration {
+                    reason: "no ACS endpoint configured (config validated empty list)",
+                })?,
         };
 
         // 4. Resolve and validate the requested Response binding.
@@ -362,6 +398,39 @@ pub struct ConsumeResponse<'a> {
     pub expected_destination: &'a str,
     pub now: SystemTime,
     pub clock_skew: Duration,
+    /// Optional anti-replay cache, consulted after signature verification
+    /// and all spec checks succeed. When `Some(cache)`, the recovered
+    /// `assertion_id` is offered to `cache.check_and_insert(...)`; a
+    /// duplicate within the validity window surfaces as
+    /// [`Error::AssertionReplay`]. When `None`, no replay check runs
+    /// — caller code is responsible for deduping `Identity::assertion_id`
+    /// against its own store, or for accepting the residual replay risk.
+    pub replay_cache: Option<&'a dyn ReplayCache>,
+}
+
+/// Inputs for [`ServiceProvider::consume_response_artifact`]. The artifact
+/// value (`SAMLart` query parameter) is resolved against the IdP's
+/// `ArtifactResolutionService` over SOAP via the caller-supplied
+/// [`crate::http::HttpClient`]. The recovered `<samlp:Response>` is then
+/// validated exactly as in [`ServiceProvider::consume_response`].
+///
+/// See SAML 2.0 Bindings §3.6.
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+pub struct ConsumeArtifactResponse<'a> {
+    pub idp: &'a crate::descriptor::IdpDescriptor,
+    pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// The `SAMLart` value received at the SP's ACS, already URL-decoded.
+    pub artifact: &'a str,
+    pub relay_state: Option<&'a str>,
+    pub tracker: Option<&'a LoginTracker>,
+    /// SP ACS URL that received the artifact.
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+    /// Optional anti-replay cache, threaded into the inner
+    /// [`ConsumeResponse`] after artifact resolution. See
+    /// [`ConsumeResponse::replay_cache`] for semantics.
+    pub replay_cache: Option<&'a dyn ReplayCache>,
 }
 
 impl ServiceProvider {
@@ -397,6 +466,7 @@ impl ServiceProvider {
             .unwrap_or(&self.config.default_peer_crypto_policy);
 
         // Thread the SP decryption key (if any) into a single-element slice.
+        #[cfg(feature = "xmlenc")]
         let decryption_keys_owned: Vec<&KeyPair> = self
             .config
             .decryption_key
@@ -404,23 +474,84 @@ impl ServiceProvider {
             .map(|k| vec![k])
             .unwrap_or_default();
 
-        validate_response(ValidateResponse {
+        let identity = validate_response(ValidateResponse {
             document: &document,
             parsed,
             idp: input.idp,
             peer_crypto_policy: policy,
+            #[cfg(feature = "xmlenc")]
             decryption_keys: &decryption_keys_owned,
             sp_entity_id: &self.config.entity_id,
             expected_destination: input.expected_destination,
             tracker_request_id: input.tracker.map(|t| t.request_id.as_str()),
             allow_unsolicited: self.config.allow_unsolicited,
-            want_response_signed: self.config.want_response_signed,
-            want_assertions_signed: self.config.want_assertions_signed,
+            want_response_signed: self.config.want_signed.response,
+            want_assertions_signed: self.config.want_signed.assertions,
             now: input.now,
             clock_skew: input.clock_skew,
             requested_authn_context: input
                 .tracker
                 .and_then(|t| t.requested_authn_context.as_ref()),
+        })?;
+
+        // Replay-cache check, AFTER signature + all spec checks succeed.
+        // We never offer an `assertion_id` to the cache until the
+        // assertion is structurally valid and signed by a trusted cert
+        // — otherwise an attacker could pollute the cache with garbage
+        // ids by hammering the ACS. The cache is updated only on the
+        // success path, so a rejected Response leaves no trace.
+        //
+        // SAML 2.0 Core §2.5.1.5 (OneTimeUse): we apply this check to
+        // *every* assertion, not just OneTimeUse-marked ones, because
+        // safer-default. `Identity::is_one_time_use` is still surfaced
+        // for callers who need to distinguish the cases.
+        if let Some(cache) = input.replay_cache {
+            let fresh = cache.check_and_insert(&identity.assertion_id, identity.not_on_or_after)?;
+            if !fresh {
+                return Err(Error::AssertionReplay);
+            }
+        }
+
+        Ok(identity)
+    }
+
+    /// Resolve an inbound `?SAMLart=<artifact>` against the IdP's
+    /// `ArtifactResolutionService` via SOAP, then validate the recovered
+    /// `<samlp:Response>` exactly as [`ServiceProvider::consume_response`].
+    ///
+    /// Returns the validated [`Identity`].
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub async fn consume_response_artifact<H: crate::http::HttpClient>(
+        &self,
+        http: &H,
+        input: ConsumeArtifactResponse<'_>,
+    ) -> Result<Identity, Error> {
+        let ars = input
+            .idp
+            .artifact_resolution_endpoint()
+            .ok_or(Error::UnsupportedByPeer {
+                binding: Binding::HttpArtifact,
+            })?;
+
+        let inner_xml = crate::binding::artifact::resolve_artifact(
+            http,
+            ars.url.as_str(),
+            &self.config.entity_id,
+            input.artifact,
+        )
+        .await?;
+
+        self.consume_response(ConsumeResponse {
+            idp: input.idp,
+            peer_crypto_policy: input.peer_crypto_policy,
+            saml_response: &inner_xml,
+            binding: SsoResponseBinding::HttpArtifact,
+            relay_state: input.relay_state,
+            tracker: input.tracker,
+            expected_destination: input.expected_destination,
+            now: input.now,
+            clock_skew: input.clock_skew,
+            replay_cache: input.replay_cache,
         })
     }
 }
@@ -442,7 +573,7 @@ impl ServiceProvider {
             .ok_or(Error::UnsupportedByPeer {
                 binding: opts.binding,
             })?;
-        let destination_url = url::Url::parse(&slo_endpoint.url).map_err(|_| {
+        let destination_url = url::Url::parse(&slo_endpoint.url).map_err(|_err| {
             Error::InvalidConfiguration {
                 reason: "IdP SLO endpoint URL is not a valid URL",
             }
@@ -465,7 +596,7 @@ impl ServiceProvider {
 
         let dispatch = match opts.binding {
             Binding::HttpRedirect => {
-                if self.config.sign_logout_requests {
+                if self.config.logout_signing.sign_requests {
                     let signing_key = self.signing_key()?;
                     let sig_alg = self.config.outbound_signature_algorithm;
                     redirect_encode_signed(
@@ -486,7 +617,7 @@ impl ServiceProvider {
                 }
             }
             Binding::HttpPost => {
-                let xml_to_post = if self.config.sign_logout_requests {
+                let xml_to_post = if self.config.logout_signing.sign_requests {
                     self.sign_protocol_xml(&unsigned_xml)?
                 } else {
                     unsigned_xml
@@ -522,14 +653,17 @@ impl ServiceProvider {
     pub fn consume_logout_response(
         &self,
         idp: &IdpDescriptor,
-        peer_crypto_policy: Option<&PeerCryptoPolicy>,
-        body: &[u8],
-        binding: Binding,
-        tracker: &LogoutTracker,
-        expected_destination: &str,
-        now: SystemTime,
-        clock_skew: Duration,
+        input: ConsumeLogoutResponse<'_>,
     ) -> Result<LogoutOutcome, Error> {
+        let ConsumeLogoutResponse {
+            peer_crypto_policy,
+            body,
+            binding,
+            tracker,
+            expected_destination,
+            now,
+            clock_skew,
+        } = input;
         // 1. Decode the binding wire format.
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
         let decoded = decode_logout_wire(body, binding, /* is_request */ false)?;
@@ -566,7 +700,7 @@ impl ServiceProvider {
             binding,
             &idp.signing_certs,
             &policy.allowed_signature_algorithms,
-            self.config.want_logout_responses_signed,
+            self.config.logout_want_signed.responses,
         )?;
 
         // 7. InResponseTo match.
@@ -591,19 +725,22 @@ impl ServiceProvider {
     pub fn consume_logout_request(
         &self,
         idp: &IdpDescriptor,
-        peer_crypto_policy: Option<&PeerCryptoPolicy>,
-        body: &[u8],
-        binding: Binding,
-        expected_destination: &str,
-        now: SystemTime,
-        clock_skew: Duration,
+        input: ConsumeLogoutRequest<'_>,
     ) -> Result<ParsedLogoutRequest, Error> {
+        let ConsumeLogoutRequest {
+            peer_crypto_policy,
+            body,
+            binding,
+            expected_destination,
+            now,
+            clock_skew,
+        } = input;
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
         let decoded = decode_logout_wire(body, binding, /* is_request */ true)?;
 
         let document = Document::parse(&decoded.xml)?;
         let (mut parsed, _) = parse_logout_request(&document)?;
-        parsed.relay_state = decoded.relay_state.clone();
+        parsed.relay_state.clone_from(&decoded.relay_state);
 
         // Destination registration check.
         if !self.config.slo.iter().any(|e| e.url == expected_destination) {
@@ -632,12 +769,12 @@ impl ServiceProvider {
             binding,
             &idp.signing_certs,
             &policy.allowed_signature_algorithms,
-            self.config.want_logout_requests_signed,
+            self.config.logout_want_signed.requests,
         )?;
 
         // NotOnOrAfter expiry (if present).
         if let Some(nooa) = parsed.not_on_or_after
-            && nooa <= now - clock_skew
+            && nooa <= now.checked_sub(clock_skew).unwrap_or(now)
         {
             return Err(Error::Expired);
         }
@@ -658,7 +795,7 @@ impl ServiceProvider {
         let slo_endpoint = idp
             .slo_endpoint(binding)
             .ok_or(Error::UnsupportedByPeer { binding })?;
-        let destination_url = url::Url::parse(&slo_endpoint.url).map_err(|_| {
+        let destination_url = url::Url::parse(&slo_endpoint.url).map_err(|_err| {
             Error::InvalidConfiguration {
                 reason: "IdP SLO endpoint URL is not a valid URL",
             }
@@ -680,7 +817,7 @@ impl ServiceProvider {
 
         let dispatch = match binding {
             Binding::HttpRedirect => {
-                if self.config.sign_logout_responses {
+                if self.config.logout_signing.sign_responses {
                     let signing_key = self.signing_key()?;
                     let sig_alg = self.config.outbound_signature_algorithm;
                     redirect_encode_signed(
@@ -701,7 +838,7 @@ impl ServiceProvider {
                 }
             }
             Binding::HttpPost => {
-                let xml_to_post = if self.config.sign_logout_responses {
+                let xml_to_post = if self.config.logout_signing.sign_responses {
                     self.sign_protocol_xml(&unsigned_xml)?
                 } else {
                     unsigned_xml
@@ -747,21 +884,20 @@ impl ServiceProvider {
             session_index: opts.session_index,
         };
         let unsigned_xml = build_logout_request_xml(&build)?;
-        let logout_request_xml = if self.config.sign_logout_requests {
+        let logout_request_xml = if self.config.logout_signing.sign_requests {
             self.sign_protocol_xml(&unsigned_xml)?
         } else {
             unsigned_xml
         };
 
         // Wrap in a SOAP envelope.
-        let logout_request_str = std::str::from_utf8(&logout_request_xml).map_err(|_| {
+        let logout_request_str = std::str::from_utf8(&logout_request_xml).map_err(|_err| {
             Error::XmlEmit("logout request XML is not UTF-8".to_string())
         })?;
         let soap_envelope = format!(
             "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
-<soap:Body>{}</soap:Body>\
-</soap:Envelope>",
-            logout_request_str
+<soap:Body>{logout_request_str}</soap:Body>\
+</soap:Envelope>"
         );
 
         // Dispatch via the caller's HttpClient.
@@ -808,7 +944,7 @@ impl ServiceProvider {
         }
 
         // Signature gate (SOAP path uses embedded XML-DSig).
-        if self.config.want_logout_responses_signed {
+        if self.config.logout_want_signed.responses {
             let sig = inner_doc
                 .root()
                 .child_element(
@@ -902,7 +1038,7 @@ impl ServiceProvider {
             #[cfg(feature = "xmlenc")]
             encryption_algorithms,
             authn_requests_signed: self.config.sign_authn_requests,
-            want_assertions_signed: self.config.want_assertions_signed,
+            want_assertions_signed: self.config.want_signed.assertions,
             valid_until: None,
             cache_duration: None,
             extras,
@@ -949,12 +1085,14 @@ impl ServiceProvider {
         let signed_root = sign_element(
             doc.root().clone(),
             &doc,
-            key,
-            self.config.outbound_signature_algorithm,
-            self.config.outbound_digest_algorithm,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            true,
+            SignOptions {
+                signing_key: key,
+                sig_alg: self.config.outbound_signature_algorithm,
+                digest_alg: self.config.outbound_digest_algorithm,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )?;
         let signed_doc = Document::new(signed_root)?;
         Ok(emit_document(&signed_doc)?.into_bytes())
@@ -964,25 +1102,26 @@ impl ServiceProvider {
 /// `_<hex16>` SAML message ID. XML Schema `xs:ID` forbids leading digits, so
 /// the leading `_` is mandatory by convention.
 fn generate_saml_id() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(1 + bytes.len() * 2);
+    // 1 ('_') + 2 hex chars per byte: bounded constant, no overflow possible
+    // for the fixed-size `bytes` array.
+    let capacity = 1usize.saturating_add(bytes.len().saturating_mul(2));
+    let mut out = String::with_capacity(capacity);
     out.push('_');
     for b in bytes {
-        let hi = b >> 4;
-        let lo = b & 0x0f;
-        out.push(hex_nibble(hi));
-        out.push(hex_nibble(lo));
+        let hi = usize::from(b >> 4);
+        let lo = usize::from(b & 0x0f);
+        // `hi` and `lo` are constrained to 0..16 by masking; both indices are
+        // guaranteed in-bounds for the 16-byte HEX table. Use `.get()` to
+        // avoid `indexing_slicing`.
+        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
+            out.push(h as char);
+            out.push(l as char);
+        }
     }
     out
-}
-
-fn hex_nibble(n: u8) -> char {
-    match n {
-        0..=9 => (b'0' + n) as char,
-        10..=15 => (b'a' + n - 10) as char,
-        _ => unreachable!(),
-    }
 }
 
 /// Output of the SLO wire-format decoder. Holds the decoded XML alongside any
@@ -1014,7 +1153,7 @@ fn decode_logout_wire(
     match binding {
         Binding::HttpRedirect => {
             // `body` is the raw query string bytes (everything after `?`).
-            let qs = std::str::from_utf8(body).map_err(|_| Error::Base64Decode)?;
+            let qs = std::str::from_utf8(body).map_err(|_err| Error::Base64Decode)?;
             let direction = if is_request {
                 RedirectDirection::Request
             } else {
@@ -1033,7 +1172,7 @@ fn decode_logout_wire(
             // `body` is the base64-encoded form value (after form-URL decoding
             // by the caller). The form layer passes us the value of
             // `SAMLRequest` / `SAMLResponse` directly.
-            let b64 = std::str::from_utf8(body).map_err(|_| Error::Base64Decode)?;
+            let b64 = std::str::from_utf8(body).map_err(|_err| Error::Base64Decode)?;
             let decoded = post_decode(b64, None)?;
             Ok(DecodedSlo {
                 xml: decoded.xml,
@@ -1148,7 +1287,9 @@ mod tests {
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
     use crate::dsig::sign::sign_element;
-    use crate::nameid::{NameId, NameIdFormat};
+    #[cfg(feature = "slo")]
+    use crate::nameid::NameId;
+    use crate::nameid::NameIdFormat;
     use crate::response::SAMLP_NS as RESPONSE_SAMLP_NS;
     use crate::response::SAML_NS as RESPONSE_SAML_NS;
     use crate::response::parse::SUBJECT_CONFIRMATION_BEARER as RESPONSE_SUBJECT_CONFIRMATION_BEARER;
@@ -1205,17 +1346,15 @@ mod tests {
             signing_key,
             decryption_key: None,
             sign_authn_requests,
-            want_response_signed: false,
-            want_assertions_signed: true,
+            want_signed: SpWantSigned {
+                response: false,
+                assertions: true,
+            },
             allow_unsolicited,
             #[cfg(feature = "slo")]
-            sign_logout_requests: false,
+            logout_signing: SpLogoutSigning::default(),
             #[cfg(feature = "slo")]
-            sign_logout_responses: false,
-            #[cfg(feature = "slo")]
-            want_logout_requests_signed: false,
-            #[cfg(feature = "slo")]
-            want_logout_responses_signed: false,
+            logout_want_signed: SpLogoutWantSigned::default(),
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -1225,11 +1364,29 @@ mod tests {
     // ---------- new / validation ----------
 
     #[test]
-    fn rejects_invalid_entity_id() {
+    fn rejects_empty_entity_id() {
         let mut cfg = fixture_sp_config(None, false, false);
-        cfg.entity_id = "not-a-uri".to_owned();
+        cfg.entity_id = String::new();
         let err = ServiceProvider::new(cfg).unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn rejects_whitespace_entity_id() {
+        let mut cfg = fixture_sp_config(None, false, false);
+        cfg.entity_id = "has space".to_owned();
+        let err = ServiceProvider::new(cfg).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn accepts_bare_xs_anyuri_entity_id() {
+        // SAML 2.0 §8.3.6: entityID is xs:anyURI; URL shape is RECOMMENDED
+        // but not REQUIRED. Real-world IdPs emit bare identifiers like
+        // "example.com" — those must be accepted.
+        let mut cfg = fixture_sp_config(None, false, false);
+        cfg.entity_id = "example.com".to_owned();
+        ServiceProvider::new(cfg).expect("bare anyURI accepted");
     }
 
     #[test]
@@ -1256,12 +1413,12 @@ mod tests {
     #[test]
     fn rejects_sign_logout_without_key() {
         let mut cfg = fixture_sp_config(None, false, false);
-        cfg.sign_logout_requests = true;
+        cfg.logout_signing.sign_requests = true;
         let err = ServiceProvider::new(cfg).unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
 
         let mut cfg = fixture_sp_config(None, false, false);
-        cfg.sign_logout_responses = true;
+        cfg.logout_signing.sign_responses = true;
         let err = ServiceProvider::new(cfg).unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
@@ -1317,7 +1474,7 @@ mod tests {
                 assert!(q.contains("SAMLRequest="), "query: {q}");
                 assert!(q.contains("RelayState=opaque-rs"), "query: {q}");
             }
-            other => panic!("expected Redirect, got {other:?}"),
+            other @ Dispatch::Post(_) => panic!("expected Redirect, got {other:?}"),
         }
     }
 
@@ -1351,7 +1508,7 @@ mod tests {
                 assert!(q.contains("SigAlg="), "missing SigAlg: {q}");
                 assert!(q.contains("Signature="), "missing Signature: {q}");
             }
-            other => panic!("expected Redirect, got {other:?}"),
+            other @ Dispatch::Post(_) => panic!("expected Redirect, got {other:?}"),
         }
     }
 
@@ -1390,7 +1547,7 @@ mod tests {
                 assert!(saml_response.is_none());
                 assert_eq!(relay_state.as_deref(), Some("rs"));
             }
-            other => panic!("expected Post, got {other:?}"),
+            other @ Dispatch::Redirect(_) => panic!("expected Post, got {other:?}"),
         }
     }
 
@@ -1670,12 +1827,14 @@ mod tests {
         let signed_assertion = sign_element(
             assertion_doc.root().clone(),
             &assertion_doc,
-            kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            true,
+            SignOptions {
+                signing_key: kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )
         .unwrap();
 
@@ -1715,7 +1874,9 @@ mod tests {
 
     fn fixed_now() -> SystemTime {
         // 2026-05-26T12:00:30Z
-        UNIX_EPOCH + Duration::from_secs(1_779_796_830)
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_779_796_830))
+            .expect("static UNIX_EPOCH + bounded Duration cannot overflow")
     }
 
     #[test]
@@ -1755,6 +1916,7 @@ mod tests {
                 expected_destination: "https://sp.example.com/acs",
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
+                replay_cache: None,
             })
             .expect("consume_response");
 
@@ -1792,6 +1954,7 @@ mod tests {
                 expected_destination: "https://sp.example.com/acs",
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
+                replay_cache: None,
             })
             .expect("consume_response (unsolicited)");
         assert_eq!(identity.assertion_id, "_a1");
@@ -1834,6 +1997,7 @@ mod tests {
                 expected_destination: "https://sp.example.com/acs",
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
+                replay_cache: None,
             })
             .unwrap_err();
         assert!(matches!(err, Error::InResponseToMismatch));
@@ -1875,9 +2039,99 @@ mod tests {
                 expected_destination: "https://other.example.com/acs",
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
+                replay_cache: None,
             })
             .unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    // ---------- replay cache ----------
+
+    /// End-to-end: a successful `consume_response` followed by a second
+    /// call with the exact same Response (same `assertion_id`) MUST be
+    /// rejected with `Error::AssertionReplay`. The first call also
+    /// populates the cache, so the assertion is the only thing in
+    /// `cache.len()` afterward.
+    ///
+    /// Caveat: `InMemoryReplayCache` sweeps entries whose `expires_at`
+    /// is in the past against the *real* wall clock (`SystemTime::now()`),
+    /// not the test's `now` argument. The synthetic Response fixture
+    /// uses the year 2026 — so this test only behaves correctly while
+    /// the wall clock is still before the `NotOnOrAfter` in the
+    /// fixture. We exercise the cache directly with a far-future
+    /// expiry as a precondition, then the e2e path with the real
+    /// fixture; together they exercise both the cache and the
+    /// `consume_response`-side wiring.
+    #[test]
+    fn consume_response_rejects_replay() {
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        // Set the assertion's NotOnOrAfter ~30 years out so the cache's
+        // wall-clock-based lazy sweep doesn't drop the entry between
+        // the two `consume_response` calls. The fixture's `now` /
+        // `clock_skew` window is still anchored to the fixture's 2026
+        // baseline; that path runs purely against the supplied `now`.
+        let xml = build_signed_response_xml(
+            &kp,
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2099-05-26T12:10:00Z",
+        );
+
+        let cache = crate::replay::InMemoryReplayCache::new(32);
+
+        // First consume succeeds; the assertion id is now in the cache.
+        let identity = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: Some(&cache),
+            })
+            .expect("first consume_response succeeds");
+        assert_eq!(identity.assertion_id, "_a1");
+        assert_eq!(cache.len(), 1, "cache populated by first consume");
+
+        // Second consume with the exact same Response is a replay.
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: Some(&cache),
+            })
+            .expect_err("second consume_response is a replay");
+        assert!(
+            matches!(err, Error::AssertionReplay),
+            "expected Error::AssertionReplay, got {err:?}"
+        );
+        // Cache size unchanged — replay path doesn't double-insert.
+        assert_eq!(cache.len(), 1, "cache size unchanged after replay");
     }
 
     // ---------- SLO ----------
@@ -1912,7 +2166,7 @@ mod tests {
                 assert!(q.contains("SAMLRequest="));
                 assert!(q.contains("RelayState=rs"));
             }
-            other => panic!("expected Redirect, got {other:?}"),
+            other @ Dispatch::Post(_) => panic!("expected Redirect, got {other:?}"),
         }
     }
 
@@ -1981,13 +2235,15 @@ mod tests {
         let outcome = sp
             .consume_logout_response(
                 &idp,
-                None,
-                &body,
-                Binding::HttpPost,
-                &logout_tracker,
-                "https://sp.example.com/slo/post",
-                fixed_now(),
-                Duration::from_secs(30),
+                ConsumeLogoutResponse {
+                    peer_crypto_policy: None,
+                    body: &body,
+                    binding: Binding::HttpPost,
+                    tracker: &logout_tracker,
+                    expected_destination: "https://sp.example.com/slo/post",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_secs(30),
+                },
             )
             .expect("consume_logout_response");
         assert!(matches!(outcome, LogoutOutcome::Success));
@@ -2013,13 +2269,15 @@ mod tests {
         let err = sp
             .consume_logout_response(
                 &idp,
-                None,
-                &body,
-                Binding::HttpPost,
-                &logout_tracker,
-                "https://sp.example.com/slo/post",
-                fixed_now(),
-                Duration::from_secs(30),
+                ConsumeLogoutResponse {
+                    peer_crypto_policy: None,
+                    body: &body,
+                    binding: Binding::HttpPost,
+                    tracker: &logout_tracker,
+                    expected_destination: "https://sp.example.com/slo/post",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_secs(30),
+                },
             )
             .unwrap_err();
         assert!(matches!(err, Error::InResponseToMismatch));
@@ -2057,12 +2315,14 @@ mod tests {
         let parsed = sp
             .consume_logout_request(
                 &idp,
-                None,
-                &body,
-                Binding::HttpPost,
-                "https://sp.example.com/slo/post",
-                fixed_now(),
-                Duration::from_secs(30),
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &body,
+                    binding: Binding::HttpPost,
+                    expected_destination: "https://sp.example.com/slo/post",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_secs(30),
+                },
             )
             .expect("consume_logout_request");
         assert_eq!(parsed.id, "_idp-req-1");
@@ -2083,12 +2343,14 @@ mod tests {
         let err = sp
             .consume_logout_request(
                 &idp,
-                None,
-                &body,
-                Binding::HttpPost,
-                "https://sp.example.com/slo/post",
-                fixed_now(),
-                Duration::from_secs(30),
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &body,
+                    binding: Binding::HttpPost,
+                    expected_destination: "https://sp.example.com/slo/post",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_secs(30),
+                },
             )
             .unwrap_err();
         assert!(matches!(err, Error::IssuerMismatch { .. }));
@@ -2134,7 +2396,7 @@ mod tests {
                 assert_eq!(action.path(), "/slo/post");
                 assert_eq!(relay_state.as_deref(), Some("rs"));
             }
-            other => panic!("expected Post, got {other:?}"),
+            other @ Dispatch::Redirect(_) => panic!("expected Post, got {other:?}"),
         }
     }
 

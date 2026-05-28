@@ -25,12 +25,11 @@
 //!   is consistently declared with the same prefix (the SAML common case).
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 use crate::error::Error;
 
 use super::parse::{
-    Document, Element, ElementId, ElementPath, Node, QName, XML_NS,
+    Attribute, Document, Element, ElementId, ElementPath, Node, QName, XML_NS,
 };
 
 // =============================================================================
@@ -66,18 +65,21 @@ fn renumber(
     paths: &mut Vec<ElementPath>,
     id_index: &mut HashMap<String, ElementId>,
 ) -> Result<(), Error> {
-    let new_id = ElementId(paths.len() as u32);
+    let new_id = ElementId(
+        u32::try_from(paths.len())
+            .map_err(|_err| Error::XmlEmit("element id exceeds u32::MAX".to_string()))?,
+    );
     element.id = new_id;
     paths.push(current_path.clone());
 
-    for (attr_qname, attr_value) in &element.attributes {
-        let is_id_attr = (attr_qname.namespace.is_none() && attr_qname.local == "ID")
-            || (attr_qname.namespace.as_deref() == Some(XML_NS) && attr_qname.local == "id");
+    for attr in &element.attributes {
+        let is_id_attr = (attr.qname.namespace.is_none() && attr.qname.local == "ID")
+            || (attr.qname.namespace.as_deref() == Some(XML_NS) && attr.qname.local == "id");
         if is_id_attr {
-            if id_index.contains_key(attr_value) {
+            if id_index.contains_key(&attr.value) {
                 return Err(Error::XmlParse("duplicate ID".to_string()));
             }
-            id_index.insert(attr_value.clone(), new_id);
+            id_index.insert(attr.value.clone(), new_id);
         }
     }
 
@@ -85,7 +87,9 @@ fn renumber(
     // through so each descendant gets a unique ElementId in DFS pre-order.
     for (child_idx, child) in element.children.iter_mut().enumerate() {
         if let Node::Element(child_elem) = child {
-            current_path.push(child_idx as u32);
+            let idx = u32::try_from(child_idx)
+                .map_err(|_err| Error::XmlEmit("child index exceeds u32::MAX".to_string()))?;
+            current_path.push(idx);
             renumber(child_elem, current_path, paths, id_index)?;
             current_path.pop();
         }
@@ -113,13 +117,20 @@ impl Element {
 pub(crate) struct ElementBuilder {
     qname: QName,
     namespaces: Vec<(Option<String>, String)>,
-    attributes: Vec<(QName, String)>,
+    attributes: Vec<Attribute>,
     children: Vec<Node>,
 }
 
 impl ElementBuilder {
+    /// Add an attribute with no recorded source prefix. Programmatic emission
+    /// has no signer-original prefix to preserve, so c14n falls back to
+    /// whichever in-scope binding resolves the URI.
     pub(crate) fn with_attribute(mut self, name: QName, value: impl Into<String>) -> Self {
-        self.attributes.push((name, value.into()));
+        self.attributes.push(Attribute {
+            qname: name,
+            source_prefix: None,
+            value: value.into(),
+        });
         self
     }
 
@@ -145,6 +156,7 @@ impl ElementBuilder {
     pub(crate) fn finish(self) -> Element {
         Element {
             qname: self.qname,
+            source_prefix: None,
             namespaces_declared_here: self.namespaces,
             attributes: self.attributes,
             children: self.children,
@@ -203,13 +215,14 @@ fn emit_element_inner(
     }
 
     // Attributes, in recorded order.
-    for (name, value) in &element.attributes {
+    for attr in &element.attributes {
         out.push(' ');
         let attr_prefix: Option<String> =
-            resolve_prefix_for_attribute(name.namespace.as_deref(), ns_stack)?.map(str::to_owned);
-        write_qualified_name(out, attr_prefix.as_deref(), &name.local);
+            resolve_prefix_for_attribute(attr.qname.namespace.as_deref(), ns_stack)?
+                .map(str::to_owned);
+        write_qualified_name(out, attr_prefix.as_deref(), &attr.qname.local);
         out.push_str("=\"");
-        push_attr_escaped(out, value);
+        push_attr_escaped(out, &attr.value);
         out.push('"');
     }
 
@@ -253,10 +266,9 @@ fn resolve_prefix_for_emit<'a>(
     uri: Option<&str>,
     ns_stack: &'a [Vec<(Option<String>, String)>],
 ) -> Result<Option<&'a str>, Error> {
-    if uri.is_none() {
+    let Some(uri) = uri else {
         return Ok(None);
-    }
-    let uri = uri.unwrap();
+    };
     if uri == XML_NS {
         return Ok(Some("xml"));
     }
@@ -280,10 +292,9 @@ fn resolve_prefix_for_attribute<'a>(
     uri: Option<&str>,
     ns_stack: &'a [Vec<(Option<String>, String)>],
 ) -> Result<Option<&'a str>, Error> {
-    if uri.is_none() {
+    let Some(uri) = uri else {
         return Ok(None);
-    }
-    let uri = uri.unwrap();
+    };
     if uri == XML_NS {
         return Ok(Some("xml"));
     }
@@ -333,15 +344,9 @@ fn push_attr_escaped(out: &mut String, value: &str) {
             '"' => out.push_str("&quot;"),
             // Tab, newline, carriage return inside attribute values are
             // normalized to space on re-parse unless escaped numerically.
-            '\t' => {
-                let _ = write!(out, "&#9;");
-            }
-            '\n' => {
-                let _ = write!(out, "&#10;");
-            }
-            '\r' => {
-                let _ = write!(out, "&#13;");
-            }
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
             c => out.push(c),
         }
     }
@@ -361,7 +366,7 @@ mod tests {
 
     #[test]
     fn emit_round_trip_simple() {
-        let xml = r#"<root><child>hello</child></root>"#;
+        let xml = r"<root><child>hello</child></root>";
         let doc = parse(xml);
         let out = emit_document(&doc).unwrap();
         // Re-parse and compare structurally.
@@ -408,7 +413,7 @@ mod tests {
 
     #[test]
     fn emit_preserves_comments() {
-        let xml = r#"<root><!-- keep --><x/></root>"#;
+        let xml = r"<root><!-- keep --><x/></root>";
         let doc = parse(xml);
         let out = emit_document(&doc).unwrap();
         assert!(out.contains("<!-- keep -->"));
@@ -486,7 +491,7 @@ mod tests {
         let xml = r#"<root xmlns="urn:n"><a><b>x</b></a></root>"#;
         let doc = parse(xml);
         let a = doc.root().child_element(Some("urn:n"), "a").unwrap();
-        assert!(emit_element(a).is_err());
+        emit_element(a).unwrap_err();
 
         // Emitting the root itself, which carries the declaration, works.
         let out = emit_element(doc.root()).unwrap();

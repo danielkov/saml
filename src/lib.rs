@@ -18,11 +18,12 @@
 //!
 //! ```no_run
 //! use std::time::{Duration, SystemTime};
+//! # #[cfg(feature = "slo")]
 //! use saml::{
 //!     Binding, ConsumeResponse, Dispatch, Endpoint, IdpDescriptor, KeyPair,
 //!     LoginTracker, NameIdFormat, PeerCryptoPolicy, DigestAlgorithm, ServiceProvider,
-//!     ServiceProviderConfig, SignatureAlgorithm, SsoResponseBinding, SsoResponseEndpoint,
-//!     StartLogin,
+//!     ServiceProviderConfig, SignatureAlgorithm, SpLogoutSigning, SpLogoutWantSigned,
+//!     SpWantSigned, SsoResponseBinding, SsoResponseEndpoint, StartLogin,
 //! };
 //!
 //! # #[cfg(feature = "slo")]
@@ -46,13 +47,10 @@
 //!     signing_key: Some(KeyPair::from_pkcs8_pem(sp_priv)?),
 //!     decryption_key: Some(KeyPair::from_pkcs8_pem(sp_enc_priv)?),
 //!     sign_authn_requests: true,
-//!     want_response_signed: false,
-//!     want_assertions_signed: true,
+//!     want_signed: SpWantSigned { response: false, assertions: true },
 //!     allow_unsolicited: false,
-//!     sign_logout_requests: true,
-//!     sign_logout_responses: true,
-//!     want_logout_requests_signed: true,
-//!     want_logout_responses_signed: true,
+//!     logout_signing: SpLogoutSigning { sign_requests: true, sign_responses: true },
+//!     logout_want_signed: SpLogoutWantSigned { requests: true, responses: true },
 //!     default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
 //!     outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
 //!     outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -69,6 +67,7 @@
 //!     requested_name_id_format: None,
 //!     requested_authn_context: None,
 //!     acs_index: None,
+//!     acs_url: None,
 //!     response_binding: None,
 //! })?;
 //! match start.dispatch {
@@ -87,8 +86,10 @@
 //!     expected_destination: "https://app.example.com/saml/acs",
 //!     now: SystemTime::now(),
 //!     clock_skew: Duration::from_secs(60),
+//!     replay_cache: None,
 //! })?;
-//! // Dedupe identity.assertion_id against your replay store.
+//! // Dedupe identity.assertion_id against your replay store, or pass
+//! // `Some(&InMemoryReplayCache::default())` in the field above.
 //! // Create app session keyed off identity.name_id + identity.session_index.
 //! # Ok(())
 //! # }
@@ -102,8 +103,9 @@
 //! use saml::{
 //!     Attribute, AuthnContextClassRef, Binding, C14nAlgorithm, ConsumeAuthnRequest,
 //!     DataEncryptionAlgorithm, DetachedSignature, DigestAlgorithm, Endpoint, IdentityProvider,
-//!     IdentityProviderConfig, IssueResponse, KeyPair, KeyTransportAlgorithm, NameId,
-//!     NameIdFormat, PeerCryptoPolicy, SignatureAlgorithm, SpDescriptor,
+//!     IdentityProviderConfig, IdpAssertionSigning, IdpLogoutSigning, IdpLogoutWantSigned,
+//!     IssueResponse, KeyPair, KeyTransportAlgorithm, NameId, NameIdFormat, PeerCryptoPolicy,
+//!     SignatureAlgorithm, SpDescriptor,
 //! };
 //!
 //! # #[cfg(all(feature = "xmlenc", feature = "slo"))]
@@ -134,13 +136,10 @@
 //!     signing_key: KeyPair::from_pkcs8_pem(idp_priv)?,
 //!     decryption_key: None,
 //!     want_authn_requests_signed: true,
-//!     sign_responses: false,
-//!     sign_assertions: true,
+//!     assertion_signing: IdpAssertionSigning { sign_responses: false, sign_assertions: true },
 //!     encrypt_assertions_when_possible: true,
-//!     sign_logout_requests: true,
-//!     sign_logout_responses: true,
-//!     want_logout_requests_signed: true,
-//!     want_logout_responses_signed: true,
+//!     logout_signing: IdpLogoutSigning { sign_requests: true, sign_responses: true },
+//!     logout_want_signed: IdpLogoutWantSigned { requests: true, responses: true },
 //!     default_session_duration: Duration::from_secs(3600),
 //!     default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
 //!     outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
@@ -259,6 +258,7 @@
 //!     expected_destination: "https://hub.example.com/saml/acs",
 //!     now: SystemTime::now(),
 //!     clock_skew: Duration::from_secs(60),
+//!     replay_cache: None,
 //! })?;
 //!
 //! let _dispatch = proxy.relay_to_downstream(RelayToDownstream {
@@ -298,6 +298,7 @@
 
 pub mod error;
 pub mod http;
+pub mod replay;
 pub mod time;
 
 pub mod attribute;
@@ -318,6 +319,9 @@ pub mod xmlenc;
 pub mod authn;
 pub mod response;
 
+#[cfg(feature = "xsd-validate")]
+pub(crate) mod schema;
+
 #[cfg(feature = "slo")]
 pub mod logout;
 
@@ -329,6 +333,7 @@ pub mod sp;
 
 pub use crate::error::Error;
 pub use crate::http::{HttpClient, HttpRequest, HttpResponse};
+pub use crate::replay::{InMemoryReplayCache, ReplayCache};
 pub use crate::time::{format_xs_datetime, parse_xs_datetime};
 
 pub use crate::attribute::Attribute;
@@ -368,14 +373,24 @@ pub use crate::response::Identity;
 pub use crate::response::issue::SamlStatusCode;
 
 pub use crate::sp::{
-    ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, StartLogin,
-    StartLoginResult,
+    ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
+    StartLogin, StartLoginResult,
 };
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+pub use crate::sp::ConsumeArtifactResponse;
+#[cfg(feature = "slo")]
+pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};
+
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+pub use crate::binding::artifact::ArtifactResolveRequest;
 
 pub use crate::idp::{
     AcsSelection, ConsumeAuthnRequest, DetachedSignature, IdentityProvider,
-    IdentityProviderConfig, IssueErrorResponse, IssueResponse, ParsedAuthnRequest,
+    IdentityProviderConfig, IdpAssertionSigning, IssueErrorResponse, IssueResponse,
+    ParsedAuthnRequest,
 };
+#[cfg(feature = "slo")]
+pub use crate::idp::{IdpLogoutSigning, IdpLogoutWantSigned};
 
 pub use crate::proxy::{
     Aes256GcmCodec, AttributeReleasePolicy, AuthnContextComparator, BounceResult,
@@ -392,8 +407,39 @@ pub use crate::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorit
 
 #[cfg(feature = "slo")]
 pub use crate::logout::{
-    LogoutDispatch, LogoutOutcome, LogoutStatus, LogoutTracker, ParsedLogoutRequest, StartLogout,
+    ConsumeLogoutRequest, ConsumeLogoutResponse, LogoutDispatch, LogoutOutcome, LogoutStatus,
+    LogoutTracker, ParsedLogoutRequest, StartLogout,
 };
 
 #[cfg(feature = "reqwest-client")]
 pub use crate::http::ReqwestClient;
+
+// === Fuzzing hooks ===
+//
+// cargo-fuzz sets `--cfg fuzzing` when building any fuzz target. The targets
+// under `fuzz/` link against this crate as a regular dependency and therefore
+// only see `pub` items; the parser and canonicalizer they need to exercise are
+// otherwise `pub(crate)`. This module hands the fuzzer thin shims into those
+// internals without widening the stable public surface — the items below are
+// invisible to ordinary builds, doctests, and downstream callers.
+#[cfg(fuzzing)]
+pub mod __fuzz {
+    use crate::dsig::algorithms::C14nAlgorithm;
+    use crate::dsig::c14n;
+    use crate::error::Error;
+    use crate::xml::parse::Document;
+
+    /// Parse `bytes` as XML through the production parser. Errors are
+    /// surfaced verbatim so the fuzzer can distinguish parse failures from
+    /// panics / aborts.
+    pub fn parse_document(bytes: &[u8]) -> Result<(), Error> {
+        Document::parse(bytes).map(drop)
+    }
+
+    /// Parse `bytes` then canonicalize the document root with `algorithm`.
+    /// Returns the canonical byte sequence on success.
+    pub fn canonicalize_root(bytes: &[u8], algorithm: C14nAlgorithm) -> Result<Vec<u8>, Error> {
+        let doc = Document::parse(bytes)?;
+        c14n::canonicalize(&doc, doc.root(), &[], algorithm, &[])
+    }
+}

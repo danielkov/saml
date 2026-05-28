@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Signed in — saml-demo</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2315803d'/%3E%3Ctext x='50%25' y='58%25' text-anchor='middle' font-family='-apple-system,Inter,sans-serif' font-weight='700' font-size='15' fill='white'%3E%E2%9C%93%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <main class="shell" style="--provider-accent: {{provider_accent}};">
+    <header class="brand">
+      <div class="mark">S</div>
+      <div class="name">saml-demo <span>· dashboard · {{provider_label}}</span></div>
+    </header>
+
+    <section class="hero" style="margin-bottom: 32px;">
+      <span class="kicker"><span class="dot"></span> Session active · {{provider_id}}</span>
+      <h1>Welcome back, <em>{{display_name}}</em>.</h1>
+      <p class="lede">
+        Your browser just completed a SAML 2.0 Web Browser SSO round-trip
+        with <strong>{{provider_label}}</strong>. The assertion's signature
+        was verified, the audience and subject-confirmation windows checked
+        out, and an HMAC-signed session cookie was set on this domain.
+      </p>
+    </section>
+
+    <div class="panel">
+      <div class="profile">
+        <div class="avatar provider-tinted">{{initial}}</div>
+        <div>
+          <h2>{{display_name}}</h2>
+          <p class="email">{{email}}</p>
+          <div class="badges">
+            <span class="badge success">
+              <svg width="10" height="10" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M3 6.5L5 8.5L9 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Assertion verified
+            </span>
+            <span class="badge">NameID · {{name_id_format_short}}</span>
+            <span class="badge">via {{provider_label}}</span>
+          </div>
+        </div>
+      </div>
+
+      <dl class="facts">
+        <dt>NameID</dt>
+        <dd>{{name_id_value}}</dd>
+
+        <dt>Format URI</dt>
+        <dd>{{name_id_format}}</dd>
+
+        <dt>Session index</dt>
+        <dd>{{session_index}}</dd>
+
+        <dt>Authn instant</dt>
+        <dd>{{authn_instant}}</dd>
+      </dl>
+    </div>
+
+    <div class="panel">
+      <h2 style="margin: 0 0 16px; font-size: 18px; letter-spacing: -0.015em;">
+        Attributes ({{attribute_count}})
+      </h2>
+      <table class="attrs">
+        <thead>
+          <tr><th>Name</th><th>Values</th></tr>
+        </thead>
+        <tbody>
+          {{attribute_rows}}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="logout-row">
+      <a class="btn btn-ghost" href="/">Try a different IdP</a>
+      <form method="post" action="/logout">
+        <button class="btn btn-ghost" type="submit">Sign out</button>
+      </form>
+    </div>
+
+    <footer class="meta">
+      <span>SP entity: <code>{{sp_entity_id}}</code></span>
+      <span>·</span>
+      <span>IdP entity: <code>{{idp_entity_id}}</code></span>
+    </footer>
+  </main>
+</body>
+</html>

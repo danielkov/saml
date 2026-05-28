@@ -169,7 +169,7 @@ pub(crate) fn parse_reference(
         });
     }
     if let Some(&idx) = c14n_indices.first()
-        && idx != transforms.len() - 1
+        && Some(idx) != transforms.len().checked_sub(1)
     {
         return Err(Error::DisallowedTransform {
             transform: "c14n transform must be the final transform".to_owned(),
@@ -248,20 +248,31 @@ pub(crate) fn decode_base64_lenient(input: &str) -> Result<Vec<u8>, Error> {
     }
     BASE64_STANDARD
         .decode(&cleaned)
-        .map_err(|_| Error::Base64Decode)
+        .map_err(|_e| Error::Base64Decode)
 }
 
 /// Compute the digest of the resolved reference target, applying transforms
 /// in declared order. Returns the byte digest; caller compares to
 /// `digest_value`.
 ///
+/// `enclosing_signature` is the `ElementId` of the `<ds:Signature>` whose
+/// `<ds:SignedInfo>` contains this `<ds:Reference>`. When the
+/// `enveloped-signature` transform is in the chain, *only that one* signature
+/// is removed from the subtree before canonicalization — per the XML-DSig
+/// spec, the enveloped-signature transform removes the Signature element
+/// containing the SignedInfo containing the Reference containing the
+/// transform definition. Other `<ds:Signature>` elements nested inside the
+/// signed subtree (e.g. an inner `<saml:Assertion>` signature on a
+/// double-signed `<samlp:Response>`) must be preserved verbatim.
+///
 /// Implementation notes
 /// --------------------
 /// - The enveloped-signature transform is implemented by cloning the resolved
-///   subtree, omitting the `<ds:Signature>` descendant during the clone. The
-///   clone preserves the ancestor namespace context (which c14n walks via
-///   the unchanged `ancestor_chain` arg), so the canonical output is byte-
-///   identical to what an in-place removal would produce.
+///   subtree, omitting *only the enclosing* `<ds:Signature>` (identified by
+///   its `ElementId`) during the clone. The clone preserves the ancestor
+///   namespace context (which c14n walks via the unchanged `ancestor_chain`
+///   arg), so the canonical output is byte-identical to what an in-place
+///   removal of that one signature would produce.
 /// - The SAML profile mandates that c14n is the *last* transform; that is
 ///   validated by `parse_reference`. Multiple c14n transforms in a row would
 ///   require feeding bytes into another transform, which we do not support
@@ -274,6 +285,7 @@ pub(crate) fn decode_base64_lenient(input: &str) -> Result<Vec<u8>, Error> {
 pub(crate) fn compute_reference_digest(
     document: &Document,
     parsed: &ParsedReference,
+    enclosing_signature: ElementId,
 ) -> Result<Vec<u8>, Error> {
     let target = document
         .element(parsed.target)
@@ -285,8 +297,7 @@ pub(crate) fn compute_reference_digest(
     // Decide whether to strip the <ds:Signature> child before c14n.
     let strip_signature = parsed
         .transforms
-        .iter()
-        .any(|t| *t == AllowedTransform::EnvelopedSignature);
+        .contains(&AllowedTransform::EnvelopedSignature);
 
     // Pick the c14n algorithm. SAML's overwhelming default is Exclusive
     // (no comments) and that's what we use when no c14n transform is
@@ -294,8 +305,7 @@ pub(crate) fn compute_reference_digest(
     let c14n_alg = parsed
         .transforms
         .iter()
-        .filter_map(|t| t.as_c14n_algorithm())
-        .next()
+        .find_map(|t| t.as_c14n_algorithm())
         .unwrap_or(C14nAlgorithm::ExclusiveCanonical);
 
     let prefix_refs: Vec<&str> = parsed
@@ -305,12 +315,16 @@ pub(crate) fn compute_reference_digest(
         .collect();
 
     let canonical_bytes = if strip_signature {
-        // Clone the target subtree, dropping any <ds:Signature> descendant
-        // child of the target during the clone. The original ancestor chain
-        // is reused — `canonicalize` only reads `namespaces_declared_here`
-        // off ancestor elements, never their `ElementId` or children, so
-        // mixing a cloned target with originally-borrowed ancestors is safe.
-        let pruned = clone_without_signature(target);
+        // Clone the target subtree, dropping *only* the enclosing
+        // <ds:Signature> (identified by its ElementId) during the clone. Any
+        // other <ds:Signature> elements nested inside the subtree (e.g. a
+        // separately-signed <saml:Assertion>) are preserved — those signatures
+        // are part of the bytes the outer signer committed to. The original
+        // ancestor chain is reused — `canonicalize` only reads
+        // `namespaces_declared_here` off ancestor elements, never their
+        // `ElementId` or children, so mixing a cloned target with
+        // originally-borrowed ancestors is safe.
+        let pruned = clone_excluding_id(target, enclosing_signature);
         canonicalize(document, &pruned, &chain, c14n_alg, &prefix_refs)?
     } else {
         canonicalize(document, target, &chain, c14n_alg, &prefix_refs)?
@@ -325,10 +339,10 @@ pub(crate) fn compute_reference_digest(
 /// Implementation: walks the `paths` index — every `ElementId` resolves to a
 /// sequence of child-indices from the root. Walking all but the last index
 /// yields the parent chain.
-pub(crate) fn ancestor_chain<'a>(
-    document: &'a Document,
+pub(crate) fn ancestor_chain(
+    document: &Document,
     target: ElementId,
-) -> Option<Vec<&'a Element>> {
+) -> Option<Vec<&Element>> {
     let path = document.paths.get(target.0 as usize)?;
     let mut chain: Vec<&Element> = Vec::with_capacity(path.len());
     let mut current: &Element = &document.root;
@@ -338,7 +352,11 @@ pub(crate) fn ancestor_chain<'a>(
     }
     chain.push(current);
     // Walk all but the last path step (which would land *on* the target).
-    for &idx in &path[..path.len() - 1] {
+    // `path` is non-empty (handled above), so the slice up to len-1 is well
+    // defined; use a checked range to avoid the indexing/arithmetic lints.
+    let last = path.len().checked_sub(1)?;
+    let parents = path.get(..last)?;
+    for &idx in parents {
         let child_node = current.children().nth(idx as usize)?;
         match child_node {
             Node::Element(child) => {
@@ -351,24 +369,26 @@ pub(crate) fn ancestor_chain<'a>(
     Some(chain)
 }
 
-/// Deep-clone `element`, dropping any direct or descendant `<ds:Signature>`
-/// child. The clone preserves namespace declarations, attributes, and text
-/// content verbatim.
+/// Deep-clone `element`, dropping any descendant element whose `ElementId`
+/// matches `excluded`. The clone preserves namespace declarations,
+/// attributes, and text content verbatim.
 ///
 /// SAML's enveloped-signature transform calls for stripping the `<ds:Signature>`
-/// from the signed subtree. There is at most one such signature per signed
-/// element in well-formed SAML payloads; we still scan recursively in case a
-/// future profile nests them.
-fn clone_without_signature(element: &Element) -> Element {
+/// element *that contains the SignedInfo containing the Reference being
+/// computed* — i.e. exactly one specific signature, not every signature in
+/// the subtree. On a double-signed payload (e.g. `<samlp:Response>` carrying
+/// an inner-signed `<saml:Assertion>`), the inner signature is part of the
+/// bytes the outer signer committed to and must survive canonicalization.
+fn clone_excluding_id(element: &Element, excluded: ElementId) -> Element {
     let mut cloned_children: Vec<Node> = Vec::with_capacity(element.children.len());
     for child in &element.children {
         match child {
             Node::Element(child_elem) => {
-                if is_ds_signature(child_elem) {
-                    // Drop this element entirely from the clone.
+                if child_elem.id() == excluded {
+                    // Drop *only* this element entirely from the clone.
                     continue;
                 }
-                cloned_children.push(Node::Element(clone_without_signature(child_elem)));
+                cloned_children.push(Node::Element(clone_excluding_id(child_elem, excluded)));
             }
             Node::Text(t) => cloned_children.push(Node::Text(t.clone())),
             Node::Comment(c) => cloned_children.push(Node::Comment(c.clone())),
@@ -376,16 +396,12 @@ fn clone_without_signature(element: &Element) -> Element {
     }
     Element {
         qname: element.qname.clone(),
+        source_prefix: element.source_prefix.clone(),
         namespaces_declared_here: element.namespaces_declared_here.clone(),
         attributes: element.attributes.clone(),
         children: cloned_children,
         id: element.id, // preserve the original ID for diagnostics; not used by c14n.
     }
-}
-
-fn is_ds_signature(element: &Element) -> bool {
-    element.qname().local() == "Signature"
-        && element.qname().namespace() == Some(DS_NS)
 }
 
 // =============================================================================
@@ -419,7 +435,7 @@ mod tests {
             AllowedTransform::from_uri("http://www.w3.org/TR/1999/REC-xslt-19991116").unwrap_err();
         match err {
             Error::DisallowedTransform { transform } => {
-                assert!(transform.contains("xslt"), "got: {transform}")
+                assert!(transform.contains("xslt"), "got: {transform}");
             }
             other => panic!("expected DisallowedTransform, got {other:?}"),
         }
@@ -441,49 +457,49 @@ mod tests {
 
     #[test]
     fn resolve_uri_empty_returns_root() {
-        let doc = parse(r##"<Root xmlns="urn:p" ID="r"/>"##);
+        let doc = parse(r#"<Root xmlns="urn:p" ID="r"/>"#);
         let id = resolve_uri(&doc, "").unwrap();
         assert_eq!(id, doc.root().id());
     }
 
     #[test]
     fn resolve_uri_hash_resolves_via_id_index() {
-        let doc = parse(r##"<Root xmlns="urn:p" ID="r"><Child ID="abc"/></Root>"##);
+        let doc = parse(r#"<Root xmlns="urn:p" ID="r"><Child ID="abc"/></Root>"#);
         let id = resolve_uri(&doc, "#abc").unwrap();
         assert_eq!(id, doc.element_by_id_attr("abc").unwrap());
     }
 
     #[test]
     fn resolve_uri_unknown_id_errors() {
-        let doc = parse(r##"<Root ID="r"/>"##);
+        let doc = parse(r#"<Root ID="r"/>"#);
         let err = resolve_uri(&doc, "#nope").unwrap_err();
         assert!(matches!(err, Error::ReferenceResolution));
     }
 
     #[test]
     fn resolve_uri_external_rejected() {
-        let doc = parse(r##"<Root ID="r"/>"##);
+        let doc = parse(r#"<Root ID="r"/>"#);
         let err = resolve_uri(&doc, "https://attacker.example/x.xml").unwrap_err();
         assert!(matches!(err, Error::ReferenceResolution));
     }
 
     #[test]
     fn resolve_uri_xpointer_rejected() {
-        let doc = parse(r##"<Root ID="r"/>"##);
+        let doc = parse(r#"<Root ID="r"/>"#);
         let err = resolve_uri(&doc, "#xpointer(/Root)").unwrap_err();
         assert!(matches!(err, Error::ReferenceResolution));
     }
 
     #[test]
     fn ancestor_chain_root_has_empty() {
-        let doc = parse(r##"<Root><A/></Root>"##);
+        let doc = parse(r"<Root><A/></Root>");
         let chain = ancestor_chain(&doc, doc.root().id()).unwrap();
         assert!(chain.is_empty());
     }
 
     #[test]
     fn ancestor_chain_deep_walks_to_parent() {
-        let doc = parse(r##"<Root><A><B><C/></B></A></Root>"##);
+        let doc = parse(r"<Root><A><B><C/></B></A></Root>");
         let c_id = {
             let a = doc.root().child_element(None, "A").unwrap();
             let b = a.child_element(None, "B").unwrap();
@@ -495,10 +511,19 @@ mod tests {
     }
 
     #[test]
-    fn clone_without_signature_drops_ds_signature_only() {
-        let xml = r##"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><A/><ds:Signature/><B><ds:Signature/></B></Root>"##;
+    fn clone_excluding_id_drops_only_the_named_signature() {
+        // Two ds:Signature elements: one direct child of Root, one nested
+        // inside B. Excluding *only* the outer one's ElementId must drop that
+        // signature and leave the inner one intact — this is the
+        // double-signed Response/Assertion shape.
+        let xml = r#"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><A/><ds:Signature/><B><ds:Signature/></B></Root>"#;
         let doc = parse(xml);
-        let cloned = clone_without_signature(doc.root());
+        let outer_sig_id = doc
+            .root()
+            .child_element(Some(DS_NS), "Signature")
+            .unwrap()
+            .id();
+        let cloned = clone_excluding_id(doc.root(), outer_sig_id);
         let kinds: Vec<&str> = cloned
             .children()
             .filter_map(|n| match n {
@@ -507,18 +532,18 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["A", "B"]);
-        // Also stripped recursively from B.
+        // The inner ds:Signature inside B must survive.
         let b = cloned.child_element(Some("urn:p"), "B").unwrap();
         assert!(
-            b.child_element(Some(DS_NS), "Signature").is_none(),
-            "ds:Signature must be stripped recursively"
+            b.child_element(Some(DS_NS), "Signature").is_some(),
+            "nested ds:Signature with a different ElementId must be preserved"
         );
     }
 
     /// Build a synthetic `<ds:Reference URI="#X">` for parse_reference tests.
     fn synth_reference(uri: &str, digest_b64: &str) -> String {
         format!(
-            r##"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="X">
+            r#"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="X">
                 <ds:Reference URI="{uri}">
                     <ds:Transforms>
                         <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
@@ -527,7 +552,7 @@ mod tests {
                     <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
                     <ds:DigestValue>{digest_b64}</ds:DigestValue>
                 </ds:Reference>
-            </Root>"##
+            </Root>"#
         )
     }
 
@@ -625,7 +650,7 @@ mod tests {
     fn compute_digest_round_trip_simple_element() {
         // Construct a minimal "signed" element with a well-known canonical form
         // and a stub Reference whose digest matches.
-        let xml = r##"<Root xmlns="urn:p" ID="X"><Inner>hello</Inner></Root>"##;
+        let xml = r#"<Root xmlns="urn:p" ID="X"><Inner>hello</Inner></Root>"#;
         let doc = parse(xml);
 
         // Compute the canonical form + digest of the Root subtree directly so
@@ -650,7 +675,9 @@ mod tests {
             inclusive_namespace_prefixes: Vec::new(),
         };
 
-        let got = compute_reference_digest(&doc, &parsed).unwrap();
+        // No enveloped-signature transform here, so the enclosing-signature
+        // id is unused by `compute_reference_digest`; pass the root's id.
+        let got = compute_reference_digest(&doc, &parsed, doc.root().id()).unwrap();
         assert_eq!(got, expected_digest);
     }
 
@@ -661,8 +688,8 @@ mod tests {
         // because Exclusive C14N drops the unused `ds:` declaration from the
         // canonical output once its only consumer (the Signature subtree) is
         // stripped.
-        let with_sig = r##"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="X"><Inner>hello</Inner><ds:Signature><ds:SignedInfo/></ds:Signature></Root>"##;
-        let without_sig = r##"<Root xmlns="urn:p" ID="X"><Inner>hello</Inner></Root>"##;
+        let with_sig = r#"<Root xmlns="urn:p" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="X"><Inner>hello</Inner><ds:Signature><ds:SignedInfo/></ds:Signature></Root>"#;
+        let without_sig = r#"<Root xmlns="urn:p" ID="X"><Inner>hello</Inner></Root>"#;
         let doc_a = parse(with_sig);
         let doc_b = parse(without_sig);
 
@@ -677,7 +704,14 @@ mod tests {
             digest_value: Vec::new(),
             inclusive_namespace_prefixes: Vec::new(),
         };
-        let digest_a = compute_reference_digest(&doc_a, &parsed_a).unwrap();
+        // The signature being verified is the direct ds:Signature child of
+        // the Root in doc_a — identify it for the enveloped-signature strip.
+        let outer_sig_id = doc_a
+            .root()
+            .child_element(Some(DS_NS), "Signature")
+            .unwrap()
+            .id();
+        let digest_a = compute_reference_digest(&doc_a, &parsed_a, outer_sig_id).unwrap();
 
         // Canonicalize doc_b directly (no enveloped-signature needed; nothing
         // to strip) and digest.
@@ -703,7 +737,7 @@ mod tests {
 
         // Belt-and-suspenders: the canonical pruned bytes do not contain any
         // `ds:Signature` substring.
-        let pruned = clone_without_signature(doc_a.root());
+        let pruned = clone_excluding_id(doc_a.root(), outer_sig_id);
         let chain_a = ancestor_chain(&doc_a, doc_a.root().id()).unwrap();
         let canonical_pruned = canonicalize(
             &doc_a,

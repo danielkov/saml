@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>saml-demo — pick an IdP</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='50%25' y='58%25' text-anchor='middle' font-family='-apple-system,Inter,sans-serif' font-weight='700' font-size='15' fill='white'%3ES%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <div class="mark">S</div>
+      <div class="name">saml-demo <span>· choose a provider</span></div>
+    </header>
+
+    <section class="hero">
+      <span class="kicker"><span class="dot"></span> SAML 2.0 · Service Provider</span>
+      <h1>One <em>Axum</em> app, seven IdPs.</h1>
+      <p class="lede">
+        This is a working Service Provider wired up to {{provider_count}}
+        Identity Providers — three you can boot locally with
+        <code>docker compose</code>, four hosted in the cloud. Pick one to
+        bounce through the Web Browser SSO profile and land on a
+        session-cookie–authenticated dashboard.
+      </p>
+    </section>
+
+    <section class="provider-grid">
+      {{provider_cards}}
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h3>Stateless verification</h3>
+        <p>Signature, audience, subject-confirmation, and clock-window checks
+           happen inside the SP — no IdP round-trip on every request.</p>
+      </div>
+      <div class="card">
+        <h3>XSW-resistant by structure</h3>
+        <p>The verified Identity is bound to the element the signature
+           actually covered, so signature-wrapping attacks can't reshape it.</p>
+      </div>
+      <div class="card">
+        <h3>Pure Rust crypto</h3>
+        <p>No libxml2 / xmlsec / openssl C build chain. RSA + ECDSA via the
+           RustCrypto ecosystem; XML-C14N + XML-DSig hand-rolled.</p>
+      </div>
+      <div class="card">
+        <h3>Cross-provider replay defense</h3>
+        <p>RelayState is asserted to match the Issuer-resolved provider on
+           every ACS, so a Response from IdP <em>A</em> can't ride a tracker
+           from IdP <em>B</em>.</p>
+      </div>
+    </section>
+
+    <footer class="meta">
+      <span>SP entity: <code>{{sp_entity_id}}</code></span>
+      <span>·</span>
+      <a href="/metadata">Metadata XML</a>
+      <span>·</span>
+      <a href="/healthz">Health</a>
+    </footer>
+  </main>
+</body>
+</html>

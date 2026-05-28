@@ -57,7 +57,7 @@ pub(crate) fn build_logout_request_element(
         .with_attribute(QName::new(None, "Version"), "2.0")
         .with_attribute(
             QName::new(None, "IssueInstant"),
-            format_xs_datetime(input.issue_instant),
+            format_xs_datetime(input.issue_instant)?,
         );
 
     if let Some(dest) = input.destination {
@@ -66,7 +66,7 @@ pub(crate) fn build_logout_request_element(
     if let Some(not_after) = input.not_on_or_after {
         builder = builder.with_attribute(
             QName::new(None, "NotOnOrAfter"),
-            format_xs_datetime(not_after),
+            format_xs_datetime(not_after)?,
         );
     }
     if let Some(reason) = input.reason {
@@ -129,10 +129,12 @@ mod tests {
 
     fn fixed_instant() -> SystemTime {
         // 2026-05-26T12:34:56Z, same vector as time.rs round-trip tests.
-        UNIX_EPOCH + Duration::from_secs(1_779_798_896)
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_779_798_896))
+            .expect("UNIX_EPOCH + small duration fits in SystemTime")
     }
 
-    fn minimal_input<'a>(name_id: &'a NameId) -> BuildLogoutRequest<'a> {
+    fn minimal_input(name_id: &NameId) -> BuildLogoutRequest<'_> {
         BuildLogoutRequest {
             id: "_logout-abc",
             issue_instant: fixed_instant(),
@@ -208,7 +210,7 @@ mod tests {
         let mut input = minimal_input(&nid);
         // +5 minutes from fixed_instant.
         input.not_on_or_after =
-            Some(fixed_instant() + Duration::from_secs(300));
+            Some(fixed_instant() + Duration::from_mins(5));
 
         let doc = emit_and_reparse(&input);
         assert_eq!(
@@ -279,7 +281,7 @@ mod tests {
             issue_instant: fixed_instant(),
             issuer_entity_id: "https://sp.example.com/saml",
             destination: Some("https://idp.example.com/slo"),
-            not_on_or_after: Some(fixed_instant() + Duration::from_secs(60)),
+            not_on_or_after: Some(fixed_instant() + Duration::from_mins(1)),
             reason: Some("urn:oasis:names:tc:SAML:2.0:logout:user"),
             name_id: &nid,
             session_index: Some("sess-XYZ"),

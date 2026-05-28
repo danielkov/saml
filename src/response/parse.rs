@@ -94,6 +94,12 @@ pub(crate) fn parse_response(document: &Document) -> Result<(ParsedResponse, Ele
         )));
     }
 
+    // Structural schema gate. Runs before any content extraction so a tree
+    // that fails XSD-shape checks never reaches the signature / time-window
+    // pipeline (see `crate::schema` for the rule set).
+    #[cfg(feature = "xsd-validate")]
+    crate::schema::validate_response(root)?;
+
     root.attribute(None, "ID")
         .ok_or_else(|| Error::XmlParse("Response missing ID".to_string()))?;
     let version = root
@@ -183,6 +189,15 @@ pub(crate) fn parse_assertion(assertion: &Element) -> Result<ParsedAssertion, Er
         )));
     }
 
+    // Structural schema gate at the assertion subtree level. Covers both the
+    // cleartext path (Response → Assertion was already validated as part of
+    // the Response shape walk, but a second pass here is cheap and lets the
+    // decrypted-assertion code path get the same gate without a special
+    // case) and the EncryptedAssertion path (caller re-parses the decrypted
+    // bytes into a fresh `Document` whose root IS the assertion).
+    #[cfg(feature = "xsd-validate")]
+    crate::schema::validate_assertion(assertion)?;
+
     let id = assertion
         .attribute(None, "ID")
         .ok_or_else(|| Error::XmlParse("Assertion missing ID".to_string()))?
@@ -257,8 +272,7 @@ fn parse_name_id(elem: &Element) -> NameId {
     let value = elem.text_content().trim().to_owned();
     let format = elem
         .attribute(None, "Format")
-        .map(NameIdFormat::from_uri)
-        .unwrap_or(NameIdFormat::Unspecified);
+        .map_or(NameIdFormat::Unspecified, NameIdFormat::from_uri);
     let name_qualifier = elem.attribute(None, "NameQualifier").map(str::to_owned);
     let sp_name_qualifier = elem.attribute(None, "SPNameQualifier").map(str::to_owned);
     let sp_provided_id = elem.attribute(None, "SPProvidedID").map(str::to_owned);
@@ -323,7 +337,7 @@ fn parse_conditions(elem: &Element) -> Result<Conditions, Error> {
             let count = pr
                 .attribute(None, "Count")
                 .map(|c| {
-                    c.parse::<u32>().map_err(|_| {
+                    c.parse::<u32>().map_err(|_parse_err| {
                         Error::XmlParse(format!("ProxyRestriction/@Count not an integer: {c}"))
                     })
                 })
@@ -379,7 +393,7 @@ fn parse_attribute(elem: &Element) -> Attribute {
     let friendly_name = elem.attribute(None, "FriendlyName").map(str::to_owned);
     let values: Vec<String> = elem
         .all_child_elements(Some(SAML_NS), "AttributeValue")
-        .map(|v| v.text_content())
+        .map(Element::text_content)
         .collect();
     Attribute {
         name,
@@ -397,12 +411,11 @@ fn parse_attribute(elem: &Element) -> Attribute {
 mod tests {
     use super::*;
     use crate::xml::parse::Document;
-    use std::time::{Duration, UNIX_EPOCH};
 
     /// Build a complete Response XML with a single cleartext Assertion.
     fn sample_response_xml() -> String {
         format!(
-            r##"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+            r#"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                                    ID="_resp1" Version="2.0"
                                    IssueInstant="2026-05-26T12:00:00Z"
                                    Destination="https://sp.example.com/acs"
@@ -447,7 +460,7 @@ mod tests {
                       </saml:Attribute>
                     </saml:AttributeStatement>
                   </saml:Assertion>
-                </samlp:Response>"##
+                </samlp:Response>"#
         )
     }
 
@@ -474,9 +487,8 @@ mod tests {
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let (resp, _) = parse_response(&doc).expect("parse_response");
 
-        let assertion_id = match resp.assertion {
-            Some(AssertionWrapper::Cleartext(id)) => id,
-            _ => panic!("expected cleartext assertion"),
+        let Some(AssertionWrapper::Cleartext(assertion_id)) = resp.assertion else {
+            panic!("expected cleartext assertion")
         };
         let assertion_elem = doc.element(assertion_id).expect("assertion element");
         let assertion = parse_assertion(assertion_elem).expect("parse_assertion");
@@ -532,7 +544,7 @@ mod tests {
 
     #[test]
     fn rejects_non_samlp_response_root() {
-        let xml = format!(r##"<saml:Foo xmlns:saml="{SAML_NS}"/>"##);
+        let xml = format!(r#"<saml:Foo xmlns:saml="{SAML_NS}"/>"#);
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let err = parse_response(&doc).unwrap_err();
         match err {
@@ -546,7 +558,7 @@ mod tests {
         // Two cleartext assertions inside a single Response is the canonical
         // XSW vector class — reject it at parse time.
         let xml = format!(
-            r##"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+            r#"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                                 ID="_r" Version="2.0"
                                 IssueInstant="2026-05-26T12:00:00Z">
               <saml:Issuer>https://idp.example.com</saml:Issuer>
@@ -559,7 +571,7 @@ mod tests {
                 <saml:Issuer>https://idp.example.com</saml:Issuer>
                 <saml:Subject><saml:NameID>y</saml:NameID></saml:Subject>
               </saml:Assertion>
-            </samlp:Response>"##
+            </samlp:Response>"#
         );
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let err = parse_response(&doc).unwrap_err();
@@ -575,7 +587,7 @@ mod tests {
     #[test]
     fn rejects_response_with_missing_status() {
         let xml = format!(
-            r##"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+            r#"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                                 ID="_r" Version="2.0"
                                 IssueInstant="2026-05-26T12:00:00Z">
               <saml:Issuer>https://idp.example.com</saml:Issuer>
@@ -583,20 +595,23 @@ mod tests {
                 <saml:Issuer>https://idp.example.com</saml:Issuer>
                 <saml:Subject><saml:NameID>x</saml:NameID></saml:Subject>
               </saml:Assertion>
-            </samlp:Response>"##
+            </samlp:Response>"#
         );
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let err = parse_response(&doc).unwrap_err();
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("Status"), "got: {msg}"),
-            other => panic!("expected XmlParse, got {other:?}"),
+            Error::SchemaViolation { reason, .. } => {
+                assert!(reason.contains("Status"), "got: {reason}");
+            }
+            other => panic!("expected XmlParse or SchemaViolation, got {other:?}"),
         }
     }
 
     #[test]
     fn parses_second_level_status_code_and_message() {
         let xml = format!(
-            r##"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+            r#"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                                 ID="_r" Version="2.0"
                                 IssueInstant="2026-05-26T12:00:00Z">
               <saml:Issuer>https://idp.example.com</saml:Issuer>
@@ -610,7 +625,7 @@ mod tests {
                 <saml:Issuer>https://idp.example.com</saml:Issuer>
                 <saml:Subject><saml:NameID>x</saml:NameID></saml:Subject>
               </saml:Assertion>
-            </samlp:Response>"##
+            </samlp:Response>"#
         );
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let (resp, _) = parse_response(&doc).expect("parse");
@@ -618,10 +633,96 @@ mod tests {
         assert_eq!(resp.status_message.as_deref(), Some("Consent declined"));
     }
 
+    /// Regression test for SAML 2.0 Core §2.7.2: a `<saml:Assertion>` MAY
+    /// contain multiple `<saml:AttributeStatement>` elements. Some IdPs
+    /// (OneLogin in this fixture) split identity attributes across two
+    /// statements. The parser must visit every statement in document order
+    /// and concatenate their `<saml:Attribute>` children into
+    /// `ParsedAssertion.attributes`.
+    ///
+    /// A duplicate `Name` across statements (here `role`) is permitted by the
+    /// spec; we keep it as two separate `Attribute` entries (one per wire
+    /// element) rather than merging values, so the wire grouping survives
+    /// round-trip and callers can disambiguate by `NameFormat` if needed.
+    #[test]
+    fn merges_multiple_attribute_statements_ruby_saml_fixture() {
+        // ruby-saml corpus fixture: two AttributeStatements, the second
+        // contains a duplicate-Name `role` attribute and several xsi:nil
+        // shapes. We only assert on the parse-time shape here.
+        let xml = include_str!(
+            "../../tests/corpus/ruby-saml/responses/response_with_multiple_attribute_statements.xml"
+        );
+        let doc = Document::parse(xml.as_bytes()).expect("parse fixture");
+        let (resp, _) = parse_response(&doc).expect("parse_response");
+
+        let Some(AssertionWrapper::Cleartext(assertion_id)) = resp.assertion else {
+            panic!("expected cleartext assertion")
+        };
+        let assertion_elem = doc.element(assertion_id).expect("assertion element");
+        let assertion = parse_assertion(assertion_elem).expect("parse_assertion");
+
+        // First statement: surname, another_value, role (=role1).
+        // Second statement: firstname, role (=role2,role3),
+        //                   attribute_with_nil_value,
+        //                   attribute_with_nils_and_empty_strings.
+        // Concatenated in document order = 7 Attribute entries total.
+        let names: Vec<&str> = assertion.attributes.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "surname",
+                "another_value",
+                "role",
+                "firstname",
+                "role",
+                "attribute_with_nil_value",
+                "attribute_with_nils_and_empty_strings",
+            ],
+            "attributes must be concatenated across statements in document order"
+        );
+
+        // Within-statement ordering preserved: another_value carries
+        // [value1, value2] in that order.
+        let another = assertion
+            .attributes
+            .iter()
+            .find(|a| a.name == "another_value")
+            .expect("another_value attribute");
+        assert_eq!(another.values, vec!["value1".to_string(), "value2".to_string()]);
+
+        // Duplicate Name `role` is preserved as TWO separate Attribute
+        // entries — first statement contributes role1, second contributes
+        // role2 + role3. This is the documented behavior (see doc comment
+        // above): we keep wire grouping; callers that want a flat
+        // multi-valued view can fold by Name themselves.
+        let roles: Vec<&Attribute> = assertion
+            .attributes
+            .iter()
+            .filter(|a| a.name == "role")
+            .collect();
+        assert_eq!(roles.len(), 2, "duplicate-Name attributes kept as separate entries");
+        assert_eq!(roles[0].values, vec!["role1".to_string()]);
+        assert_eq!(roles[1].values, vec!["role2".to_string(), "role3".to_string()]);
+
+        // Sanity: surname is single-valued, firstname is single-valued.
+        let surname = assertion
+            .attributes
+            .iter()
+            .find(|a| a.name == "surname")
+            .expect("surname attribute");
+        assert_eq!(surname.values, vec!["smith".to_string()]);
+        let firstname = assertion
+            .attributes
+            .iter()
+            .find(|a| a.name == "firstname")
+            .expect("firstname attribute");
+        assert_eq!(firstname.values, vec!["bob".to_string()]);
+    }
+
     #[test]
     fn parses_encrypted_assertion_wrapper() {
         let xml = format!(
-            r##"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+            r#"<samlp:Response xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                                 ID="_r" Version="2.0"
                                 IssueInstant="2026-05-26T12:00:00Z">
               <saml:Issuer>https://idp.example.com</saml:Issuer>
@@ -629,7 +730,7 @@ mod tests {
               <saml:EncryptedAssertion>
                 <fake-ciphertext/>
               </saml:EncryptedAssertion>
-            </samlp:Response>"##
+            </samlp:Response>"#
         );
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let (resp, _) = parse_response(&doc).expect("parse");

@@ -1,0 +1,80 @@
+[package]
+name = "saml-demo"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "End-to-end Axum SAML 2.0 SSO demo wired up to seven IdPs (Keycloak, Zitadel, Auth0, Descope, Asgardeo, Authentik, FusionAuth) behind one /saml/acs."
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "saml-demo"
+path = "src/main.rs"
+
+[dependencies]
+saml = { path = "../..", default-features = false, features = [
+    "rsa-sha",
+    "ecdsa-sha",
+    "xmlenc",
+    "metadata-emit",
+    "slo",
+] }
+
+# Web stack
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+
+# HTTP client used to fetch each IdP's metadata at startup. We don't reuse
+# the saml crate's reqwest because we want to swallow per-provider fetch
+# failures without aborting the whole boot.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "cookies",
+] }
+
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Configuration: providers.toml -> typed `ProviderConfig`.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Session cookie crypto: HMAC-signed JSON payload.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+base64 = "0.22"
+
+# Misc small utilities.
+url = "2"
+percent-encoding = "2"
+rand = "0.9"
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious  = { level = "deny", priority = -1 }
+complexity  = { level = "deny", priority = -1 }
+perf        = { level = "deny", priority = -1 }
+style       = { level = "deny", priority = -1 }
+pedantic    = { level = "deny", priority = -1 }
+
+# Example carve-outs - keep the bar high but allow a few pedantic items that
+# would otherwise force noisy refactors in glue code.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+too_many_lines = "allow"
+doc_markdown = "allow"
+struct_field_names = "allow"

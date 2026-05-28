@@ -1,7 +1,12 @@
 //! In-memory `HttpClient` impl used by SOAP-bound tests. Records every request
 //! it sees and serves a canned response.
 
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "mock client is shared across multiple integration-test binaries; \
+              each binary only references a subset, so the unused-code lint \
+              would otherwise fire spuriously per-binary."
+)]
 
 use std::future::Future;
 use std::sync::Mutex;
@@ -36,7 +41,14 @@ impl HttpClient for MockHttpClient {
     > + Send {
         let body = self.canned_response.clone();
         let status = self.canned_status;
-        let mut guard = self.recorded.lock().unwrap();
+        // `PoisonError::into_inner` lets us keep recording on a poisoned mutex
+        // — a poisoned lock here only means a *previous* test panicked between
+        // lock acquisition and release, and recording the current request is
+        // still the right thing to do.
+        let mut guard = self
+            .recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.push(request);
         drop(guard);
         async move {

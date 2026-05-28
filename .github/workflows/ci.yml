@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Format check (fast, fail-fast)
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # Clippy: run across every feature combo we test
+  # Uses stable toolchain. Clippy on MSRV / beta would just duplicate noise.
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all-features
+            flags: --all-features
+          - name: default-features
+            flags: ""
+          - name: no-default-features
+            flags: --no-default-features
+          - name: artifact+weak (default)
+            flags: --features "artifact-binding weak-algos"
+          - name: artifact+weak (no-default)
+            flags: --features "artifact-binding weak-algos" --no-default-features
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.name }}
+      - name: cargo clippy ${{ matrix.flags }}
+        run: cargo clippy --workspace --all-targets ${{ matrix.flags }} -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Tests: matrix on Rust toolchain X feature combo, Ubuntu only
+  # ---------------------------------------------------------------------------
+  test:
+    name: test ${{ matrix.rust }} / ${{ matrix.features.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, beta, "1.91.0"]
+        features:
+          - name: default
+            flags: ""
+          - name: all-features
+            flags: --all-features
+          - name: no-default-features
+            flags: --no-default-features
+          - name: artifact+weak (default)
+            flags: --features "artifact-binding weak-algos"
+          - name: artifact+weak (no-default)
+            flags: --features "artifact-binding weak-algos" --no-default-features
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.rust }}-${{ matrix.features.name }}
+      - name: cargo test ${{ matrix.features.flags }}
+        # Exclude the keycloak example from default test runs — it requires
+        # SAML_RUN_KEYCLOAK_E2E=1 and a live Keycloak instance.
+        run: cargo test --workspace --exclude saml-keycloak-example ${{ matrix.features.flags }}
+
+  # ---------------------------------------------------------------------------
+  # Cross-platform smoke test: default features only, stable only.
+  # Keeps CI minutes reasonable; full matrix lives on Linux.
+  # ---------------------------------------------------------------------------
+  cross-platform:
+    name: smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-${{ matrix.os }}
+      - name: cargo test (default features)
+        run: cargo test --workspace --exclude saml-keycloak-example
+
+  # ---------------------------------------------------------------------------
+  # Documentation must build cleanly.
+  # ---------------------------------------------------------------------------
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: doc
+      - name: cargo doc --all-features
+        run: cargo doc --workspace --all-features --no-deps
+
+  # ---------------------------------------------------------------------------
+  # Future home of the Keycloak e2e suite — gated by SAML_RUN_KEYCLOAK_E2E=1
+  # and a docker-spun Keycloak. Left as a stub for now.
+  # ---------------------------------------------------------------------------
+  # keycloak-e2e:
+  #   name: keycloak e2e
+  #   runs-on: ubuntu-latest
+  #   services:
+  #     keycloak:
+  #       image: quay.io/keycloak/keycloak:25.0
+  #       ports: ["8080:8080"]
+  #       env:
+  #         KEYCLOAK_ADMIN: admin
+  #         KEYCLOAK_ADMIN_PASSWORD: admin
+  #       options: --health-cmd "curl -fsS http://localhost:8080/health/ready || exit 1"
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #     - name: Run keycloak e2e tests
+  #       env:
+  #         SAML_RUN_KEYCLOAK_E2E: "1"
+  #       run: cargo test -p saml-keycloak-example --tests

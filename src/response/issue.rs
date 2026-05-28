@@ -15,7 +15,7 @@ use crate::binding::{
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
 use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
-use crate::dsig::sign::sign_element;
+use crate::dsig::sign::{SignOptions, sign_element};
 use crate::error::Error;
 use crate::nameid::{NameId, NameIdFormat};
 use crate::response::{SAML_NS, SAMLP_NS, saml_qname, samlp_qname};
@@ -71,22 +71,22 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
     let response_id = generate_xml_id();
     let assertion_id = generate_xml_id();
 
-    let assertion_elem = build_assertion(
-        &assertion_id,
-        input.idp_entity_id,
-        &input.name_id,
-        input.sp.entity_id.as_str(),
-        input.acs_endpoint.url.as_str(),
-        input.in_response_to,
-        input.now,
-        input.assertion_lifetime,
-        input.subject_confirmation_lifetime,
-        input.session_index.as_str(),
-        input.session_not_on_or_after,
-        &input.authn_context_class_ref,
-        input.authn_instant,
-        &input.attributes,
-    );
+    let assertion_elem = build_assertion(&BuildAssertionParams {
+        assertion_id: &assertion_id,
+        idp_entity_id: input.idp_entity_id,
+        name_id: &input.name_id,
+        sp_entity_id: input.sp.entity_id.as_str(),
+        acs_url: input.acs_endpoint.url.as_str(),
+        in_response_to: input.in_response_to,
+        now: input.now,
+        assertion_lifetime: input.assertion_lifetime,
+        subject_confirmation_lifetime: input.subject_confirmation_lifetime,
+        session_index: input.session_index.as_str(),
+        session_not_on_or_after: input.session_not_on_or_after,
+        authn_context_class_ref: &input.authn_context_class_ref,
+        authn_instant: input.authn_instant,
+        attributes: &input.attributes,
+    })?;
 
     // ---- Optionally sign the assertion in-place. ---------------------------
     let assertion_elem = maybe_sign(
@@ -135,7 +135,7 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
         input.now,
         Status::success(),
         Some(assertion_or_encrypted),
-    );
+    )?;
 
     let response_elem = maybe_sign(
         response_elem,
@@ -280,7 +280,7 @@ pub(crate) fn issue_error_response(
         input.now,
         status,
         None,
-    );
+    )?;
 
     let response_elem = maybe_sign(
         response_elem,
@@ -322,12 +322,14 @@ fn maybe_sign(
     sign_element(
         stash.root().clone(),
         &stash,
-        signing_key,
-        sig_alg,
-        digest_alg,
-        c14n,
-        &[],
-        /* include_x509_cert */ true,
+        SignOptions {
+            signing_key,
+            sig_alg,
+            digest_alg,
+            c14n_alg: c14n,
+            inclusive_namespaces: &[],
+            include_x509_cert: true,
+        },
     )
 }
 
@@ -351,23 +353,42 @@ impl Status {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_assertion(
-    assertion_id: &str,
-    idp_entity_id: &str,
-    name_id: &NameId,
-    sp_entity_id: &str,
-    acs_url: &str,
-    in_response_to: Option<&str>,
+/// Inputs for [`build_assertion`].
+struct BuildAssertionParams<'a> {
+    assertion_id: &'a str,
+    idp_entity_id: &'a str,
+    name_id: &'a NameId,
+    sp_entity_id: &'a str,
+    acs_url: &'a str,
+    in_response_to: Option<&'a str>,
     now: SystemTime,
     assertion_lifetime: Duration,
     subject_confirmation_lifetime: Duration,
-    session_index: &str,
+    session_index: &'a str,
     session_not_on_or_after: Option<SystemTime>,
-    authn_context_class_ref: &AuthnContextClassRef,
+    authn_context_class_ref: &'a AuthnContextClassRef,
     authn_instant: SystemTime,
-    attributes: &[Attribute],
-) -> Element {
+    attributes: &'a [Attribute],
+}
+
+fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> {
+    let &BuildAssertionParams {
+        assertion_id,
+        idp_entity_id,
+        name_id,
+        sp_entity_id,
+        acs_url,
+        in_response_to,
+        now,
+        assertion_lifetime,
+        subject_confirmation_lifetime,
+        session_index,
+        session_not_on_or_after,
+        authn_context_class_ref,
+        authn_instant,
+        attributes,
+    } = params;
+
     let issuer = Element::build(saml_qname("Issuer"))
         .with_text(idp_entity_id.to_owned())
         .finish();
@@ -395,11 +416,16 @@ fn build_assertion(
     }
     let name_id_elem = name_id_builder.finish();
 
+    let subject_confirmation_not_on_or_after = now
+        .checked_add(subject_confirmation_lifetime)
+        .ok_or(Error::InvalidConfiguration {
+            reason: "now + subject_confirmation_lifetime overflows SystemTime",
+        })?;
     let mut scd_builder = Element::build(saml_qname("SubjectConfirmationData"))
         .with_attribute(QName::new(None, "Recipient"), acs_url.to_owned())
         .with_attribute(
             QName::new(None, "NotOnOrAfter"),
-            format_xs_datetime(now + subject_confirmation_lifetime),
+            format_xs_datetime(subject_confirmation_not_on_or_after)?,
         );
     if let Some(irt) = in_response_to {
         scd_builder = scd_builder
@@ -426,15 +452,24 @@ fn build_assertion(
     let audience_restriction = Element::build(saml_qname("AudienceRestriction"))
         .with_child(Node::Element(audience))
         .finish();
-    let conditions_not_before = now - Duration::from_secs(60);
+    let conditions_not_before = now
+        .checked_sub(Duration::from_mins(1))
+        .ok_or(Error::InvalidConfiguration {
+            reason: "now - 1min underflows SystemTime",
+        })?;
+    let conditions_not_on_or_after =
+        now.checked_add(assertion_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now + assertion_lifetime overflows SystemTime",
+            })?;
     let conditions = Element::build(saml_qname("Conditions"))
         .with_attribute(
             QName::new(None, "NotBefore"),
-            format_xs_datetime(conditions_not_before),
+            format_xs_datetime(conditions_not_before)?,
         )
         .with_attribute(
             QName::new(None, "NotOnOrAfter"),
-            format_xs_datetime(now + assertion_lifetime),
+            format_xs_datetime(conditions_not_on_or_after)?,
         )
         .with_child(Node::Element(audience_restriction))
         .finish();
@@ -449,13 +484,13 @@ fn build_assertion(
     let mut authn_stmt_builder = Element::build(saml_qname("AuthnStatement"))
         .with_attribute(
             QName::new(None, "AuthnInstant"),
-            format_xs_datetime(authn_instant),
+            format_xs_datetime(authn_instant)?,
         )
         .with_attribute(QName::new(None, "SessionIndex"), session_index.to_owned());
     if let Some(snoa) = session_not_on_or_after {
         authn_stmt_builder = authn_stmt_builder.with_attribute(
             QName::new(None, "SessionNotOnOrAfter"),
-            format_xs_datetime(snoa),
+            format_xs_datetime(snoa)?,
         );
     }
     let authn_stmt = authn_stmt_builder
@@ -467,7 +502,7 @@ fn build_assertion(
         .with_namespace(Some("saml".to_owned()), SAML_NS)
         .with_attribute(QName::new(None, "ID"), assertion_id.to_owned())
         .with_attribute(QName::new(None, "Version"), "2.0")
-        .with_attribute(QName::new(None, "IssueInstant"), format_xs_datetime(now))
+        .with_attribute(QName::new(None, "IssueInstant"), format_xs_datetime(now)?)
         .with_child(Node::Element(issuer))
         .with_child(Node::Element(subject))
         .with_child(Node::Element(conditions))
@@ -481,7 +516,7 @@ fn build_assertion(
         assertion_builder = assertion_builder.with_child(Node::Element(attr_stmt.finish()));
     }
 
-    assertion_builder.finish()
+    Ok(assertion_builder.finish())
 }
 
 fn build_attribute(attr: &Attribute) -> Element {
@@ -510,7 +545,7 @@ fn build_response(
     now: SystemTime,
     status: Status,
     assertion_or_encrypted: Option<Element>,
-) -> Element {
+) -> Result<Element, Error> {
     let issuer = Element::build(saml_qname("Issuer"))
         .with_text(idp_entity_id.to_owned())
         .finish();
@@ -539,7 +574,7 @@ fn build_response(
         .with_namespace(Some("saml".to_owned()), SAML_NS)
         .with_attribute(QName::new(None, "ID"), response_id.to_owned())
         .with_attribute(QName::new(None, "Version"), "2.0")
-        .with_attribute(QName::new(None, "IssueInstant"), format_xs_datetime(now))
+        .with_attribute(QName::new(None, "IssueInstant"), format_xs_datetime(now)?)
         .with_attribute(QName::new(None, "Destination"), destination.to_owned());
     if let Some(irt) = in_response_to {
         response_builder = response_builder
@@ -551,7 +586,7 @@ fn build_response(
     if let Some(a) = assertion_or_encrypted {
         response_builder = response_builder.with_child(Node::Element(a));
     }
-    response_builder.finish()
+    Ok(response_builder.finish())
 }
 
 // =============================================================================
@@ -567,7 +602,7 @@ fn dispatch_binding(
     match acs_endpoint.binding {
         SsoResponseBinding::HttpPost => {
             let url = url::Url::parse(&acs_endpoint.url)
-                .map_err(|_| Error::InvalidConfiguration {
+                .map_err(|_url_parse_err| Error::InvalidConfiguration {
                     reason: "ACS endpoint URL is not a valid URL",
                 })?;
             Ok(crate::binding::post::encode_sso_response(&url, xml, relay_state))
@@ -583,12 +618,14 @@ fn issue_artifact(
     relay_state: Option<&str>,
     idp_entity_id: &str,
 ) -> Result<SsoResponseDispatch, Error> {
-    let url = url::Url::parse(&acs_endpoint.url).map_err(|_| Error::InvalidConfiguration {
-        reason: "ACS endpoint URL is not a valid URL",
+    let url = url::Url::parse(&acs_endpoint.url).map_err(|_url_parse_err| {
+        Error::InvalidConfiguration {
+            reason: "ACS endpoint URL is not a valid URL",
+        }
     })?;
-    let xml_str = std::str::from_utf8(xml).map_err(|_| Error::XmlEmit(
-        "non-UTF-8 XML bytes for artifact response".to_string(),
-    ))?;
+    let xml_str = std::str::from_utf8(xml).map_err(|_utf8_err| {
+        Error::XmlEmit("non-UTF-8 XML bytes for artifact response".to_string())
+    })?;
     let redirect = crate::binding::artifact::build_artifact_redirect(
         &url,
         idp_entity_id,
@@ -621,13 +658,19 @@ fn generate_xml_id() -> String {
     let mut bytes = [0u8; 16];
     // OsRng essentially never fails on production OSes; on the rare failure
     // path we still emit a well-formed (if low-entropy) ID rather than panic.
-    let _ = OsRng.try_fill_bytes(&mut bytes);
+    let _fill_result = OsRng.try_fill_bytes(&mut bytes);
     let mut out = String::with_capacity(33);
     out.push('_');
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+        let hi = usize::from(b >> 4);
+        let lo = usize::from(b & 0x0f);
+        // SAFETY-via-construction: `hi` and `lo` are in 0..16 by definition of
+        // the right-shift and mask, and `HEX` is a 16-byte table.
+        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
+            out.push(h as char);
+            out.push(l as char);
+        }
     }
     out
 }
@@ -694,7 +737,10 @@ mod tests {
     }
 
     fn fixed_now() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(1_779_796_800)
+        // 2026-05-26T12:00:00Z == 494388 hours past UNIX_EPOCH.
+        UNIX_EPOCH
+            .checked_add(Duration::from_hours(494_388))
+            .expect("UNIX_EPOCH + small duration fits in SystemTime")
     }
 
     fn make_inputs<'a>(
@@ -711,13 +757,13 @@ mod tests {
             attributes,
             authn_instant: fixed_now(),
             session_index: "sess-7".to_owned(),
-            session_not_on_or_after: Some(fixed_now() + Duration::from_secs(3600)),
+            session_not_on_or_after: fixed_now().checked_add(Duration::from_hours(1)),
             authn_context_class_ref: AuthnContextClassRef::Password,
             force_encrypt_assertion: None,
             encrypt_assertions_when_possible: false,
             now: fixed_now(),
-            assertion_lifetime: Duration::from_secs(600),
-            subject_confirmation_lifetime: Duration::from_secs(300),
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
             signing_key,
             sign_responses: false,
             sign_assertions: true,
@@ -748,7 +794,9 @@ mod tests {
         // Extract the POST form.
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected Post, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected Post, got {other:?}")
+            }
         };
         assert_eq!(form.action.as_str(), "https://sp.example.com/acs");
         assert_eq!(form.relay_state.as_deref(), Some("opaque-state"));
@@ -766,6 +814,7 @@ mod tests {
             parsed,
             idp: &idp,
             peer_crypto_policy: &policy,
+            #[cfg(feature = "xmlenc")]
             decryption_keys: &[],
             sp_entity_id: "https://sp.example.com",
             expected_destination: "https://sp.example.com/acs",
@@ -774,7 +823,7 @@ mod tests {
             want_response_signed: false,
             want_assertions_signed: true,
             now: fixed_now() + Duration::from_secs(30),
-            clock_skew: Duration::from_secs(60),
+            clock_skew: Duration::from_mins(1),
             requested_authn_context: None,
         };
         let identity = validate_response(validate_input).expect("validate");
@@ -797,7 +846,9 @@ mod tests {
 
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected Post, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected Post, got {other:?}")
+            }
         };
         let decoded = crate::binding::post::decode(&form.saml_response, None).expect("decode");
         let doc = Document::parse(&decoded.xml).expect("reparse");
@@ -845,7 +896,9 @@ mod tests {
         let dispatch = issue_response(inputs).expect("issue");
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected Post, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected Post, got {other:?}")
+            }
         };
         let decoded = crate::binding::post::decode(&form.saml_response, None).expect("decode");
         let doc = Document::parse(&decoded.xml).expect("reparse");
@@ -874,7 +927,9 @@ mod tests {
         let dispatch = issue_response(inputs).expect("issue");
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected Post, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected Post, got {other:?}")
+            }
         };
         let decoded = crate::binding::post::decode(&form.saml_response, None).expect("decode");
         let doc = Document::parse(&decoded.xml).expect("reparse");
@@ -934,7 +989,9 @@ mod tests {
         let dispatch = issue_error_response(inputs).expect("issue error");
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected Post, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected Post, got {other:?}")
+            }
         };
         let decoded = crate::binding::post::decode(&form.saml_response, None).expect("decode");
         let doc = Document::parse(&decoded.xml).expect("reparse");
@@ -999,7 +1056,9 @@ mod tests {
                 assert!(redirect.response_xml.contains("<samlp:Response")
                     || redirect.response_xml.contains("Response"));
             }
-            other => panic!("expected Artifact, got {other:?}"),
+            other @ SsoResponseDispatch::Post(_) => {
+                panic!("expected Artifact, got {other:?}")
+            }
         }
     }
 

@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(sp.entity_id, "https://sp.example.com/saml");
         assert!(sp.authn_requests_signed);
         assert!(sp.want_assertions_signed);
-        assert_eq!(sp.cache_duration, Some(Duration::from_secs(15 * 60)));
+        assert_eq!(sp.cache_duration, Some(Duration::from_mins(15)));
         assert!(sp.valid_until.is_some());
 
         assert_eq!(sp.assertion_consumer_services.len(), 2);

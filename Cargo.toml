@@ -1,7 +1,11 @@
+[workspace]
+members = [".", "examples/demo", "fuzz"]
+
 [package]
 name = "saml"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91.0"
 description = "Stateless, async-native SAML 2.0 toolkit with no libxml2/xmlsec C build chain"
 license = "MIT OR Apache-2.0"
 
@@ -36,9 +40,10 @@ bincode = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 percent-encoding = "2"
 zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
 
 [features]
-default = ["reqwest-client", "rsa-sha", "ecdsa-sha", "xmlenc", "slo", "metadata-emit"]
+default = ["reqwest-client", "rsa-sha", "ecdsa-sha", "xmlenc", "slo", "metadata-emit", "xsd-validate"]
 reqwest-client = ["dep:reqwest"]
 rsa-sha = []
 ecdsa-sha = []
@@ -47,6 +52,10 @@ slo = []
 metadata-emit = []
 artifact-binding = []
 weak-algos = ["dep:sha1"]
+# Structural XSD-style schema validation of inbound SAML messages. On by
+# default; opt-out via `default-features = false` for permissive interop with
+# IdPs that emit borderline-non-conformant XML.
+xsd-validate = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -56,6 +65,10 @@ hex = "0.4"
 [lints.rust]
 unsafe_code = "forbid"
 rust_2018_idioms = { level = "deny", priority = -1 }
+# `cargo-fuzz` injects `--cfg fuzzing` when building fuzz targets, gating
+# `pub mod __fuzz` in lib.rs. Register the cfg name so ordinary builds don't
+# warn about it under `unexpected_cfgs`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [lints.clippy]
 # Categories

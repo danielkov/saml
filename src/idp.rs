@@ -66,7 +66,8 @@ use crate::logout::response_build::{BuildLogoutResponse, build_logout_response_e
 use crate::logout::response_parse::parse_logout_response;
 #[cfg(feature = "slo")]
 use crate::logout::{
-    LogoutDispatch, LogoutOutcome, LogoutStatus, LogoutTracker, ParsedLogoutRequest, StartLogout,
+    ConsumeLogoutRequest, ConsumeLogoutResponse, LogoutDispatch, LogoutOutcome, LogoutStatus,
+    LogoutTracker, ParsedLogoutRequest, StartLogout,
 };
 use crate::metadata::MetadataExtras;
 use crate::metadata::emit_idp::{IdpMetadataInputs, emit_idp_metadata};
@@ -86,7 +87,7 @@ pub use crate::authn::request_validate::{AcsSelection, ParsedAuthnRequest};
 // pub(crate) and we'd otherwise have to plumb a re-export).
 // =============================================================================
 
-#[allow(dead_code)] // used in tests and (with feature `slo`) in SLO SOAP envelope parsing
+#[cfg(any(feature = "slo", test))]
 const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 #[cfg(feature = "slo")]
 const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
@@ -96,6 +97,38 @@ const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 // =============================================================================
 // Configuration
 // =============================================================================
+
+/// IdP-side outbound assertion signing flags. SAML 2.0 Core §5 treats
+/// Response- and Assertion-level signatures as independent decisions; we group
+/// them here so [`IdentityProviderConfig`] stays under the default
+/// `struct_excessive_bools` threshold.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdpAssertionSigning {
+    /// If true, sign the `<samlp:Response>` envelope.
+    pub sign_responses: bool,
+    /// If true, sign each `<saml:Assertion>` inside the Response.
+    pub sign_assertions: bool,
+}
+
+/// IdP-side outbound logout signing flags (RFC-007 §5).
+#[cfg(feature = "slo")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdpLogoutSigning {
+    /// If true, outbound LogoutRequest is signed.
+    pub sign_requests: bool,
+    /// If true, outbound LogoutResponse is signed.
+    pub sign_responses: bool,
+}
+
+/// IdP-side inbound logout signature requirements (RFC-007 §5).
+#[cfg(feature = "slo")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IdpLogoutWantSigned {
+    /// If true, reject inbound LogoutRequest unless it carries a valid signature.
+    pub requests: bool,
+    /// If true, reject inbound LogoutResponse unless it carries a valid signature.
+    pub responses: bool,
+}
 
 /// IdP role configuration. See RFC-004 §1.
 #[derive(Debug, Clone)]
@@ -115,17 +148,15 @@ pub struct IdentityProviderConfig {
     /// (rare in practice).
     pub decryption_key: Option<KeyPair>,
     pub want_authn_requests_signed: bool,
-    pub sign_responses: bool,
-    pub sign_assertions: bool,
+    /// Outbound assertion / Response signing flags.
+    pub assertion_signing: IdpAssertionSigning,
     pub encrypt_assertions_when_possible: bool,
+    /// Outbound logout signing flags (RFC-007 §5).
     #[cfg(feature = "slo")]
-    pub sign_logout_requests: bool,
+    pub logout_signing: IdpLogoutSigning,
+    /// Inbound logout signature requirements (RFC-007 §5).
     #[cfg(feature = "slo")]
-    pub sign_logout_responses: bool,
-    #[cfg(feature = "slo")]
-    pub want_logout_requests_signed: bool,
-    #[cfg(feature = "slo")]
-    pub want_logout_responses_signed: bool,
+    pub logout_want_signed: IdpLogoutWantSigned,
     pub default_session_duration: Duration,
     pub default_peer_crypto_policy: PeerCryptoPolicy,
     pub outbound_signature_algorithm: SignatureAlgorithm,
@@ -155,9 +186,14 @@ impl IdentityProvider {
     /// - `signing_key` is a required field by type (not `Option`), so its
     ///   presence is enforced by the type system.
     pub fn new(config: IdentityProviderConfig) -> Result<Self, Error> {
-        if url::Url::parse(&config.entity_id).is_err() {
+        // SAML 2.0 Core §8.3.6: entityID is xs:anyURI; URL shape is
+        // RECOMMENDED but not REQUIRED. See ServiceProvider::new for the
+        // ecosystem-compat reasoning.
+        if config.entity_id.is_empty()
+            || config.entity_id.chars().any(char::is_whitespace)
+        {
             return Err(Error::InvalidConfiguration {
-                reason: "IdentityProviderConfig.entity_id must be a valid URI",
+                reason: "IdentityProviderConfig.entity_id must be a non-empty, whitespace-free xs:anyURI",
             });
         }
         if config.sso.is_empty() {
@@ -302,7 +338,7 @@ fn verify_redirect_request_signature(
         Some(d) => {
             let sig_bytes = BASE64
                 .decode(d.signature.as_bytes())
-                .map_err(|_| Error::Base64Decode)?;
+                .map_err(|_err| Error::Base64Decode)?;
             let sig_alg = SignatureAlgorithm::from_uri(d.sig_alg)?;
             verify_detached_signature(
                 d.raw_query_string.as_bytes(),
@@ -410,8 +446,8 @@ impl IdentityProvider {
             assertion_lifetime: input.assertion_lifetime,
             subject_confirmation_lifetime: input.subject_confirmation_lifetime,
             signing_key: &self.config.signing_key,
-            sign_responses: self.config.sign_responses,
-            sign_assertions: self.config.sign_assertions,
+            sign_responses: self.config.assertion_signing.sign_responses,
+            sign_assertions: self.config.assertion_signing.sign_assertions,
             outbound_signature_algorithm: self.config.outbound_signature_algorithm,
             outbound_digest_algorithm: self.config.outbound_digest_algorithm,
             outbound_c14n: self.config.outbound_c14n,
@@ -445,7 +481,7 @@ impl IdentityProvider {
             second_level_status_code: input.second_level_status_code,
             message: input.message,
             signing_key: &self.config.signing_key,
-            sign_responses: self.config.sign_responses,
+            sign_responses: self.config.assertion_signing.sign_responses,
             outbound_signature_algorithm: self.config.outbound_signature_algorithm,
             outbound_digest_algorithm: self.config.outbound_digest_algorithm,
             outbound_c14n: self.config.outbound_c14n,
@@ -454,6 +490,50 @@ impl IdentityProvider {
         };
 
         issue_error_response(inputs)
+    }
+
+    /// Parse an inbound `<samlp:ArtifactResolve>` SOAP envelope received at
+    /// this IdP's `ArtifactResolutionService` endpoint. The caller looks up
+    /// the artifact value in its store and constructs the response via
+    /// [`IdentityProvider::build_artifact_response`].
+    ///
+    /// Verifies the requesting SP's issuer matches the supplied
+    /// [`SpDescriptor`]; mismatches return [`Error::IssuerMismatch`].
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub fn parse_artifact_resolve(
+        &self,
+        sp: &SpDescriptor,
+        soap_envelope: &[u8],
+    ) -> Result<crate::binding::artifact::ArtifactResolveRequest, Error> {
+        let req = crate::binding::artifact::parse_artifact_resolve(soap_envelope)?;
+        if req.issuer != sp.entity_id {
+            return Err(Error::IssuerMismatch {
+                expected: sp.entity_id.clone(),
+                got: Some(req.issuer.clone()),
+            });
+        }
+        Ok(req)
+    }
+
+    /// Build an outbound `<samlp:ArtifactResponse>` SOAP envelope wrapping
+    /// `payload_xml` (typically the previously-stashed `<samlp:Response>`
+    /// keyed by `request.artifact`). `request` must be the
+    /// [`crate::binding::artifact::ArtifactResolveRequest`] returned from
+    /// [`IdentityProvider::parse_artifact_resolve`].
+    ///
+    /// The returned SOAP envelope is ready to be served as the HTTP response
+    /// body with `Content-Type: text/xml`.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub fn build_artifact_response(
+        &self,
+        request: &crate::binding::artifact::ArtifactResolveRequest,
+        payload_xml: &str,
+    ) -> Result<String, Error> {
+        crate::binding::artifact::build_artifact_response(
+            &self.config.entity_id,
+            &request.request_id,
+            payload_xml,
+        )
     }
 }
 
@@ -482,13 +562,16 @@ impl IdentityProvider {
     pub fn consume_logout_request(
         &self,
         sp: &SpDescriptor,
-        peer_crypto_policy: Option<&PeerCryptoPolicy>,
-        body: &[u8],
-        binding: Binding,
-        expected_destination: &str,
-        now: SystemTime,
-        clock_skew: Duration,
+        input: ConsumeLogoutRequest<'_>,
     ) -> Result<ParsedLogoutRequest, Error> {
+        let ConsumeLogoutRequest {
+            peer_crypto_policy,
+            body,
+            binding,
+            expected_destination,
+            now,
+            clock_skew,
+        } = input;
         let doc = Document::parse(body)?;
         let (mut parsed, root_id) = parse_logout_request(&doc)?;
 
@@ -514,7 +597,7 @@ impl IdentityProvider {
 
         // Signature (§5.1 step 5).
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
-        let signature_required = self.config.want_logout_requests_signed;
+        let signature_required = self.config.logout_want_signed.requests;
         verify_logout_signature(
             signature_required,
             binding,
@@ -566,7 +649,7 @@ impl IdentityProvider {
             status_message: None,
         };
         let element = build_logout_response_element(&build)?;
-        let element = self.maybe_sign_outbound(element, self.config.sign_logout_responses)?;
+        let element = self.maybe_sign_outbound(element, self.config.logout_signing.sign_responses)?;
         let xml = serialize_element(element)?;
 
         encode_logout_dispatch_response(binding, &destination_endpoint.url, &xml, relay_state)
@@ -611,11 +694,11 @@ impl IdentityProvider {
                     &destination_endpoint.url,
                     &xml,
                     opts.relay_state,
-                    self.config.sign_logout_requests.then_some(self),
+                    self.config.logout_signing.sign_requests.then_some(self),
                 )?
             }
             Binding::HttpPost => {
-                let element = self.maybe_sign_outbound(element, self.config.sign_logout_requests)?;
+                let element = self.maybe_sign_outbound(element, self.config.logout_signing.sign_requests)?;
                 let xml = serialize_element(element)?;
                 crate::binding::post::encode_request(
                     &parse_url(&destination_endpoint.url)?,
@@ -647,14 +730,17 @@ impl IdentityProvider {
     pub fn consume_logout_response(
         &self,
         sp: &SpDescriptor,
-        peer_crypto_policy: Option<&PeerCryptoPolicy>,
-        body: &[u8],
-        binding: Binding,
-        tracker: &LogoutTracker,
-        expected_destination: &str,
-        now: SystemTime,
-        clock_skew: Duration,
+        input: ConsumeLogoutResponse<'_>,
     ) -> Result<LogoutOutcome, Error> {
+        let ConsumeLogoutResponse {
+            peer_crypto_policy,
+            body,
+            binding,
+            tracker,
+            expected_destination,
+            now,
+            clock_skew,
+        } = input;
         // `now` and `clock_skew` are accepted for API symmetry with SLO §5.2;
         // LogoutResponse has no time-bound attribute to validate against.
         let _ = (now, clock_skew);
@@ -684,7 +770,7 @@ impl IdentityProvider {
 
         // Signature (§5.2 step 5).
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
-        let signature_required = self.config.want_logout_responses_signed;
+        let signature_required = self.config.logout_want_signed.responses;
         verify_logout_signature(
             signature_required,
             binding,
@@ -737,11 +823,11 @@ impl IdentityProvider {
             session_index: opts.session_index,
         };
         let element = build_logout_request_element(&build)?;
-        let element = self.maybe_sign_outbound(element, self.config.sign_logout_requests)?;
+        let element = self.maybe_sign_outbound(element, self.config.logout_signing.sign_requests)?;
         let xml = serialize_element(element)?;
         let xml_str = std::str::from_utf8(&xml)
-            .map_err(|_| Error::XmlEmit("non-UTF-8 outbound XML".to_string()))?;
-        let envelope = wrap_soap_envelope(xml_str)?;
+            .map_err(|_err| Error::XmlEmit("non-UTF-8 outbound XML".to_string()))?;
+        let envelope = wrap_soap_envelope(xml_str);
 
         let request = HttpRequest {
             method: http::Method::POST,
@@ -774,13 +860,15 @@ impl IdentityProvider {
             .unwrap_or_default();
         self.consume_logout_response(
             sp,
-            peer_crypto_policy,
-            &response_xml,
-            Binding::Soap,
-            &tracker,
-            &expected_destination,
-            SystemTime::now(),
-            Duration::ZERO,
+            ConsumeLogoutResponse {
+                peer_crypto_policy,
+                body: &response_xml,
+                binding: Binding::Soap,
+                tracker: &tracker,
+                expected_destination: &expected_destination,
+                now: SystemTime::now(),
+                clock_skew: Duration::ZERO,
+            },
         )
     }
 
@@ -798,12 +886,14 @@ impl IdentityProvider {
         crate::dsig::sign::sign_element(
             stash.root().clone(),
             &stash,
-            &self.config.signing_key,
-            self.config.outbound_signature_algorithm,
-            self.config.outbound_digest_algorithm,
-            self.config.outbound_c14n,
-            &[],
-            /* include_x509_cert */ true,
+            crate::dsig::sign::SignOptions {
+                signing_key: &self.config.signing_key,
+                sig_alg: self.config.outbound_signature_algorithm,
+                digest_alg: self.config.outbound_digest_algorithm,
+                c14n_alg: self.config.outbound_c14n,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )
     }
 }
@@ -851,12 +941,10 @@ fn verify_logout_signature(
 
 /// Wrap a SAML protocol message XML body in a SOAP 1.1 envelope.
 #[cfg(feature = "slo")]
-fn wrap_soap_envelope(saml_xml: &str) -> Result<String, Error> {
-    Ok(format!(
-        r#"<soap:Envelope xmlns:soap="{ns}"><soap:Body>{body}</soap:Body></soap:Envelope>"#,
-        ns = SOAP_NS,
-        body = saml_xml,
-    ))
+fn wrap_soap_envelope(saml_xml: &str) -> String {
+    format!(
+        r#"<soap:Envelope xmlns:soap="{SOAP_NS}"><soap:Body>{saml_xml}</soap:Body></soap:Envelope>"#
+    )
 }
 
 /// Unwrap a SOAP 1.1 envelope and return the inner SAML protocol message
@@ -911,8 +999,8 @@ fn encode_logout_dispatch_response(
         ),
         Binding::Soap => {
             let xml_str = std::str::from_utf8(xml)
-                .map_err(|_| Error::XmlEmit("non-UTF-8 outbound XML".to_string()))?;
-            let envelope = wrap_soap_envelope(xml_str)?;
+                .map_err(|_err| Error::XmlEmit("non-UTF-8 outbound XML".to_string()))?;
+            let envelope = wrap_soap_envelope(xml_str);
             Ok(Dispatch::Post(crate::binding::PostForm {
                 action: dest,
                 saml_request: None,
@@ -964,7 +1052,7 @@ fn encode_logout_redirect_request(
 /// error as an `InvalidConfiguration`.
 #[cfg(feature = "slo")]
 fn parse_url(url: &str) -> Result<url::Url, Error> {
-    url::Url::parse(url).map_err(|_| Error::InvalidConfiguration {
+    url::Url::parse(url).map_err(|_err| Error::InvalidConfiguration {
         reason: "endpoint URL is not a valid URL",
     })
 }
@@ -982,14 +1070,26 @@ fn serialize_element(element: Element) -> Result<Vec<u8>, Error> {
 #[cfg(feature = "slo")]
 fn generate_xml_id() -> String {
     use rsa::rand_core::{OsRng, RngCore as _};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut bytes = [0u8; 16];
-    let _ = OsRng.try_fill_bytes(&mut bytes);
+    // `try_fill_bytes` failure is treated as catastrophic for ID minting; fall
+    // back to a deterministic placeholder rather than `unwrap()` to keep this
+    // call path panic-free. Returning a (very unlikely) zero-byte ID is
+    // acceptable: callers treat the value as opaque and the surrounding
+    // protocol layer never relies on entropy beyond uniqueness within the
+    // session window.
+    if OsRng.try_fill_bytes(&mut bytes).is_err() {
+        bytes = [0u8; 16];
+    }
     let mut out = String::with_capacity(33);
     out.push('_');
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+        let hi = usize::from(b >> 4);
+        let lo = usize::from(b & 0x0f);
+        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
+            out.push(h as char);
+            out.push(l as char);
+        }
     }
     out
 }
@@ -1120,18 +1220,16 @@ mod tests {
             signing_key: rsa_keypair_with_cert(),
             decryption_key: None,
             want_authn_requests_signed,
-            sign_responses,
-            sign_assertions: true,
+            assertion_signing: IdpAssertionSigning {
+                sign_responses,
+                sign_assertions: true,
+            },
             encrypt_assertions_when_possible: false,
             #[cfg(feature = "slo")]
-            sign_logout_requests: false,
+            logout_signing: IdpLogoutSigning::default(),
             #[cfg(feature = "slo")]
-            sign_logout_responses: false,
-            #[cfg(feature = "slo")]
-            want_logout_requests_signed: false,
-            #[cfg(feature = "slo")]
-            want_logout_responses_signed: false,
-            default_session_duration: Duration::from_secs(3600),
+            logout_want_signed: IdpLogoutWantSigned::default(),
+            default_session_duration: Duration::from_hours(1),
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -1173,7 +1271,9 @@ mod tests {
     }
 
     fn fixed_now() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(1_779_796_800)
+        UNIX_EPOCH
+            .checked_add(Duration::from_hours(494_388))
+            .expect("static UNIX_EPOCH + bounded Duration cannot overflow")
     }
 
     fn build_unsigned_authn_request(id: &str, with_destination: bool) -> Vec<u8> {
@@ -1193,7 +1293,7 @@ mod tests {
             requested_name_id_format: Some(NameIdFormat::Persistent),
             requested_authn_context: None,
         };
-        let element = build_authn_request_element(&build).expect("build");
+        let element = build_authn_request_element(&build).unwrap();
         let doc = Document::new(element).unwrap();
         emit_document(&doc).unwrap().into_bytes()
     }
@@ -1211,18 +1311,20 @@ mod tests {
             requested_name_id_format: Some(NameIdFormat::Persistent),
             requested_authn_context: None,
         };
-        let element = build_authn_request_element(&build).expect("build");
+        let element = build_authn_request_element(&build).unwrap();
         let stash = Document::new(element).unwrap();
         let kp = rsa_keypair_with_cert();
         let signed = crate::dsig::sign::sign_element(
             stash.root().clone(),
             &stash,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            true,
+            crate::dsig::sign::SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )
         .expect("sign");
         let final_doc = Document::new(signed).unwrap();
@@ -1234,11 +1336,28 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn new_rejects_invalid_entity_id() {
+    fn new_rejects_empty_entity_id() {
+        let mut cfg = idp_with(false, false).config.clone();
+        cfg.entity_id = String::new();
+        let err = IdentityProvider::new(cfg).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn new_rejects_whitespace_entity_id() {
         let mut cfg = idp_with(false, false).config.clone();
         cfg.entity_id = "not a uri".into();
         let err = IdentityProvider::new(cfg).unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn new_accepts_bare_xs_anyuri_entity_id() {
+        // SAML 2.0 §8.3.6: entityID is xs:anyURI. Real-world IdPs emit
+        // bare identifiers like "example.com"; those must be accepted.
+        let mut cfg = idp_with(false, false).config.clone();
+        cfg.entity_id = "example.com".into();
+        IdentityProvider::new(cfg).expect("bare anyURI accepted");
     }
 
     #[test]
@@ -1275,7 +1394,7 @@ mod tests {
                 detached_signature: None,
                 expected_destination: "https://idp.example.com/sso",
                 now: fixed_now(),
-                clock_skew: Duration::from_secs(60),
+                clock_skew: Duration::from_mins(1),
             })
             .expect("consume ok");
 
@@ -1303,7 +1422,7 @@ mod tests {
                 detached_signature: None,
                 expected_destination: "https://idp.example.com/sso",
                 now: fixed_now(),
-                clock_skew: Duration::from_secs(60),
+                clock_skew: Duration::from_mins(1),
             })
             .unwrap_err();
         assert!(matches!(err, Error::SignatureMissing));
@@ -1324,7 +1443,7 @@ mod tests {
                 detached_signature: None,
                 expected_destination: "https://idp.example.com/sso",
                 now: fixed_now(),
-                clock_skew: Duration::from_secs(60),
+                clock_skew: Duration::from_mins(1),
             })
             .expect("consume ok");
         assert_eq!(parsed.id, "_req-3");
@@ -1345,7 +1464,7 @@ mod tests {
                 detached_signature: None,
                 expected_destination: "https://idp.example.com/sso",
                 now: fixed_now(),
-                clock_skew: Duration::from_secs(60),
+                clock_skew: Duration::from_mins(1),
             })
             .unwrap_err();
         assert!(matches!(err, Error::SignatureMissing));
@@ -1367,7 +1486,7 @@ mod tests {
                 // Wrong endpoint — does not match request's Destination.
                 expected_destination: "https://idp.example.com/sso-other",
                 now: fixed_now(),
-                clock_skew: Duration::from_secs(60),
+                clock_skew: Duration::from_mins(1),
             })
             .unwrap_err();
         match err {
@@ -1408,18 +1527,18 @@ mod tests {
                 attributes: vec![Attribute::email("alice@example.com")],
                 authn_instant: fixed_now(),
                 session_index: "sess-1".into(),
-                session_not_on_or_after: Some(fixed_now() + Duration::from_secs(3600)),
+                session_not_on_or_after: Some(fixed_now() + Duration::from_hours(1)),
                 authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
                 force_encrypt_assertion: Some(false),
                 now: fixed_now(),
-                assertion_lifetime: Duration::from_secs(600),
-                subject_confirmation_lifetime: Duration::from_secs(300),
+                assertion_lifetime: Duration::from_mins(10),
+                subject_confirmation_lifetime: Duration::from_mins(5),
             })
             .expect("issue ok");
 
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected POST dispatch, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => panic!("expected POST dispatch, got {other:?}"),
         };
         assert_eq!(form.action.as_str(), "https://sp.example.com/acs");
         assert_eq!(form.relay_state.as_deref(), Some("rs-token"));
@@ -1428,9 +1547,8 @@ mod tests {
         let doc = Document::parse(&decoded.xml).unwrap();
         let (parsed_resp, _) = parse_response(&doc).expect("parse");
         let assertion = parsed_resp.assertion.expect("assertion");
-        let assertion_id = match assertion {
-            crate::response::parse::AssertionWrapper::Cleartext(a) => a,
-            _ => panic!("expected cleartext assertion"),
+        let crate::response::parse::AssertionWrapper::Cleartext(assertion_id) = assertion else {
+            panic!("expected cleartext assertion")
         };
         let assertion_elem = doc.element(assertion_id).unwrap();
         let parsed_assertion =
@@ -1456,7 +1574,7 @@ mod tests {
             .expect("issue error");
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other => panic!("expected POST dispatch, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => panic!("expected POST dispatch, got {other:?}"),
         };
         let decoded = crate::binding::post::decode(&form.saml_response, None).unwrap();
         let doc = Document::parse(&decoded.xml).unwrap();
@@ -1503,12 +1621,14 @@ mod tests {
         let signed = crate::dsig::sign::sign_element(
             stash.root().clone(),
             &stash,
-            &kp,
-            SignatureAlgorithm::RsaSha256,
-            DigestAlgorithm::Sha256,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-            true,
+            crate::dsig::sign::SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
         )
         .unwrap();
         let final_doc = Document::new(signed).unwrap();
@@ -1519,18 +1639,20 @@ mod tests {
     #[test]
     fn consume_logout_request_signed_post_succeeds() {
         let mut idp = idp_with(false, false);
-        idp.config.want_logout_requests_signed = true;
+        idp.config.logout_want_signed.requests = true;
         let sp = sp_descriptor(false);
         let xml = build_signed_logout_request("_lo-req-1");
         let parsed = idp
             .consume_logout_request(
                 &sp,
-                None,
-                &xml,
-                Binding::HttpPost,
-                "https://idp.example.com/slo",
-                fixed_now(),
-                Duration::from_secs(60),
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &xml,
+                    binding: Binding::HttpPost,
+                    expected_destination: "https://idp.example.com/slo",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_mins(1),
+                },
             )
             .expect("consume ok");
         assert_eq!(parsed.id, "_lo-req-1");
@@ -1542,7 +1664,7 @@ mod tests {
     #[test]
     fn consume_logout_request_unsigned_rejected_when_required() {
         let mut idp = idp_with(false, false);
-        idp.config.want_logout_requests_signed = true;
+        idp.config.logout_want_signed.requests = true;
         let sp = sp_descriptor(false);
 
         let nid = NameId::email("alice@example.com");
@@ -1561,12 +1683,14 @@ mod tests {
         let err = idp
             .consume_logout_request(
                 &sp,
-                None,
-                &xml,
-                Binding::HttpPost,
-                "https://idp.example.com/slo",
-                fixed_now(),
-                Duration::from_secs(60),
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &xml,
+                    binding: Binding::HttpPost,
+                    expected_destination: "https://idp.example.com/slo",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_mins(1),
+                },
             )
             .unwrap_err();
         assert!(matches!(err, Error::SignatureMissing));
@@ -1606,7 +1730,7 @@ mod tests {
             .expect("build ok");
         let form = match dispatch {
             Dispatch::Post(f) => f,
-            other => panic!("expected POST dispatch, got {other:?}"),
+            other @ Dispatch::Redirect(_) => panic!("expected POST dispatch, got {other:?}"),
         };
         let saml_response = form.saml_response.expect("saml_response in POST form");
         let decoded = crate::binding::post::decode(&saml_response, Some("rs")).unwrap();
@@ -1706,7 +1830,7 @@ mod tests {
     #[test]
     fn soap_envelope_round_trip_extracts_payload() {
         let saml = r#"<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_x" Version="2.0" IssueInstant="2026-05-26T12:34:56Z" InResponseTo="_y"><saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">idp</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status></samlp:LogoutResponse>"#;
-        let envelope = wrap_soap_envelope(saml).unwrap();
+        let envelope = wrap_soap_envelope(saml);
         let unwrapped = unwrap_soap_envelope(envelope.as_bytes()).unwrap();
         // The unwrapped payload must re-parse as a LogoutResponse.
         let doc = Document::parse(&unwrapped).unwrap();

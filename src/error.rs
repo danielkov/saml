@@ -21,6 +21,20 @@ pub enum Error {
     Base64Decode,
     #[error("DEFLATE decode failed")]
     Inflate,
+    /// Structural-XSD-style schema mismatch on an inbound message. Surfaced
+    /// from the `xsd-validate` first-pass walk that runs before any
+    /// cryptographic or content-policy check (see `crate::schema`).
+    ///
+    /// `element` carries the offending element's expanded `{ns}local` name so
+    /// callers can log which part of the wire tree was wrong; `reason` is a
+    /// static description of the rule that fired (missing required attribute,
+    /// unknown child, wrong child ordering, etc.) without leaking caller-
+    /// supplied byte ranges.
+    #[error("SAML schema violation at <{element}>: {reason}")]
+    SchemaViolation {
+        element: String,
+        reason: &'static str,
+    },
 
     // --- Signature / crypto ---
     #[error("XML signature verification failed: {reason}")]
@@ -81,6 +95,25 @@ pub enum Error {
     // --- Configuration ---
     #[error("Invalid configuration: {reason}")]
     InvalidConfiguration { reason: &'static str },
+
+    // --- Replay protection (SAML 2.0 Core §2.5.1.5) ---
+    /// Assertion ID was already present in the replay cache within its
+    /// validity window. Surfaces from
+    /// [`ServiceProvider::consume_response`](crate::sp::ServiceProvider::consume_response)
+    /// when a caller-supplied [`ReplayCache`](crate::replay::ReplayCache)
+    /// reports the id as previously consumed.
+    #[error("Assertion replay detected: assertion_id was already consumed within its validity window")]
+    AssertionReplay,
+    /// In-memory replay cache hit its hard capacity ceiling. Bigger
+    /// capacity, a TTL shorter than the assertion lifetime, or a
+    /// distributed cache backend will resolve this.
+    #[error("Replay cache full: refusing to evict live entries to make room")]
+    ReplayCacheFull,
+    /// Replay cache backend itself errored (e.g. a poisoned mutex, a
+    /// Redis timeout). The static `reason` describes the specific
+    /// failure mode without leaking caller data.
+    #[error("Replay cache backend error: {reason}")]
+    ReplayCache { reason: &'static str },
 
     // --- Transport ---
     #[error("HTTP request failed: {0}")]

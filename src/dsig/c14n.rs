@@ -78,7 +78,6 @@ pub(crate) fn canonicalize(
 // Element emission
 // =============================================================================
 
-#[allow(clippy::too_many_arguments)]
 fn emit_element(
     element: &Element,
     ancestor_chain: &[&Element],
@@ -99,13 +98,17 @@ fn emit_element(
     )?;
 
     // Element prefix: walk in-scope decls (ancestors + own) to find the prefix
-    // bound to the element's namespace URI. The parser preserves
-    // `namespaces_declared_here` verbatim, so prefix selection is unambiguous.
+    // bound to the element's namespace URI. The parser preserves the literal
+    // source prefix on `Element::source_prefix`; when two in-scope prefixes
+    // resolve to the same URI (e.g. Keycloak's `<saml:Assertion xmlns="…"
+    // xmlns:saml="…">`), we prefer the prefix the signer wrote, because c14n
+    // must reproduce the bytes that the signature was computed against.
     let elem_prefix = lookup_prefix_for_uri(
         element.qname().namespace(),
         ancestor_chain,
         element,
         /* is_attribute */ false,
+        element.source_prefix.as_deref(),
     )?;
 
     // ---- start tag ----------------------------------------------------------
@@ -131,16 +134,20 @@ fn emit_element(
     }
 
     // Attributes, sorted lexicographically by (namespace URI, local name).
-    // Unqualified attributes have URI "" and sort first.
-    let mut attrs_sorted: Vec<(&QName, &str)> = element.attributes().collect();
-    attrs_sorted.sort_by(|(a, _), (b, _)| attr_sort_key(a).cmp(&attr_sort_key(b)));
-    for (qname, value) in &attrs_sorted {
+    // Unqualified attributes have URI "" and sort first. Each attribute
+    // carries its own source-prefix hint (see `Element::source_prefix` for
+    // why) so the canonical output preserves the signer's prefix choice.
+    let mut attrs_sorted: Vec<(&QName, Option<&str>, &str)> =
+        element.attributes_with_source_prefix().collect();
+    attrs_sorted.sort_by(|(a, _, _), (b, _, _)| attr_sort_key(a).cmp(&attr_sort_key(b)));
+    for (qname, source_prefix, value) in &attrs_sorted {
         out.push(b' ');
         let attr_prefix = lookup_prefix_for_uri(
             qname.namespace(),
             ancestor_chain,
             element,
             /* is_attribute */ true,
+            *source_prefix,
         )?;
         push_qname(out, attr_prefix.as_deref(), qname.local());
         out.extend_from_slice(b"=\"");
@@ -154,7 +161,7 @@ fn emit_element(
     // Build the rendered-above set for children: it is `rendered_above`
     // overlaid with `ns_sorted` (later same-prefix entries shadow earlier).
     let mut rendered_for_children: Vec<(Option<String>, String)> =
-        Vec::with_capacity(rendered_above.len() + ns_sorted.len());
+        Vec::with_capacity(rendered_above.len().saturating_add(ns_sorted.len()));
     rendered_for_children.extend_from_slice(rendered_above);
     for (prefix, uri) in ns_sorted {
         merge_rendered(&mut rendered_for_children, prefix, uri);
@@ -240,7 +247,12 @@ fn compute_rendered_namespaces(
             inclusive_namespace_prefixes,
         )
     } else {
-        compute_inclusive(element, &in_scope, rendered_above, is_apex)
+        Ok(compute_inclusive(
+            element,
+            &in_scope,
+            rendered_above,
+            is_apex,
+        ))
     }
 }
 
@@ -268,7 +280,7 @@ fn compute_exclusive(
                 // is xmlns="" and only renders if the output ancestor had
                 // a non-empty default ns (i.e., we need to clear it).
                 if prefix.is_none() {
-                    "".to_owned()
+                    String::new()
                 } else {
                     return Err(Error::XmlEmit(format!(
                         "namespace prefix '{}' visibly utilized but not in scope",
@@ -298,7 +310,7 @@ fn compute_exclusive(
             Some(u) => u.to_owned(),
             None => {
                 if prefix.is_none() {
-                    "".to_owned()
+                    String::new()
                 } else {
                     // Prefix named in PrefixList but not in scope — skip silently.
                     // (The spec says PrefixList prefixes that aren't in scope are
@@ -320,7 +332,7 @@ fn compute_inclusive(
     in_scope: &[(Option<String>, String)],
     rendered_above: &[(Option<String>, String)],
     is_apex: bool,
-) -> Result<Vec<(Option<String>, String)>, Error> {
+) -> Vec<(Option<String>, String)> {
     let mut out: Vec<(Option<String>, String)> = Vec::new();
 
     if is_apex {
@@ -356,13 +368,18 @@ fn compute_inclusive(
         }
     }
 
-    Ok(out)
+    out
 }
 
 /// Collect the set of prefixes visibly utilized at `element` for Exclusive
 /// C14N: the prefix of the element's own QName, and the prefix of each of its
 /// namespace-qualified attributes. `None` represents the default namespace,
 /// which is "visibly utilized" iff the element is unprefixed.
+///
+/// Each lookup honors the source-prefix hint recorded on the parsed value so
+/// that — when multiple in-scope prefixes resolve to the same URI — the
+/// "visibly utilized" prefix matches the one the signer actually wrote, and
+/// the rendered declaration is the binding the signer rendered.
 fn utilized_prefixes(
     element: &Element,
     in_scope: &[(Option<String>, String)],
@@ -371,11 +388,16 @@ fn utilized_prefixes(
 
     // Element name prefix.
     let elem_uri = element.qname().namespace();
-    let elem_prefix = prefix_for_uri(in_scope, elem_uri, /* is_attribute */ false)?;
+    let elem_prefix = prefix_for_uri(
+        in_scope,
+        elem_uri,
+        /* is_attribute */ false,
+        element.source_prefix.as_deref(),
+    )?;
     push_unique_opt(&mut out, elem_prefix);
 
     // Each attribute's prefix.
-    for (qname, _value) in element.attributes() {
+    for (qname, source_prefix, _value) in element.attributes_with_source_prefix() {
         // Unqualified attributes do NOT visibly utilize the default namespace
         // (XML Namespaces 1.0 §6.2 — attributes have no default).
         let Some(uri) = qname.namespace() else {
@@ -385,7 +407,12 @@ fn utilized_prefixes(
         if uri == XML_NS {
             continue;
         }
-        let pfx = prefix_for_uri(in_scope, Some(uri), /* is_attribute */ true)?;
+        let pfx = prefix_for_uri(
+            in_scope,
+            Some(uri),
+            /* is_attribute */ true,
+            source_prefix,
+        )?;
         // Attributes never use the default namespace; pfx must be Some.
         if pfx.is_some() {
             push_unique_opt(&mut out, pfx);
@@ -455,11 +482,20 @@ fn namespaces_in_scope(
 /// For *attributes* in Exclusive C14N, only a non-default (named) prefix can
 /// be used to qualify an attribute; unqualified attributes have no namespace.
 /// If `uri` is not bound in scope, returns an error.
+///
+/// `source_prefix` is the prefix the source document used to write this
+/// element/attribute (carried through from the parser on
+/// `Element::source_prefix` / `Attribute::source_prefix`). When `Some`, c14n
+/// prefers that prefix iff the in-scope binding for the URI matches — this
+/// keeps the canonical bytes byte-identical to what the signer hashed, even
+/// when multiple prefixes resolve to the same URI (Keycloak-style assertions
+/// declare both `xmlns="…"` and `xmlns:saml="…"` to the same URI).
 fn lookup_prefix_for_uri(
     uri: Option<&str>,
     ancestor_chain: &[&Element],
     element: &Element,
     is_attribute: bool,
+    source_prefix: Option<&str>,
 ) -> Result<Option<String>, Error> {
     let Some(uri) = uri else {
         return Ok(None);
@@ -468,14 +504,22 @@ fn lookup_prefix_for_uri(
         return Ok(Some("xml".to_owned()));
     }
     let in_scope = namespaces_in_scope(element, ancestor_chain);
-    prefix_for_uri(&in_scope, Some(uri), is_attribute)
+    prefix_for_uri(&in_scope, Some(uri), is_attribute, source_prefix)
 }
 
 /// Like [`lookup_prefix_for_uri`] but takes a pre-built in-scope set.
+///
+/// Selection order:
+/// 1. If `source_prefix = Some(p)` and an in-scope binding for prefix `p`
+///    resolves to `uri`, return `Some(p)`. (For attributes, this requires
+///    `p` to be non-empty — attributes never use the default namespace.)
+/// 2. Otherwise walk inward-to-outward and return the first (most deeply
+///    nested) binding whose URI matches.
 fn prefix_for_uri(
     in_scope: &[(Option<String>, String)],
     uri: Option<&str>,
     is_attribute: bool,
+    source_prefix: Option<&str>,
 ) -> Result<Option<String>, Error> {
     let Some(uri) = uri else {
         return Ok(None);
@@ -483,8 +527,42 @@ fn prefix_for_uri(
     if uri == XML_NS {
         return Ok(Some("xml".to_owned()));
     }
-    // Walk inward-to-outward: later (more deeply nested) declarations win.
-    // For attributes we must use a named prefix (default ns doesn't apply).
+
+    // Step 1: prefer the prefix the signer wrote, if it is in scope and bound
+    // to this URI. `source_prefix = Some("")` would be nonsensical XML so we
+    // treat the bare-empty-string case as "no hint" and fall through.
+    // Unprefixed source names (element default-ns binding) correspond to
+    // `source_prefix = None` on the parsed value, which we represent here as
+    // the absence of the hint.
+    if let Some(hint) = source_prefix
+        && !hint.is_empty()
+    {
+        for (prefix, decl_uri) in in_scope.iter().rev() {
+            if decl_uri == uri
+                && let Some(p) = prefix.as_deref()
+                && p == hint
+            {
+                return Ok(Some(hint.to_owned()));
+            }
+        }
+        // Hint not in scope for this URI — fall through to general lookup.
+    }
+
+    // Step 1b: if the caller passed no source-prefix hint, that means the
+    // source either wrote no prefix (default-ns binding) or this value was
+    // produced programmatically. For elements, prefer the default-ns binding
+    // when it matches. Attributes never use the default namespace.
+    if source_prefix.is_none() && !is_attribute {
+        for (prefix, decl_uri) in in_scope.iter().rev() {
+            if decl_uri == uri && prefix.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
+    // Step 2: walk inward-to-outward; later (more deeply nested) declarations
+    // win. For attributes we must use a named prefix (default ns doesn't
+    // apply).
     for (prefix, decl_uri) in in_scope.iter().rev() {
         if decl_uri == uri {
             if is_attribute && prefix.is_none() {
@@ -521,7 +599,7 @@ fn push_unique(out: &mut Vec<(Option<String>, String)>, prefix: Option<String>, 
 
 /// Push `prefix` into `out` (a list of optional prefixes) only if absent.
 fn push_unique_opt(out: &mut Vec<Option<String>>, prefix: Option<String>) {
-    if !out.iter().any(|p| *p == prefix) {
+    if !out.contains(&prefix) {
         out.push(prefix);
     }
 }
@@ -555,9 +633,9 @@ fn ns_sort_key(decl: &(Option<String>, String)) -> (u8, &[u8]) {
 /// Sort key for attributes: (namespace URI as bytes, local name as bytes).
 /// Unqualified attributes use URI "" and therefore sort before any namespaced
 /// attribute (per C14N §3.7 step 3).
-fn attr_sort_key<'a>(qname: &'a QName) -> (&'a [u8], &'a [u8]) {
+fn attr_sort_key(qname: &QName) -> (&[u8], &[u8]) {
     (
-        qname.namespace().map(str::as_bytes).unwrap_or(&[][..]),
+        qname.namespace().map_or(&[][..], str::as_bytes),
         qname.local().as_bytes(),
     )
 }
@@ -732,7 +810,7 @@ mod tests {
         // also not visibly used by apex/leaf, so it too is omitted.
         let input = r#"<root xmlns:p="urn:p"><apex xmlns:q="urn:q"><leaf/></apex></root>"#;
         let got = canon_named(input, "apex", C14nAlgorithm::ExclusiveCanonical, &[]);
-        assert_eq!(got, r#"<apex><leaf></leaf></apex>"#);
+        assert_eq!(got, r"<apex><leaf></leaf></apex>");
     }
 
     // ---------- Example 5: attribute sorting --------------------------------
@@ -766,28 +844,28 @@ mod tests {
 
     #[test]
     fn exclusive_example_6_drops_comments() {
-        let input = r#"<doc><!-- comment --><e/></doc>"#;
+        let input = r"<doc><!-- comment --><e/></doc>";
         let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
         assert_eq!(got, "<doc><e></e></doc>");
     }
 
     #[test]
     fn exclusive_with_comments_example_6_preserves_comments() {
-        let input = r#"<doc><!-- comment --><e/></doc>"#;
+        let input = r"<doc><!-- comment --><e/></doc>";
         let got = canon_root(input, C14nAlgorithm::ExclusiveCanonicalWithComments, &[]);
         assert_eq!(got, "<doc><!-- comment --><e></e></doc>");
     }
 
     #[test]
     fn inclusive_example_6_drops_comments() {
-        let input = r#"<doc><!-- comment --><e/></doc>"#;
+        let input = r"<doc><!-- comment --><e/></doc>";
         let got = canon_root(input, C14nAlgorithm::InclusiveCanonical, &[]);
         assert_eq!(got, "<doc><e></e></doc>");
     }
 
     #[test]
     fn inclusive_with_comments_example_6_preserves_comments() {
-        let input = r#"<doc><!-- comment --><e/></doc>"#;
+        let input = r"<doc><!-- comment --><e/></doc>";
         let got = canon_root(input, C14nAlgorithm::InclusiveCanonicalWithComments, &[]);
         assert_eq!(got, "<doc><!-- comment --><e></e></doc>");
     }
@@ -940,7 +1018,7 @@ mod tests {
     fn exclusive_prefix_list_unbound_prefix_silently_ignored() {
         // PrefixList contains "missing" which isn't in scope. Per spec, such
         // tokens are silently ignored.
-        let input = r#"<root><apex/></root>"#;
+        let input = r"<root><apex/></root>";
         let got = canon_named(
             input,
             "apex",
@@ -1012,5 +1090,111 @@ mod tests {
         assert_eq!(ca, cb);
         assert_eq!(cb, cc);
         assert_eq!(ca, r#"<e a="1" b="2" c="3"></e>"#);
+    }
+
+    // ---------- Keycloak-shape prefix-vs-default-ns regression --------------
+    //
+    // Real Keycloak SAMLResponses declare both the default xmlns and a
+    // `xmlns:saml=` binding to the same URI on the same element, then write
+    // the element name with the `saml:` prefix:
+    //   <saml:Assertion xmlns="urn:oasis:names:tc:SAML:2.0:assertion"
+    //                   xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+    //                   ID="…" …>
+    // Both prefixes resolve to the same URI, but the signer hashed the byte
+    // sequence containing `saml:`. Exclusive XML-C14N requires the canonical
+    // form to use the same prefix the signer used; otherwise the digest the
+    // verifier computes will differ from the embedded `<ds:DigestValue>` and
+    // signature verification fails with "digest mismatch". Before this fix,
+    // `prefix_for_uri` walked the in-scope set in declaration order and
+    // could pick the default (empty) prefix when it appeared later, dropping
+    // the `saml:` prefix from canonical output. The fixed version honors the
+    // source prefix recorded on `Element::source_prefix`.
+    //
+    // Cross-checked against lxml's c14n with `exclusive=True` (Python 3,
+    // libxml2 2.x):
+    //   <saml:Foo xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"></saml:Foo>
+    //
+    // We use a self-contained synthetic element here so the regression is
+    // exercised in unit tests; the longer Keycloak SAMLResponse fixture lives
+    // alongside the end-to-end integration tests.
+
+    #[test]
+    fn keycloak_shape_preserves_saml_prefix_default_xmlns_first() {
+        // Source declares the default xmlns *first*, then the prefixed one.
+        // Before the fix the c14n output rendered `xmlns="…"` and dropped the
+        // `saml:` prefix on the element name.
+        let input = r#"<saml:Foo xmlns="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"/>"#;
+        let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
+        // lxml ground truth: only `xmlns:saml=` is rendered (the default
+        // xmlns is not visibly utilized — the element uses the `saml:`
+        // prefix), and the element name keeps the `saml:` prefix.
+        assert_eq!(
+            got,
+            r#"<saml:Foo xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"></saml:Foo>"#
+        );
+    }
+
+    #[test]
+    fn keycloak_shape_preserves_saml_prefix_prefixed_xmlns_first() {
+        // Same logical input, opposite declaration order in the source. The
+        // canonical bytes must be identical to the case above — both forms
+        // represent the same XML Infoset and must canonicalize the same way.
+        let input = r#"<saml:Foo xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns="urn:oasis:names:tc:SAML:2.0:assertion"/>"#;
+        let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
+        assert_eq!(
+            got,
+            r#"<saml:Foo xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"></saml:Foo>"#
+        );
+    }
+
+    #[test]
+    fn keycloak_shape_preserves_default_when_source_used_default() {
+        // The mirror case: same dual declaration, but the element name has
+        // *no* prefix in the source — the source bound it via the default
+        // xmlns. The canonical form must preserve the default-ns binding,
+        // not switch to `saml:`.
+        let input = r#"<Foo xmlns="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"/>"#;
+        let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
+        assert_eq!(
+            got,
+            r#"<Foo xmlns="urn:oasis:names:tc:SAML:2.0:assertion"></Foo>"#
+        );
+    }
+
+    #[test]
+    fn keycloak_shape_with_nested_assertion_subtree() {
+        // The realistic case: a Keycloak-style `<saml:Assertion>` with the
+        // ambiguous double declaration on the apex, a prefixed `<saml:Issuer>`
+        // child, and an `ID` attribute. The canonical output must use
+        // `saml:` consistently for both the element and the child element.
+        let input = r#"<saml:Assertion xmlns="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="abc"><saml:Issuer>idp</saml:Issuer></saml:Assertion>"#;
+        let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
+        // Exclusive C14N only renders visibly-utilized bindings on the apex:
+        // `saml:` is utilized, the default xmlns is not — so it's dropped.
+        // The `<saml:Issuer>` descendant inherits `saml:` from the apex and
+        // does not re-render the binding.
+        assert_eq!(
+            got,
+            r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="abc"><saml:Issuer>idp</saml:Issuer></saml:Assertion>"#
+        );
+    }
+
+    #[test]
+    fn keycloak_shape_attribute_with_dual_prefix_keeps_source_prefix() {
+        // Attribute on a Keycloak-shape element: `saml:Foo` carries an
+        // attribute `saml:Bar="…"`. The element declares two prefixes
+        // resolving to the same URI; the attribute was written with `saml:`.
+        // Canonical output must keep `saml:Bar`, not switch to a different
+        // prefix bound to the same URI.
+        let input = r#"<saml:Foo xmlns:other="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" saml:Bar="v"/>"#;
+        let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
+        // Both `other:` and `saml:` are bound to the same URI in scope, but
+        // only `saml:` is visibly utilized (by the element name and the
+        // attribute). Canonical output keeps `saml:Bar` and renders only the
+        // `xmlns:saml=` declaration.
+        assert_eq!(
+            got,
+            r#"<saml:Foo xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" saml:Bar="v"></saml:Foo>"#
+        );
     }
 }

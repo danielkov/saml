@@ -5,9 +5,10 @@ pub mod request_parse;
 pub mod response_build;
 pub mod response_parse;
 
+use crate::dsig::algorithms::PeerCryptoPolicy;
 use crate::nameid::NameId;
 use crate::xml::parse::QName;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 pub(crate) const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 pub(crate) const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
@@ -18,6 +19,44 @@ pub(crate) fn samlp_qname(local: &str) -> QName {
 
 pub(crate) fn saml_qname(local: &str) -> QName {
     QName::new(Some(SAML_NS.to_owned()), local)
+}
+
+/// Inputs to a `consume_logout_request` call. Shared by both
+/// [`crate::sp::ServiceProvider::consume_logout_request`] and
+/// [`crate::idp::IdentityProvider::consume_logout_request`] — the parameter
+/// shape is identical on both sides of the SLO exchange (RFC-007 §5.1).
+pub struct ConsumeLogoutRequest<'a> {
+    /// Per-peer inbound crypto policy. `None` falls back to the role's
+    /// `default_peer_crypto_policy`.
+    pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Binding-decoded SAML wire bytes. For HTTP-Redirect/POST the SP-side
+    /// implementation decodes the form value internally; on the IdP side the
+    /// caller hands already-decoded XML (see `crate::idp` module docs).
+    pub body: &'a [u8],
+    pub binding: crate::binding::Binding,
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+}
+
+/// Inputs to a `consume_logout_response` call. Shared by both
+/// [`crate::sp::ServiceProvider::consume_logout_response`] and
+/// [`crate::idp::IdentityProvider::consume_logout_response`] — the parameter
+/// shape is identical on both sides of the SLO exchange (RFC-007 §5.2).
+pub struct ConsumeLogoutResponse<'a> {
+    /// Per-peer inbound crypto policy. `None` falls back to the role's
+    /// `default_peer_crypto_policy`.
+    pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Binding-decoded SAML wire bytes. See [`ConsumeLogoutRequest::body`]
+    /// for the SP-vs-IdP decoding distinction.
+    pub body: &'a [u8],
+    pub binding: crate::binding::Binding,
+    /// The tracker recorded when the matching `<samlp:LogoutRequest>` was
+    /// sent — provides the `InResponseTo` anchor (RFC-007 §5.2 step 6).
+    pub tracker: &'a LogoutTracker,
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
 }
 
 /// Inputs for initiating a Logout (sp.start_logout / idp.start_logout).
@@ -109,10 +148,12 @@ impl LogoutStatus {
     pub(crate) fn top_level_uri(self) -> &'static str {
         match self {
             LogoutStatus::Success => "urn:oasis:names:tc:SAML:2.0:status:Success",
-            LogoutStatus::PartialLogout => "urn:oasis:names:tc:SAML:2.0:status:Responder",
-            LogoutStatus::RequestDenied => "urn:oasis:names:tc:SAML:2.0:status:Requester",
-            LogoutStatus::Requester => "urn:oasis:names:tc:SAML:2.0:status:Requester",
-            LogoutStatus::Responder => "urn:oasis:names:tc:SAML:2.0:status:Responder",
+            LogoutStatus::PartialLogout | LogoutStatus::Responder => {
+                "urn:oasis:names:tc:SAML:2.0:status:Responder"
+            }
+            LogoutStatus::RequestDenied | LogoutStatus::Requester => {
+                "urn:oasis:names:tc:SAML:2.0:status:Requester"
+            }
         }
     }
 

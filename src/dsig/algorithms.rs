@@ -74,6 +74,10 @@ impl SignatureAlgorithm {
             "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512" => Ok(Self::EcdsaSha512),
             #[cfg(feature = "weak-algos")]
             "http://www.w3.org/2000/09/xmldsig#rsa-sha1" => Ok(Self::RsaSha1),
+            // ADFS vendor alias for the xmldsig RSA-SHA1 URI. Not in any
+            // W3C standard but observed in real-world Microsoft IdP emit.
+            #[cfg(feature = "weak-algos")]
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha1" => Ok(Self::RsaSha1),
             #[cfg(feature = "weak-algos")]
             "http://www.w3.org/2000/09/xmldsig#dsa-sha1" => Ok(Self::DsaSha1),
             _ => Err(Error::DisallowedAlgorithm {
@@ -116,9 +120,19 @@ impl DigestAlgorithm {
         match uri {
             "http://www.w3.org/2001/04/xmlenc#sha256" => Ok(Self::Sha256),
             "http://www.w3.org/2001/04/xmldsig-more#sha384" => Ok(Self::Sha384),
+            // W3C XML Signature 1.1 form of the SHA-384 digest URI (the
+            // `xmldsig-more` URI above is the RFC 4051 form). The spec at
+            // https://www.w3.org/TR/xmldsig-core1/#sec-AlgID lists this URI
+            // alongside the matching SHA-256 / SHA-512 xmlenc variants;
+            // Microsoft ADFS and other IdPs emit this form in the wild.
+            "http://www.w3.org/2001/04/xmlenc#sha384" => Ok(Self::Sha384),
             "http://www.w3.org/2001/04/xmlenc#sha512" => Ok(Self::Sha512),
             #[cfg(feature = "weak-algos")]
             "http://www.w3.org/2000/09/xmldsig#sha1" => Ok(Self::Sha1),
+            // ADFS vendor alias for SHA-1 digest URI. Not in any W3C
+            // standard but observed in real-world Microsoft IdP emit.
+            #[cfg(feature = "weak-algos")]
+            "http://www.w3.org/2001/04/xmlenc#sha1" => Ok(Self::Sha1),
             _ => Err(Error::DisallowedAlgorithm {
                 alg: uri.to_owned(),
             }),

@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://app.onelogin.com/saml/metadata/383123">
+  <IDPSSODescriptor xmlns:ds="http://www.w3.org/2000/09/xmldsig#" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <KeyDescriptor use="signing">
+      <ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+        <ds:X509Data>
+          <ds:X509Certificate>MIIEHjCCAwagAwIBAgIBATANBgkqhkiG9w0BAQUFADBnMQswCQYDJeOldsig#">
+        <ds:X509Data>
+          <ds:X509Certificate>MIIEHjCCAwagAwIBAgIBATANBgkqhkiG9w0BAQUFADBnMQswCQYDVQQGEwJVUzET
+MBEGA1UECAwKQ2FsaWZvcm5pYTEVMBMGA1UEBwwMU2Foasis:names:tc:SAML:1.0:protocol">
+  <ds:S URI="#x'] or [SignedInfo>
+  </dsudGEgTW9uaWNhMREwDwYD
+VQQKDAhPbmVMb2dpbjEZMBcGA1UEAwwQYXBwLm9uZWxvZ2luLmNvbTAeFw0xMzA2
+MDUxNzE2MjBaFw0xODA2MDUxNzE2gnOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" Location="saml:Response xmlns:saml="urn:oasis:names:tc:SAML:&1.0:protocol">
+  <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+    <derson>
+</EntityDescriptor>

@@ -63,6 +63,10 @@ pub(crate) fn parse_authn_request(
         ));
     }
 
+    // Structural schema gate. See `crate::schema` for the rule set.
+    #[cfg(feature = "xsd-validate")]
+    crate::schema::validate_authn_request(root)?;
+
     let version = required_attr(root, "Version")?;
     if version != "2.0" {
         return Err(Error::XmlParse("unsupported SAML version".to_string()));
@@ -103,8 +107,11 @@ pub(crate) fn parse_authn_request(
     let assertion_consumer_service_index = root
         .attribute(None, "AssertionConsumerServiceIndex")
         .map(|s| {
-            s.parse::<u16>()
-                .map_err(|_| Error::XmlParse("AssertionConsumerServiceIndex not u16".to_string()))
+            s.parse::<u16>().map_err(|source| {
+                Error::XmlParse(format!(
+                    "AssertionConsumerServiceIndex not u16: {source}"
+                ))
+            })
         })
         .transpose()?;
 
@@ -182,8 +189,8 @@ fn required_attr(element: &Element, local: &str) -> Result<String, Error> {
 fn parse_optional_xs_bool(value: Option<&str>) -> Result<Option<bool>, Error> {
     match value {
         None => Ok(None),
-        Some("true") | Some("1") => Ok(Some(true)),
-        Some("false") | Some("0") => Ok(Some(false)),
+        Some("true" | "1") => Ok(Some(true)),
+        Some("false" | "0") => Ok(Some(false)),
         Some(other) => Err(Error::XmlParse(format!(
             "invalid xs:boolean attribute value: {other}"
         ))),
@@ -231,7 +238,7 @@ mod tests {
         assert!(p.force_authn);
         assert!(!p.is_passive);
         assert_eq!(
-            p.requested_name_id_format.as_ref().map(|f| f.as_uri()),
+            p.requested_name_id_format.as_ref().map(NameIdFormat::as_uri),
             Some("urn:oasis:names:tc:SAML:2.0:nameid-format:persistent")
         );
         assert!(p.requested_authn_context.is_none());
@@ -383,11 +390,18 @@ mod tests {
           <saml:Issuer>https://sp.example.com/saml</saml:Issuer>
         </samlp:AuthnRequest>"#;
         let err = parse(xml).unwrap_err();
+        // Under default features the structural schema gate fires first
+        // (SchemaViolation); when `xsd-validate` is off the manual
+        // `required_attr` check below surfaces XmlParse. Both express the
+        // same rule.
         match err {
             Error::XmlParse(msg) => {
                 assert!(msg.contains("IssueInstant"), "got: {msg}");
             }
-            other => panic!("expected XmlParse, got {other:?}"),
+            Error::SchemaViolation { reason, .. } => {
+                assert!(reason.contains("IssueInstant"), "got: {reason}");
+            }
+            other => panic!("expected XmlParse or SchemaViolation, got {other:?}"),
         }
     }
 
@@ -403,7 +417,8 @@ mod tests {
         let err = parse(xml).unwrap_err();
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("ID"), "got: {msg}"),
-            other => panic!("expected XmlParse, got {other:?}"),
+            Error::SchemaViolation { reason, .. } => assert!(reason.contains("ID"), "got: {reason}"),
+            other => panic!("expected XmlParse or SchemaViolation, got {other:?}"),
         }
     }
 

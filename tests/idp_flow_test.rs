@@ -31,10 +31,11 @@ const IDP_SSO_URL: &str = "https://idp.example.com/idp-flow/sso";
 /// issues Response → response re-parses.
 #[test]
 fn idp_consumes_redirect_authn_request_and_emits_response() {
-    let sp = common::make_sp(SP_ENTITY_ID, SP_ACS_URL, false);
-    let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL);
-    let idp_descriptor = common::idp_descriptor(&idp);
-    let sp_descriptor = common::sp_descriptor(&sp);
+    let sp = common::make_sp(SP_ENTITY_ID, SP_ACS_URL, false).expect("sp builds");
+    let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL).expect("idp builds");
+    let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
+    let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
+    let now = common::fixed_now().expect("fixed_now");
 
     // 1. SP builds an AuthnRequest dispatched over HTTP-Redirect.
     let start = sp
@@ -93,8 +94,8 @@ fn idp_consumes_redirect_authn_request_and_emits_response() {
             // SP is unsigned in this fixture; no detached signature.
             detached_signature: None,
             expected_destination: IDP_SSO_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
         })
         .expect("idp consume_authn_request");
 
@@ -114,14 +115,17 @@ fn idp_consumes_redirect_authn_request_and_emits_response() {
             in_response_to: &parsed,
             name_id: NameId::persistent_for_sp("opaque-user-42", SP_ENTITY_ID),
             attributes: vec![Attribute::display_name("Idp Flow User")],
-            authn_instant: common::fixed_now(),
+            authn_instant: now,
             session_index: "sess-idp-flow-1".to_owned(),
-            session_not_on_or_after: Some(common::fixed_now() + Duration::from_secs(3600)),
+            session_not_on_or_after: Some(
+                now.checked_add(Duration::from_hours(1))
+                    .expect("session_not_on_or_after fits"),
+            ),
             authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
             force_encrypt_assertion: None,
-            now: common::fixed_now(),
-            assertion_lifetime: Duration::from_secs(600),
-            subject_confirmation_lifetime: Duration::from_secs(300),
+            now,
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
         })
         .expect("idp issue_response");
 
@@ -164,8 +168,9 @@ fn idp_consumes_redirect_authn_request_and_emits_response() {
             relay_state: Some("idp-flow-relay"),
             tracker: Some(&start.tracker),
             expected_destination: SP_ACS_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
+            replay_cache: None,
         })
         .expect("SP round-trips the IdP-issued Response");
     assert_eq!(identity.name_id.value, "opaque-user-42");

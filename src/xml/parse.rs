@@ -14,12 +14,13 @@
 //! - DTDs, processing instructions, and duplicate ID attributes are rejected
 //!   at parse time per RFC-002 §1.1.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use quick_xml::events::attributes::Attribute;
+use quick_xml::events::attributes::Attribute as QxAttribute;
 use quick_xml::name::{PrefixDeclaration, QName as QxQName};
 
 use crate::error::Error;
@@ -108,13 +109,36 @@ pub struct ElementId(pub(crate) u32);
 /// (not the in-scope set inherited from ancestors). `attributes` is preserved
 /// in document order, after XML 1.0 attribute-value normalization performed by
 /// `quick-xml`.
+///
+/// `source_prefix` is the literal prefix the source document used to qualify
+/// this element's name (or `None` for elements written without a prefix,
+/// including those bound through the default namespace). Both `Exclusive` and
+/// `Inclusive` XML-C14N require canonicalization to emit the prefix the signer
+/// actually wrote: when a Keycloak-style assertion declares both `xmlns="…"`
+/// and `xmlns:saml="…"` resolving to the same URI on the same element, picking
+/// either prefix yields a well-formed document but produces a *different* byte
+/// sequence — and therefore a different digest — than the one the signer
+/// committed to. Preserving this hint lets c14n reproduce the original prefix
+/// choice on canonical emit. For programmatically-built elements the field is
+/// `None`; c14n then falls back to whichever in-scope binding resolves the URI.
 #[derive(Debug, Clone)]
 pub(crate) struct Element {
     pub(crate) qname: QName,
+    pub(crate) source_prefix: Option<String>,
     pub(crate) namespaces_declared_here: Vec<(Option<String>, String)>,
-    pub(crate) attributes: Vec<(QName, String)>,
+    pub(crate) attributes: Vec<Attribute>,
     pub(crate) children: Vec<Node>,
     pub(crate) id: ElementId,
+}
+
+/// A single XML attribute on an [`Element`], preserving the source prefix
+/// for c14n prefix selection. See the [`Element::source_prefix`] field
+/// documentation for why this matters.
+#[derive(Debug, Clone)]
+pub(crate) struct Attribute {
+    pub(crate) qname: QName,
+    pub(crate) source_prefix: Option<String>,
+    pub(crate) value: String,
 }
 
 #[derive(Debug, Clone)]
@@ -134,25 +158,34 @@ impl Element {
     }
 
     pub(crate) fn attribute(&self, namespace: Option<&str>, local: &str) -> Option<&str> {
-        for (name, value) in &self.attributes {
-            if name.local == local && name.namespace.as_deref() == namespace {
-                return Some(value.as_str());
+        for attr in &self.attributes {
+            if attr.qname.local == local && attr.qname.namespace.as_deref() == namespace {
+                return Some(attr.value.as_str());
             }
         }
         None
     }
 
-    pub(crate) fn attributes(&self) -> impl Iterator<Item = (&QName, &str)> {
+    /// Iterate attributes along with the prefix the source document used to
+    /// qualify each one. Returns `(qname, source_prefix, value)` per
+    /// attribute. The `source_prefix` is the literal prefix string written
+    /// in the source XML (for example `"saml"` for `saml:foo="..."`), or
+    /// `None` for unprefixed attributes (which per XML Namespaces 1.0 §6.2
+    /// have no namespace). c14n uses this to reproduce the signer's prefix
+    /// choice when multiple in-scope prefixes resolve to the same URI.
+    pub(crate) fn attributes_with_source_prefix(
+        &self,
+    ) -> impl Iterator<Item = (&QName, Option<&str>, &str)> {
         self.attributes
             .iter()
-            .map(|(name, value)| (name, value.as_str()))
+            .map(|attr| (&attr.qname, attr.source_prefix.as_deref(), attr.value.as_str()))
     }
 
     pub(crate) fn children(&self) -> impl Iterator<Item = &Node> {
         self.children.iter()
     }
 
-    pub(crate) fn child_elements<'a>(&'a self) -> impl Iterator<Item = &'a Element> {
+    pub(crate) fn child_elements(&self) -> impl Iterator<Item = &Element> {
         self.children.iter().filter_map(|child| match child {
             Node::Element(e) => Some(e),
             _ => None,
@@ -271,6 +304,7 @@ impl Document {
 
     /// First element in document order with the given expanded name, anywhere
     /// in the subtree (including the root).
+    #[cfg(any(test, feature = "slo"))]
     pub(crate) fn find_first<'a>(
         &'a self,
         namespace: Option<&str>,
@@ -280,6 +314,7 @@ impl Document {
     }
 }
 
+#[cfg(any(test, feature = "slo"))]
 fn find_first_in<'a>(
     element: &'a Element,
     namespace: Option<&str>,
@@ -337,8 +372,45 @@ fn resolve_prefix<'a>(stack: &'a [NsLayer], prefix: Option<&[u8]>) -> Option<&'a
     None
 }
 
+/// Apply XML 1.0 §2.11 end-of-line normalization to the raw input bytes:
+/// translate every two-byte `#xD #xA` sequence and every standalone `#xD` to
+/// a single `#xA`. Returns a borrowed slice when the input has no `#xD` bytes
+/// (the common LF-terminated case) so the fast path is zero-copy.
+fn normalize_line_endings(xml: &[u8]) -> Cow<'_, [u8]> {
+    if !xml.contains(&b'\r') {
+        return Cow::Borrowed(xml);
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(xml.len());
+    // Single-pass scan with a peekable iterator so we can collapse `\r\n`
+    // without indexing into the slice (which would trip `clippy::indexing_slicing`).
+    let mut iter = xml.iter().peekable();
+    while let Some(&b) = iter.next() {
+        if b == b'\r' {
+            out.push(b'\n');
+            // `\r\n` collapses to a single `\n`; standalone `\r` also becomes `\n`.
+            if iter.peek().copied().copied() == Some(b'\n') {
+                iter.next();
+            }
+        } else {
+            out.push(b);
+        }
+    }
+    Cow::Owned(out)
+}
+
 fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
-    let mut reader = Reader::from_reader(xml);
+    // XML 1.0 §2.11 line-end normalization: translate every `#xD #xA` two-byte
+    // sequence and every standalone `#xD` to a single `#xA` before parsing.
+    // This is the spec's first-pass behavior ("the XML processor must behave as
+    // if it normalized all line breaks ... on input, before parsing") and is
+    // essential for c14n correctness — without it, text content from CRLF
+    // sources contains literal `\r` bytes that c14n escapes as `&#xD;`, and
+    // signatures over those texts fail to verify against the signer's
+    // canonical bytes (which were computed from a normalized infoset).
+    //
+    // We use `Cow` so that the common LF-only case stays zero-copy.
+    let normalized = normalize_line_endings(xml);
+    let mut reader = Reader::from_reader(normalized.as_ref());
     {
         let cfg = reader.config_mut();
         // Distinguish `<x/>` (Empty) from `<x></x>` (Start+End). We use this
@@ -360,7 +432,7 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
     loop {
         let event = reader
             .read_event()
-            .map_err(|e| Error::XmlParse(format!("quick-xml: {}", e)))?;
+            .map_err(|e| Error::XmlParse(format!("quick-xml: {e}")))?;
 
         match event {
             Event::Eof => break,
@@ -423,11 +495,10 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
                 let actual = end.name();
                 let actual_local_name = actual.local_name();
                 let actual_local = std::str::from_utf8(actual_local_name.as_ref())
-                    .map_err(|_| Error::XmlParse("non-UTF-8 element name".to_string()))?;
+                    .map_err(|err| Error::XmlParse(format!("non-UTF-8 element name: {err}")))?;
                 if actual_local != expected_local.as_str() {
                     return Err(Error::XmlParse(format!(
-                        "end tag mismatch: expected </{}>, got </{}>",
-                        expected_local, actual_local
+                        "end tag mismatch: expected </{expected_local}>, got </{actual_local}>"
                     )));
                 }
                 close_element(frame.element, &mut stack, &mut completed_root)?;
@@ -435,7 +506,7 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
             Event::Text(text) => {
                 let value = text
                     .unescape()
-                    .map_err(|e| Error::XmlParse(format!("text decode: {}", e)))?
+                    .map_err(|e| Error::XmlParse(format!("text decode: {e}")))?
                     .into_owned();
                 if value.len() > limits.max_text_length {
                     return Err(Error::XmlParse("max text length exceeded".to_string()));
@@ -448,7 +519,7 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
             Event::CData(cdata) => {
                 let bytes = cdata.into_inner();
                 let value = std::str::from_utf8(&bytes)
-                    .map_err(|_| Error::XmlParse("non-UTF-8 CDATA".to_string()))?
+                    .map_err(|err| Error::XmlParse(format!("non-UTF-8 CDATA: {err}")))?
                     .to_owned();
                 if value.len() > limits.max_text_length {
                     return Err(Error::XmlParse("max text length exceeded".to_string()));
@@ -461,7 +532,7 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
             Event::Comment(comment) => {
                 let bytes = comment.into_inner();
                 let value = std::str::from_utf8(&bytes)
-                    .map_err(|_| Error::XmlParse("non-UTF-8 comment".to_string()))?
+                    .map_err(|err| Error::XmlParse(format!("non-UTF-8 comment: {err}")))?
                     .to_owned();
                 if value.len() > limits.max_text_length {
                     return Err(Error::XmlParse("max text length exceeded".to_string()));
@@ -526,7 +597,6 @@ fn push_text(
 /// - Registers the element's path in `paths` and assigns its `ElementId`.
 /// - Inserts an `(id_value -> ElementId)` mapping into `id_index` for any
 ///   `ID` or `xml:id` attribute; duplicate values fail with `Error::XmlParse`.
-#[allow(clippy::too_many_arguments)]
 fn open_element(
     start: &quick_xml::events::BytesStart<'_>,
     self_closing: bool,
@@ -539,12 +609,16 @@ fn open_element(
     // -------- Pass 1: collect namespace declarations from raw attributes ----
     let mut new_layer = NsLayer::default();
     let mut declared: Vec<(Option<String>, String)> = Vec::new();
+    // Raw attributes carry their original key bytes verbatim so that a
+    // following resolution pass can both expand the QName *and* record the
+    // literal source prefix used to qualify them (needed for c14n prefix
+    // selection — see `Element::source_prefix` docs).
     let mut raw_attrs: Vec<(Vec<u8>, String)> = Vec::new();
     let mut attribute_count: usize = 0;
 
     for attr_result in start.attributes() {
-        let attr: Attribute<'_> =
-            attr_result.map_err(|e| Error::XmlParse(format!("attribute: {}", e)))?;
+        let attr: QxAttribute<'_> =
+            attr_result.map_err(|e| Error::XmlParse(format!("attribute: {e}")))?;
 
         attribute_count = attribute_count.checked_add(1).ok_or_else(|| {
             Error::XmlParse("max attributes per element exceeded".to_string())
@@ -558,7 +632,7 @@ fn open_element(
         let key_bytes = attr.key.into_inner().to_vec();
         let value = attr
             .unescape_value()
-            .map_err(|e| Error::XmlParse(format!("attribute value decode: {}", e)))?
+            .map_err(|e| Error::XmlParse(format!("attribute value decode: {e}")))?
             .into_owned();
 
         match QxQName(&key_bytes).as_namespace_binding() {
@@ -568,7 +642,9 @@ fn open_element(
             }
             Some(PrefixDeclaration::Named(prefix_bytes)) => {
                 let prefix_str = std::str::from_utf8(prefix_bytes)
-                    .map_err(|_| Error::XmlParse("non-UTF-8 namespace prefix".to_string()))?
+                    .map_err(|err| {
+                        Error::XmlParse(format!("non-UTF-8 namespace prefix: {err}"))
+                    })?
                     .to_owned();
                 declared.push((Some(prefix_str), value.clone()));
                 new_layer
@@ -591,42 +667,53 @@ fn open_element(
     let raw_name = start.name();
     let raw_name_bytes = raw_name.into_inner();
     let elem_qname = resolve_qname(raw_name_bytes, ns_stack, /* is_attribute */ false)?;
+    let elem_source_prefix = extract_source_prefix(raw_name_bytes)?;
 
     // -------- Resolve non-namespace attribute QNames -----------------------
-    let mut resolved_attrs: Vec<(QName, String)> = Vec::with_capacity(raw_attrs.len());
+    let mut resolved_attrs: Vec<Attribute> = Vec::with_capacity(raw_attrs.len());
     for (key_bytes, value) in raw_attrs {
         let qn = resolve_qname(&key_bytes, ns_stack, /* is_attribute */ true)?;
-        resolved_attrs.push((qn, value));
+        let source_prefix = extract_source_prefix(&key_bytes)?;
+        resolved_attrs.push(Attribute {
+            qname: qn,
+            source_prefix,
+            value,
+        });
     }
 
     // -------- Compute path + assign ElementId ------------------------------
     let path: ElementPath = if let Some(parent) = stack.last() {
         let mut p = parent.path.clone();
-        let child_index = parent.element.children.len() as u32;
+        let child_index = u32::try_from(parent.element.children.len())
+            .map_err(|_err| Error::XmlParse("element index exceeds u32::MAX".to_string()))?;
         p.push(child_index);
         p
     } else {
         Vec::new()
     };
-    let id_value = ElementId(paths.len() as u32);
+    let id_value = ElementId(
+        u32::try_from(paths.len())
+            .map_err(|_err| Error::XmlParse("element id exceeds u32::MAX".to_string()))?,
+    );
     paths.push(path.clone());
 
     // -------- Register `ID` / `xml:id` attribute in id_index ---------------
     // Rule per RFC-002 §1.1: any attribute whose local name is exactly `ID`
     // (with no namespace), or `xml:id` (local `id` in the XML namespace).
-    for (attr_qname, attr_value) in &resolved_attrs {
-        let is_id_attr = (attr_qname.namespace.is_none() && attr_qname.local == "ID")
-            || (attr_qname.namespace.as_deref() == Some(XML_NS) && attr_qname.local == "id");
+    for attr in &resolved_attrs {
+        let is_id_attr = (attr.qname.namespace.is_none() && attr.qname.local == "ID")
+            || (attr.qname.namespace.as_deref() == Some(XML_NS) && attr.qname.local == "id");
         if is_id_attr {
-            if id_index.contains_key(attr_value) {
+            if id_index.contains_key(&attr.value) {
                 return Err(Error::XmlParse("duplicate ID".to_string()));
             }
-            id_index.insert(attr_value.clone(), id_value);
+            id_index.insert(attr.value.clone(), id_value);
         }
     }
 
     let element = Element {
         qname: elem_qname,
+        source_prefix: elem_source_prefix,
         namespaces_declared_here: declared,
         attributes: resolved_attrs,
         children: Vec::new(),
@@ -642,7 +729,7 @@ fn open_element(
 
 fn close_element(
     element: Element,
-    stack: &mut Vec<StackFrame>,
+    stack: &mut [StackFrame],
     completed_root: &mut Option<Element>,
 ) -> Result<(), Error> {
     if let Some(parent) = stack.last_mut() {
@@ -655,6 +742,23 @@ fn close_element(
     } else {
         *completed_root = Some(element);
         Ok(())
+    }
+}
+
+/// Extract the literal prefix substring (if any) from a raw QName byte slice.
+/// Returns `Ok(Some("saml"))` for `b"saml:Assertion"`, `Ok(None)` for
+/// `b"Assertion"`. Used to thread the source document's prefix choice through
+/// to canonicalization so the c14n output matches what the signer hashed.
+fn extract_source_prefix(name: &[u8]) -> Result<Option<String>, Error> {
+    let q = QxQName(name);
+    let (_local, prefix) = q.decompose();
+    match prefix {
+        Some(p) => {
+            let s = std::str::from_utf8(p.as_ref())
+                .map_err(|err| Error::XmlParse(format!("non-UTF-8 namespace prefix: {err}")))?;
+            Ok(Some(s.to_owned()))
+        }
+        None => Ok(None),
     }
 }
 
@@ -671,7 +775,7 @@ fn resolve_qname(
     let q = QxQName(name);
     let (local, prefix) = q.decompose();
     let local_str = std::str::from_utf8(local.as_ref())
-        .map_err(|_| Error::XmlParse("non-UTF-8 local name".to_string()))?
+        .map_err(|err| Error::XmlParse(format!("non-UTF-8 local name: {err}")))?
         .to_owned();
 
     let namespace = match prefix {
@@ -708,6 +812,8 @@ fn resolve_qname(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     fn parse(xml: &str) -> Document {
@@ -716,7 +822,7 @@ mod tests {
 
     #[test]
     fn parses_simple_document() {
-        let doc = parse(r#"<root><child>hello</child></root>"#);
+        let doc = parse(r"<root><child>hello</child></root>");
         assert_eq!(doc.root().qname().local(), "root");
         assert_eq!(doc.root().qname().namespace(), None);
         let child = doc.root().child_element(None, "child").unwrap();
@@ -780,7 +886,7 @@ mod tests {
 
     #[test]
     fn dtd_rejected() {
-        let xml = r#"<!DOCTYPE foo><root/>"#;
+        let xml = r"<!DOCTYPE foo><root/>";
         let err = Document::parse(xml.as_bytes()).unwrap_err();
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("DTDs"), "got: {msg}"),
@@ -790,7 +896,7 @@ mod tests {
 
     #[test]
     fn processing_instruction_rejected() {
-        let xml = r#"<?php evil ?><root/>"#;
+        let xml = r"<?php evil ?><root/>";
         let err = Document::parse(xml.as_bytes()).unwrap_err();
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("processing instruction"), "got: {msg}"),
@@ -800,7 +906,7 @@ mod tests {
 
     #[test]
     fn comments_preserved() {
-        let xml = r#"<root><!-- hello --><child/><!-- world --></root>"#;
+        let xml = r"<root><!-- hello --><child/><!-- world --></root>";
         let doc = parse(xml);
         let kinds: Vec<&str> = doc
             .root()
@@ -866,7 +972,7 @@ mod tests {
     fn attribute_count_limit_triggers() {
         let mut xml = String::from("<root");
         for i in 0..20 {
-            xml.push_str(&format!(r#" a{i}="v""#));
+            write!(xml, r#" a{i}="v""#).unwrap();
         }
         xml.push_str("/>");
         let limits = XmlLimits {
@@ -912,14 +1018,14 @@ mod tests {
 
     #[test]
     fn unbound_prefix_is_rejected() {
-        let xml = r#"<a:root/>"#;
+        let xml = r"<a:root/>";
         let err = Document::parse(xml.as_bytes()).unwrap_err();
         assert!(matches!(err, Error::XmlParse(_)));
     }
 
     #[test]
     fn element_handle_resolution_round_trip() {
-        let xml = r#"<root><a/><b><c/></b></root>"#;
+        let xml = r"<root><a/><b><c/></b></root>";
         let doc = parse(xml);
         let b = doc.root().child_element(None, "b").unwrap();
         let c = b.child_element(None, "c").unwrap();

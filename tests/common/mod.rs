@@ -6,7 +6,12 @@
 //! `IdpDescriptor`, and `SpDescriptor` fixtures by going through each role's
 //! `metadata_xml` emit + `from_metadata_xml` parse.
 
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "helpers are shared across multiple integration-test binaries; \
+              each binary only references a subset, so the unused-code lint \
+              would otherwise fire spuriously per-binary."
+)]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +28,11 @@ use saml::nameid::NameIdFormat;
 use saml::sp::{ServiceProvider, ServiceProviderConfig};
 
 pub mod mock_http_client;
+
+/// Shorthand for fallible helper return types — every builder funnels its
+/// constructor failures through a single boxed error so call sites can just
+/// `?`-propagate or `.expect(...)` inside a `#[test]` function.
+pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 // =============================================================================
 // Static test cert + key bundle
@@ -91,28 +101,31 @@ K0dYsJzrrDnL23ajO1yzAak=
 
 /// Deterministic test timestamp — 2026-05-26T12:00:30Z. Keeps NotBefore /
 /// NotOnOrAfter checks stable when callers thread `fixed_now()` everywhere.
-pub fn fixed_now() -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(1_779_796_830)
+pub fn fixed_now() -> TestResult<SystemTime> {
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_779_796_830))
+        .ok_or_else(|| "fixed_now timestamp overflowed SystemTime".into())
 }
 
 /// Build an RSA `KeyPair` with the static test cert attached. The same cert is
 /// used for both IdP and SP fixtures by design — these are integration tests,
 /// not key-rotation tests.
-pub fn rsa_keypair_with_cert() -> KeyPair {
-    let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("PEM parses");
-    let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("cert parses");
-    kp.with_certificate(cert)
+pub fn rsa_keypair_with_cert() -> TestResult<KeyPair> {
+    let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM)?;
+    let cert = X509Certificate::from_pem(RSA_CERT_PEM)?;
+    Ok(kp.with_certificate(cert))
 }
 
 /// Build a fresh `X509Certificate` from the static PEM bundle.
-pub fn rsa_cert() -> X509Certificate {
-    X509Certificate::from_pem(RSA_CERT_PEM).expect("cert parses")
+pub fn rsa_cert() -> TestResult<X509Certificate> {
+    Ok(X509Certificate::from_pem(RSA_CERT_PEM)?)
 }
 
 /// Build an IdP role with the static signing key and the supplied entityID +
 /// SSO POST endpoint.
-pub fn make_idp(entity_id: &str, sso_url: &str) -> IdentityProvider {
-    IdentityProvider::new(IdentityProviderConfig {
+pub fn make_idp(entity_id: &str, sso_url: &str) -> TestResult<IdentityProvider> {
+    let signing_key = rsa_keypair_with_cert()?;
+    Ok(IdentityProvider::new(IdentityProviderConfig {
         entity_id: entity_id.to_owned(),
         sso: vec![
             Endpoint::post(sso_url, 0, true),
@@ -125,17 +138,19 @@ pub fn make_idp(entity_id: &str, sso_url: &str) -> IdentityProvider {
             NameIdFormat::EmailAddress,
         ],
         default_name_id_format: NameIdFormat::EmailAddress,
-        signing_key: rsa_keypair_with_cert(),
+        signing_key,
         decryption_key: None,
         want_authn_requests_signed: false,
-        sign_responses: false,
-        sign_assertions: true,
+        assertion_signing: saml::IdpAssertionSigning {
+            sign_responses: false,
+            sign_assertions: true,
+        },
         encrypt_assertions_when_possible: false,
-        sign_logout_requests: false,
-        sign_logout_responses: false,
-        want_logout_requests_signed: false,
-        want_logout_responses_signed: false,
-        default_session_duration: Duration::from_secs(3600),
+        #[cfg(feature = "slo")]
+        logout_signing: saml::IdpLogoutSigning::default(),
+        #[cfg(feature = "slo")]
+        logout_want_signed: saml::IdpLogoutWantSigned::default(),
+        default_session_duration: Duration::from_hours(1),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -146,16 +161,19 @@ pub fn make_idp(entity_id: &str, sso_url: &str) -> IdentityProvider {
         #[cfg(feature = "xmlenc")]
         outbound_key_transport_algorithm:
             saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
-    })
-    .expect("idp config valid")
+    })?)
 }
 
 /// Build an SP role. When `signing` is true the SP carries the static signing
 /// key and emits signed AuthnRequests; otherwise it issues unsigned requests
 /// and carries no key.
-pub fn make_sp(entity_id: &str, acs_url: &str, signing: bool) -> ServiceProvider {
-    let signing_key = signing.then(rsa_keypair_with_cert);
-    ServiceProvider::new(ServiceProviderConfig {
+pub fn make_sp(entity_id: &str, acs_url: &str, signing: bool) -> TestResult<ServiceProvider> {
+    let signing_key = if signing {
+        Some(rsa_keypair_with_cert()?)
+    } else {
+        None
+    };
+    Ok(ServiceProvider::new(ServiceProviderConfig {
         entity_id: entity_id.to_owned(),
         acs: vec![SsoResponseEndpoint::post(acs_url, 0, true)],
         slo: vec![],
@@ -163,30 +181,31 @@ pub fn make_sp(entity_id: &str, acs_url: &str, signing: bool) -> ServiceProvider
         signing_key,
         decryption_key: None,
         sign_authn_requests: signing,
-        want_response_signed: false,
-        want_assertions_signed: true,
+        want_signed: saml::SpWantSigned {
+            response: false,
+            assertions: true,
+        },
         allow_unsolicited: false,
-        sign_logout_requests: false,
-        sign_logout_responses: false,
-        want_logout_requests_signed: false,
-        want_logout_responses_signed: false,
+        #[cfg(feature = "slo")]
+        logout_signing: saml::SpLogoutSigning::default(),
+        #[cfg(feature = "slo")]
+        logout_want_signed: saml::SpLogoutWantSigned::default(),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
-    })
-    .expect("sp config valid")
+    })?)
 }
 
 /// Round-trip an IdP through metadata emit + parse so tests can hand the SP a
 /// real `IdpDescriptor` (the same code path a peer relying party would use).
-pub fn idp_descriptor(idp: &IdentityProvider) -> IdpDescriptor {
-    let xml = idp.metadata_xml(false).expect("metadata emits");
-    IdpDescriptor::from_metadata_xml(xml.as_bytes()).expect("metadata parses")
+pub fn idp_descriptor(idp: &IdentityProvider) -> TestResult<IdpDescriptor> {
+    let xml = idp.metadata_xml(false)?;
+    Ok(IdpDescriptor::from_metadata_xml(xml.as_bytes())?)
 }
 
 /// Round-trip an SP through metadata emit + parse so the IdP gets a real
 /// `SpDescriptor`.
-pub fn sp_descriptor(sp: &ServiceProvider) -> SpDescriptor {
-    let xml = sp.metadata_xml(false).expect("metadata emits");
-    SpDescriptor::from_metadata_xml(xml.as_bytes()).expect("metadata parses")
+pub fn sp_descriptor(sp: &ServiceProvider) -> TestResult<SpDescriptor> {
+    let xml = sp.metadata_xml(false)?;
+    Ok(SpDescriptor::from_metadata_xml(xml.as_bytes())?)
 }

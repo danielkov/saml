@@ -41,7 +41,7 @@ pub struct HttpResponse {
 
 #[cfg(feature = "reqwest-client")]
 mod reqwest_impl {
-    use super::*;
+    use super::{Future, HttpClient, HttpRequest, HttpResponse};
 
     /// `HttpClient` implementation backed by `reqwest`.
     ///
@@ -114,19 +114,15 @@ mod tests {
     struct EchoClient;
 
     impl HttpClient for EchoClient {
-        fn send(
+        async fn send(
             &self,
             request: HttpRequest,
-        ) -> impl Future<
-            Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
-        > + Send {
-            async move {
-                Ok(HttpResponse {
-                    status: 200,
-                    headers: request.headers,
-                    body: request.body,
-                })
-            }
+        ) -> Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: request.headers,
+                body: request.body,
+            })
         }
     }
 

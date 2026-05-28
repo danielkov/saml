@@ -37,8 +37,8 @@ mod tests {
 
     fn sample() -> Conditions {
         Conditions {
-            not_before: Some(UNIX_EPOCH + Duration::from_secs(1)),
-            not_on_or_after: Some(UNIX_EPOCH + Duration::from_secs(3600)),
+            not_before: UNIX_EPOCH.checked_add(Duration::from_secs(1)),
+            not_on_or_after: UNIX_EPOCH.checked_add(Duration::from_hours(1)),
             audiences: vec!["https://sp.example.com".into()],
             one_time_use: false,
             proxy_restriction_count: None,

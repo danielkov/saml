@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to dry-run release for (e.g. v0.1.0)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-and-dry-run:
+    name: Verify tag + cargo publish --dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "ref=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.ref }}"
+          # Strip leading 'v'
+          tag_version="${tag#v}"
+          # Pull `version = "..."` from the [package] table of the root crate.
+          # awk: only consider lines inside the [package] section, take first version =.
+          crate_version=$(awk '
+            /^\[package\]/ { in_pkg=1; next }
+            /^\[/ { in_pkg=0 }
+            in_pkg && /^version[[:space:]]*=/ {
+              gsub(/[" ]/, "", $0)
+              sub(/^version=/, "", $0)
+              print
+              exit
+            }
+          ' Cargo.toml)
+          echo "tag      = $tag_version"
+          echo "Cargo.toml = $crate_version"
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::Tag $tag does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --all-features
+
+      # ----- Manual gate -----
+      # The real publish step is intentionally left commented out. To cut a
+      # release, run `cargo publish` locally (or uncomment after reviewing the
+      # dry-run output) so a human approves each upload to crates.io.
+      #
+      # - name: cargo publish
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      #   run: cargo publish --all-features

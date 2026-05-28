@@ -77,7 +77,7 @@ pub(crate) fn build_authn_request_element(
         .with_attribute(QName::new(None, "Version"), "2.0")
         .with_attribute(
             QName::new(None, "IssueInstant"),
-            format_xs_datetime(input.issue_instant),
+            format_xs_datetime(input.issue_instant)?,
         )
         .with_attribute(
             QName::new(None, "Destination"),
@@ -191,7 +191,9 @@ mod tests {
 
     fn fixed_instant() -> std::time::SystemTime {
         // 2026-05-26T12:34:56Z, matches time.rs round-trip vector.
-        UNIX_EPOCH + Duration::from_secs(1_779_798_896)
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_779_798_896))
+            .expect("UNIX_EPOCH + small duration fits in SystemTime")
     }
 
     fn minimal_input<'a>() -> BuildAuthnRequest<'a> {
@@ -405,7 +407,7 @@ mod tests {
         assert_eq!(rac_el.attribute(None, "Comparison"), Some("minimum"));
         let class_refs: Vec<String> = rac_el
             .all_child_elements(Some(SAML_NS), "AuthnContextClassRef")
-            .map(|e| e.text_content())
+            .map(Element::text_content)
             .collect();
         assert_eq!(class_refs.len(), 2);
         assert!(class_refs[0].ends_with("PasswordProtectedTransport"));

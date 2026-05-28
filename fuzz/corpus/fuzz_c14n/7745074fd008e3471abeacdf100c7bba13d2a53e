@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<samlp:Response<?xml versi xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_6b02a2b5-496b-4acc-a3c5-c86d0e9a3825" Version="2.0" IssueInstant="2012-04-04T07:33:10.921Z" Destination="httn">idp.example.com</saml:Issuer>
+  <samlp:Status>
+    <samlp:StatusCode Value="urn:oasis:names:tc:Son="1.0"?>
+<samlp:Response xmlns:samlp="urn:oasis:nAMLam

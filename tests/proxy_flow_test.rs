@@ -47,17 +47,25 @@ const USER_DISPLAY: &str = "Alice Example";
 #[test]
 fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     // ---- Build all four roles. -----------------------------------------
-    let downstream_sp = common::make_sp(DOWN_SP_ENTITY_ID, DOWN_SP_ACS_URL, false);
-    let proxy_idp = common::make_idp(PROXY_IDP_ENTITY_ID, PROXY_IDP_SSO_URL);
-    let proxy_sp = common::make_sp(PROXY_SP_ENTITY_ID, PROXY_SP_ACS_URL, false);
-    let upstream_idp = common::make_idp(UP_IDP_ENTITY_ID, UP_IDP_SSO_URL);
+    let downstream_sp =
+        common::make_sp(DOWN_SP_ENTITY_ID, DOWN_SP_ACS_URL, false).expect("downstream sp builds");
+    let proxy_idp =
+        common::make_idp(PROXY_IDP_ENTITY_ID, PROXY_IDP_SSO_URL).expect("proxy idp builds");
+    let proxy_sp =
+        common::make_sp(PROXY_SP_ENTITY_ID, PROXY_SP_ACS_URL, false).expect("proxy sp builds");
+    let upstream_idp =
+        common::make_idp(UP_IDP_ENTITY_ID, UP_IDP_SSO_URL).expect("upstream idp builds");
 
     // Descriptors via metadata round-trip — same wire-level handshake a
     // real deployment would use.
-    let downstream_sp_descriptor = common::sp_descriptor(&downstream_sp);
-    let proxy_idp_descriptor = common::idp_descriptor(&proxy_idp);
-    let proxy_sp_descriptor = common::sp_descriptor(&proxy_sp);
-    let upstream_idp_descriptor = common::idp_descriptor(&upstream_idp);
+    let downstream_sp_descriptor =
+        common::sp_descriptor(&downstream_sp).expect("downstream sp descriptor");
+    let proxy_idp_descriptor =
+        common::idp_descriptor(&proxy_idp).expect("proxy idp descriptor");
+    let proxy_sp_descriptor = common::sp_descriptor(&proxy_sp).expect("proxy sp descriptor");
+    let upstream_idp_descriptor =
+        common::idp_descriptor(&upstream_idp).expect("upstream idp descriptor");
+    let now = common::fixed_now().expect("fixed_now");
 
     // Proxy composes the proxy_sp + proxy_idp roles. Use the in-memory
     // AEAD codec so the test has no extra storage dependency. The codec's
@@ -66,7 +74,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     // which is pinned, so widen the window to swallow that delta — a
     // century is more than enough.
     let codec = Aes256GcmCodec::new([0x42u8; 32])
-        .with_max_age(Duration::from_secs(100 * 365 * 24 * 3600));
+        .with_max_age(Duration::from_hours(100 * 365 * 24));
     let proxy = Proxy::new(&proxy_sp, &proxy_idp, Box::new(codec));
 
     // ---- 1. Downstream SP starts login against the proxy. ---------------
@@ -108,8 +116,8 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             relay_state: Some("downstream-relay"),
             detached_signature: None,
             expected_destination: PROXY_IDP_SSO_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
         })
         .expect("proxy idp consume_authn_request");
 
@@ -122,7 +130,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             propagate_authn_context: true,
             propagate_name_id_policy: true,
             upstream_binding: Binding::HttpPost,
-            now: common::fixed_now(),
+            now,
         })
         .expect("proxy bounce_to_upstream");
 
@@ -156,8 +164,8 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             relay_state: Some(&upstream_relay_state),
             detached_signature: None,
             expected_destination: UP_IDP_SSO_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
         })
         .expect("upstream consume_authn_request");
 
@@ -176,14 +184,17 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
                 Attribute::single("groups", "admins"),
                 Attribute::single("internalSecret", "do-not-release"),
             ],
-            authn_instant: common::fixed_now(),
+            authn_instant: now,
             session_index: "sess-upstream-1".to_owned(),
-            session_not_on_or_after: Some(common::fixed_now() + Duration::from_secs(3600)),
+            session_not_on_or_after: Some(
+                now.checked_add(Duration::from_hours(1))
+                    .expect("session_not_on_or_after fits"),
+            ),
             authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
             force_encrypt_assertion: None,
-            now: common::fixed_now(),
-            assertion_lifetime: Duration::from_secs(600),
-            subject_confirmation_lifetime: Duration::from_secs(300),
+            now,
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
         })
         .expect("upstream issue_response");
 
@@ -209,8 +220,9 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             relay_state: Some(&upstream_relay_state),
             tracker: Some(&proxy_context.upstream_tracker),
             expected_destination: PROXY_SP_ACS_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
+            replay_cache: None,
         })
         .expect("proxy sp consume_response");
 
@@ -240,9 +252,9 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             attribute_release: &release_policy,
             name_id_transform: &name_id_transform,
             passthrough_authn_context: true,
-            now: common::fixed_now(),
-            session_lifetime: Duration::from_secs(3600),
-            subject_confirmation_lifetime: Duration::from_secs(300),
+            now,
+            session_lifetime: Duration::from_hours(1),
+            subject_confirmation_lifetime: Duration::from_mins(5),
         })
         .expect("proxy relay_to_downstream");
 
@@ -272,8 +284,9 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             relay_state: Some("downstream-relay"),
             tracker: Some(&downstream_start.tracker),
             expected_destination: DOWN_SP_ACS_URL,
-            now: common::fixed_now(),
-            clock_skew: Duration::from_secs(120),
+            now,
+            clock_skew: Duration::from_mins(2),
+            replay_cache: None,
         })
         .expect("downstream consume_response");
 

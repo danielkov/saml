@@ -1,0 +1,4 @@
+<saml:Response xmlns:saml="urn:oasis:names:tc:SAML:1.0:protocol">
+  <ds:nedInfo>
+  </ds:Signature>
+</saml:Response>
