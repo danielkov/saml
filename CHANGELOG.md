@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.1-alpha.1] - 2026-05-29
+
+### Added
+
+- `ReplayMode::{All, OneTimeUseOnly, Off}` opt-out on `ConsumeResponse` and
+  `ConsumeArtifactResponse`. Default `All` matches existing behavior; spec-
+  conformant minimum is `OneTimeUseOnly`. Caller opt-out via `Off`.
+- `IdentityProvider::consume_authn_request_wire`,
+  `consume_logout_request_wire`, and `consume_logout_response_wire` — wire-
+  level helpers that decode the form body and dispatch in one call, matching
+  the symmetry the SP side already had.
+- Crate metadata for crates.io (`repository`, `homepage`, `documentation`,
+  `readme`, `keywords`, `categories`).
+- `LICENSE-MIT`, `LICENSE-APACHE`, `SECURITY.md`, `CHANGELOG.md`,
+  `ROADMAP.md`, `docs/interop.md`.
+- `scripts/coverage.sh` (cargo-llvm-cov HTML report helper) and
+  `examples/idps/fusionauth/regen_cert.sh` (rotate the FA IdP signing
+  keypair).
+- Demo landing renders per-provider notes on each provider card.
+
+### Changed
+
+- Rustdoc intra-doc links to private items rewritten as plain backticks so
+  `cargo doc -D warnings` is clean.
+
+[0.0.1-alpha.1]: https://github.com/danielkov/saml/releases/tag/v0.0.1-alpha.1
+
 ## [0.0.1-alpha.0] - 2026-05-28
 
 ### Added

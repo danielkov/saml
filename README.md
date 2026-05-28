@@ -10,7 +10,7 @@ Stateless, async-native SAML 2.0 toolkit with no libxml2 / xmlsec C build chain.
 
 ## Status
 
-Pre-release: **v0.1.0**. The protocol surface described below is implemented and exercised against an interop corpus drawn from Okta, Microsoft Entra ID, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, and Shibboleth fixtures. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
+Pre-release: **v0.0.1-alpha**. The protocol surface described below is implemented and exercised against an interop corpus drawn from Okta, Microsoft Entra ID, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, and Shibboleth fixtures. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
 
 ## Why this vs. samael
 
@@ -118,6 +118,8 @@ The full SP, IdP, and proxy quickstarts live in [`src/lib.rs`](src/lib.rs) crate
 A runnable Axum SP wired up to seven IdPs (Keycloak, Authentik, FusionAuth locally; Zitadel, Auth0, Descope, Asgardeo in the cloud) behind one `/saml/acs` lives under [`examples/demo/`](examples/demo/). See [`examples/demo/README.md`](examples/demo/README.md) for the setup steps, and [`examples/idps/`](examples/idps/) for the merged docker-compose stack for the three local IdPs.
 
 A standalone Rust IdP built on top of `saml::IdentityProvider` lives at [`examples/idp/`](examples/idp/) — pair it with the Axum SP in `examples/demo/` to exercise the SP and IdP sides of the crate against each other without any third-party software in the loop.
+
+Known per-IdP quirks observed during the demo build (Zitadel SLO no-op, Asgardeo URL validator, Descope free-tier no-SLO, FusionAuth signing/SLO overrides) are documented in [`docs/interop.md`](docs/interop.md).
 
 ## Replay protection
 
