@@ -659,6 +659,9 @@ impl ServiceProvider {
             peer_crypto_policy,
             body,
             binding,
+            // SP side: we binding-decode internally, so the caller-supplied
+            // detached signature material isn't consulted here.
+            detached_signature: _,
             tracker,
             expected_destination,
             now,
@@ -731,6 +734,9 @@ impl ServiceProvider {
             peer_crypto_policy,
             body,
             binding,
+            // SP side: we binding-decode internally, so the caller-supplied
+            // detached signature material isn't consulted here.
+            detached_signature: _,
             expected_destination,
             now,
             clock_skew,
@@ -2239,6 +2245,7 @@ mod tests {
                     peer_crypto_policy: None,
                     body: &body,
                     binding: Binding::HttpPost,
+                    detached_signature: None,
                     tracker: &logout_tracker,
                     expected_destination: "https://sp.example.com/slo/post",
                     now: fixed_now(),
@@ -2273,6 +2280,7 @@ mod tests {
                     peer_crypto_policy: None,
                     body: &body,
                     binding: Binding::HttpPost,
+                    detached_signature: None,
                     tracker: &logout_tracker,
                     expected_destination: "https://sp.example.com/slo/post",
                     now: fixed_now(),
@@ -2319,6 +2327,7 @@ mod tests {
                     peer_crypto_policy: None,
                     body: &body,
                     binding: Binding::HttpPost,
+                    detached_signature: None,
                     expected_destination: "https://sp.example.com/slo/post",
                     now: fixed_now(),
                     clock_skew: Duration::from_secs(30),
@@ -2347,6 +2356,7 @@ mod tests {
                     peer_crypto_policy: None,
                     body: &body,
                     binding: Binding::HttpPost,
+                    detached_signature: None,
                     expected_destination: "https://sp.example.com/slo/post",
                     now: fixed_now(),
                     clock_skew: Duration::from_secs(30),

@@ -572,20 +572,22 @@ pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): 
         );
     };
 
-    // The IdP-side `consume_logout_request` accepts only already-decoded
-    // XML and does NOT take a detached HTTP-Redirect signature payload
-    // (`verify_logout_signature` hardcodes the detached parameter to
-    // `None`). When `logout_want_signed.requests` is on, the only way
-    // to deliver a signed Redirect-bound LogoutRequest is to pass the
-    // deflated XML with `Binding::HttpRedirect` and accept that the
-    // IdP role silently treats it as unsigned (the saml crate's
-    // redirect-signature gate is `None if required => Err`, otherwise
-    // `Ok`). The Issuer-match against the configured SP registry,
-    // performed above, still proves the request came from a known
-    // peer. A production deployment of this example would either
-    // disable redirect-binding SLO on the IdP metadata or wait for
-    // the saml crate to expose the detached-signature surface on the
-    // IdP role.
+    // For Redirect-bound SLO the signature (when present) is computed over
+    // the URL-encoded `SAMLRequest=…&RelayState=…&SigAlg=…` query slice,
+    // never embedded in the XML. Thread it through to `consume_logout_request`
+    // so the IdP role can verify it; otherwise a Redirect-bound signed
+    // request would be rejected as unsigned when `logout_want_signed.requests`
+    // is on.
+    let slo_detached = parsed_query
+        .signature_raw
+        .as_deref()
+        .zip(parsed_query.sig_alg_raw.as_deref())
+        .map(|(sig, alg)| DetachedSignature {
+            signature: sig,
+            sig_alg: alg,
+            raw_query_string: parsed_query.signed_query_string.as_str(),
+        });
+
     let expected_destination = format!("{}/saml/slo", state.config.idp_base_url);
     let parsed = match state.idp.consume_logout_request(
         &entry.sp,
@@ -593,6 +595,7 @@ pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): 
             peer_crypto_policy: None,
             body: &parsed_query.xml,
             binding: Binding::HttpRedirect,
+            detached_signature: slo_detached,
             expected_destination: &expected_destination,
             now: SystemTime::now(),
             clock_skew: Duration::from_mins(2),
@@ -665,6 +668,9 @@ fn handle_slo_request_post(
             peer_crypto_policy: None,
             body: &decoded_xml,
             binding: Binding::HttpPost,
+            // POST binding embeds the XML-DSig signature inside the XML;
+            // no detached signature material to thread through.
+            detached_signature: None,
             expected_destination: &expected_destination,
             now: SystemTime::now(),
             clock_skew: Duration::from_mins(2),

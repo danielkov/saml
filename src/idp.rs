@@ -568,6 +568,7 @@ impl IdentityProvider {
             peer_crypto_policy,
             body,
             binding,
+            detached_signature,
             expected_destination,
             now,
             clock_skew,
@@ -603,7 +604,7 @@ impl IdentityProvider {
             binding,
             &doc,
             root_id,
-            None,
+            detached_signature.as_ref(),
             &sp.signing_certs,
             &policy.allowed_signature_algorithms,
         )?;
@@ -736,6 +737,7 @@ impl IdentityProvider {
             peer_crypto_policy,
             body,
             binding,
+            detached_signature,
             tracker,
             expected_destination,
             now,
@@ -776,7 +778,7 @@ impl IdentityProvider {
             binding,
             &doc,
             root_id,
-            None,
+            detached_signature.as_ref(),
             &sp.signing_certs,
             &policy.allowed_signature_algorithms,
         )?;
@@ -864,6 +866,7 @@ impl IdentityProvider {
                 peer_crypto_policy,
                 body: &response_xml,
                 binding: Binding::Soap,
+                detached_signature: None,
                 tracker: &tracker,
                 expected_destination: &expected_destination,
                 now: SystemTime::now(),
@@ -1649,6 +1652,7 @@ mod tests {
                     peer_crypto_policy: None,
                     body: &xml,
                     binding: Binding::HttpPost,
+                    detached_signature: None,
                     expected_destination: "https://idp.example.com/slo",
                     now: fixed_now(),
                     clock_skew: Duration::from_mins(1),
@@ -1687,6 +1691,7 @@ mod tests {
                     peer_crypto_policy: None,
                     body: &xml,
                     binding: Binding::HttpPost,
+                    detached_signature: None,
                     expected_destination: "https://idp.example.com/slo",
                     now: fixed_now(),
                     clock_skew: Duration::from_mins(1),
@@ -1694,6 +1699,178 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, Error::SignatureMissing));
+    }
+
+    /// Build a signed HTTP-Redirect LogoutRequest the SP would send to the
+    /// IdP's `/slo` endpoint. Returns the decoded XML alongside the canonical
+    /// signed-query slice and the detached `Signature` / `SigAlg` values, in
+    /// the shape the IdP-side caller would extract from the inbound URL.
+    #[cfg(feature = "slo")]
+    fn build_signed_redirect_logout_request(
+        id: &str,
+    ) -> (Vec<u8>, String, String, String) {
+        use crate::binding::redirect::{
+            RedirectDirection, decode as redirect_decode, encode_signed,
+        };
+
+        let nid = NameId::email("alice@example.com");
+        let xml = crate::logout::request_build::build_logout_request_xml(&BuildLogoutRequest {
+            id,
+            issue_instant: fixed_now(),
+            issuer_entity_id: "https://sp.example.com/saml",
+            destination: Some("https://idp.example.com/slo"),
+            not_on_or_after: None,
+            reason: None,
+            name_id: &nid,
+            session_index: Some("sess-1"),
+        })
+        .unwrap();
+
+        let kp = rsa_keypair_with_cert();
+        let sig_alg = SignatureAlgorithm::RsaSha256;
+        let dest = url::Url::parse("https://idp.example.com/slo").unwrap();
+        let dispatch = encode_signed(
+            &dest,
+            RedirectDirection::Request,
+            &xml,
+            None,
+            sig_alg.uri(),
+            |to_sign| crate::dsig::sign::sign_detached_query(to_sign, &kp, sig_alg),
+        )
+        .unwrap();
+        let url = match dispatch {
+            Dispatch::Redirect(u) => u,
+            other @ Dispatch::Post(_) => panic!("expected Redirect dispatch, got {other:?}"),
+        };
+        let raw_query = url.query().unwrap().to_owned();
+        let decoded = redirect_decode(&raw_query, RedirectDirection::Request).unwrap();
+
+        // The signature and sig_alg come back URL-decoded from `decoded`,
+        // but `DetachedSignature::signature` / `.sig_alg` are documented as
+        // the raw query-parameter values. Re-extract from the raw query.
+        let mut signature_raw = String::new();
+        let mut sig_alg_raw = String::new();
+        for pair in raw_query.split('&') {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            match k {
+                "Signature" => signature_raw = v.to_owned(),
+                "SigAlg" => sig_alg_raw = v.to_owned(),
+                _ => {}
+            }
+        }
+        let signed_query_string = decoded
+            .signed_query_string
+            .expect("decoder returned canonical signed query string");
+
+        // Percent-decode the Signature parameter — `DetachedSignature::signature`
+        // is documented as the base64-encoded signature bytes (not the
+        // percent-encoded form value).
+        let signature_decoded = percent_encoding::percent_decode_str(&signature_raw)
+            .decode_utf8()
+            .unwrap()
+            .into_owned();
+        let sig_alg_decoded = percent_encoding::percent_decode_str(&sig_alg_raw)
+            .decode_utf8()
+            .unwrap()
+            .into_owned();
+
+        (decoded.xml, signed_query_string, signature_decoded, sig_alg_decoded)
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn consume_logout_request_signed_redirect_succeeds() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.requests = true;
+        let sp = sp_descriptor(false);
+        let (xml, signed_qs, signature, sig_alg) =
+            build_signed_redirect_logout_request("_lo-redir-1");
+
+        let parsed = idp
+            .consume_logout_request(
+                &sp,
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &xml,
+                    binding: Binding::HttpRedirect,
+                    detached_signature: Some(DetachedSignature {
+                        signature: &signature,
+                        sig_alg: &sig_alg,
+                        raw_query_string: &signed_qs,
+                    }),
+                    expected_destination: "https://idp.example.com/slo",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_mins(1),
+                },
+            )
+            .expect("signed redirect logout request must verify");
+
+        assert_eq!(parsed.id, "_lo-redir-1");
+        assert_eq!(parsed.name_id.value, "alice@example.com");
+        assert_eq!(parsed.session_index, vec!["sess-1".to_string()]);
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn consume_logout_request_redirect_without_detached_payload_rejected() {
+        // Mimic the pre-fix API: caller omits `detached_signature`. With
+        // `require_signed_requests` on the IdP must reject the request as
+        // unsigned even though the wire really was signed.
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.requests = true;
+        let sp = sp_descriptor(false);
+        let (xml, _signed_qs, _signature, _sig_alg) =
+            build_signed_redirect_logout_request("_lo-redir-2");
+
+        let err = idp
+            .consume_logout_request(
+                &sp,
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &xml,
+                    binding: Binding::HttpRedirect,
+                    detached_signature: None,
+                    expected_destination: "https://idp.example.com/slo",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_mins(1),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::SignatureMissing));
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn consume_logout_request_redirect_tampered_signature_rejected() {
+        // Flip a byte in the canonical signed query string after signing.
+        // Verification must reject; we don't want a false-positive accept
+        // from any future short-circuit in the dispatch.
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.requests = true;
+        let sp = sp_descriptor(false);
+        let (xml, signed_qs, signature, sig_alg) =
+            build_signed_redirect_logout_request("_lo-redir-3");
+        let tampered_qs = format!("{signed_qs}&Tamper=1");
+
+        let err = idp
+            .consume_logout_request(
+                &sp,
+                ConsumeLogoutRequest {
+                    peer_crypto_policy: None,
+                    body: &xml,
+                    binding: Binding::HttpRedirect,
+                    detached_signature: Some(DetachedSignature {
+                        signature: &signature,
+                        sig_alg: &sig_alg,
+                        raw_query_string: &tampered_qs,
+                    }),
+                    expected_destination: "https://idp.example.com/slo",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_mins(1),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::SignatureVerification { .. }));
     }
 
     #[cfg(feature = "slo")]

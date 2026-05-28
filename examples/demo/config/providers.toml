@@ -177,11 +177,6 @@ attribute_keys.department = []
 id = "rust-idp"
 label = "Rust IdP"
 metadata_url = "http://localhost:3001/metadata"
-# The saml crate's IdP-side `consume_logout_request` doesn't accept a
-# detached HTTP-Redirect signature payload — only enveloped XML-DSig
-# signatures over POST/SOAP bindings. Pin SP-init SLO to POST so the
-# IdP can actually verify the signature.
-prefer_slo_binding = "POST"
 accent_color = "#dea584"
 brand_initial = "R"
 requested_name_id_format = "EmailAddress"

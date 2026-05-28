@@ -34,6 +34,17 @@ pub struct ConsumeLogoutRequest<'a> {
     /// caller hands already-decoded XML (see `crate::idp` module docs).
     pub body: &'a [u8],
     pub binding: crate::binding::Binding,
+    /// Detached HTTP-Redirect query-string signature payload per SAML 2.0
+    /// Bindings §3.4.4.1. On Redirect-bound SLO the signature is computed
+    /// over the canonical `SAMLRequest=…&RelayState=…&SigAlg=…` query slice
+    /// and travels in a separate `Signature=…` parameter — never embedded in
+    /// the XML. Callers using the IdP-side `consume_logout_request` MUST
+    /// populate this when handling Redirect requests (the IdP role only sees
+    /// pre-decoded XML, so it cannot reconstruct the signed input itself).
+    /// The SP-side `consume_logout_request` ignores this — it decodes the
+    /// binding wire format internally and extracts the signature there.
+    /// `None` for POST / SOAP bindings.
+    pub detached_signature: Option<crate::idp::DetachedSignature<'a>>,
     pub expected_destination: &'a str,
     pub now: SystemTime,
     pub clock_skew: Duration,
@@ -51,6 +62,11 @@ pub struct ConsumeLogoutResponse<'a> {
     /// for the SP-vs-IdP decoding distinction.
     pub body: &'a [u8],
     pub binding: crate::binding::Binding,
+    /// Detached HTTP-Redirect query-string signature payload per SAML 2.0
+    /// Bindings §3.4.4.1 — the `SAMLResponse=…&RelayState=…&SigAlg=…` slice
+    /// the peer signed. See [`ConsumeLogoutRequest::detached_signature`]
+    /// for the SP-vs-IdP semantics.
+    pub detached_signature: Option<crate::idp::DetachedSignature<'a>>,
     /// The tracker recorded when the matching `<samlp:LogoutRequest>` was
     /// sent — provides the `InResponseTo` anchor (RFC-007 §5.2 step 6).
     pub tracker: &'a LogoutTracker,

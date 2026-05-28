@@ -864,6 +864,7 @@ impl FrontChannelChain {
                 peer_crypto_policy: target.peer_crypto_policy.as_ref(),
                 body: logout_response_body,
                 binding,
+                detached_signature: None,
                 tracker: &tracker,
                 expected_destination: &expected_destination,
                 now,
