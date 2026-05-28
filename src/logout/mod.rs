@@ -31,7 +31,8 @@ pub struct ConsumeLogoutRequest<'a> {
     pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
     /// Binding-decoded SAML wire bytes. For HTTP-Redirect/POST the SP-side
     /// implementation decodes the form value internally; on the IdP side the
-    /// caller hands already-decoded XML (see `crate::idp` module docs).
+    /// caller hands already-decoded XML (see `crate::idp` module docs and
+    /// [`crate::decode_wire`]).
     pub body: &'a [u8],
     pub binding: crate::binding::Binding,
     /// Detached HTTP-Redirect query-string signature payload per SAML 2.0
@@ -40,7 +41,9 @@ pub struct ConsumeLogoutRequest<'a> {
     /// and travels in a separate `Signature=…` parameter — never embedded in
     /// the XML. Callers using the IdP-side `consume_logout_request` MUST
     /// populate this when handling Redirect requests (the IdP role only sees
-    /// pre-decoded XML, so it cannot reconstruct the signed input itself).
+    /// pre-decoded XML, so it cannot reconstruct the signed input itself);
+    /// [`crate::decode_wire`] surfaces it as `detached_signature` /
+    /// `detached_sig_alg` / `signed_query_string`.
     /// The SP-side `consume_logout_request` ignores this — it decodes the
     /// binding wire format internally and extracts the signature there.
     /// `None` for POST / SOAP bindings.

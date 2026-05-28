@@ -344,8 +344,8 @@ pub use crate::conditions::Conditions;
 pub use crate::nameid::{NameId, NameIdFormat};
 
 pub use crate::binding::{
-    ArtifactRedirect, Binding, Dispatch, Endpoint, PostForm, SsoResponseBinding,
-    SsoResponseDispatch, SsoResponseEndpoint, SsoResponsePostForm,
+    ArtifactRedirect, Binding, DecodedWire, Dispatch, Endpoint, PostForm, SsoResponseBinding,
+    SsoResponseDispatch, SsoResponseEndpoint, SsoResponsePostForm, WireDirection, decode_wire,
 };
 
 pub use crate::crypto::cert::{PublicKey, PublicKeyAlgorithm, X509Certificate};

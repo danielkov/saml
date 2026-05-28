@@ -16,17 +16,18 @@
 //!
 //! The IdP role consumes already-decoded SAML XML. The caller is responsible
 //! for binding-layer decoding *before* calling [`IdentityProvider::consume_authn_request`]
-//! or any of the SLO consume methods:
+//! or any of the SLO consume methods. The crate exposes a one-call wire
+//! decoder for this — [`crate::decode_wire`] — which handles both bindings:
 //!
-//! - HTTP-Redirect: caller DEFLATE+base64-decodes the `SAMLRequest` /
-//!   `SAMLResponse` query parameter via `crate::binding::redirect::decode`,
-//!   then passes the resulting `xml: Vec<u8>` here. For signed Redirect
-//!   requests the caller additionally passes the
-//!   [`DetachedSignature`] populated from the same decode pass.
-//! - HTTP-POST: caller base64-decodes the form value via
-//!   `crate::binding::post::decode`, then passes the resulting `xml` here.
+//! - HTTP-Redirect: hand `decode_wire` the raw query string. It percent-,
+//!   base64-, and DEFLATE-decodes the `SAMLRequest` / `SAMLResponse` value
+//!   and surfaces the detached `Signature` / `SigAlg` / canonical signed
+//!   query string in the returned [`crate::DecodedWire`] for plumbing into a
+//!   [`DetachedSignature`].
+//! - HTTP-POST: hand `decode_wire` the form value (after form-URL decoding).
+//!   It base64-decodes into XML.
 //! - SOAP: caller unwraps the `soap:Envelope/soap:Body` and hands the inner
-//!   SAML element XML to this layer.
+//!   SAML element XML to this layer. `decode_wire` does not cover SOAP.
 //!
 //! This split keeps the signature path explicit — see RFC-004 §2.1 step 6
 //! and RFC-007 §5.1 step 5 — and lets the role layer enforce the

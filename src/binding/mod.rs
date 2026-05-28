@@ -266,6 +266,131 @@ pub struct ArtifactRedirect {
     pub response_xml: String,
 }
 
+// ── wire decoder ──────────────────────────────────────────────────────
+
+/// Direction of an inbound SAML wire payload. Selects whether the decoder
+/// looks for a `SAMLRequest=…` (AuthnRequest / LogoutRequest) or a
+/// `SAMLResponse=…` (Response / LogoutResponse) parameter when decoding a
+/// Redirect-binding query string. Ignored for POST and SOAP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireDirection {
+    /// Inbound *request* — `SAMLRequest=…` for Redirect / POST.
+    Request,
+    /// Inbound *response* — `SAMLResponse=…` for Redirect / POST.
+    Response,
+}
+
+/// Unified output of [`decode_wire`]. Carries the binding-decoded XML plus
+/// any Redirect-only sidecar fields (detached signature material, canonical
+/// signed query string). The Redirect-only fields are `None` for POST and
+/// SOAP inputs.
+#[derive(Debug, Clone)]
+pub struct DecodedWire {
+    /// The recovered SAML XML, ready to hand to
+    /// [`crate::IdentityProvider::consume_authn_request`] /
+    /// [`crate::ServiceProvider::consume_response`] / the SLO consume entry
+    /// points.
+    pub xml: Vec<u8>,
+    /// `RelayState` parameter value, if present.
+    pub relay_state: Option<String>,
+    /// Redirect-only: detached signature bytes (base64-decoded from the
+    /// `Signature=…` query parameter). Always `None` for POST / SOAP.
+    pub detached_signature: Option<Vec<u8>>,
+    /// Redirect-only: `SigAlg=…` URI from the query string. Always `None`
+    /// for POST / SOAP.
+    pub detached_sig_alg: Option<String>,
+    /// Redirect-only: canonical signed query string per SAML 2.0 Bindings
+    /// §3.4.4.1 — the byte sequence the signer covered. `None` when no
+    /// `Signature=…` parameter was present, and always `None` for POST /
+    /// SOAP.
+    pub signed_query_string: Option<String>,
+}
+
+/// Decode the binding wire bytes of an inbound SAML message into XML plus
+/// any Redirect-binding detached signature material.
+///
+/// `body` is the raw, binding-layer wire payload as it arrived:
+///
+/// - [`Binding::HttpRedirect`]: the exact, percent-encoded query string the
+///   server received (everything after `?`, before `#`). The decoder splits
+///   it on `&`, picks out `SAMLRequest` / `SAMLResponse` / `RelayState` /
+///   `Signature` / `SigAlg`, base64-decodes the SAML payload, and DEFLATE-
+///   inflates it. When a `Signature=…` pair is present, the canonical signed
+///   query string is reconstructed in the field of the same name.
+/// - [`Binding::HttpPost`]: the value of the `SAMLRequest` / `SAMLResponse`
+///   form field, after form-URL decoding. The decoder base64-decodes it
+///   into the SAML XML. Any `RelayState` form value should be threaded in
+///   separately by the caller — the decoder cannot see it here.
+/// - [`Binding::Soap`] / [`Binding::HttpArtifact`]: returns
+///   [`Error::UnsupportedByPeer`] — those bindings have richer envelope
+///   structures (SOAP) or require a back-channel exchange (Artifact) that
+///   this single-shot helper deliberately does not cover.
+///
+/// `direction` selects between the `SAMLRequest=…` and `SAMLResponse=…`
+/// parameter names for the Redirect binding (it is ignored for POST, which
+/// is invoked on the bare form value).
+///
+/// This is the entry point IdP authors should call before handing XML to
+/// [`crate::IdentityProvider::consume_authn_request`] (and equivalents for
+/// the SLO consume methods). The SP-side `consume_*` calls binding-decode
+/// internally; this exposes the same plumbing for symmetry.
+///
+/// # Examples
+///
+/// ```no_run
+/// use saml::{Binding, WireDirection, decode_wire};
+///
+/// # fn run(raw_query_string: &str) -> Result<(), saml::Error> {
+/// // /saml/sso GET handler — caller has the full URL query string.
+/// let decoded = decode_wire(
+///     raw_query_string.as_bytes(),
+///     Binding::HttpRedirect,
+///     WireDirection::Request,
+/// )?;
+/// let _xml: &[u8] = &decoded.xml;
+/// let _relay_state: Option<&str> = decoded.relay_state.as_deref();
+/// // For signed Redirect-bound requests, the detached signature material
+/// // is plumbed through `decoded.detached_signature` / `.detached_sig_alg`
+/// // / `.signed_query_string` to thread into a `DetachedSignature` struct.
+/// # Ok(())
+/// # }
+/// ```
+pub fn decode_wire(
+    body: &[u8],
+    binding: Binding,
+    direction: WireDirection,
+) -> Result<DecodedWire, Error> {
+    match binding {
+        Binding::HttpRedirect => {
+            let qs = std::str::from_utf8(body).map_err(|_err| Error::Base64Decode)?;
+            let redirect_direction = match direction {
+                WireDirection::Request => redirect::RedirectDirection::Request,
+                WireDirection::Response => redirect::RedirectDirection::Response,
+            };
+            let decoded = redirect::decode(qs, redirect_direction)?;
+            Ok(DecodedWire {
+                xml: decoded.xml,
+                relay_state: decoded.relay_state,
+                detached_signature: decoded.signature,
+                detached_sig_alg: decoded.sig_alg,
+                signed_query_string: decoded.signed_query_string,
+            })
+        }
+        Binding::HttpPost => {
+            let b64 = std::str::from_utf8(body).map_err(|_err| Error::Base64Decode)?;
+            let decoded = post::decode(b64, None)?;
+            Ok(DecodedWire {
+                xml: decoded.xml,
+                relay_state: decoded.relay_state,
+                detached_signature: None,
+                detached_sig_alg: None,
+                signed_query_string: None,
+            })
+        }
+        Binding::Soap | Binding::HttpArtifact => Err(Error::UnsupportedByPeer { binding }),
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -462,6 +587,164 @@ mod tests {
                 assert_eq!(reason, "ACS endpoint binding must be POST or Artifact");
             }
             other => panic!("expected InvalidConfiguration, got {other:?}"),
+        }
+    }
+
+    // ── decode_wire ───────────────────────────────────────────────────
+
+    #[test]
+    fn decode_wire_post_round_trips_request() {
+        // POST binding: form value is base64 of raw XML, no compression.
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        let xml = b"<samlp:AuthnRequest ID=\"_r\"/>";
+        let b64 = B64.encode(xml);
+        let decoded = decode_wire(b64.as_bytes(), Binding::HttpPost, WireDirection::Request)
+            .expect("decode_wire post");
+        assert_eq!(decoded.xml, xml);
+        assert!(decoded.relay_state.is_none());
+        assert!(decoded.detached_signature.is_none());
+        assert!(decoded.detached_sig_alg.is_none());
+        assert!(decoded.signed_query_string.is_none());
+    }
+
+    #[test]
+    fn decode_wire_post_round_trips_response() {
+        // POST binding: `WireDirection::Response` is ignored for POST — the
+        // decoder operates on the bare form value, not a query string.
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as B64;
+
+        let xml = b"<samlp:Response ID=\"_x\"/>";
+        let b64 = B64.encode(xml);
+        let decoded = decode_wire(b64.as_bytes(), Binding::HttpPost, WireDirection::Response)
+            .expect("decode_wire post response");
+        assert_eq!(decoded.xml, xml);
+    }
+
+    #[test]
+    fn decode_wire_redirect_round_trips_unsigned() {
+        // Build a Redirect-encoded query string via the crate's own encoder
+        // so we know it's valid; then verify `decode_wire` pulls the XML
+        // (DEFLATE+base64 reversed) and RelayState back out.
+        use url::Url;
+
+        let xml = b"<samlp:AuthnRequest ID=\"_r1\"/>";
+        let dest = Url::parse("https://idp.example.com/sso").unwrap();
+        let dispatch = redirect::encode_unsigned(
+            &dest,
+            redirect::RedirectDirection::Request,
+            xml,
+            Some("rs-token"),
+        )
+        .unwrap();
+        let Dispatch::Redirect(url) = dispatch else {
+            panic!("expected redirect dispatch");
+        };
+        let query = url.query().expect("query");
+
+        let decoded = decode_wire(
+            query.as_bytes(),
+            Binding::HttpRedirect,
+            WireDirection::Request,
+        )
+        .expect("decode_wire redirect");
+        assert_eq!(decoded.xml, xml);
+        assert_eq!(decoded.relay_state.as_deref(), Some("rs-token"));
+        // No `Signature=` parameter present → no detached material.
+        assert!(decoded.detached_signature.is_none());
+        assert!(decoded.detached_sig_alg.is_none());
+        assert!(decoded.signed_query_string.is_none());
+    }
+
+    #[test]
+    fn decode_wire_redirect_surfaces_detached_signature_fields() {
+        // Build a *signed* Redirect dispatch; the canonical signed-query
+        // bytes, base64-decoded signature bytes, and SigAlg URI MUST all
+        // surface verbatim through `decode_wire` so an IdP author can fold
+        // them into a `DetachedSignature` and pass to `consume_authn_request`.
+        use url::Url;
+
+        let xml = b"<samlp:AuthnRequest ID=\"_r2\"/>";
+        let dest = Url::parse("https://idp.example.com/sso").unwrap();
+        let sig_alg = "urn:test:alg";
+        let raw_signature_bytes = vec![0x42u8; 16];
+        let captured_signed_input: std::cell::RefCell<Option<Vec<u8>>> =
+            std::cell::RefCell::new(None);
+
+        let dispatch = redirect::encode_signed(
+            &dest,
+            redirect::RedirectDirection::Request,
+            xml,
+            Some("rs"),
+            sig_alg,
+            |signed_bytes| {
+                *captured_signed_input.borrow_mut() = Some(signed_bytes.to_vec());
+                Ok(raw_signature_bytes.clone())
+            },
+        )
+        .unwrap();
+        let Dispatch::Redirect(url) = dispatch else {
+            panic!("expected redirect dispatch");
+        };
+        let query = url.query().expect("query");
+
+        let decoded = decode_wire(
+            query.as_bytes(),
+            Binding::HttpRedirect,
+            WireDirection::Request,
+        )
+        .expect("decode_wire signed redirect");
+        assert_eq!(decoded.xml, xml);
+        assert_eq!(decoded.relay_state.as_deref(), Some("rs"));
+        assert_eq!(
+            decoded.detached_signature.as_deref(),
+            Some(raw_signature_bytes.as_slice()),
+            "raw signature bytes round-trip"
+        );
+        assert_eq!(decoded.detached_sig_alg.as_deref(), Some(sig_alg));
+        let signed_qs = decoded
+            .signed_query_string
+            .as_deref()
+            .expect("signed_query_string set on signed payload");
+        let captured = captured_signed_input.into_inner().expect("signer ran");
+        assert_eq!(
+            signed_qs.as_bytes(),
+            captured.as_slice(),
+            "canonical signed query string round-trips byte-for-byte",
+        );
+    }
+
+    #[test]
+    fn decode_wire_redirect_rejects_invalid_utf8_query() {
+        // Redirect bodies must be UTF-8 (they're percent-encoded ASCII
+        // query strings). Non-UTF-8 input is rejected as Base64Decode —
+        // we reuse the same error variant as the percent / base64 path.
+        let err = decode_wire(
+            &[0xff, 0xfe, 0xfd],
+            Binding::HttpRedirect,
+            WireDirection::Request,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Base64Decode), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_wire_soap_unsupported() {
+        let err = decode_wire(b"<x/>", Binding::Soap, WireDirection::Request).unwrap_err();
+        match err {
+            Error::UnsupportedByPeer { binding } => assert_eq!(binding, Binding::Soap),
+            other => panic!("expected UnsupportedByPeer(Soap), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_wire_artifact_unsupported() {
+        let err = decode_wire(b"abc", Binding::HttpArtifact, WireDirection::Request).unwrap_err();
+        match err {
+            Error::UnsupportedByPeer { binding } => assert_eq!(binding, Binding::HttpArtifact),
+            other => panic!("expected UnsupportedByPeer(HttpArtifact), got {other:?}"),
         }
     }
 }

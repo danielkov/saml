@@ -15,7 +15,6 @@
 //! - `GET | POST /saml/slo` — verify the SP's signed LogoutRequest, clear
 //!   the local session, echo the LogoutResponse back.
 
-use std::io::Read;
 use std::time::{Duration, SystemTime};
 
 use axum::{
@@ -25,14 +24,13 @@ use axum::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use flate2::read::DeflateDecoder;
 use serde::Deserialize;
 use tracing::{info, warn};
 
 use saml::{
     AuthnContextClassRef, Attribute, Binding, ConsumeAuthnRequest, ConsumeLogoutRequest,
     DetachedSignature, Dispatch, IssueResponse, LogoutStatus, NameId, NameIdFormat,
-    ParsedAuthnRequest, SsoResponseDispatch,
+    ParsedAuthnRequest, SsoResponseDispatch, WireDirection, decode_wire,
 };
 
 use crate::auth::StoredUser;
@@ -102,17 +100,21 @@ pub async fn handle_sso_post(
     headers: HeaderMap,
     Form(form): Form<SsoForm>,
 ) -> Response {
-    let decoded = match BASE64_STD.decode(form.saml_request.as_bytes()) {
-        Ok(bytes) => bytes,
+    let decoded = match decode_wire(
+        form.saml_request.as_bytes(),
+        Binding::HttpPost,
+        WireDirection::Request,
+    ) {
+        Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "/saml/sso POST: SAMLRequest base64 decode failed");
+            warn!(error = %e, "/saml/sso POST: SAMLRequest decode failed");
             return error_page(StatusCode::BAD_REQUEST, "SAMLRequest is not valid base64");
         }
     };
     handle_sso_xml(
         &state,
         &headers,
-        &decoded,
+        &decoded.xml,
         form.relay_state.as_deref(),
         Binding::HttpPost,
         None,
@@ -131,29 +133,40 @@ pub async fn handle_sso_get(
         );
     };
 
-    let parsed_query = match parse_redirect_query(&raw_query) {
-        Ok(q) => q,
+    let decoded = match decode_wire(
+        raw_query.as_bytes(),
+        Binding::HttpRedirect,
+        WireDirection::Request,
+    ) {
+        Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "/saml/sso GET: query parse failed");
-            return error_page(StatusCode::BAD_REQUEST, e);
+            warn!(error = %e, "/saml/sso GET: query decode failed");
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "could not decode SAMLRequest from query string",
+            );
         }
     };
 
-    let detached = parsed_query
-        .signature_raw
+    // `DetachedSignature::signature` is the base64-encoded string per
+    // SAML 2.0 Bindings §3.4.4.1; `decode_wire` already base64-decoded it
+    // into `detached_signature: Vec<u8>`. Re-encode for the role API.
+    let signature_b64 = decoded.detached_signature.as_deref().map(b64_encode);
+    let detached = signature_b64
         .as_deref()
-        .zip(parsed_query.sig_alg_raw.as_deref())
-        .map(|(sig, alg)| DetachedSignature {
+        .zip(decoded.detached_sig_alg.as_deref())
+        .zip(decoded.signed_query_string.as_deref())
+        .map(|((sig, alg), qs)| DetachedSignature {
             signature: sig,
             sig_alg: alg,
-            raw_query_string: parsed_query.signed_query_string.as_str(),
+            raw_query_string: qs,
         });
 
     handle_sso_xml(
         &state,
         &headers,
-        &parsed_query.xml,
-        parsed_query.relay_state.as_deref(),
+        &decoded.xml,
+        decoded.relay_state.as_deref(),
         Binding::HttpRedirect,
         detached,
     )
@@ -553,16 +566,23 @@ pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): 
             "/saml/slo GET requires a query string carrying SAMLRequest",
         );
     };
-    let parsed_query = match parse_redirect_query(&raw_query) {
-        Ok(q) => q,
+    let decoded = match decode_wire(
+        raw_query.as_bytes(),
+        Binding::HttpRedirect,
+        WireDirection::Request,
+    ) {
+        Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "/saml/slo GET: query parse failed");
-            return error_page(StatusCode::BAD_REQUEST, e);
+            warn!(error = %e, "/saml/slo GET: query decode failed");
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "could not decode SAMLRequest from query string",
+            );
         }
     };
 
     // Peek the Issuer to find the SP entry.
-    let Some(issuer) = peek_issuer(&parsed_query.xml) else {
+    let Some(issuer) = peek_issuer(&decoded.xml) else {
         return error_page(StatusCode::BAD_REQUEST, "LogoutRequest carries no Issuer");
     };
     let Some(entry) = state.sp_by_entity_id(&issuer) else {
@@ -578,14 +598,15 @@ pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): 
     // so the IdP role can verify it; otherwise a Redirect-bound signed
     // request would be rejected as unsigned when `logout_want_signed.requests`
     // is on.
-    let slo_detached = parsed_query
-        .signature_raw
+    let slo_sig_b64 = decoded.detached_signature.as_deref().map(b64_encode);
+    let slo_detached = slo_sig_b64
         .as_deref()
-        .zip(parsed_query.sig_alg_raw.as_deref())
-        .map(|(sig, alg)| DetachedSignature {
+        .zip(decoded.detached_sig_alg.as_deref())
+        .zip(decoded.signed_query_string.as_deref())
+        .map(|((sig, alg), qs)| DetachedSignature {
             signature: sig,
             sig_alg: alg,
-            raw_query_string: parsed_query.signed_query_string.as_str(),
+            raw_query_string: qs,
         });
 
     let expected_destination = format!("{}/saml/slo", state.config.idp_base_url);
@@ -593,7 +614,7 @@ pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): 
         &entry.sp,
         ConsumeLogoutRequest {
             peer_crypto_policy: None,
-            body: &parsed_query.xml,
+            body: &decoded.xml,
             binding: Binding::HttpRedirect,
             detached_signature: slo_detached,
             expected_destination: &expected_destination,
@@ -618,7 +639,7 @@ pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): 
         &entry.sp,
         &parsed,
         LogoutStatus::Success,
-        parsed_query.relay_state.as_deref(),
+        decoded.relay_state.as_deref(),
         binding,
     ) {
         Ok(d) => d,
@@ -640,14 +661,18 @@ fn handle_slo_request_post(
     saml_request_b64: &str,
     relay_state: Option<&str>,
 ) -> Response {
-    let decoded_xml = match BASE64_STD.decode(saml_request_b64.as_bytes()) {
-        Ok(b) => b,
+    let decoded = match decode_wire(
+        saml_request_b64.as_bytes(),
+        Binding::HttpPost,
+        WireDirection::Request,
+    ) {
+        Ok(d) => d,
         Err(e) => {
-            warn!(error = %e, "/saml/slo POST: SAMLRequest base64 decode failed");
+            warn!(error = %e, "/saml/slo POST: SAMLRequest decode failed");
             return error_page(StatusCode::BAD_REQUEST, "SAMLRequest is not valid base64");
         }
     };
-    let Some(issuer) = peek_issuer(&decoded_xml) else {
+    let Some(issuer) = peek_issuer(&decoded.xml) else {
         return error_page(StatusCode::BAD_REQUEST, "LogoutRequest carries no Issuer");
     };
     let Some(entry) = state.sp_by_entity_id(&issuer) else {
@@ -659,14 +684,14 @@ fn handle_slo_request_post(
 
     // Unlike the SP-side `consume_logout_request`, the IdP-side variant
     // expects the caller to have already binding-decoded the wire bytes
-    // (see `crate::idp` module docs in the saml crate). Pass the
-    // base64-decoded XML through directly.
+    // (see `crate::idp` module docs in the saml crate). `decode_wire`
+    // takes care of that — pass the recovered XML through directly.
     let expected_destination = format!("{}/saml/slo", state.config.idp_base_url);
     let parsed = match state.idp.consume_logout_request(
         &entry.sp,
         ConsumeLogoutRequest {
             peer_crypto_policy: None,
-            body: &decoded_xml,
+            body: &decoded.xml,
             binding: Binding::HttpPost,
             // POST binding embeds the XML-DSig signature inside the XML;
             // no detached signature material to thread through.
@@ -805,111 +830,12 @@ fn finalize_logout_dispatch(dispatch: Dispatch, sp_label: &str, clear_cookie: bo
     }
 }
 
-#[derive(Debug)]
-struct RedirectQuery {
-    xml: Vec<u8>,
-    relay_state: Option<String>,
-    signature_raw: Option<String>,
-    sig_alg_raw: Option<String>,
-    /// Canonical signed query string per SAML 2.0 §3.4.4.1, used as the
-    /// signature input. Empty when no signature is present.
-    signed_query_string: String,
-}
-
-/// Decode an inbound Redirect-binding SAMLRequest. Mirrors the saml
-/// crate's internal `binding::redirect::decode` shape because that helper
-/// is `pub(crate)` and not exported.
-fn parse_redirect_query(raw_query: &str) -> Result<RedirectQuery, &'static str> {
-    let mut saml_request_raw: Option<&str> = None;
-    let mut relay_state_raw: Option<&str> = None;
-    let mut sig_alg_raw: Option<&str> = None;
-    let mut signature_raw: Option<&str> = None;
-    let mut has_signature_pair = false;
-
-    for pair in raw_query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        match k {
-            "SAMLRequest" => saml_request_raw = Some(v),
-            "RelayState" => relay_state_raw = Some(v),
-            "SigAlg" => sig_alg_raw = Some(v),
-            "Signature" => {
-                signature_raw = Some(v);
-                has_signature_pair = true;
-            }
-            _ => {}
-        }
-    }
-
-    let pct_saml = saml_request_raw.ok_or("missing SAMLRequest in query")?;
-    let saml_b64 = pct_decode(pct_saml).map_err(|_| "SAMLRequest percent-decode failed")?;
-    let deflated = BASE64_STD
-        .decode(saml_b64.as_bytes())
-        .map_err(|_| "SAMLRequest base64 decode failed")?;
-    let xml = inflate_capped(&deflated)?;
-
-    let relay_state = relay_state_raw
-        .map(pct_decode)
-        .transpose()
-        .map_err(|_| "RelayState percent-decode failed")?;
-    let sig_alg = sig_alg_raw
-        .map(pct_decode)
-        .transpose()
-        .map_err(|_| "SigAlg percent-decode failed")?;
-    let signature = signature_raw
-        .map(pct_decode)
-        .transpose()
-        .map_err(|_| "Signature percent-decode failed")?;
-
-    let signed_query_string = if has_signature_pair {
-        let mut qs = format!("SAMLRequest={pct_saml}");
-        if let Some(rs) = relay_state_raw {
-            qs.push_str("&RelayState=");
-            qs.push_str(rs);
-        }
-        if let Some(sa) = sig_alg_raw {
-            qs.push_str("&SigAlg=");
-            qs.push_str(sa);
-        }
-        qs
-    } else {
-        String::new()
-    };
-
-    Ok(RedirectQuery {
-        xml,
-        relay_state,
-        signature_raw: signature,
-        sig_alg_raw: sig_alg,
-        signed_query_string,
-    })
-}
-
-fn pct_decode(s: &str) -> Result<String, std::str::Utf8Error> {
-    percent_encoding::percent_decode_str(s)
-        .decode_utf8()
-        .map(std::borrow::Cow::into_owned)
-}
-
-const MAX_INFLATED_BYTES: usize = 10 * 1024 * 1024;
-
-fn inflate_capped(deflated: &[u8]) -> Result<Vec<u8>, &'static str> {
-    let mut decoder = DeflateDecoder::new(deflated);
-    let limit = u64::try_from(MAX_INFLATED_BYTES)
-        .ok()
-        .and_then(|n| n.checked_add(1))
-        .ok_or("inflate cap overflow")?;
-    let mut buf = Vec::new();
-    let mut limited = (&mut decoder).take(limit);
-    limited
-        .read_to_end(&mut buf)
-        .map_err(|_| "DEFLATE decode failed")?;
-    if buf.len() > MAX_INFLATED_BYTES {
-        return Err("inflated payload exceeded cap");
-    }
-    Ok(buf)
+/// Re-encode raw signature bytes as standard-alphabet base64. The crate's
+/// `decode_wire` surfaces the detached Redirect-binding signature as raw
+/// decoded bytes, but `DetachedSignature::signature` is documented to be the
+/// base64-encoded form (SAML 2.0 Bindings §3.4.4.1).
+fn b64_encode(bytes: &[u8]) -> String {
+    BASE64_STD.encode(bytes)
 }
 
 fn read_request_id_query_param(raw_query: &str) -> Option<&str> {
@@ -1024,10 +950,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_redirect_query_round_trips_unsigned() {
+    fn decode_wire_round_trips_unsigned_redirect() {
         // Synthesize an XML payload and DEFLATE+base64 it the same way
-        // the SP demo does. Sanity-check parse_redirect_query can pull
-        // it back out.
+        // the SP demo does. Sanity-check the crate's `decode_wire` pulls
+        // it back out — this replaces the old hand-rolled
+        // `parse_redirect_query` helper.
         use base64::engine::general_purpose::STANDARD as B64;
         use flate2::Compression;
         use flate2::write::DeflateEncoder;
@@ -1044,11 +971,24 @@ mod tests {
         )
         .to_string();
         let query = format!("SAMLRequest={pct}&RelayState=hello");
-        let parsed = parse_redirect_query(&query).expect("parses");
-        assert_eq!(parsed.xml.as_slice(), xml.as_slice());
-        assert_eq!(parsed.relay_state.as_deref(), Some("hello"));
-        assert!(parsed.signature_raw.is_none());
-        assert!(parsed.signed_query_string.is_empty());
+        let decoded = decode_wire(
+            query.as_bytes(),
+            Binding::HttpRedirect,
+            WireDirection::Request,
+        )
+        .expect("decode_wire");
+        assert_eq!(decoded.xml.as_slice(), xml.as_slice());
+        assert_eq!(decoded.relay_state.as_deref(), Some("hello"));
+        assert!(decoded.detached_signature.is_none());
+        assert!(decoded.signed_query_string.is_none());
+    }
+
+    #[test]
+    fn b64_encode_matches_standard_alphabet() {
+        // `b64_encode` re-wraps raw signature bytes for `DetachedSignature`.
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"A"), "QQ==");
+        assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

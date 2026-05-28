@@ -15,13 +15,10 @@ use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::Compression;
-#[cfg(any(test, feature = "slo"))]
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
-#[cfg(any(test, feature = "slo"))]
 use percent_encoding::percent_decode_str;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-#[cfg(any(test, feature = "slo"))]
 use std::io::Read;
 use std::io::Write;
 use url::Url;
@@ -63,7 +60,6 @@ const ENCODE_SET: &AsciiSet = &CONTROLS
 
 /// Hard upper bound on DEFLATE inflation output. Prevents zip-bomb-style
 /// resource exhaustion where a tiny ciphertext expands to many gigabytes.
-#[cfg(any(test, feature = "slo"))]
 const MAX_INFLATED_BYTES: usize = 10 * 1024 * 1024;
 
 /// One side of a redirect-bound SAML message direction.
@@ -168,7 +164,6 @@ fn write_pct_pair(out: &mut String, name: &str, value: &str) {
 }
 
 /// Decoded fields extracted from an inbound Redirect-bound request.
-#[cfg(any(test, feature = "slo"))]
 #[derive(Debug, Clone)]
 pub struct DecodedRedirect {
     /// DEFLATE-decompressed XML bytes.
@@ -191,8 +186,7 @@ pub struct DecodedRedirect {
 /// function picks out `SAMLRequest` / `SAMLResponse` / `RelayState` /
 /// `Signature` / `SigAlg` and reconstructs the canonical signed-input bytes
 /// per spec.
-#[cfg(any(test, feature = "slo"))]
-pub(crate) fn decode(
+pub fn decode(
     raw_query_string: &str,
     direction: RedirectDirection,
 ) -> Result<DecodedRedirect, Error> {
@@ -282,7 +276,6 @@ pub(crate) fn decode(
 /// UTF-8 decode failures surface as `Error::Base64Decode` (we don't have a
 /// distinct percent-decode error variant, and the caller's next step on these
 /// values is always a base64 decode anyway).
-#[cfg(any(test, feature = "slo"))]
 fn pct_decode(value: &str) -> Result<String, Error> {
     percent_decode_str(value)
         .decode_utf8()
@@ -303,7 +296,6 @@ fn deflate_and_base64(xml: &[u8]) -> Result<String, Error> {
 }
 
 /// DEFLATE-decompress, capping the output at `MAX_INFLATED_BYTES`.
-#[cfg(any(test, feature = "slo"))]
 fn inflate_capped(deflated: &[u8]) -> Result<Vec<u8>, Error> {
     let mut decoder = DeflateDecoder::new(deflated);
     // Cap at MAX_INFLATED_BYTES + 1 so we can detect over-limit reads.

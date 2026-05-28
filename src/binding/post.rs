@@ -9,7 +9,6 @@
 //! See `docs/rfcs/RFC-002-xml-crypto-core.md` §3 (XML-DSig path).
 
 use crate::binding::{Dispatch, PostForm, SsoResponseDispatch, SsoResponsePostForm};
-#[cfg(any(test, feature = "slo"))]
 use crate::error::Error;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -17,13 +16,11 @@ use url::Url;
 
 /// Hard upper bound on POST-binding base64-decoded payload size. Same 10 MiB
 /// cap as the Redirect binding's inflation guard.
-#[cfg(any(test, feature = "slo"))]
 const MAX_DECODED_BYTES: usize = 10 * 1024 * 1024;
 
 /// Precomputed upper bound on the base64-encoded input length such that the
 /// decoded output cannot exceed `MAX_DECODED_BYTES`. Each base64 char encodes
 /// 6 bits → 3 output bytes per 4 input chars, plus a small slack for padding.
-#[cfg(any(test, feature = "slo"))]
 const MAX_BASE64_INPUT_LEN: usize = MAX_DECODED_BYTES
     .saturating_mul(4)
     .saturating_div(3)
@@ -75,7 +72,6 @@ pub(crate) fn encode_sso_response(
     })
 }
 
-#[cfg(any(test, feature = "slo"))]
 #[derive(Debug, Clone)]
 pub struct DecodedPost {
     /// Base64-decoded XML bytes (the SAML message itself).
@@ -86,8 +82,7 @@ pub struct DecodedPost {
 /// Decode an inbound POST-bound payload. The caller provides the
 /// base64-encoded `SAMLRequest` or `SAMLResponse` form value (after form-URL
 /// decoding) and optional `RelayState`.
-#[cfg(any(test, feature = "slo"))]
-pub(crate) fn decode(
+pub fn decode(
     saml_request_or_response_b64: &str,
     relay_state: Option<&str>,
 ) -> Result<DecodedPost, Error> {
