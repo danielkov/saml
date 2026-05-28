@@ -85,13 +85,9 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub attribute_keys: AttributeKeys,
     /// Optional list of human-readable notes shown on the provider card.
-    /// Currently unused at runtime; the field is here so the README and
-    /// providers.toml stay in sync.
+    /// Surfaces per-provider quirks (FA tenant URL split, Zitadel SLO caveat,
+    /// etc.) inside a collapsed `<details>` block on the landing page.
     #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "Reserved for future use; serde tolerates the field on disk"
-    )]
     pub notes: Vec<String>,
 }
 

@@ -49,22 +49,41 @@ fn render_provider_cards(providers: &[&ProviderConfig]) -> String {
     for p in providers {
         let _ = write!(
             &mut out,
-            "<a class=\"provider-card\" href=\"/login/{id}\" \
-             style=\"--provider-accent: {accent};\">\
-               <div class=\"provider-mark\">{initial}</div>\
-               <div class=\"provider-body\">\
-                 <div class=\"provider-label\">{label}</div>\
-                 <div class=\"provider-meta\"><code>{id}</code></div>\
-               </div>\
-               <div class=\"provider-arrow\">&rarr;</div>\
-             </a>",
+            "<div class=\"provider-slot\" style=\"--provider-accent: {accent};\">\
+               <a class=\"provider-card\" href=\"/login/{id}\">\
+                 <div class=\"provider-mark\">{initial}</div>\
+                 <div class=\"provider-body\">\
+                   <div class=\"provider-label\">{label}</div>\
+                   <div class=\"provider-meta\"><code>{id}</code></div>\
+                 </div>\
+                 <div class=\"provider-arrow\">&rarr;</div>\
+               </a>\
+               {notes}\
+             </div>",
             id = escape(&p.id),
             accent = escape(&p.accent_color),
             initial = escape(&p.brand_initial),
             label = escape(&p.label),
+            notes = render_provider_notes(&p.notes),
         );
     }
     out
+}
+
+fn render_provider_notes(notes: &[String]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    for note in notes {
+        let _ = write!(&mut items, "<li>{}</li>", escape(note));
+    }
+    format!(
+        "<details class=\"provider-notes\">\
+           <summary>Notes</summary>\
+           <ul>{items}</ul>\
+         </details>",
+    )
 }
 
 /// One row in the attribute table.
@@ -325,6 +344,39 @@ mod tests {
         assert!(html.contains("#cd0000"));
         assert!(html.contains("#5469d4"));
         assert!(html.contains("saml-axum-demo"));
+    }
+
+    #[test]
+    fn render_index_skips_notes_block_when_provider_has_no_notes() {
+        let kc = p("keycloak", "#cd0000", "Keycloak");
+        let html = render_index("saml-axum-demo", &[&kc], None);
+        assert!(
+            !html.contains("provider-notes"),
+            "no <details> rendered when notes is empty"
+        );
+    }
+
+    #[test]
+    fn render_index_renders_notes_in_details_block() {
+        let mut z = p("zitadel", "#5469d4", "Zitadel");
+        z.notes = vec![
+            "SLO works but only with persistent NameID".to_owned(),
+            "Reuses AssertionID on retry".to_owned(),
+        ];
+        let html = render_index("saml-axum-demo", &[&z], None);
+        assert!(html.contains("<details class=\"provider-notes\""));
+        assert!(html.contains("<summary>Notes</summary>"));
+        assert!(html.contains("SLO works but only with persistent NameID"));
+        assert!(html.contains("Reuses AssertionID on retry"));
+    }
+
+    #[test]
+    fn render_index_escapes_notes_content() {
+        let mut z = p("zitadel", "#5469d4", "Zitadel");
+        z.notes = vec!["<script>x</script>".to_owned()];
+        let html = render_index("saml-axum-demo", &[&z], None);
+        assert!(!html.contains("<script>x</script>"));
+        assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"));
     }
 
     #[test]

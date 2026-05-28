@@ -264,6 +264,51 @@ h1 em {
   margin-left: 4px;
 }
 
+.provider-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.provider-notes {
+  font-size: 12px;
+  color: var(--text-soft);
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 4px);
+  background: var(--bg-subtle);
+}
+
+.provider-notes > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--provider-accent, var(--accent));
+  list-style: none;
+}
+
+.provider-notes > summary::-webkit-details-marker { display: none; }
+
+.provider-notes > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 100ms ease;
+}
+
+.provider-notes[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.provider-notes ul {
+  margin: 8px 0 0 0;
+  padding-left: 18px;
+  color: var(--text);
+}
+
+.provider-notes li + li {
+  margin-top: 4px;
+}
+
 /* ─── feature grid ────────────────────────────────────────────────── */
 
 .grid {
