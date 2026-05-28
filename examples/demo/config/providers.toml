@@ -59,6 +59,17 @@ attribute_keys.department = ["department"]
 id = "fusionauth"
 label = "FusionAuth"
 metadata_url = "http://localhost:9011/samlv2/metadata/e9fdb985-9173-4e01-9d73-ac2d60d1dc8e"
+# FusionAuth advertises /samlv2/login/{applicationId} in metadata, which is the
+# IdP-initiated entry point. SP-initiated AuthnRequests must hit the tenant URL
+# instead; otherwise FA returns "AuthnRequest contained an invalid issuer".
+sso_url_override = "http://localhost:9011/samlv2/login/d7d09513-a3f5-401c-9685-34ab6c552453"
+# FA's Response <Issuer> uses tenantId, but the metadata's entityID uses
+# applicationId. ACS routing needs the runtime value, not the metadata one.
+idp_entity_id_override = "http://localhost:9011/samlv2/d7d09513-a3f5-401c-9685-34ab6c552453"
+# FA's metadata XML doesn't include a <KeyDescriptor>, so the SP needs the IdP
+# signing cert configured out-of-band. The cert is imported into FA at boot via
+# kickstart and lives here for the SP to trust.
+extra_signing_cert_paths = ["examples/idps/fusionauth/idp/cert.pem"]
 accent_color = "#f6843a"
 brand_initial = "F"
 requested_name_id_format = "EmailAddress"

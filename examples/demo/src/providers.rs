@@ -32,6 +32,25 @@ pub struct ProviderConfig {
     pub id: String,
     pub label: String,
     pub metadata_url: String,
+    /// Override the IdP SSO endpoint URL discovered from metadata. FusionAuth
+    /// advertises `/samlv2/login/{applicationId}` in its metadata but that's
+    /// the IdP-initiated entry point; SP-initiated AuthnRequests must hit
+    /// `/samlv2/login/{tenantId}`. Set this to the SP-initiated URL to
+    /// short-circuit the metadata value.
+    #[serde(default)]
+    pub sso_url_override: Option<String>,
+    /// Override the IdP entity ID parsed from metadata. FusionAuth advertises
+    /// `…/samlv2/{applicationId}` in its `<EntityDescriptor entityID>` but
+    /// emits `…/samlv2/{tenantId}` in the Response's `<Issuer>` at runtime,
+    /// so the SP's by-entity-id lookup misses. Set this to the runtime value
+    /// to make routing match.
+    #[serde(default)]
+    pub idp_entity_id_override: Option<String>,
+    /// Extra IdP signing certs (PEM file paths) to trust alongside whatever
+    /// was parsed from metadata. Needed for IdPs like FusionAuth that don't
+    /// publish a `<KeyDescriptor>` in their metadata XML.
+    #[serde(default)]
+    pub extra_signing_cert_paths: Vec<String>,
     /// Hex accent color used in the brand mark + the login card border.
     pub accent_color: String,
     /// Single character or short glyph rendered inside the brand mark on

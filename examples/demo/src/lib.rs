@@ -46,7 +46,7 @@ use saml::{
     Attribute, Binding, ConsumeResponse, Dispatch, Endpoint, IdpDescriptor, InMemoryReplayCache,
     KeyPair, LoginTracker, NameIdFormat, PeerCryptoPolicy, ServiceProvider, ServiceProviderConfig,
     SignatureAlgorithm, SpLogoutSigning, SpLogoutWantSigned, SpWantSigned, SsoResponseBinding,
-    SsoResponseEndpoint, StartLogin,
+    SsoResponseEndpoint, StartLogin, X509Certificate,
 };
 
 use crate::providers::{ProviderConfig, ProviderIndex, ProvidersFile};
@@ -344,10 +344,35 @@ pub async fn fetch_all_descriptors(index: &ProviderIndex) -> Vec<ProviderEntry> 
         .map(|cfg| {
             tokio::spawn(async move {
                 match fetch_one_descriptor(&cfg.metadata_url).await {
-                    Ok(idp) => Some(ProviderEntry {
-                        config: cfg,
-                        idp: Arc::new(idp),
-                    }),
+                    Ok(mut idp) => {
+                        if let Some(override_url) = cfg.sso_url_override.as_deref() {
+                            for ep in &mut idp.sso_endpoints {
+                                ep.url = override_url.to_string();
+                            }
+                        }
+                        if let Some(override_id) = cfg.idp_entity_id_override.as_deref() {
+                            idp.entity_id = override_id.to_string();
+                        }
+                        for path in &cfg.extra_signing_cert_paths {
+                            match std::fs::read(path).and_then(|bytes| {
+                                X509Certificate::from_pem(&bytes).map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                                })
+                            }) {
+                                Ok(cert) => idp.signing_certs.push(cert),
+                                Err(e) => warn!(
+                                    provider = %cfg.id,
+                                    path = %path,
+                                    error = %e,
+                                    "failed to load extra signing cert"
+                                ),
+                            }
+                        }
+                        Some(ProviderEntry {
+                            config: cfg,
+                            idp: Arc::new(idp),
+                        })
+                    }
                     Err(e) => {
                         warn!(
                             provider = %cfg.id,

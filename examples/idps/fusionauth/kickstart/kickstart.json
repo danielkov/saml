@@ -22,12 +22,13 @@
   "requests": [
     {
       "method": "POST",
-      "url": "/api/key/generate/#{samlSigningKeyId}",
+      "url": "/api/key/import/#{samlSigningKeyId}",
       "body": {
         "key": {
+          "name": "saml-axum-demo IdP signing key (static)",
           "algorithm": "RS256",
-          "name": "saml-axum-demo IdP signing key",
-          "length": 2048
+          "certificate": "-----BEGIN CERTIFICATE-----\nMIIDITCCAgmgAwIBAgIUL9p9BKa72F623ZozNCMIV1EVjnMwDQYJKoZIhvcNAQEL\nBQAwIDEeMBwGA1UEAwwVc2FtbC1heHVtLWRlbW8tZmEtaWRwMB4XDTI2MDUyODE1\nMzg0NloXDTM2MDUyNTE1Mzg0NlowIDEeMBwGA1UEAwwVc2FtbC1heHVtLWRlbW8t\nZmEtaWRwMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAhOEj7lLrAzsx\nO1SR2yvIybQPBHp+WCW/ww+bWo7oShtH3kI9i6JPi0q2jUpf98KrR1LbmBGJAby0\nTNi7vbZ7HEanyBkgK7SoCwQmXzBT3Yuned3Vf/tPBrD6ZmsuD43wpGB6o2tbhJDB\naNk24HntOiljYOohSrXAYXLAhrMKnruSyv+wnoBUjJVnJ8En7LsSFDFfjAdTRllO\n5+/PUgZsCQhEkNiMgXAoJE5eKzwCH/u9ChGPoa3/X0nQWhXqs3xlfLfpeUqkvbaH\nNOxUz8+v6Ja8+Rad4g7Di0v7oG2k+Ev3Ddk9jnOd/M3dDFv3mDxaakCp1rypdKy1\nEJFU0WYp2QIDAQABo1MwUTAdBgNVHQ4EFgQUZulgAlnYy90BJLpiCcTBUJo7sW8w\nHwYDVR0jBBgwFoAUZulgAlnYy90BJLpiCcTBUJo7sW8wDwYDVR0TAQH/BAUwAwEB\n/zANBgkqhkiG9w0BAQsFAAOCAQEAIg0AwJT8hriyjbAXWmb30ch6e8gYu6FJycQV\nTjtJmI2N1lZRpuGxo6ReBv/Ms4XdDJxSGBed4HEl347ldNjVETY8D69CMhJV3qlc\nXAMnZ6rjz/wrw533iDSy+Gx+0I+1K9zswBvSswJd7dE0Sx4bVXfQUmC1XTaKCRT/\nXNn1sN8niosS0dwbvLAkYlWfIhHaYlaOJr6uMnF1fr65Hyzi066vaP09x+9mgd5N\nXAjjKDewW7QkY76cb/ewpZn6xDwiNj7WALcy+IjHCgtS/KeAYlEe4pqP8OrgAD0g\nH6fIfBsl0NAwmo65t129012TZZdWZA1lPZ/XWGr3ctdeWrDXYA==\n-----END CERTIFICATE-----\n",
+          "privateKey": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCE4SPuUusDOzE7\nVJHbK8jJtA8Een5YJb/DD5tajuhKG0feQj2Lok+LSraNSl/3wqtHUtuYEYkBvLRM\n2Lu9tnscRqfIGSArtKgLBCZfMFPdi6d53dV/+08GsPpmay4PjfCkYHqja1uEkMFo\n2Tbgee06KWNg6iFKtcBhcsCGswqeu5LK/7CegFSMlWcnwSfsuxIUMV+MB1NGWU7n\n789SBmwJCESQ2IyBcCgkTl4rPAIf+70KEY+hrf9fSdBaFeqzfGV8t+l5SqS9toc0\n7FTPz6/olrz5Fp3iDsOLS/ugbaT4S/cN2T2Oc538zd0MW/eYPFpqQKnWvKl0rLUQ\nkVTRZinZAgMBAAECggEAAmDWqp9XpoN7VmxC7/fQXIOuQarSSPekJq0+i3HyY4I9\nwnWjtHl1F27tEmdG0kBZMcnvMFnow3ItPxrIzeYCWwn+AjLtsestjXrsUqoFLLV+\nsx951HHJwKIUdxae0CO526KxvCcBxjBsYcVRV5FkBI3+5FVW5tsqf4Z3jVVTrkaj\nYebQGbD8gqf6dskdMm9CQ2D0AfrseyaDDsfBOqTk9z4h0npr+25kU+aTxhjmkRUd\niOkeivWV3kxjuU5T4Un4gaw4Ba2IGweDbiqUPK5MS7qMXXUSGQCV9zvoKWpRLTyA\n/rFdj2LXG0piGLPOCbSnqOgWVsQ9M4+tGUaYs1+ZvQKBgQC6DduMxiPO9ij82tuV\n09cRVQoPFrioFnl5g4H3hoSEQz1kDEWF0fCFT8c+Cx8Lz3umQ4NpkgMUq29J4vaF\ngKzSO/caMQBCdMaPKtTp0uJjD9jnIXU0MDmJUKUCOcqRZE9B5hZdZsjZB3+z9rln\n88Qr5vDArefnWdYMa2ReA4M5dQKBgQC21asM0J/D4PL0j64irO5GsK1FiQTiZVNU\nQqd7wAw1UBgDaL/EX+Y7Opq6y54VKZD/n4SvodpSjyG7ZND+2Txu1leJ0Goxz/GP\nW+T5N0rGH5e31QI/hxEWukmhCXVYndTxzUx9BAa+1eWOdnY727x+PECVhdztsnnP\nWTQ0eEr+VQKBgDvILB2FpQfhLLZilGAGG3rkOkEy6c6IuiuDSAWC4Z2mBVnaX5Rq\nKsCLK9gRtr4SwwZfdyA63GaN10qEdPXcrKs4vWNbD1xLLWnfN16Sdk+iTe2mYISO\nYk5u7TZT33TsKFNiXRlR54Nk13G5+0UdnJEGuaEPwA4kXZTMBQn4UvfpAoGAUGHe\nIvMx2n9ysVzd9TbMR13zv+d+sz5TBW+MjNahR2sgM5eBAAgdg5q/XjKZHLq6mff6\n8PCauMNe1DF9xR2i+SPZNqjfl2jRzfJb18mcYUCQhmzq4R0zwSdDqb4rzjsN3QUi\nhLAZexs1Io4oayavV1yMFHDW8dYOwb95OTxN1EUCgYAPf+MWl+0KNd184ejuf9fN\ns5Kvuh6Fh+iYWg7FDSPntKBeuYNaXfxST+d9QaKbVnU4XQwMxUygqVf3blmZX+cB\nGfYislM4Frl16UPoReq2+BYjHsTMKeS3WJ9uc0UjX2Y83etIiNoEp/3H/lzleNVy\nOAAmGhp5PFbhzY993VxITA==\n-----END PRIVATE KEY-----\n"
         }
       }
     },
@@ -76,7 +77,7 @@
           "name": "saml-axum-demo",
           "samlv2Configuration": {
             "enabled": true,
-            "issuer": "http://localhost:9011/samlv2/idp/#{applicationId}",
+            "issuer": "saml-axum-demo",
             "audience": "saml-axum-demo",
             "authorizedRedirectURLs": [
               "http://localhost:3000/saml/acs"
