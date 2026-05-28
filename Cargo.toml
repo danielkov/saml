@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "examples/demo", "fuzz"]
+members = [".", "examples/demo", "examples/idp", "fuzz"]
 
 [package]
 name = "saml"

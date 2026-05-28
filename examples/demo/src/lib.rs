@@ -1800,8 +1800,8 @@ mod tests {
     fn baked_in_providers_toml_parses() {
         let file = ProvidersFile::from_toml(DEFAULT_PROVIDERS_TOML).expect("baked-in toml parses");
         assert!(
-            file.provider.len() >= 7,
-            "expected at least 7 providers, got {}",
+            file.provider.len() >= 8,
+            "expected at least 8 providers, got {}",
             file.provider.len()
         );
         let ids: Vec<&str> = file.provider.iter().map(|p| p.id.as_str()).collect();
@@ -1813,6 +1813,7 @@ mod tests {
             "auth0",
             "descope",
             "asgardeo",
+            "rust-idp",
         ] {
             assert!(ids.contains(&expected), "missing provider id: {expected}");
         }

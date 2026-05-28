@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — saml-idp-example</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <div class="mark">R</div>
+      <div class="name">saml-idp-example <span>· sign in</span></div>
+    </header>
+
+    {{banner}}
+
+    <section class="hero">
+      <span class="kicker"><span class="dot"></span> SAML 2.0 · Identity Provider</span>
+      <h1>Sign in to continue.</h1>
+      <p class="lede">
+        The Service Provider <strong>{{sp_label}}</strong> requested
+        authentication. Enter your credentials to issue an Assertion and
+        return to the app.
+      </p>
+    </section>
+
+    <div class="panel">
+      <dl class="sp-meta">
+        <dt>SP Entity ID</dt>
+        <dd>{{sp_entity_id}}</dd>
+        <dt>ACS URL</dt>
+        <dd>{{acs_url}}</dd>
+        <dt>Request ID</dt>
+        <dd>{{request_id}}</dd>
+      </dl>
+
+      <form method="post" action="/login">
+        <input type="hidden" name="request_id" value="{{request_id}}">
+        <label for="username">Username or email</label>
+        <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+        <div style="margin-top: 24px;">
+          <button class="btn btn-primary" type="submit">Sign in</button>
+        </div>
+      </form>
+
+      <p class="lede" style="font-size: 13px; margin-top: 24px;">
+        Seed users: <code>alice@saml-demo.local</code> · <code>bob@saml-demo.local</code>
+        · password is <code>password</code>.
+      </p>
+    </div>
+
+    <footer class="meta">
+      <span>IdP entity: <code>{{idp_entity_id}}</code></span>
+      <span>·</span>
+      <a href="/metadata">Metadata XML</a>
+      <span>·</span>
+      <a href="/healthz">Health</a>
+    </footer>
+  </main>
+</body>
+</html>

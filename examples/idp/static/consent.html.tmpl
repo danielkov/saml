@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Consent — saml-idp-example</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <div class="mark">R</div>
+      <div class="name">saml-idp-example <span>· consent</span></div>
+    </header>
+
+    <section class="hero">
+      <span class="kicker"><span class="dot"></span> Authorize release</span>
+      <h1>Share your identity with <em>{{sp_label}}</em>?</h1>
+      <p class="lede">
+        We'll send your email, display name, and a session identifier to
+        the Service Provider so it can sign you in.
+      </p>
+    </section>
+
+    <div class="panel">
+      <div class="signed-in">
+        <div class="avatar">{{initial}}</div>
+        <div>
+          <div class="name">{{display_name}}</div>
+          <div class="email">{{email}}</div>
+        </div>
+      </div>
+
+      <form method="post" action="/saml/sso/continue">
+        <input type="hidden" name="request_id" value="{{request_id}}">
+        <input type="hidden" name="decision" value="allow">
+        <button class="btn btn-primary" type="submit">Allow and continue</button>
+      </form>
+      <form method="post" action="/saml/sso/continue" style="display: inline-block; margin-left: 8px;">
+        <input type="hidden" name="request_id" value="{{request_id}}">
+        <input type="hidden" name="decision" value="deny">
+        <button class="btn btn-ghost" type="submit">Deny</button>
+      </form>
+    </div>
+
+    <footer class="meta">
+      <span>IdP entity: <code>{{idp_entity_id}}</code></span>
+    </footer>
+  </main>
+</body>
+</html>

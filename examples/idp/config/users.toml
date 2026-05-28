@@ -1,0 +1,19 @@
+# Seed users for the standalone Rust IdP example. Passwords are stored in
+# cleartext here for reproducibility; the IdP hashes them with argon2id at
+# startup and never persists them. Do NOT reuse this file outside the demo.
+
+[[user]]
+id = "alice"
+email = "alice@saml-demo.local"
+password = "password"
+first_name = "Alice"
+last_name = "Anderson"
+department = "Platform"
+
+[[user]]
+id = "bob"
+email = "bob@saml-demo.local"
+password = "password"
+first_name = "Bob"
+last_name = "Builder"
+department = "Infrastructure"

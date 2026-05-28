@@ -1,0 +1,13 @@
+# Known Service Providers this IdP will accept AuthnRequests from. Each
+# entry mirrors the shape of the demo SP's providers.toml; at startup the
+# IdP fetches each SP's metadata to pick up the signing cert used to
+# verify inbound AuthnRequest/LogoutRequest signatures. If the metadata
+# fetch fails the SP is left out of the registry and the IdP logs a warning.
+
+[[sp]]
+entity_id = "saml-axum-demo"
+acs_url = "http://localhost:3000/saml/acs"
+acs_binding = "HTTP-POST"
+slo_url = "http://localhost:3000/saml/slo"
+slo_binding = "HTTP-POST"
+metadata_url = "http://localhost:3000/metadata"

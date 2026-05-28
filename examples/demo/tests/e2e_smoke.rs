@@ -34,6 +34,7 @@ const PROVIDERS: &[(&str, &str)] = &[
     ("auth0", "SAML_DEMO_E2E_AUTH0"),
     ("descope", "SAML_DEMO_E2E_DESCOPE"),
     ("asgardeo", "SAML_DEMO_E2E_ASGARDEO"),
+    ("rust-idp", "SAML_DEMO_E2E_RUST_IDP"),
 ];
 
 async fn boot_sp() -> Option<(SocketAddr, AppConfig, tokio::task::JoinHandle<()>)> {
@@ -149,6 +150,15 @@ async fn smoke_descope() {
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_asgardeo() {
     run_gated("asgardeo").await;
+}
+
+/// Smoke for the in-tree saml-idp-example. Mirrors the other gated
+/// per-provider tests but the actual closed-loop SP↔IdP round-trip
+/// (login → ACS → dashboard → SLO → re-login) lives in
+/// `examples/idp/tests/e2e_loop.rs` and is gated on the same env var.
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_rust_idp() {
+    run_gated("rust-idp").await;
 }
 
 async fn run_gated(provider_id: &str) {
@@ -326,3 +336,4 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
+

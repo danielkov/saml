@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>saml-idp-example</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="brand">
+      <div class="mark">R</div>
+      <div class="name">saml-idp-example <span>· identity provider</span></div>
+    </header>
+
+    {{banner}}
+
+    {{body}}
+
+    <footer class="meta">
+      <span>IdP entity: <code>{{idp_entity_id}}</code></span>
+      <span>·</span>
+      <a href="/metadata">Metadata XML</a>
+      <span>·</span>
+      <a href="/healthz">Health</a>
+    </footer>
+  </main>
+</body>
+</html>
