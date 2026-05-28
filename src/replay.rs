@@ -5,10 +5,12 @@
 //! This module provides a [`ReplayCache`] trait and an in-memory default.
 //!
 //! SAML 2.0 Core §2.5.1.5 OneTimeUse: when present, the relying party
-//! MUST consume the assertion at most once. We treat replay as forbidden
-//! for ALL assertions (not just OneTimeUse-marked ones) — that's the
-//! safer default. Callers who want OneTimeUse-only semantics can wrap
-//! [`InMemoryReplayCache`] with their own conditional logic.
+//! MUST consume the assertion at most once. By default we treat replay as
+//! forbidden for ALL assertions — that's the safer default. Callers who
+//! need to accommodate IdPs that legitimately reuse `AssertionID` on
+//! retry can downshift to [`ReplayMode::OneTimeUseOnly`] to enforce only
+//! the spec-mandated minimum, or to [`ReplayMode::Off`] when replay
+//! defense lives entirely in caller code.
 //!
 //! The cache is consulted by
 //! [`ServiceProvider::consume_response`](crate::sp::ServiceProvider::consume_response)
@@ -123,6 +125,45 @@ impl Default for InMemoryReplayCache {
     fn default() -> Self {
         Self::new(Self::DEFAULT_CAPACITY)
     }
+}
+
+/// Selects which subset of inbound assertions are submitted to the
+/// [`ReplayCache`] from
+/// [`ServiceProvider::consume_response`](crate::sp::ServiceProvider::consume_response).
+///
+/// Per SAML 2.0 Core §2.5.1.5 and §3.4.5 the `<saml:OneTimeUse>` condition
+/// MUST be enforced (single-use only); for assertions that do not carry it,
+/// replay defense is recommended but not strictly mandatory. Some
+/// real-world IdPs reuse `AssertionID` values on retry, which means strict
+/// replay defense rejects legitimate retries as replays. `ReplayMode` is
+/// the knob to relax that behavior when (and only when) the deployment
+/// requires it.
+///
+/// Defaults to [`ReplayMode::All`] so that existing callers — and callers
+/// who don't think about this knob — get the safest behavior.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReplayMode {
+    /// Reject any `AssertionID` previously seen, regardless of whether the
+    /// assertion carries `<OneTimeUse/>`. This is the safe, strict default
+    /// and matches the crate's pre-`ReplayMode` behavior. Choose this
+    /// unless you have a concrete reason not to.
+    #[default]
+    All,
+    /// Only reject `AssertionID`s from assertions whose `<Conditions>`
+    /// element carries `<OneTimeUse/>`. Matches the spec-mandated minimum
+    /// (Core §2.5.1.5). Use this when the IdP legitimately reuses
+    /// `AssertionID` on retry — strict mode would falsely reject the
+    /// second delivery as a replay. The trade-off is a wider window for
+    /// attacker replay of non-`OneTimeUse` assertions; pair this with
+    /// short assertion lifetimes and out-of-band correlation
+    /// (`SessionIndex`, `NameID`, etc.) when applicable.
+    OneTimeUseOnly,
+    /// Disable replay defense entirely — the cache is never consulted from
+    /// `consume_response`. Choose this only when the caller dedupes
+    /// `Identity::assertion_id` against its own store, or when the caller
+    /// explicitly accepts the residual replay risk. Misusing this knob
+    /// re-opens the SAML 2.0 replay attack surface in full.
+    Off,
 }
 
 impl ReplayCache for InMemoryReplayCache {
@@ -259,6 +300,13 @@ mod tests {
             .check_and_insert("_a", future_expiry(300))
             .expect("default cache accepts inserts");
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn replay_mode_default_is_strict() {
+        // Strict is the safe default. Callers who don't reach for the knob
+        // get the same behavior as before `ReplayMode` existed.
+        assert_eq!(ReplayMode::default(), ReplayMode::All);
     }
 
     /// The trait must be object-safe; `ConsumeResponse::replay_cache`

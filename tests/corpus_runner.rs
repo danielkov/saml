@@ -38,6 +38,7 @@ use saml::descriptor::IdpDescriptor;
 use saml::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
 use saml::error::Error;
 use saml::nameid::NameIdFormat;
+use saml::replay::ReplayMode;
 use saml::sp::{ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned};
 use saml::time::parse_xs_datetime;
 
@@ -691,6 +692,7 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         now,
         clock_skew: Duration::from_mins(30),
         replay_cache: None,
+        replay_mode: ReplayMode::All,
     })
     .map_err(|e| format!("consume_response: {e:?}"))
 }
@@ -910,6 +912,7 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
         now,
         clock_skew: Duration::from_mins(30),
         replay_cache: None,
+        replay_mode: ReplayMode::All,
     });
 
     match result {

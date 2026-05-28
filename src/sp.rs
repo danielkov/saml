@@ -54,7 +54,7 @@ use crate::logout::{
 use crate::metadata::MetadataExtras;
 use crate::metadata::emit_sp::{SpMetadataInputs, emit_sp_metadata};
 use crate::nameid::NameIdFormat;
-use crate::replay::ReplayCache;
+use crate::replay::{ReplayCache, ReplayMode};
 use crate::response::Identity;
 use crate::response::parse::parse_response;
 use crate::response::validate::{ValidateResponse, validate_response};
@@ -406,6 +406,12 @@ pub struct ConsumeResponse<'a> {
     /// — caller code is responsible for deduping `Identity::assertion_id`
     /// against its own store, or for accepting the residual replay risk.
     pub replay_cache: Option<&'a dyn ReplayCache>,
+    /// Selects which subset of assertions are submitted to `replay_cache`.
+    /// Defaults to [`ReplayMode::All`] — the strictest setting and the
+    /// crate's pre-`ReplayMode` behavior. See [`ReplayMode`] for the
+    /// trade-offs each variant makes. Ignored when `replay_cache` is
+    /// `None`.
+    pub replay_mode: ReplayMode,
 }
 
 /// Inputs for [`ServiceProvider::consume_response_artifact`]. The artifact
@@ -431,6 +437,10 @@ pub struct ConsumeArtifactResponse<'a> {
     /// [`ConsumeResponse`] after artifact resolution. See
     /// [`ConsumeResponse::replay_cache`] for semantics.
     pub replay_cache: Option<&'a dyn ReplayCache>,
+    /// Replay-mode policy threaded into the inner [`ConsumeResponse`]
+    /// after artifact resolution. See [`ConsumeResponse::replay_mode`] for
+    /// semantics.
+    pub replay_mode: ReplayMode,
 }
 
 impl ServiceProvider {
@@ -501,11 +511,12 @@ impl ServiceProvider {
         // ids by hammering the ACS. The cache is updated only on the
         // success path, so a rejected Response leaves no trace.
         //
-        // SAML 2.0 Core §2.5.1.5 (OneTimeUse): we apply this check to
-        // *every* assertion, not just OneTimeUse-marked ones, because
-        // safer-default. `Identity::is_one_time_use` is still surfaced
-        // for callers who need to distinguish the cases.
-        if let Some(cache) = input.replay_cache {
+        // SAML 2.0 Core §2.5.1.5 (OneTimeUse): `<OneTimeUse/>` MUST be
+        // enforced. For other assertions the spec recommends but does not
+        // mandate replay defense; `input.replay_mode` selects the policy.
+        if let Some(cache) = input.replay_cache
+            && replay_check_needed(input.replay_mode, identity.is_one_time_use)
+        {
             let fresh = cache.check_and_insert(&identity.assertion_id, identity.not_on_or_after)?;
             if !fresh {
                 return Err(Error::AssertionReplay);
@@ -552,7 +563,20 @@ impl ServiceProvider {
             now: input.now,
             clock_skew: input.clock_skew,
             replay_cache: input.replay_cache,
+            replay_mode: input.replay_mode,
         })
+    }
+}
+
+/// Whether the replay cache should be consulted for an assertion, given the
+/// caller-selected mode and whether the assertion carried `<OneTimeUse/>`.
+/// Encapsulates the policy decision so it can be unit-tested independently
+/// of the surrounding `consume_response` machinery.
+fn replay_check_needed(mode: ReplayMode, is_one_time_use: bool) -> bool {
+    match mode {
+        ReplayMode::All => true,
+        ReplayMode::OneTimeUseOnly => is_one_time_use,
+        ReplayMode::Off => false,
     }
 }
 
@@ -1749,6 +1773,19 @@ mod tests {
     /// Build an SP-bound Response signed at the Assertion level. This mirrors
     /// the shape `IdentityProvider::issue_response` (Wave 5) produces but uses
     /// only crates we don't share state with (no idp.rs dependency).
+    /// Options block for [`build_signed_response_xml_with_options`]. Keeps the
+    /// builder under clippy's `too_many_arguments` ceiling without bouncing
+    /// off the lint, and lets new fields land additively.
+    struct ResponseFixtureOptions<'a> {
+        in_response_to: Option<&'a str>,
+        recipient_url: &'a str,
+        audience: &'a str,
+        not_before: &'a str,
+        not_on_or_after: &'a str,
+        assertion_id: &'a str,
+        one_time_use: bool,
+    }
+
     fn build_signed_response_xml(
         kp: &KeyPair,
         in_response_to: Option<&str>,
@@ -1757,6 +1794,32 @@ mod tests {
         not_before: &str,
         not_on_or_after: &str,
     ) -> Vec<u8> {
+        build_signed_response_xml_with_options(
+            kp,
+            &ResponseFixtureOptions {
+                in_response_to,
+                recipient_url,
+                audience,
+                not_before,
+                not_on_or_after,
+                assertion_id: "_a1",
+                one_time_use: false,
+            },
+        )
+    }
+
+    fn build_signed_response_xml_with_options(
+        kp: &KeyPair,
+        opts: &ResponseFixtureOptions<'_>,
+    ) -> Vec<u8> {
+        let in_response_to = opts.in_response_to;
+        let recipient_url = opts.recipient_url;
+        let audience = opts.audience;
+        let not_before = opts.not_before;
+        let not_on_or_after = opts.not_on_or_after;
+        let assertion_id = opts.assertion_id;
+        let one_time_use = opts.one_time_use;
+
         let saml_ns = RESPONSE_SAML_NS;
         let samlp_ns = RESPONSE_SAMLP_NS;
         let bearer = RESPONSE_SUBJECT_CONFIRMATION_BEARER;
@@ -1791,14 +1854,19 @@ mod tests {
             Element::build(QName::new(Some(saml_ns.to_owned()), "AudienceRestriction"))
                 .with_child(Node::Element(aud_el))
                 .finish();
-        let conditions = Element::build(QName::new(Some(saml_ns.to_owned()), "Conditions"))
+        let mut conditions_builder = Element::build(QName::new(Some(saml_ns.to_owned()), "Conditions"))
             .with_attribute(QName::new(None, "NotBefore"), not_before.to_owned())
             .with_attribute(
                 QName::new(None, "NotOnOrAfter"),
                 not_on_or_after.to_owned(),
             )
-            .with_child(Node::Element(aud_restr))
-            .finish();
+            .with_child(Node::Element(aud_restr));
+        if one_time_use {
+            let one_time_use_el =
+                Element::build(QName::new(Some(saml_ns.to_owned()), "OneTimeUse")).finish();
+            conditions_builder = conditions_builder.with_child(Node::Element(one_time_use_el));
+        }
+        let conditions = conditions_builder.finish();
 
         let class_ref =
             Element::build(QName::new(Some(saml_ns.to_owned()), "AuthnContextClassRef"))
@@ -1819,7 +1887,7 @@ mod tests {
                 .finish();
         let assertion = Element::build(QName::new(Some(saml_ns.to_owned()), "Assertion"))
             .with_namespace(Some("saml".to_owned()), saml_ns)
-            .with_attribute(QName::new(None, "ID"), "_a1".to_owned())
+            .with_attribute(QName::new(None, "ID"), assertion_id.to_owned())
             .with_attribute(QName::new(None, "Version"), "2.0")
             .with_attribute(QName::new(None, "IssueInstant"), "2026-05-26T12:00:00Z")
             .with_child(Node::Element(assertion_issuer))
@@ -1923,6 +1991,7 @@ mod tests {
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
+                replay_mode: ReplayMode::All,
             })
             .expect("consume_response");
 
@@ -1961,6 +2030,7 @@ mod tests {
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
+                replay_mode: ReplayMode::All,
             })
             .expect("consume_response (unsolicited)");
         assert_eq!(identity.assertion_id, "_a1");
@@ -2004,6 +2074,7 @@ mod tests {
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
+                replay_mode: ReplayMode::All,
             })
             .unwrap_err();
         assert!(matches!(err, Error::InResponseToMismatch));
@@ -2046,6 +2117,7 @@ mod tests {
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
+                replay_mode: ReplayMode::All,
             })
             .unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
@@ -2112,6 +2184,7 @@ mod tests {
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
+                replay_mode: ReplayMode::All,
             })
             .expect("first consume_response succeeds");
         assert_eq!(identity.assertion_id, "_a1");
@@ -2130,6 +2203,7 @@ mod tests {
                 now: fixed_now(),
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
+                replay_mode: ReplayMode::All,
             })
             .expect_err("second consume_response is a replay");
         assert!(
@@ -2138,6 +2212,222 @@ mod tests {
         );
         // Cache size unchanged — replay path doesn't double-insert.
         assert_eq!(cache.len(), 1, "cache size unchanged after replay");
+    }
+
+    /// `ReplayMode::OneTimeUseOnly` must accept a replayed assertion that
+    /// does NOT carry `<OneTimeUse/>`, mirroring real-world IdPs that
+    /// legitimately resend the same `AssertionID` on retry.
+    #[test]
+    fn replay_mode_one_time_use_only_accepts_repeated_non_one_time_use() {
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-otu-1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        let xml = build_signed_response_xml_with_options(
+            &kp,
+            &ResponseFixtureOptions {
+                in_response_to: Some("_req-otu-1"),
+                recipient_url: "https://sp.example.com/acs",
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T11:59:00Z",
+                not_on_or_after: "2099-05-26T12:10:00Z",
+                assertion_id: "_a-otu-skip",
+                one_time_use: false,
+            },
+        );
+        let cache = crate::replay::InMemoryReplayCache::new(32);
+
+        let first = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::OneTimeUseOnly,
+            })
+            .expect("first consume succeeds");
+        assert_eq!(first.assertion_id, "_a-otu-skip");
+        assert!(!first.is_one_time_use);
+        assert_eq!(cache.len(), 0, "non-OneTimeUse assertion bypasses the cache");
+
+        // Second consume of the same assertion succeeds: not OneTimeUse, so
+        // OneTimeUseOnly mode never offered it to the cache.
+        let second = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::OneTimeUseOnly,
+            })
+            .expect("second consume must succeed under OneTimeUseOnly");
+        assert_eq!(second.assertion_id, "_a-otu-skip");
+        assert_eq!(cache.len(), 0, "cache still untouched");
+    }
+
+    /// `ReplayMode::OneTimeUseOnly` must still reject a replayed assertion
+    /// that carries `<OneTimeUse/>` — spec-mandated minimum (Core §2.5.1.5).
+    #[test]
+    fn replay_mode_one_time_use_only_rejects_repeated_one_time_use() {
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-otu-2".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        let xml = build_signed_response_xml_with_options(
+            &kp,
+            &ResponseFixtureOptions {
+                in_response_to: Some("_req-otu-2"),
+                recipient_url: "https://sp.example.com/acs",
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T11:59:00Z",
+                not_on_or_after: "2099-05-26T12:10:00Z",
+                assertion_id: "_a-otu-must",
+                one_time_use: true,
+            },
+        );
+        let cache = crate::replay::InMemoryReplayCache::new(32);
+
+        let first = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::OneTimeUseOnly,
+            })
+            .expect("first OneTimeUse consume succeeds");
+        assert!(first.is_one_time_use);
+        assert_eq!(cache.len(), 1, "OneTimeUse assertion was offered to the cache");
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::OneTimeUseOnly,
+            })
+            .expect_err("replay of OneTimeUse assertion must reject");
+        assert!(
+            matches!(err, Error::AssertionReplay),
+            "expected Error::AssertionReplay, got {err:?}"
+        );
+    }
+
+    /// `ReplayMode::Off` must never consult the cache, even for a literal
+    /// repeat of the same assertion bytes.
+    #[test]
+    fn replay_mode_off_accepts_repeated_assertion() {
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-off".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        let xml = build_signed_response_xml_with_options(
+            &kp,
+            &ResponseFixtureOptions {
+                in_response_to: Some("_req-off"),
+                recipient_url: "https://sp.example.com/acs",
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T11:59:00Z",
+                not_on_or_after: "2099-05-26T12:10:00Z",
+                assertion_id: "_a-off",
+                one_time_use: true,
+            },
+        );
+        let cache = crate::replay::InMemoryReplayCache::new(32);
+
+        sp.consume_response(ConsumeResponse {
+            idp: &idp,
+            peer_crypto_policy: None,
+            saml_response: &xml,
+            binding: SsoResponseBinding::HttpPost,
+            relay_state: None,
+            tracker: Some(&tracker),
+            expected_destination: "https://sp.example.com/acs",
+            now: fixed_now(),
+            clock_skew: Duration::from_secs(30),
+            replay_cache: Some(&cache),
+            replay_mode: ReplayMode::Off,
+        })
+        .expect("first consume under Off mode succeeds");
+
+        sp.consume_response(ConsumeResponse {
+            idp: &idp,
+            peer_crypto_policy: None,
+            saml_response: &xml,
+            binding: SsoResponseBinding::HttpPost,
+            relay_state: None,
+            tracker: Some(&tracker),
+            expected_destination: "https://sp.example.com/acs",
+            now: fixed_now(),
+            clock_skew: Duration::from_secs(30),
+            replay_cache: Some(&cache),
+            replay_mode: ReplayMode::Off,
+        })
+        .expect("second consume under Off mode also succeeds — cache never consulted");
+
+        assert_eq!(cache.len(), 0, "cache stays untouched under Off mode");
+    }
+
+    #[test]
+    fn replay_check_needed_truth_table() {
+        // All — always check.
+        assert!(replay_check_needed(ReplayMode::All, false));
+        assert!(replay_check_needed(ReplayMode::All, true));
+        // OneTimeUseOnly — check only when <OneTimeUse/> is set.
+        assert!(!replay_check_needed(ReplayMode::OneTimeUseOnly, false));
+        assert!(replay_check_needed(ReplayMode::OneTimeUseOnly, true));
+        // Off — never check.
+        assert!(!replay_check_needed(ReplayMode::Off, false));
+        assert!(!replay_check_needed(ReplayMode::Off, true));
     }
 
     // ---------- SLO ----------

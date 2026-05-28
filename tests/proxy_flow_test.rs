@@ -25,6 +25,7 @@ use saml::proxy::{
     Aes256GcmCodec, BounceToUpstream, PersistentPerSpHmac, Proxy, ProxyContext,
     RelayToDownstream, ReleaseAllowList,
 };
+use saml::replay::ReplayMode;
 use saml::sp::{ConsumeResponse, StartLogin};
 
 // Downstream SP — the relying app.
@@ -223,6 +224,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             now,
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
+            replay_mode: ReplayMode::All,
         })
         .expect("proxy sp consume_response");
 
@@ -287,6 +289,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             now,
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
+            replay_mode: ReplayMode::All,
         })
         .expect("downstream consume_response");
 

@@ -21,9 +21,10 @@
 //! # #[cfg(feature = "slo")]
 //! use saml::{
 //!     Binding, ConsumeResponse, Dispatch, Endpoint, IdpDescriptor, KeyPair,
-//!     LoginTracker, NameIdFormat, PeerCryptoPolicy, DigestAlgorithm, ServiceProvider,
-//!     ServiceProviderConfig, SignatureAlgorithm, SpLogoutSigning, SpLogoutWantSigned,
-//!     SpWantSigned, SsoResponseBinding, SsoResponseEndpoint, StartLogin,
+//!     LoginTracker, NameIdFormat, PeerCryptoPolicy, DigestAlgorithm, ReplayMode,
+//!     ServiceProvider, ServiceProviderConfig, SignatureAlgorithm, SpLogoutSigning,
+//!     SpLogoutWantSigned, SpWantSigned, SsoResponseBinding, SsoResponseEndpoint,
+//!     StartLogin,
 //! };
 //!
 //! # #[cfg(feature = "slo")]
@@ -87,6 +88,7 @@
 //!     now: SystemTime::now(),
 //!     clock_skew: Duration::from_secs(60),
 //!     replay_cache: None,
+//!     replay_mode: ReplayMode::All,
 //! })?;
 //! // Dedupe identity.assertion_id against your replay store, or pass
 //! // `Some(&InMemoryReplayCache::default())` in the field above.
@@ -195,8 +197,8 @@
 //! use saml::{
 //!     Binding, BounceToUpstream, ConsumeAuthnRequest, ConsumeResponse, IdpDescriptor,
 //!     IdentityProvider, NameIdFormat, OpaqueHandleCodec, PersistentPerSpHmac, Proxy,
-//!     ProxyContext, ProxyContextStore, RelayToDownstream, ReleaseAllowList, ServiceProvider,
-//!     SpDescriptor, SsoResponseBinding,
+//!     ProxyContext, ProxyContextStore, RelayToDownstream, ReleaseAllowList, ReplayMode,
+//!     ServiceProvider, SpDescriptor, SsoResponseBinding,
 //! };
 //!
 //! # fn run<S: ProxyContextStore + 'static>(
@@ -259,6 +261,7 @@
 //!     now: SystemTime::now(),
 //!     clock_skew: Duration::from_secs(60),
 //!     replay_cache: None,
+//!     replay_mode: ReplayMode::All,
 //! })?;
 //!
 //! let _dispatch = proxy.relay_to_downstream(RelayToDownstream {
@@ -333,7 +336,7 @@ pub mod sp;
 
 pub use crate::error::Error;
 pub use crate::http::{HttpClient, HttpRequest, HttpResponse};
-pub use crate::replay::{InMemoryReplayCache, ReplayCache};
+pub use crate::replay::{InMemoryReplayCache, ReplayCache, ReplayMode};
 pub use crate::time::{format_xs_datetime, parse_xs_datetime};
 
 pub use crate::attribute::Attribute;

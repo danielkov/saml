@@ -34,6 +34,7 @@ use saml::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, S
 use saml::http::{HttpClient, HttpRequest, HttpResponse};
 use saml::idp::{ConsumeAuthnRequest, IdentityProvider, IdentityProviderConfig, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
+use saml::replay::ReplayMode;
 use saml::sp::{ConsumeArtifactResponse, ServiceProvider, ServiceProviderConfig, StartLogin};
 use saml::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
 
@@ -282,6 +283,7 @@ async fn artifact_flow_end_to_end() {
                 now,
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
+                replay_mode: ReplayMode::All,
             },
         )
         .await
@@ -328,6 +330,7 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
                 now,
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
+                replay_mode: ReplayMode::All,
             },
         )
         .await

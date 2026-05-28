@@ -46,7 +46,7 @@ use saml::{
     Attribute, Binding, ConsumeLogoutRequest, ConsumeLogoutResponse, ConsumeResponse, Dispatch,
     Endpoint, IdpDescriptor, InMemoryReplayCache, KeyPair, LoginTracker, LogoutOutcome,
     LogoutStatus, LogoutTracker, NameId, NameIdFormat, ParsedLogoutRequest, PeerCryptoPolicy,
-    ServiceProvider, ServiceProviderConfig, SignatureAlgorithm, SpLogoutSigning,
+    ReplayMode, ServiceProvider, ServiceProviderConfig, SignatureAlgorithm, SpLogoutSigning,
     SpLogoutWantSigned, SpWantSigned, SsoResponseBinding, SsoResponseEndpoint, StartLogin,
     StartLogout, X509Certificate,
 };
@@ -651,6 +651,7 @@ async fn handle_acs(State(state): State<AppState>, Form(form): Form<AcsForm>) ->
         now: SystemTime::now(),
         clock_skew: Duration::from_mins(2),
         replay_cache: Some(state.replay_cache.as_ref()),
+        replay_mode: ReplayMode::All,
     }) {
         Ok(id) => id,
         Err(e) => {

@@ -19,6 +19,7 @@ use saml::binding::{Binding, Dispatch, SsoResponseBinding, SsoResponseDispatch};
 use saml::error::Error;
 use saml::idp::{ConsumeAuthnRequest, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
+use saml::replay::ReplayMode;
 use saml::sp::{ConsumeResponse, StartLogin};
 
 const SP_ENTITY_ID: &str = "https://sp.example.com/sp-flow";
@@ -122,6 +123,7 @@ fn sp_consumes_real_idp_response() {
             now,
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
+            replay_mode: ReplayMode::All,
         })
         .expect("sp consume_response");
 
@@ -238,6 +240,7 @@ fn sp_rejects_tampered_response() {
             now,
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
+            replay_mode: ReplayMode::All,
         })
         .expect_err("tampered response must fail");
 

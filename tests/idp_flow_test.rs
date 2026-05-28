@@ -171,6 +171,7 @@ fn idp_consumes_redirect_authn_request_and_emits_response() {
             now,
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
+            replay_mode: saml::replay::ReplayMode::All,
         })
         .expect("SP round-trips the IdP-issued Response");
     assert_eq!(identity.name_id.value, "opaque-user-42");
