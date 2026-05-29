@@ -19,9 +19,15 @@
 //! - `POST /login` — verifies the password, sets the session cookie,
 //!   then redirects to `/saml/sso/continue?request_id=...` which pulls
 //!   the stashed AuthnRequest and finishes the round trip.
-//! - `GET | POST /saml/slo` — IdP-side SLO: parse the SP's
-//!   `<samlp:LogoutRequest>`, clear the session, echo a
-//!   `<samlp:LogoutResponse>` back to the SP's SLO endpoint.
+//! - `POST /logout-everywhere` — IdP-initiated SLO: for the current IdP
+//!   session, build a signed `<samlp:LogoutRequest>` to a participating SP
+//!   and dispatch it over the SP's preferred SLO binding. The returning
+//!   `<samlp:LogoutResponse>` is consumed at `/saml/slo`.
+//! - `GET | POST /saml/slo` — IdP-side SLO: an inbound
+//!   `<samlp:LogoutRequest>` (SP-initiated) is verified, the session
+//!   cleared, and a `<samlp:LogoutResponse>` echoed back; an inbound
+//!   `<samlp:LogoutResponse>` (the answer to an IdP-initiated request) is
+//!   bound to its tracker and clears the session.
 
 pub mod auth;
 pub mod session;
@@ -47,7 +53,7 @@ use saml::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy};
 use saml::{
     DataEncryptionAlgorithm, Endpoint, IdentityProvider, IdentityProviderConfig,
     IdpAssertionSigning, IdpLogoutSigning, IdpLogoutWantSigned, KeyPair, KeyTransportAlgorithm,
-    NameIdFormat, ParsedAuthnRequest, SignatureAlgorithm, SpDescriptor,
+    LogoutTracker, NameIdFormat, ParsedAuthnRequest, SignatureAlgorithm, SpDescriptor,
 };
 
 use crate::auth::{UserStore, UsersFile};
@@ -273,6 +279,48 @@ impl PendingStore {
 }
 
 // =============================================================================
+// IdP-initiated SLO tracker store
+// =============================================================================
+
+/// Pending [`LogoutTracker`]s for IdP-initiated SLO, keyed by the
+/// `<samlp:LogoutRequest>` `ID` (which the SP echoes as `InResponseTo` on its
+/// `<samlp:LogoutResponse>`). Mirrors the demo SP's `LogoutTrackerStore`: a
+/// front-channel SLO round trip detours through the browser, so we have to
+/// stash the tracker between dispatching the request and consuming the
+/// response. Bounded and TTL-evicted so a hostile actor can't fill memory.
+#[derive(Debug, Default)]
+pub struct LogoutTrackerStore {
+    map: HashMap<String, LogoutTracker>,
+}
+
+impl LogoutTrackerStore {
+    const MAX_PENDING: usize = 4096;
+    const STALE_AFTER: Duration = Duration::from_mins(15);
+
+    fn insert(&mut self, tracker: LogoutTracker) {
+        let now = SystemTime::now();
+        self.map.retain(|_, t| {
+            now.duration_since(t.issued_at)
+                .map_or(true, |age| age < Self::STALE_AFTER)
+        });
+        if self.map.len() >= Self::MAX_PENDING
+            && let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, t)| t.issued_at)
+                .map(|(k, _)| k.clone())
+        {
+            self.map.remove(&oldest);
+        }
+        self.map.insert(tracker.request_id.clone(), tracker);
+    }
+
+    fn take(&mut self, request_id: &str) -> Option<LogoutTracker> {
+        self.map.remove(request_id)
+    }
+}
+
+// =============================================================================
 // AppState
 // =============================================================================
 
@@ -290,6 +338,11 @@ pub struct AppState {
     pub by_entity_id: Arc<Mutex<HashMap<String, SpEntry>>>,
     pub all_sp_configs: Arc<Vec<SpEntryConfig>>,
     pub pending: Arc<Mutex<PendingStore>>,
+    /// Pending IdP-initiated-SLO trackers, keyed by LogoutRequest `ID`. The
+    /// returning `<samlp:LogoutResponse>` carries that value as
+    /// `InResponseTo`; the `/saml/slo` handler looks the tracker up to bind
+    /// the response to the request it answers.
+    pub logout_trackers: Arc<Mutex<LogoutTrackerStore>>,
 }
 
 impl AppState {
@@ -311,6 +364,7 @@ impl AppState {
             by_entity_id: Arc::new(Mutex::new(by_entity_id)),
             all_sp_configs: Arc::new(all_sp_configs),
             pending: Arc::new(Mutex::new(PendingStore::default())),
+            logout_trackers: Arc::new(Mutex::new(LogoutTrackerStore::default())),
         }
     }
 
@@ -364,6 +418,23 @@ impl AppState {
             .lock()
             .map_err(|e| format!("pending store poisoned: {e}"))?;
         Ok(store.get(key).cloned())
+    }
+
+    pub fn insert_logout_tracker(&self, tracker: LogoutTracker) -> Result<(), String> {
+        let mut store = self
+            .logout_trackers
+            .lock()
+            .map_err(|e| format!("logout tracker store poisoned: {e}"))?;
+        store.insert(tracker);
+        Ok(())
+    }
+
+    pub fn take_logout_tracker(&self, request_id: &str) -> Result<Option<LogoutTracker>, String> {
+        let mut store = self
+            .logout_trackers
+            .lock()
+            .map_err(|e| format!("logout tracker store poisoned: {e}"))?;
+        Ok(store.take(request_id))
     }
 }
 
@@ -595,6 +666,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/login", post(sso::handle_login))
         .route("/logout", post(sso::handle_logout_self))
+        .route("/logout-everywhere", post(sso::handle_logout_everywhere))
         .route(
             "/saml/slo",
             get(sso::handle_slo_get).post(sso::handle_slo_post),

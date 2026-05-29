@@ -27,8 +27,9 @@ use tracing::{info, warn};
 
 use saml::{
     Attribute, AuthnContextClassRef, Binding, ConsumeAuthnRequest, ConsumeLogoutRequest,
-    DetachedSignature, Dispatch, IssueResponse, LogoutStatus, NameId, NameIdFormat,
-    ParsedAuthnRequest, SsoResponseDispatch, WireDirection, decode_wire,
+    ConsumeLogoutResponse, DetachedSignature, Dispatch, IssueResponse, LogoutDispatch,
+    LogoutOutcome, LogoutStatus, NameId, NameIdFormat, ParsedAuthnRequest, SsoResponseDispatch,
+    StartLogout, WireDirection, decode_wire,
 };
 
 use crate::auth::StoredUser;
@@ -518,6 +519,87 @@ pub async fn handle_logout_self(State(state): State<AppState>, _headers: HeaderM
 }
 
 // =============================================================================
+// /logout-everywhere — IdP-initiated SLO.
+//
+// For the current IdP session, build a signed `<samlp:LogoutRequest>` to a
+// participating SP and dispatch it over the SP's preferred SLO binding. The
+// returning `<samlp:LogoutResponse>` lands back at `/saml/slo`, where it is
+// bound to the tracker stashed here and clears the session.
+//
+// Front-channel SLO can only carry one SP per HTTP response, and this
+// example's session doesn't record which SPs the user actually rode into,
+// so we target the first registered SP that advertises an SLO endpoint —
+// the single-SP demo topology. A multi-SP IdP would iterate the active
+// session participants, dispatching to each in turn (typically by parking
+// the remaining SPs and chaining on each LogoutResponse).
+// =============================================================================
+
+pub async fn handle_logout_everywhere(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session) = extract_session_from_headers(&state, &headers) else {
+        return redirect_with_cleared_cookie("/?msg=already-signed-out");
+    };
+
+    let Some(entry) = first_sp_with_slo(&state) else {
+        info!("/logout-everywhere: no SP advertises an SLO endpoint; local logout only");
+        return redirect_with_cleared_cookie("/?msg=signed-out-locally");
+    };
+    let Some(binding) = pick_slo_binding(&entry) else {
+        info!(
+            sp = %entry.sp.entity_id,
+            "/logout-everywhere: SP advertises no usable SLO binding; local logout only",
+        );
+        return redirect_with_cleared_cookie("/?msg=signed-out-locally");
+    };
+
+    let name_id = NameId::new(session.email.clone(), NameIdFormat::EmailAddress);
+    let dispatch = match state.idp.start_logout(
+        &entry.sp,
+        StartLogout {
+            name_id: &name_id,
+            session_index: Some(session.session_index.as_str()),
+            relay_state: None,
+            reason: None,
+            binding,
+        },
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, sp = %entry.sp.entity_id, "/logout-everywhere: start_logout failed");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("start_logout: {e}"),
+            );
+        }
+    };
+
+    let LogoutDispatch { tracker, dispatch } = dispatch;
+    if let Err(e) = state.insert_logout_tracker(tracker) {
+        warn!(error = %e, "/logout-everywhere: tracker store unavailable");
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "logout tracker store unavailable",
+        );
+    }
+
+    info!(sp = %entry.sp.entity_id, "/logout-everywhere: dispatched LogoutRequest");
+    // Keep the IdP cookie until the SP confirms via LogoutResponse — clearing
+    // it now would orphan the round trip if the response never lands.
+    finalize_logout_dispatch(dispatch, entry.label(), /* clear_cookie */ false)
+}
+
+/// First registered SP that advertises a usable SLO endpoint, if any.
+fn first_sp_with_slo(state: &AppState) -> Option<SpEntry> {
+    let guard = state.by_entity_id.lock().ok()?;
+    guard
+        .values()
+        .find(|entry| pick_slo_binding(entry).is_some())
+        .cloned()
+}
+
+// =============================================================================
 // /saml/slo — SP-initiated logout
 //
 // Inbound LogoutRequest from the SP → verify → terminate session → echo
@@ -537,13 +619,7 @@ pub struct SloForm {
 pub async fn handle_slo_post(State(state): State<AppState>, Form(form): Form<SloForm>) -> Response {
     match (form.saml_request.as_deref(), form.saml_response.as_deref()) {
         (Some(req), None) => handle_slo_request_post(&state, req, form.relay_state.as_deref()),
-        (None, Some(_)) => {
-            // The IdP example doesn't initiate SLO toward SPs, so a
-            // SAMLResponse arriving here is unexpected. Log and 200 so
-            // the SP doesn't spin.
-            info!("/saml/slo POST: received unsolicited LogoutResponse; ignoring");
-            redirect_with_cleared_cookie("/?msg=signed-out-locally")
-        }
+        (None, Some(resp)) => handle_slo_response(&state, resp, Binding::HttpPost),
         (Some(_), Some(_)) => error_page(
             StatusCode::BAD_REQUEST,
             "/saml/slo received both SAMLRequest and SAMLResponse",
@@ -562,9 +638,36 @@ pub async fn handle_slo_get(
     let Some(raw_query) = raw_query.filter(|q| !q.is_empty()) else {
         return error_page(
             StatusCode::BAD_REQUEST,
-            "/saml/slo GET requires a query string carrying SAMLRequest",
+            "/saml/slo GET requires a query string carrying SAMLRequest or SAMLResponse",
         );
     };
+
+    // A returning LogoutResponse (answering an IdP-initiated request) rides
+    // the `SAMLResponse=…` parameter; an inbound SP-initiated LogoutRequest
+    // rides `SAMLRequest=…`.
+    if query_has_param(&raw_query, "SAMLResponse") {
+        let decoded = match decode_wire(
+            raw_query.as_bytes(),
+            Binding::HttpRedirect,
+            WireDirection::Response,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = %e, "/saml/slo GET: SAMLResponse decode failed");
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "could not decode SAMLResponse from query string",
+                );
+            }
+        };
+        return consume_logout_response_xml(
+            &state,
+            &decoded.xml,
+            Binding::HttpRedirect,
+            decoded.as_detached_signature(),
+        );
+    }
+
     let decoded = match decode_wire(
         raw_query.as_bytes(),
         Binding::HttpRedirect,
@@ -723,6 +826,125 @@ fn handle_slo_request_post(
     finalize_logout_dispatch(dispatch, entry.label(), /* clear_cookie */ true)
 }
 
+/// POST-binding entry point for a returning `<samlp:LogoutResponse>` — the
+/// SP's answer to an IdP-initiated `/logout-everywhere` request.
+fn handle_slo_response(state: &AppState, saml_response_b64: &str, binding: Binding) -> Response {
+    let decoded = match decode_wire(
+        saml_response_b64.as_bytes(),
+        Binding::HttpPost,
+        WireDirection::Response,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(error = %e, "/saml/slo POST: SAMLResponse decode failed");
+            return error_page(StatusCode::BAD_REQUEST, "SAMLResponse is not valid base64");
+        }
+    };
+    // POST binding embeds the XML-DSig signature inside the XML; no detached
+    // signature material to thread through.
+    consume_logout_response_xml(state, &decoded.xml, binding, None)
+}
+
+/// Bind a returning `<samlp:LogoutResponse>` to the tracker stashed when the
+/// IdP-initiated request went out (`InResponseTo` → tracker), validate it via
+/// the lib's `consume_logout_response`, then clear the IdP session.
+fn consume_logout_response_xml(
+    state: &AppState,
+    xml: &[u8],
+    binding: Binding,
+    detached: Option<DetachedSignature<'_>>,
+) -> Response {
+    let Some(issuer) = peek_issuer(xml) else {
+        return error_page(StatusCode::BAD_REQUEST, "LogoutResponse carries no Issuer");
+    };
+    let Some(entry) = state.sp_by_entity_id(&issuer) else {
+        return error_page(
+            StatusCode::UNAUTHORIZED,
+            &format!("LogoutResponse Issuer `{issuer}` is not registered"),
+        );
+    };
+
+    // The SP echoes our LogoutRequest `ID` as `InResponseTo`; that's the key
+    // the tracker was stashed under in `/logout-everywhere`.
+    let Some(in_response_to) = peek_in_response_to(xml) else {
+        warn!("/saml/slo: LogoutResponse carries no InResponseTo; cannot bind to a tracker");
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "LogoutResponse carries no InResponseTo",
+        );
+    };
+    let tracker = match state.take_logout_tracker(&in_response_to) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn!(
+                in_response_to,
+                "/saml/slo: no pending tracker for the LogoutResponse's InResponseTo"
+            );
+            return error_page(
+                StatusCode::GONE,
+                "No pending logout matches this LogoutResponse. It may have already completed.",
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "/saml/slo: logout tracker store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "logout tracker store unavailable",
+            );
+        }
+    };
+
+    let expected_destination = format!("{}/saml/slo", state.config.idp_base_url);
+    let outcome = match state.idp.consume_logout_response(
+        &entry.sp,
+        ConsumeLogoutResponse {
+            peer_crypto_policy: None,
+            body: xml,
+            binding,
+            detached_signature: detached,
+            tracker: &tracker,
+            expected_destination: &expected_destination,
+            now: SystemTime::now(),
+            clock_skew: Duration::from_mins(2),
+        },
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(error = %e, "/saml/slo: consume_logout_response rejected the LogoutResponse");
+            return error_page(
+                StatusCode::UNAUTHORIZED,
+                &format!("LogoutResponse rejected: {e}"),
+            );
+        }
+    };
+
+    match outcome {
+        LogoutOutcome::Success => {
+            info!(sp = %entry.sp.entity_id, "/saml/slo: IdP-init SLO succeeded; clearing session");
+            redirect_with_cleared_cookie("/?msg=signed-out")
+        }
+        LogoutOutcome::PartialLogout { message } => {
+            warn!(
+                sp = %entry.sp.entity_id,
+                message = message.as_deref().unwrap_or("(none)"),
+                "/saml/slo: IdP-init SLO reported partial logout; clearing local session",
+            );
+            redirect_with_cleared_cookie("/?msg=signed-out")
+        }
+        LogoutOutcome::Failure { status, message } => {
+            warn!(
+                sp = %entry.sp.entity_id,
+                status,
+                message = message.as_deref().unwrap_or("(none)"),
+                "/saml/slo: SP refused the LogoutRequest; clearing local session anyway",
+            );
+            // The SP refused, but the IdP's own session is ours to end — the
+            // operator asked to sign out. Clear locally and report.
+            redirect_with_cleared_cookie("/?msg=signed-out-locally")
+        }
+    }
+}
+
 fn pick_slo_binding(entry: &SpEntry) -> Option<Binding> {
     if entry.sp.slo_endpoint(Binding::HttpPost).is_some() {
         return Some(Binding::HttpPost);
@@ -839,6 +1061,32 @@ fn read_msg_query_param(raw_query: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a `&`-joined query string carries the named parameter.
+fn query_has_param(raw_query: &str, name: &str) -> bool {
+    raw_query.split('&').any(|pair| {
+        let key = pair.split_once('=').map_or(pair, |(k, _)| k);
+        key == name
+    })
+}
+
+/// Best-effort scan for the `InResponseTo` attribute on the root
+/// `<samlp:LogoutResponse>` element. Mirrors the demo SP's fixed scanner;
+/// handles a leading `<?xml ... ?>` declaration.
+fn peek_in_response_to(xml: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(xml).ok()?;
+    let response_tag_start = s.find("Response")?;
+    let tag_open = s.get(..response_tag_start)?.rfind('<')?;
+    let after_open = s.get(tag_open..)?;
+    let tag_end = after_open.find('>')?;
+    let tag = after_open.get(..tag_end)?;
+
+    let key = "InResponseTo=\"";
+    let start = tag.find(key)?.saturating_add(key.len());
+    let rest = tag.get(start..)?;
+    let end = rest.find('"')?;
+    rest.get(..end).map(str::to_owned)
 }
 
 fn banner_for_msg(msg: &str) -> Option<String> {

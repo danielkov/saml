@@ -84,6 +84,9 @@ pub fn render_index(
               <form method=\"post\" action=\"/logout\" style=\"display: inline-block;\">\
                 <button class=\"btn btn-primary\" type=\"submit\">Sign out</button>\
               </form>\
+              <form method=\"post\" action=\"/logout-everywhere\" style=\"display: inline-block;\">\
+                <button class=\"btn\" type=\"submit\">Log out everywhere</button>\
+              </form>\
             </section>",
             name = escape(name),
             sp_count = sp_count,
@@ -283,6 +286,7 @@ mod tests {
         assert!(html.contains("Welcome, "));
         assert!(html.contains("Alice"));
         assert!(html.contains("action=\"/logout\""));
+        assert!(html.contains("action=\"/logout-everywhere\""));
         assert!(html.contains("hi"));
     }
 
