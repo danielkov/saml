@@ -14,6 +14,10 @@
 //!   Response over the SP's preferred binding.
 //! - `GET | POST /saml/slo` — verify the SP's signed LogoutRequest, clear
 //!   the local session, echo the LogoutResponse back.
+//! - `POST /saml/artifact` (feature `artifact-binding`) — the
+//!   ArtifactResolutionService: parse the SP's SOAP `<samlp:ArtifactResolve>`,
+//!   one-time-consume the stashed `<samlp:Response>` keyed by the artifact,
+//!   and return it wrapped in a SOAP `<samlp:ArtifactResponse>`.
 
 use std::time::{Duration, SystemTime};
 
@@ -480,7 +484,7 @@ fn finalize_login(
         }
     };
 
-    finalize_sso_dispatch(dispatch, entry.label())
+    finalize_sso_dispatch(state, &entry.sp.entity_id, dispatch, entry.label())
 }
 
 fn build_attributes(user: &StoredUser) -> Vec<Attribute> {
@@ -979,19 +983,103 @@ fn pick_slo_binding(entry: &SpEntry) -> Option<Binding> {
 // /saml/artifact (feature-gated)
 // =============================================================================
 
+/// `POST /saml/artifact` — the IdP's `ArtifactResolutionService`.
+///
+/// An SP POSTs a SOAP `<samlp:ArtifactResolve>` envelope here. We:
+///
+/// 1. Peek the requesting SP's `<saml:Issuer>` to pick its descriptor.
+/// 2. Parse + issuer-verify the resolve via the IdP role layer.
+/// 3. One-time consume the stashed `<samlp:Response>` keyed by the artifact.
+/// 4. Wrap it in a signed `<samlp:ArtifactResponse>` SOAP envelope and return
+///    it with `Content-Type: text/xml`.
 #[cfg(feature = "artifact-binding")]
-#[derive(Debug, Deserialize)]
-pub struct ArtifactBody(pub Vec<u8>);
+pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+    let Some(issuer) = peek_issuer(&body) else {
+        warn!("/saml/artifact: ArtifactResolve carries no Issuer");
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "ArtifactResolve did not carry an Issuer",
+        );
+    };
+    let Some(entry) = state.sp_by_entity_id(&issuer) else {
+        warn!(issuer = %issuer, "/saml/artifact: no SP configured for Issuer");
+        return error_page(
+            StatusCode::UNAUTHORIZED,
+            &format!("ArtifactResolve Issuer `{issuer}` is not registered with this IdP"),
+        );
+    };
 
-#[cfg(feature = "artifact-binding")]
-pub async fn handle_artifact(State(_state): State<AppState>, body: axum::body::Bytes) -> Response {
-    let _ = body;
-    error_page(
-        StatusCode::NOT_IMPLEMENTED,
-        "ArtifactResolutionService is not implemented in this example. \
-         The IdP role exposes parse_artifact_resolve / build_artifact_response \
-         under the artifact-binding + weak-algos features.",
+    let resolve = match state.idp.parse_artifact_resolve(&entry.sp, &body) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, sp = %entry.sp.entity_id, "/saml/artifact: parse_artifact_resolve failed");
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                &format!("ArtifactResolve rejected: {e}"),
+            );
+        }
+    };
+
+    let stashed = match state.take_artifact(&resolve.artifact) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            warn!(
+                artifact = %resolve.artifact,
+                "/saml/artifact: unknown or already-consumed artifact"
+            );
+            return error_page(
+                StatusCode::NOT_FOUND,
+                "The requested artifact is unknown or has already been resolved.",
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "/saml/artifact: artifact store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact store unavailable",
+            );
+        }
+    };
+
+    // Defense in depth: the artifact was minted for one SP; refuse to hand it
+    // to a different (registered) SP even though the issuer-check above passed.
+    if stashed.sp_entity_id != entry.sp.entity_id {
+        warn!(
+            artifact = %resolve.artifact,
+            minted_for = %stashed.sp_entity_id,
+            resolved_by = %entry.sp.entity_id,
+            "/saml/artifact: artifact resolved by a different SP than it was minted for"
+        );
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "This artifact was not issued to the resolving SP.",
+        );
+    }
+
+    let envelope = match state
+        .idp
+        .build_artifact_response(&resolve, &stashed.response_xml)
+    {
+        Ok(env) => env,
+        Err(e) => {
+            warn!(error = %e, "/saml/artifact: build_artifact_response failed");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("build_artifact_response: {e}"),
+            );
+        }
+    };
+
+    info!(
+        sp = %entry.sp.entity_id,
+        request_id = %resolve.request_id,
+        "/saml/artifact: resolved artifact, returning ArtifactResponse"
+    );
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/xml"))],
+        envelope,
     )
+        .into_response()
 }
 
 // =============================================================================
@@ -1013,7 +1101,14 @@ fn redirect_with_cleared_cookie(target: &str) -> Response {
     (headers, Redirect::to(target)).into_response()
 }
 
-fn finalize_sso_dispatch(dispatch: SsoResponseDispatch, sp_label: &str) -> Response {
+fn finalize_sso_dispatch(
+    state: &AppState,
+    sp_entity_id: &str,
+    dispatch: SsoResponseDispatch,
+    sp_label: &str,
+) -> Response {
+    // `sp_entity_id` is only consumed by the artifact arm below.
+    let _ = (state, sp_entity_id);
     match dispatch {
         SsoResponseDispatch::Post(form) => Html(templates::render_post_dispatch(
             form.action.as_str(),
@@ -1023,11 +1118,41 @@ fn finalize_sso_dispatch(dispatch: SsoResponseDispatch, sp_label: &str) -> Respo
             sp_label,
         ))
         .into_response(),
+        #[cfg(feature = "artifact-binding")]
+        SsoResponseDispatch::Artifact(redirect) => {
+            finalize_artifact_dispatch(state, sp_entity_id, redirect)
+        }
+        #[cfg(not(feature = "artifact-binding"))]
         SsoResponseDispatch::Artifact(_) => error_page(
             StatusCode::NOT_IMPLEMENTED,
             "Artifact-binding response dispatch is not implemented in this example.",
         ),
     }
+}
+
+/// Stash the artifact's `<samlp:Response>` XML keyed by its `SAMLart` value,
+/// then redirect the user-agent to the SP's ACS carrying `?SAMLart=…`. The SP
+/// resolves the artifact against `/saml/artifact` over the back channel.
+#[cfg(feature = "artifact-binding")]
+fn finalize_artifact_dispatch(
+    state: &AppState,
+    sp_entity_id: &str,
+    redirect: saml::ArtifactRedirect,
+) -> Response {
+    let entry = crate::StashedArtifact::new(redirect.response_xml, sp_entity_id.to_owned());
+    if let Err(e) = state.stash_artifact(redirect.artifact.clone(), entry) {
+        warn!(error = %e, "/saml/sso: artifact store unavailable");
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact store unavailable",
+        );
+    }
+    info!(
+        sp = %sp_entity_id,
+        acs = %redirect.redirect_to,
+        "/saml/sso: dispatching SSO Response over HTTP-Artifact binding",
+    );
+    Redirect::to(redirect.redirect_to.as_str()).into_response()
 }
 
 fn finalize_logout_dispatch(dispatch: Dispatch, sp_label: &str, clear_cookie: bool) -> Response {

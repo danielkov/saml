@@ -321,6 +321,89 @@ impl LogoutTrackerStore {
 }
 
 // =============================================================================
+// Artifact store (feature-gated)
+//
+// When the IdP issues a Response over the HTTP-Artifact binding it mints an
+// opaque artifact, stashes the `<samlp:Response>` XML keyed by it, and
+// redirects the user-agent to the SP's ACS carrying `?SAMLart=…`. The SP then
+// resolves the artifact against `/saml/artifact` over SOAP. The library is
+// stateless; this in-memory store is the example's persistence layer.
+// =============================================================================
+
+/// One stashed artifact payload: the `<samlp:Response>` XML the IdP must serve
+/// when the SP resolves the artifact, plus the SP that the response targets so
+/// the resolve handler can verify the requesting issuer. Bounded + TTL'd and
+/// consumed one-time, mirroring [`PendingStore`].
+#[cfg(feature = "artifact-binding")]
+#[derive(Clone)]
+pub struct StashedArtifact {
+    pub response_xml: String,
+    pub sp_entity_id: String,
+    created_at: SystemTime,
+}
+
+#[cfg(feature = "artifact-binding")]
+impl StashedArtifact {
+    #[must_use]
+    pub fn new(response_xml: String, sp_entity_id: String) -> Self {
+        Self {
+            response_xml,
+            sp_entity_id,
+            created_at: SystemTime::now(),
+        }
+    }
+}
+
+#[cfg(feature = "artifact-binding")]
+impl std::fmt::Debug for StashedArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StashedArtifact")
+            .field("sp_entity_id", &self.sp_entity_id)
+            .field("created_at", &self.created_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bounded in-memory map of stashed artifact responses, keyed by the opaque
+/// artifact string. A hostile actor can hammer `/saml/sso` to fill memory, so
+/// we cap and evict the same way [`PendingStore`] does.
+#[cfg(feature = "artifact-binding")]
+#[derive(Debug, Default)]
+pub struct ArtifactStore {
+    map: HashMap<String, StashedArtifact>,
+}
+
+#[cfg(feature = "artifact-binding")]
+impl ArtifactStore {
+    const MAX_ARTIFACTS: usize = 4096;
+    const STALE_AFTER: Duration = Duration::from_mins(5);
+
+    fn insert(&mut self, artifact: String, entry: StashedArtifact) {
+        let now = SystemTime::now();
+        self.map.retain(|_, e| {
+            now.duration_since(e.created_at)
+                .map_or(true, |age| age < Self::STALE_AFTER)
+        });
+        if self.map.len() >= Self::MAX_ARTIFACTS
+            && let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.created_at)
+                .map(|(k, _)| k.clone())
+        {
+            self.map.remove(&oldest);
+        }
+        self.map.insert(artifact, entry);
+    }
+
+    /// One-time consume: the artifact is removed on lookup so it cannot be
+    /// resolved twice (SAML 2.0 Bindings §3.6.3 — artifacts are single-use).
+    fn take(&mut self, artifact: &str) -> Option<StashedArtifact> {
+        self.map.remove(artifact)
+    }
+}
+
+// =============================================================================
 // AppState
 // =============================================================================
 
@@ -343,6 +426,10 @@ pub struct AppState {
     /// `InResponseTo`; the `/saml/slo` handler looks the tracker up to bind
     /// the response to the request it answers.
     pub logout_trackers: Arc<Mutex<LogoutTrackerStore>>,
+    /// Artifact responses stashed by the HTTP-Artifact dispatch path, keyed
+    /// by the opaque `SAMLart` value and served back from `/saml/artifact`.
+    #[cfg(feature = "artifact-binding")]
+    pub artifacts: Arc<Mutex<ArtifactStore>>,
 }
 
 impl AppState {
@@ -365,6 +452,8 @@ impl AppState {
             all_sp_configs: Arc::new(all_sp_configs),
             pending: Arc::new(Mutex::new(PendingStore::default())),
             logout_trackers: Arc::new(Mutex::new(LogoutTrackerStore::default())),
+            #[cfg(feature = "artifact-binding")]
+            artifacts: Arc::new(Mutex::new(ArtifactStore::default())),
         }
     }
 
@@ -436,6 +525,28 @@ impl AppState {
             .map_err(|e| format!("logout tracker store poisoned: {e}"))?;
         Ok(store.take(request_id))
     }
+
+    /// Stash an artifact's `<samlp:Response>` XML keyed by the opaque
+    /// `SAMLart` value, to be served back from `/saml/artifact`.
+    #[cfg(feature = "artifact-binding")]
+    pub fn stash_artifact(&self, artifact: String, entry: StashedArtifact) -> Result<(), String> {
+        let mut store = self
+            .artifacts
+            .lock()
+            .map_err(|e| format!("artifact store poisoned: {e}"))?;
+        store.insert(artifact, entry);
+        Ok(())
+    }
+
+    /// One-time consume of a stashed artifact.
+    #[cfg(feature = "artifact-binding")]
+    pub fn take_artifact(&self, artifact: &str) -> Result<Option<StashedArtifact>, String> {
+        let mut store = self
+            .artifacts
+            .lock()
+            .map_err(|e| format!("artifact store poisoned: {e}"))?;
+        Ok(store.take(artifact))
+    }
 }
 
 // =============================================================================
@@ -495,6 +606,18 @@ pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, s
     let sso_endpoint_url = format!("{}/saml/sso", config.idp_base_url);
     let logout_endpoint_url = format!("{}/saml/slo", config.idp_base_url);
 
+    // Advertise the ArtifactResolutionService only when the binding is
+    // compiled in; otherwise the IdP role would reject HTTP-Artifact ACS
+    // selection at `issue_response` time anyway.
+    #[cfg(feature = "artifact-binding")]
+    let artifact_resolution = vec![Endpoint::soap(
+        format!("{}/saml/artifact", config.idp_base_url),
+        Some(0),
+        true,
+    )];
+    #[cfg(not(feature = "artifact-binding"))]
+    let artifact_resolution = vec![];
+
     IdentityProvider::new(IdentityProviderConfig {
         entity_id: config.idp_entity_id.clone(),
         sso: vec![
@@ -505,7 +628,7 @@ pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, s
             Endpoint::post(logout_endpoint_url.clone(), 0, true),
             Endpoint::redirect(logout_endpoint_url, 1, false),
         ],
-        artifact_resolution: vec![],
+        artifact_resolution,
         supported_name_id_formats: vec![
             NameIdFormat::EmailAddress,
             NameIdFormat::Persistent,
