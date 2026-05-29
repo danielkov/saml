@@ -95,6 +95,27 @@ jobs:
         run: cargo test --workspace --exclude saml-keycloak-example ${{ matrix.features.flags }}
 
   # ---------------------------------------------------------------------------
+  # xmlsec1 interop: prove a foreign reference verifier (the XML Security
+  # Library that Shibboleth / SimpleSAMLphp / mod_auth_mellon build on) accepts
+  # our emitted XML-DSig signatures. The test self-skips when xmlsec1 is absent,
+  # so this job exists to guarantee it actually runs somewhere.
+  # ---------------------------------------------------------------------------
+  xmlsec-interop:
+    name: xmlsec1 interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xmlsec1
+        run: sudo apt-get update && sudo apt-get install -y xmlsec1
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: xmlsec-interop
+      - name: cargo test --test xmlsec_interop
+        run: cargo test --test xmlsec_interop
+
+  # ---------------------------------------------------------------------------
   # Cross-platform smoke test: default features only, stable only.
   # Keeps CI minutes reasonable; full matrix lives on Linux.
   # ---------------------------------------------------------------------------
