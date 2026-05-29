@@ -34,7 +34,7 @@ use saml_idp_example as idp;
 #[tokio::test(flavor = "multi_thread")]
 async fn rust_idp_loop_with_demo_sp() {
     if std::env::var("SAML_DEMO_E2E_RUST_IDP").as_deref() != Ok("1") {
-        eprintln!("skipping rust-idp e2e loop: set SAML_DEMO_E2E_RUST_IDP=1 to enable",);
+        eprintln!("skipping rust-idp e2e loop: set SAML_DEMO_E2E_RUST_IDP=1 to enable");
         return;
     }
 

@@ -39,7 +39,6 @@ use saml::idp::{IdentityProvider, IdentityProviderConfig};
 use saml::nameid::NameIdFormat;
 use saml::sp::{ServiceProvider, ServiceProviderConfig, SpWantSigned};
 use saml::{IdpAssertionSigning, KeyPair};
-#[cfg(feature = "slo")]
 use saml::{IdpLogoutSigning, IdpLogoutWantSigned, SpLogoutSigning, SpLogoutWantSigned};
 
 // Self-signed RSA-2048 cert + key, lifted verbatim from
@@ -132,19 +131,15 @@ fn build_fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
             sign_assertions: true,
         },
         encrypt_assertions_when_possible: false,
-        #[cfg(feature = "slo")]
         logout_signing: IdpLogoutSigning::default(),
-        #[cfg(feature = "slo")]
         logout_want_signed: IdpLogoutWantSigned::default(),
         default_session_duration: Duration::from_secs(3600),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
         outbound_c14n: C14nAlgorithm::ExclusiveCanonical,
-        #[cfg(feature = "xmlenc")]
         outbound_data_encryption_algorithm:
             saml::xmlenc::algorithms::DataEncryptionAlgorithm::Aes256Gcm,
-        #[cfg(feature = "xmlenc")]
         outbound_key_transport_algorithm: saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
     })?;
     let idp_metadata = idp.metadata_xml(false)?;
@@ -163,9 +158,7 @@ fn build_fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
             assertions: true,
         },
         allow_unsolicited: true,
-        #[cfg(feature = "slo")]
         logout_signing: SpLogoutSigning::default(),
-        #[cfg(feature = "slo")]
         logout_want_signed: SpLogoutWantSigned::default(),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,

@@ -417,7 +417,7 @@ mod tests {
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("ID"), "got: {msg}"),
             Error::SchemaViolation { reason, .. } => {
-                assert!(reason.contains("ID"), "got: {reason}")
+                assert!(reason.contains("ID"), "got: {reason}");
             }
             other => panic!("expected XmlParse or SchemaViolation, got {other:?}"),
         }

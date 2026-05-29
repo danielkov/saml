@@ -3,10 +3,10 @@
 //! - `GET /` — landing page. Welcome banner when a session is present,
 //!   "use an SP to log in" copy otherwise.
 //! - `GET /metadata` — signed `<EntityDescriptor>` per
-//!   [`IdentityProvider::metadata_xml`].
+//!   [`saml::IdentityProvider::metadata_xml`].
 //! - `GET | POST /saml/sso` — decode the inbound binding wire (DEFLATE+
 //!   base64 over Redirect, base64 over POST), hand the XML to
-//!   [`IdentityProvider::consume_authn_request`], then either issue the
+//!   [`saml::IdentityProvider::consume_authn_request`], then either issue the
 //!   Response immediately (session present) or redirect to the login form.
 //! - `POST /login` — verify credentials, mint the session cookie, redirect
 //!   to `/saml/sso/continue?request_id=…` which pulls the stashed request.

@@ -164,14 +164,14 @@ impl SpsFile {
                 tracing::info!(sp = %sp.entity_id, env = %key, "overriding metadata_url via env");
                 sp.metadata_url = v;
             }
-            let acs_key = format!("SAML_IDP_SP_{}_ACS_URL", sanitize_env_key(&sp.entity_id),);
+            let acs_key = format!("SAML_IDP_SP_{}_ACS_URL", sanitize_env_key(&sp.entity_id));
             if let Ok(v) = std::env::var(&acs_key)
                 && !v.is_empty()
             {
                 tracing::info!(sp = %sp.entity_id, env = %acs_key, "overriding acs_url via env");
                 sp.acs_url = v;
             }
-            let slo_key = format!("SAML_IDP_SP_{}_SLO_URL", sanitize_env_key(&sp.entity_id),);
+            let slo_key = format!("SAML_IDP_SP_{}_SLO_URL", sanitize_env_key(&sp.entity_id));
             if let Ok(v) = std::env::var(&slo_key)
                 && !v.is_empty()
             {

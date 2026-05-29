@@ -617,7 +617,7 @@ mod tests {
         let err = parse_response(&doc).unwrap_err();
         match err {
             Error::XmlParse(msg) => {
-                assert!(msg.contains("expected <samlp:Response>"), "got: {msg}")
+                assert!(msg.contains("expected <samlp:Response>"), "got: {msg}");
             }
             other => panic!("expected XmlParse, got {other:?}"),
         }

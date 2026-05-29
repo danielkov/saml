@@ -1533,7 +1533,7 @@ mod tests {
         let err = validate_response(doc.root()).unwrap_err();
         match err {
             Error::SchemaViolation { reason, .. } => {
-                assert!(reason.contains("@ID"), "got: {reason}")
+                assert!(reason.contains("@ID"), "got: {reason}");
             }
             other => panic!("expected SchemaViolation, got {other:?}"),
         }
