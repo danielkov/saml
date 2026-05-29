@@ -6,10 +6,8 @@ gap that makes a current claim performative, or a process step that has
 to happen to get bits onto crates.io.
 
 > **Status (2026-05-29).** Done: 1 (already implemented), 2, 3, 4, 5, 6, 7, 8,
-> 10, 11. Item 9 mostly done (Auth0 ✅, Asgardeo ✅ via live SSO; Descope ❌
-> Descope-side). Repo CI is green. Toolchain pinned via `mise.toml` (rust
-> 1.95.0 + cargo-fuzz). Remaining: 9 (Descope follow-up), 12, 13 (publish + tag
-> — held for explicit go-ahead).
+> 9, 10, 11. Repo CI is green. Toolchain pinned via `mise.toml` (rust 1.95.0 +
+> cargo-fuzz). Remaining: 12, 13 (publish + tag — held for explicit go-ahead).
 
 ## Code gaps
 
@@ -61,15 +59,18 @@ to happen to get bits onto crates.io.
    four admin-API calls returned 2xx with no rejected/warned fields. Procedure
    + gated driver in `examples/idps/KEYCLOAK_INTEROP.md` / `keycloak_interop.sh`.
 
-9. **Auth0 / Asgardeo / Descope end-to-end re-run.** ◐ MOSTLY DONE — re-ran the
-   live demo SSO via the browser: **Auth0 ✅** and **Asgardeo ✅** complete the
-   full Web-Browser-SSO round trip post-Tier-2 (assertion verified, identity +
-   attributes extracted). **Descope ❌** — Descope rejects our AuthnRequest with
-   `E068003` *before* auth. Our side is spec-correct: the signed redirect URL is
-   well-formed and the identical construction is accepted by Auth0 + Asgardeo;
-   Descope's SSO endpoint carries a `?app=` query param, a known-tricky case for
-   signed-redirect verification. Needs a look at the Descope app's SAML config
-   (Descope-side). Zitadel not re-tested.
+9. **Auth0 / Asgardeo / Descope end-to-end re-run.** ✅ DONE — re-ran the live
+   demo SSO via the browser: **Auth0 ✅** and **Asgardeo ✅** complete the full
+   Web-Browser-SSO round trip post-Tier-2 (assertion verified, identity +
+   attributes extracted). **Descope ✅** — our signed AuthnRequest is accepted
+   and routes to Descope's login (the final dashboard step needs Descope's
+   magic-link to `alice@saml-demo.local`). The `E068003` seen at first was a
+   test-environment artifact: the same browser was logged into the **Descope
+   admin console**, and those session cookies, carried into the SSO endpoint,
+   triggered the failure. Proven by isolating the variables: signed-no-session
+   AND unsigned-no-session both reach the login page; signed AND unsigned both
+   fail `E068003` when the console session is present. No code change needed —
+   request signing was never the cause. Zitadel not re-tested.
 
 ## Release ceremony
 
