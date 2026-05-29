@@ -712,6 +712,22 @@ impl IdentityProvider {
             &policy.allowed_signature_algorithms,
         )?;
 
+        // EncryptedID (§5.1): now that the request is authenticated, decrypt the
+        // subject if the SP encrypted it to our key. Cleartext NameID requests
+        // leave `parsed.name_id` untouched.
+        #[cfg(feature = "xmlenc")]
+        {
+            let decryption_keys: Vec<&KeyPair> =
+                self.config.decryption_key.as_ref().map(|k| vec![k]).unwrap_or_default();
+            if let Some(name_id) = crate::logout::request_parse::decrypt_encrypted_name_id(
+                &doc,
+                &decryption_keys,
+                policy,
+            )? {
+                parsed.name_id = name_id;
+            }
+        }
+
         // NotOnOrAfter (§5.1 step 6).
         if let Some(noa) = parsed.not_on_or_after
             && noa <= now.checked_sub(clock_skew).unwrap_or(now)

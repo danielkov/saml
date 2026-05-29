@@ -219,10 +219,27 @@ pub(crate) fn parse_assertion(assertion: &Element) -> Result<ParsedAssertion, Er
     let subject = assertion
         .child_element(Some(SAML_NS), "Subject")
         .ok_or_else(|| Error::XmlParse("Assertion missing Subject".to_string()))?;
-    let name_id_elem = subject
-        .child_element(Some(SAML_NS), "NameID")
-        .ok_or_else(|| Error::XmlParse("Subject missing NameID".to_string()))?;
-    let subject_name_id = parse_name_id(name_id_elem);
+    // The subject identifier is normally a cleartext <saml:NameID>. With the
+    // `xmlenc` feature it may instead be a <saml:EncryptedID>, which the response
+    // validator decrypts after the assertion is verified (it holds the
+    // decryption key and crypto policy). We defer here with a placeholder
+    // NameID that the validator overwrites via `decrypt_subject_encrypted_id`.
+    let subject_name_id = match subject.child_element(Some(SAML_NS), "NameID") {
+        Some(name_id_elem) => parse_name_id(name_id_elem),
+        #[cfg(feature = "xmlenc")]
+        None if subject.child_element(Some(SAML_NS), "EncryptedID").is_some() => {
+            NameId::new(String::new(), NameIdFormat::Unspecified)
+        }
+        None => {
+            #[cfg(not(feature = "xmlenc"))]
+            if subject.child_element(Some(SAML_NS), "EncryptedID").is_some() {
+                return Err(Error::XmlParse(
+                    "Subject <saml:EncryptedID> requires the `xmlenc` feature".to_string(),
+                ));
+            }
+            return Err(Error::XmlParse("Subject missing NameID".to_string()));
+        }
+    };
 
     let mut subject_confirmations = Vec::new();
     for sc in subject.all_child_elements(Some(SAML_NS), "SubjectConfirmation") {
@@ -283,6 +300,45 @@ fn parse_name_id(elem: &Element) -> NameId {
         sp_name_qualifier,
         sp_provided_id,
     }
+}
+
+/// Decrypt a `<saml:EncryptedID>` carried in an assertion `<saml:Subject>` into
+/// a cleartext [`NameId`]. Returns `Ok(None)` when the subject used a cleartext
+/// `<saml:NameID>` (the parser already populated `subject_name_id`).
+///
+/// Reuses the `<saml:EncryptedAssertion>` xmlenc plumbing — an `EncryptedID` is
+/// the same `<xenc:EncryptedData>` wrapper whose plaintext is a `<saml:NameID>`.
+/// The validator calls this only after the assertion has been verified, so we
+/// apply our private decryption key solely to authenticated ciphertext.
+#[cfg(feature = "xmlenc")]
+pub(crate) fn decrypt_subject_encrypted_id(
+    assertion: &Element,
+    decryption_keys: &[&crate::crypto::keypair::KeyPair],
+    policy: &crate::dsig::algorithms::PeerCryptoPolicy,
+) -> Result<Option<NameId>, Error> {
+    let Some(subject) = assertion.child_element(Some(SAML_NS), "Subject") else {
+        return Ok(None);
+    };
+    let Some(encrypted_id) = subject.child_element(Some(SAML_NS), "EncryptedID") else {
+        return Ok(None);
+    };
+    if decryption_keys.is_empty() {
+        return Err(Error::DecryptFailed {
+            reason: "assertion Subject carries <saml:EncryptedID> but no decryption key is configured",
+        });
+    }
+    let decrypted = crate::xmlenc::decrypt::decrypt_encrypted_assertion(
+        encrypted_id,
+        decryption_keys,
+        &policy.allowed_data_encryption_algorithms,
+        &policy.allowed_key_transport_algorithms,
+    )?;
+    if decrypted.qname().namespace() != Some(SAML_NS) || decrypted.qname().local() != "NameID" {
+        return Err(Error::XmlParse(
+            "decrypted <saml:EncryptedID> did not contain a <saml:NameID>".to_string(),
+        ));
+    }
+    Ok(Some(parse_name_id(&decrypted)))
 }
 
 fn parse_subject_confirmation(elem: &Element) -> Result<SubjectConfirmation, Error> {
@@ -738,6 +794,105 @@ mod tests {
             Some(AssertionWrapper::Encrypted(_)) => {}
             _ => panic!("expected Encrypted wrapper"),
         }
+    }
+
+    /// Build a verified-cleartext assertion `<saml:Assertion>` whose `<Subject>`
+    /// carries a `<saml:EncryptedID>` wrapping `name_id_value`.
+    #[cfg(feature = "xmlenc")]
+    fn assertion_with_encrypted_id(name_id_value: &str) -> Element {
+        use crate::crypto::cert::X509Certificate;
+        use crate::crypto::cert::test_vectors::RSA_CERT_PEM;
+        use crate::xml::emit::emit_element;
+        use crate::xml::parse::QName;
+        use crate::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
+        use crate::xmlenc::encrypt::encrypt_assertion;
+
+        let name_id = Element::build(QName::new(Some(SAML_NS.to_owned()), "NameID"))
+            .with_namespace(Some("saml".to_owned()), SAML_NS)
+            .with_attribute(
+                QName::new(None, "Format"),
+                NameIdFormat::EmailAddress.as_uri(),
+            )
+            .with_text(name_id_value)
+            .finish();
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let mut encrypted_id = encrypt_assertion(
+            &name_id,
+            &cert,
+            DataEncryptionAlgorithm::Aes256Gcm,
+            KeyTransportAlgorithm::RsaOaep,
+        )
+        .expect("encrypt");
+        // EncryptedID is structurally an EncryptedAssertion with a different
+        // wrapper local name; rename in place to keep all namespace decls.
+        encrypted_id.qname.local = "EncryptedID".to_string();
+
+        let xml = format!(
+            r#"<saml:Assertion xmlns:saml="{SAML_NS}" ID="_a1" Version="2.0"
+                  IssueInstant="2026-05-26T12:00:01Z">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                  {}
+                  <saml:SubjectConfirmation Method="{SUBJECT_CONFIRMATION_BEARER}">
+                    <saml:SubjectConfirmationData Recipient="https://sp.example.com/acs"
+                          NotOnOrAfter="2026-05-26T12:05:00Z" InResponseTo="_req1"/>
+                  </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="2026-05-26T11:59:00Z"
+                                 NotOnOrAfter="2026-05-26T12:10:00Z"/>
+              </saml:Assertion>"#,
+            emit_element(&encrypted_id).unwrap()
+        );
+        Document::parse(xml.as_bytes()).expect("parse assertion").root().clone()
+    }
+
+    /// `parse_assertion` defers a `<saml:EncryptedID>` subject: it parses with a
+    /// placeholder `subject_name_id` that the validator fills in post-decrypt.
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn encrypted_id_subject_deferred_with_placeholder() {
+        let assertion_el = assertion_with_encrypted_id("alice@example.com");
+        let parsed = parse_assertion(&assertion_el).expect("parse defers EncryptedID");
+        assert_eq!(parsed.subject_name_id.value, "");
+        assert_eq!(parsed.subject_name_id.format, NameIdFormat::Unspecified);
+    }
+
+    /// `decrypt_subject_encrypted_id` recovers the cleartext NameID from a
+    /// `<saml:EncryptedID>` subject.
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn decrypt_subject_encrypted_id_round_trip() {
+        use crate::crypto::cert::test_vectors::RSA_KEY_PKCS8_PEM;
+        use crate::crypto::keypair::KeyPair;
+        use crate::dsig::algorithms::PeerCryptoPolicy;
+
+        let assertion_el = assertion_with_encrypted_id("alice@example.com");
+        let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
+        let recovered = decrypt_subject_encrypted_id(&assertion_el, &[&kp], &policy)
+            .expect("decrypt ok")
+            .expect("EncryptedID present");
+        assert_eq!(recovered.value, "alice@example.com");
+        assert_eq!(recovered.format, NameIdFormat::EmailAddress);
+    }
+
+    /// Cleartext NameID subject yields `Ok(None)` from the decrypt helper.
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn decrypt_subject_encrypted_id_noop_for_cleartext() {
+        use crate::crypto::cert::test_vectors::RSA_KEY_PKCS8_PEM;
+        use crate::crypto::keypair::KeyPair;
+        use crate::dsig::algorithms::PeerCryptoPolicy;
+
+        let doc = Document::parse(sample_response_xml().as_bytes()).unwrap();
+        let assertion_el = doc
+            .root()
+            .child_element(Some(SAML_NS), "Assertion")
+            .expect("assertion");
+        let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
+        let got = decrypt_subject_encrypted_id(assertion_el, &[&kp], &policy).unwrap();
+        assert!(got.is_none());
     }
 
 }

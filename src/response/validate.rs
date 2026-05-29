@@ -179,7 +179,18 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     };
 
     // --- Step 11: re-parse the verified assertion ----------------------------
-    let assertion = parse_assertion(&assertion_element)?;
+    #[cfg_attr(not(feature = "xmlenc"), allow(unused_mut))]
+    let mut assertion = parse_assertion(&assertion_element)?;
+    // If the subject was carried as <saml:EncryptedID>, decrypt it now that the
+    // assertion is verified (the parser left a placeholder NameID).
+    #[cfg(feature = "xmlenc")]
+    if let Some(name_id) = crate::response::parse::decrypt_subject_encrypted_id(
+        &assertion_element,
+        decryption_keys,
+        peer_crypto_policy,
+    )? {
+        assertion.subject_name_id = name_id;
+    }
     if assertion.issuer != idp.entity_id {
         return Err(Error::IssuerMismatch {
             expected: idp.entity_id.clone(),

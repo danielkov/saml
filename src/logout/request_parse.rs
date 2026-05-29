@@ -78,21 +78,35 @@ pub(crate) fn parse_logout_request(
         ));
     }
 
-    // EncryptedID detection: schema-allowed but unsupported in v0.1.
-    if root.child_element(Some(SAML_NS), "EncryptedID").is_some() {
-        return Err(Error::XmlParse(
-            "<saml:EncryptedID> in LogoutRequest not supported in v0.1".to_string(),
-        ));
-    }
-    // BaseID is similarly out of scope; the SAML BaseID/NameID pair is mutually
-    // exclusive (xsd:choice) so if NameID is missing we fail rather than
-    // silently treating BaseID as a NameID.
-
-    // <saml:NameID> required.
-    let nameid_el = root
-        .child_element(Some(SAML_NS), "NameID")
-        .ok_or_else(|| Error::XmlParse("LogoutRequest missing <saml:NameID>".to_string()))?;
-    let name_id = parse_name_id(nameid_el);
+    // Subject identifier: a cleartext <saml:NameID>, or — with the `xmlenc`
+    // feature — an encrypted <saml:EncryptedID>. EncryptedID is decrypted by the
+    // consumer (`consume_logout_request`) *after* signature verification, where
+    // the decryption key and crypto policy live and where the message is known
+    // to be authentic before we apply our private key to its ciphertext. Here we
+    // leave a placeholder NameID that the consumer overwrites via
+    // `decrypt_encrypted_name_id`.
+    //
+    // BaseID is out of scope; the BaseID/NameID/EncryptedID group is an
+    // xsd:choice, so a missing NameID with no EncryptedID is a hard error rather
+    // than a silent BaseID fallthrough.
+    let name_id = match root.child_element(Some(SAML_NS), "NameID") {
+        Some(nameid_el) => parse_name_id(nameid_el),
+        #[cfg(feature = "xmlenc")]
+        None if root.child_element(Some(SAML_NS), "EncryptedID").is_some() => {
+            NameId::new(String::new(), NameIdFormat::Unspecified)
+        }
+        None => {
+            #[cfg(not(feature = "xmlenc"))]
+            if root.child_element(Some(SAML_NS), "EncryptedID").is_some() {
+                return Err(Error::XmlParse(
+                    "<saml:EncryptedID> in LogoutRequest requires the `xmlenc` feature".to_string(),
+                ));
+            }
+            return Err(Error::XmlParse(
+                "LogoutRequest missing <saml:NameID>".to_string(),
+            ));
+        }
+    };
 
     // <samlp:SessionIndex>* — text content, in document order. Schema allows
     // zero, so absence is not an error.
@@ -132,6 +146,47 @@ fn parse_name_id(el: &Element) -> NameId {
         sp_name_qualifier,
         sp_provided_id,
     }
+}
+
+/// Decrypt a `<saml:EncryptedID>` carried directly under a
+/// `<samlp:LogoutRequest>` into a cleartext [`NameId`]. Returns `Ok(None)` when
+/// the request used a cleartext `<saml:NameID>` (the parser already populated
+/// `name_id`, so there is nothing to do).
+///
+/// The consumer MUST call this only *after* the LogoutRequest signature has been
+/// verified: we apply our private decryption key solely to ciphertext we have
+/// already authenticated, and algorithm acceptance is gated by the peer's
+/// [`PeerCryptoPolicy`] allow-lists — never by the compile-time feature alone.
+/// This reuses the same xmlenc plumbing as `<saml:EncryptedAssertion>`; an
+/// `EncryptedID` is just an `<xenc:EncryptedData>` wrapper whose plaintext is a
+/// `<saml:NameID>` rather than an `<saml:Assertion>`.
+#[cfg(feature = "xmlenc")]
+pub(crate) fn decrypt_encrypted_name_id(
+    document: &Document,
+    decryption_keys: &[&crate::crypto::keypair::KeyPair],
+    policy: &crate::dsig::algorithms::PeerCryptoPolicy,
+) -> Result<Option<NameId>, Error> {
+    let root = document.root();
+    let Some(encrypted_id) = root.child_element(Some(SAML_NS), "EncryptedID") else {
+        return Ok(None);
+    };
+    if decryption_keys.is_empty() {
+        return Err(Error::DecryptFailed {
+            reason: "LogoutRequest carries <saml:EncryptedID> but no decryption key is configured",
+        });
+    }
+    let decrypted = crate::xmlenc::decrypt::decrypt_encrypted_assertion(
+        encrypted_id,
+        decryption_keys,
+        &policy.allowed_data_encryption_algorithms,
+        &policy.allowed_key_transport_algorithms,
+    )?;
+    if decrypted.qname().namespace() != Some(SAML_NS) || decrypted.qname().local() != "NameID" {
+        return Err(Error::XmlParse(
+            "decrypted <saml:EncryptedID> did not contain a <saml:NameID>".to_string(),
+        ));
+    }
+    Ok(Some(parse_name_id(&decrypted)))
 }
 
 // =============================================================================
@@ -319,8 +374,11 @@ mod tests {
         }
     }
 
+    /// Without the `xmlenc` feature there is no way to decrypt, so an
+    /// `<saml:EncryptedID>` LogoutRequest is rejected outright at parse time.
+    #[cfg(not(feature = "xmlenc"))]
     #[test]
-    fn encrypted_id_rejected_as_unsupported() {
+    fn encrypted_id_rejected_without_xmlenc() {
         let xml = r#"<samlp:LogoutRequest
             xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
             xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
@@ -333,6 +391,133 @@ mod tests {
             Error::XmlParse(msg) => assert!(msg.contains("EncryptedID"), "got: {msg}"),
             other => panic!("expected XmlParse, got {other:?}"),
         }
+    }
+
+    /// With `xmlenc`, the parser defers an `<saml:EncryptedID>`: it succeeds with
+    /// a placeholder `name_id` that the consumer overwrites after verifying the
+    /// signature and decrypting (see `decrypt_encrypted_name_id`).
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn encrypted_id_deferred_to_consumer() {
+        let xml = r#"<samlp:LogoutRequest
+            xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+            xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+            ID="_r" Version="2.0" IssueInstant="2026-05-26T12:34:56Z">
+            <saml:Issuer>idp</saml:Issuer>
+            <saml:EncryptedID/>
+        </samlp:LogoutRequest>"#;
+        let (req, _) = parse(xml).expect("EncryptedID parses to a placeholder");
+        // Placeholder: empty value, awaiting decryption.
+        assert_eq!(req.name_id.value, "");
+        assert_eq!(req.name_id.format, NameIdFormat::Unspecified);
+    }
+
+    /// End-to-end: encrypt a `<saml:NameID>` to a recipient cert, splice it into
+    /// a LogoutRequest as `<saml:EncryptedID>`, and confirm
+    /// `decrypt_encrypted_name_id` recovers the cleartext NameID.
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn decrypt_encrypted_name_id_round_trip() {
+        use crate::crypto::cert::X509Certificate;
+        use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
+        use crate::crypto::keypair::KeyPair;
+        use crate::dsig::algorithms::PeerCryptoPolicy;
+        use crate::xml::emit::emit_element;
+        use crate::xml::parse::QName;
+        use crate::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
+        use crate::xmlenc::encrypt::encrypt_assertion;
+
+        // The cleartext subject we expect to recover.
+        let name_id = Element::build(QName::new(Some(SAML_NS.to_owned()), "NameID"))
+            .with_namespace(Some("saml".to_owned()), SAML_NS)
+            .with_attribute(
+                QName::new(None, "Format"),
+                NameIdFormat::EmailAddress.as_uri(),
+            )
+            .with_text("alice@example.org")
+            .finish();
+
+        // Encrypt it. `encrypt_assertion` wraps any element's <xenc:EncryptedData>
+        // in a <saml:EncryptedAssertion>; we lift that EncryptedData into a
+        // <saml:EncryptedID> instead, which is the only structural difference.
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let mut encrypted_id = encrypt_assertion(
+            &name_id,
+            &cert,
+            DataEncryptionAlgorithm::Aes256Gcm,
+            KeyTransportAlgorithm::RsaOaep,
+        )
+        .expect("encrypt");
+        // `encrypt_assertion` wraps the <xenc:EncryptedData> in a
+        // <saml:EncryptedAssertion>; the only structural difference from an
+        // <saml:EncryptedID> is the wrapper's local name. Rename it in place so
+        // the wrapper keeps every namespace declaration the payload needs.
+        encrypted_id.qname.local = "EncryptedID".to_string();
+
+        let xml = format!(
+            r#"<samlp:LogoutRequest
+                xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_r" Version="2.0" IssueInstant="2026-05-26T12:34:56Z">
+                <saml:Issuer>https://sp.example.com</saml:Issuer>
+                {}
+            </samlp:LogoutRequest>"#,
+            emit_element(&encrypted_id).unwrap()
+        );
+
+        let doc = Document::parse(xml.as_bytes()).expect("parse");
+        let (req, _) = parse_logout_request(&doc).expect("parse defers EncryptedID");
+        assert_eq!(req.name_id.value, "", "placeholder before decryption");
+
+        let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
+        let decrypted = decrypt_encrypted_name_id(&doc, &[&kp], &policy)
+            .expect("decrypt ok")
+            .expect("EncryptedID present");
+        assert_eq!(decrypted.value, "alice@example.org");
+        assert_eq!(decrypted.format, NameIdFormat::EmailAddress);
+    }
+
+    /// A cleartext NameID request yields `Ok(None)` — nothing to decrypt.
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn decrypt_encrypted_name_id_noop_for_cleartext() {
+        use crate::crypto::keypair::KeyPair;
+        use crate::crypto::cert::test_vectors::RSA_KEY_PKCS8_PEM;
+        use crate::dsig::algorithms::PeerCryptoPolicy;
+
+        let xml = r#"<samlp:LogoutRequest
+            xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+            xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+            ID="_r" Version="2.0" IssueInstant="2026-05-26T12:34:56Z">
+            <saml:Issuer>idp</saml:Issuer>
+            <saml:NameID>u@example.com</saml:NameID>
+        </samlp:LogoutRequest>"#;
+        let doc = Document::parse(xml.as_bytes()).unwrap();
+        let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
+        let got = decrypt_encrypted_name_id(&doc, &[&kp], &policy).unwrap();
+        assert!(got.is_none());
+    }
+
+    /// EncryptedID present but no decryption key configured is a clear error,
+    /// not a silent placeholder leak.
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn decrypt_encrypted_name_id_requires_key() {
+        use crate::dsig::algorithms::PeerCryptoPolicy;
+
+        let xml = r#"<samlp:LogoutRequest
+            xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+            xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+            ID="_r" Version="2.0" IssueInstant="2026-05-26T12:34:56Z">
+            <saml:Issuer>idp</saml:Issuer>
+            <saml:EncryptedID/>
+        </samlp:LogoutRequest>"#;
+        let doc = Document::parse(xml.as_bytes()).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
+        let err = decrypt_encrypted_name_id(&doc, &[], &policy).unwrap_err();
+        assert!(matches!(err, Error::DecryptFailed { .. }));
     }
 
     #[test]
