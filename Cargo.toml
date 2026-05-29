@@ -23,6 +23,10 @@ exclude = [
     "examples/idps/",
     "fuzz/",
     "mise.toml",
+    # Third-party interop fixtures (ruby-saml, python3-saml, …). Used by the
+    # integration tests in CI; no reason to ship megabytes of another
+    # project's test data inside the published crate.
+    "tests/corpus/",
 ]
 
 [dependencies]
