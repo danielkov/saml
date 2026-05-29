@@ -116,6 +116,27 @@ jobs:
         run: cargo test --test xmlsec_interop
 
   # ---------------------------------------------------------------------------
+  # Fuzz targets must keep building. Their harness bodies are `#[cfg(fuzzing)]`,
+  # so a normal `cargo build`/clippy never compiles them — a fuzz target can
+  # silently rot when a public API it calls changes. This job compiles every
+  # target under the cargo-fuzz toolchain (no running) to catch that.
+  # ---------------------------------------------------------------------------
+  fuzz-build:
+    name: fuzz build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-build
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - name: cargo fuzz build
+        run: cargo +nightly fuzz build
+
+  # ---------------------------------------------------------------------------
   # Cross-platform smoke test: default features only, stable only.
   # Keeps CI minutes reasonable; full matrix lives on Linux.
   # ---------------------------------------------------------------------------
