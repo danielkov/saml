@@ -1,0 +1,28 @@
+# Reproducible toolchain for the `saml` workspace.
+#
+# Pins the Rust toolchain and the auxiliary cargo CLIs the project relies on so
+# every contributor and CI run builds and verifies with the same versions.
+# Run `mise install` to provision everything.
+#
+# The `rust` tool shells out to the system `rustup`, so additional toolchains
+# installed via rustup (e.g. `nightly`, required by `cargo fuzz`) remain usable
+# through the usual `cargo +nightly …` proxy.
+#
+# NOT managed here: `xmlsec1`. It is a system C library with no mise backend and
+# is only needed for the optional metadata signature cross-check test
+# (`tests/`); install it from your platform's package manager (macOS:
+# `brew install libxmlsec1`, Debian/Ubuntu: `apt-get install xmlsec1`). The test
+# skips itself when the binary is absent.
+
+[tools]
+# Pin to a concrete stable release rather than the floating `stable` channel so
+# builds are byte-reproducible. Must stay at or above the crate MSRV (1.91.0).
+rust = "1.94.0"
+# Coverage-guided fuzzing harnesses (`cargo fuzz run …`). Requires a nightly
+# toolchain at run time, which it picks up from rustup.
+"cargo:cargo-fuzz" = "0.13.1"
+
+[tasks.fuzz]
+description = "Run a libfuzzer target (default 30m). Usage: mise run fuzz fuzz_xml_parse"
+dir = "fuzz"
+run = "cargo +nightly fuzz run \"${1:-fuzz_xml_parse}\" -- -max_total_time=${FUZZ_SECONDS:-1800}"

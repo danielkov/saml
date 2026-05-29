@@ -22,6 +22,7 @@ exclude = [
     ".tmp/",
     "examples/idps/",
     "fuzz/",
+    "mise.toml",
 ]
 
 [dependencies]
