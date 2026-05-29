@@ -131,8 +131,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz-build
+      # Prebuilt binary — compiling cargo-fuzz from source on nightly pulls
+      # transitive deps (old rustix) that fail to build against current nightly.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.1 --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.1
       - name: cargo fuzz build
         run: cargo +nightly fuzz build
 
