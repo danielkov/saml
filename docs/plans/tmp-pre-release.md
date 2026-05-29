@@ -62,9 +62,9 @@ to happen to get bits onto crates.io.
 9. **Auth0 / Asgardeo / Descope end-to-end re-run.** ✅ DONE — re-ran the live
    demo SSO via the browser: **Auth0 ✅** and **Asgardeo ✅** complete the full
    Web-Browser-SSO round trip post-Tier-2 (assertion verified, identity +
-   attributes extracted). **Descope ✅** — our signed AuthnRequest is accepted
-   and routes to Descope's login (the final dashboard step needs Descope's
-   magic-link to `alice@saml-demo.local`). The `E068003` seen at first was a
+   attributes extracted). **Descope ✅** — full round trip completed via
+   Descope's Google login: SP dashboard reached, assertion verified, NameID +
+   4 attributes extracted. The `E068003` seen at first was a
    test-environment artifact: the same browser was logged into the **Descope
    admin console**, and those session cookies, carried into the SSO endpoint,
    triggered the failure. Proven by isolating the variables: signed-no-session
