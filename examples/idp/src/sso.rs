@@ -464,7 +464,7 @@ fn finalize_login(
         session_index: session.session_index.clone(),
         session_not_on_or_after: now.checked_add(Duration::from_hours(8)),
         authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
-        force_encrypt_assertion: Some(false),
+        force_encrypt_assertion: resolve_force_encrypt(&entry.sp),
         now,
         assertion_lifetime: Duration::from_mins(5),
         subject_confirmation_lifetime: Duration::from_mins(5),
@@ -493,6 +493,26 @@ fn build_attributes(user: &StoredUser) -> Vec<Attribute> {
         attrs.push(Attribute::single("department", dept));
     }
     attrs
+}
+
+/// Decide whether to encrypt the assertion for this SP.
+///
+/// `Some(true)` forces encryption, `Some(false)` forbids it, and `None` lets
+/// the IdP's `encrypt_assertions_when_possible` default decide.
+///
+/// Policy: when `SAML_IDP_FORCE_ENCRYPT` is truthy AND the SP advertises an
+/// encryption certificate in its metadata, encrypt. If the toggle is set but
+/// the SP has no encryption cert, we cannot encrypt, so fall back to `None`
+/// (issue cleartext) rather than forcing a failure. When the toggle is unset
+/// we defer to the IdP default (`None`).
+fn resolve_force_encrypt(sp: &saml::SpDescriptor) -> Option<bool> {
+    let toggle = std::env::var("SAML_IDP_FORCE_ENCRYPT")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"));
+    if toggle && sp.encryption_cert().is_some() {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 // =============================================================================
