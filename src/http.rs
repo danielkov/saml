@@ -61,9 +61,8 @@ mod reqwest_impl {
         fn send(
             &self,
             request: HttpRequest,
-        ) -> impl Future<
-            Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
-        > + Send {
+        ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
+        {
             let client = self.0.clone();
             async move {
                 // `reqwest::Method` is a re-export of `http::Method` in
@@ -83,12 +82,7 @@ mod reqwest_impl {
                 let headers = resp
                     .headers()
                     .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.as_str().to_owned(),
-                            v.to_str().unwrap_or("").to_owned(),
-                        )
-                    })
+                    .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
                     .collect();
                 let body = resp.bytes().await?.to_vec();
 

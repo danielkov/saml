@@ -148,11 +148,8 @@ pub(crate) fn sign_element(
     // Build a fresh document whose root *is* the SignedInfo, with the `ds`
     // namespace declared on it. This satisfies the c14n pass's requirement
     // that every visibly-utilized prefix have an in-scope declaration.
-    let signed_info_root = clone_with_namespace(
-        &signed_info,
-        Some("ds".to_owned()),
-        DSIG_NS.to_owned(),
-    );
+    let signed_info_root =
+        clone_with_namespace(&signed_info, Some("ds".to_owned()), DSIG_NS.to_owned());
     let signed_info_doc = Document::new(signed_info_root)?;
     let signed_info_canonical = canonicalize(
         &signed_info_doc,
@@ -167,12 +164,8 @@ pub(crate) fn sign_element(
     let signature_b64 = BASE64_STANDARD.encode(&signature_bytes);
 
     // ---- Step 6: assemble the <ds:Signature> element. ---------------------
-    let signature_element = build_signature_element(
-        signed_info,
-        &signature_b64,
-        include_x509_cert,
-        signing_key,
-    )?;
+    let signature_element =
+        build_signature_element(signed_info, &signature_b64, include_x509_cert, signing_key)?;
 
     // ---- Step 7: splice the <ds:Signature> into `element`. ----------------
     let position = signature_insertion_index(&element);
@@ -262,16 +255,15 @@ fn build_signed_info(
         .with_attribute(QName::new(None, "Algorithm"), ENVELOPED_SIGNATURE_URI)
         .finish();
 
-    let mut c14n_transform_builder = Element::build(ds("Transform"))
-        .with_attribute(QName::new(None, "Algorithm"), c14n.uri());
+    let mut c14n_transform_builder =
+        Element::build(ds("Transform")).with_attribute(QName::new(None, "Algorithm"), c14n.uri());
     if c14n.is_exclusive() && !inclusive_namespace_prefixes.is_empty() {
         let prefix_list = inclusive_namespace_prefixes.join(" ");
         let inclusive = Element::build(ec("InclusiveNamespaces"))
             .with_namespace(Some("ec".to_owned()), EC_NS)
             .with_attribute(QName::new(None, "PrefixList"), prefix_list)
             .finish();
-        c14n_transform_builder =
-            c14n_transform_builder.with_child(Node::Element(inclusive));
+        c14n_transform_builder = c14n_transform_builder.with_child(Node::Element(inclusive));
     }
     let c14n_transform = c14n_transform_builder.finish();
 
@@ -395,18 +387,12 @@ mod tests {
             .with_namespace(Some("saml".to_owned()), SAML_ASSERTION_NS)
             .with_attribute(QName::new(None, "ID"), id)
             .with_attribute(QName::new(None, "Version"), "2.0")
-            .with_attribute(
-                QName::new(None, "IssueInstant"),
-                "2024-01-01T00:00:00Z",
-            );
+            .with_attribute(QName::new(None, "IssueInstant"), "2024-01-01T00:00:00Z");
 
         if with_issuer {
-            let issuer = Element::build(QName::new(
-                Some(SAML_ASSERTION_NS.to_owned()),
-                "Issuer",
-            ))
-            .with_text("https://idp.example.com")
-            .finish();
+            let issuer = Element::build(QName::new(Some(SAML_ASSERTION_NS.to_owned()), "Issuer"))
+                .with_text("https://idp.example.com")
+                .finish();
             builder = builder.with_child(Node::Element(issuer));
         }
 
@@ -495,8 +481,9 @@ mod tests {
         // DigestValue (which is what the verifier will do).
         let mut sans_signature = signed.clone();
         sans_signature.children.retain(|n| match n {
-            Node::Element(e) => !(e.qname().local() == "Signature"
-                && e.qname().namespace() == Some(DSIG_NS)),
+            Node::Element(e) => {
+                !(e.qname().local() == "Signature" && e.qname().namespace() == Some(DSIG_NS))
+            }
             _ => true,
         });
         // Rewrap into a doc so canonicalize has a context.
@@ -551,9 +538,7 @@ mod tests {
         let signature = find_signature(&signed).expect("signature embedded");
         // No KeyInfo when include_x509_cert is false.
         assert!(
-            signature
-                .child_element(Some(DSIG_NS), "KeyInfo")
-                .is_none(),
+            signature.child_element(Some(DSIG_NS), "KeyInfo").is_none(),
             "KeyInfo should be absent when include_x509_cert=false"
         );
 
@@ -698,8 +683,7 @@ mod tests {
     fn detached_query_rsa_signature_length() {
         let kp = rsa_key_with_cert();
         let query = b"SAMLRequest=AAA&RelayState=state&SigAlg=foo";
-        let sig =
-            sign_detached_query(query, &kp, SignatureAlgorithm::RsaSha256).expect("sign");
+        let sig = sign_detached_query(query, &kp, SignatureAlgorithm::RsaSha256).expect("sign");
         // RSA-2048 signature: 256 bytes.
         assert_eq!(sig.len(), 256);
     }
@@ -708,8 +692,7 @@ mod tests {
     fn detached_query_ecdsa_signature_length() {
         let kp = ecdsa_key_with_cert();
         let query = b"SAMLRequest=AAA&RelayState=state&SigAlg=foo";
-        let sig = sign_detached_query(query, &kp, SignatureAlgorithm::EcdsaSha256)
-            .expect("sign");
+        let sig = sign_detached_query(query, &kp, SignatureAlgorithm::EcdsaSha256).expect("sign");
         // ECDSA P-256 IEEE P1363: 64 bytes.
         assert_eq!(sig.len(), 64);
     }
@@ -856,14 +839,13 @@ mod tests {
             .collect();
         let c14n_transform = xforms
             .iter()
-            .find(|t| t.attribute(None, "Algorithm") == Some(C14nAlgorithm::ExclusiveCanonical.uri()))
+            .find(|t| {
+                t.attribute(None, "Algorithm") == Some(C14nAlgorithm::ExclusiveCanonical.uri())
+            })
             .expect("c14n transform");
         let inclusive = c14n_transform
             .child_element(Some(EC_NS), "InclusiveNamespaces")
             .expect("InclusiveNamespaces present");
-        assert_eq!(
-            inclusive.attribute(None, "PrefixList"),
-            Some("samlp saml")
-        );
+        assert_eq!(inclusive.attribute(None, "PrefixList"), Some("samlp saml"));
     }
 }

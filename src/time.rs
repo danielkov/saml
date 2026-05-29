@@ -119,8 +119,8 @@ pub fn parse_xs_datetime(s: &str) -> Result<SystemTime, Error> {
     }
 
     // --- Convert civil time to Unix seconds (UTC) ---
-    let days_since_epoch =
-        days_from_civil(i64::from(year), i64::from(month), i64::from(day)).ok_or_else(|| {
+    let days_since_epoch = days_from_civil(i64::from(year), i64::from(month), i64::from(day))
+        .ok_or_else(|| {
             Error::XmlParse(format!(
                 "invalid xs:dateTime: date does not exist: {year:04}-{month:02}-{day:02}"
             ))
@@ -191,9 +191,7 @@ pub fn format_xs_datetime(t: SystemTime) -> Result<String, Error> {
         // value with sub-ms precision should not change the wire form when
         // re-emitted by something that only cares to ms.
         let millis = nanos / 1_000_000;
-        format!(
-            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
-        )
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
     })
 }
 
@@ -204,11 +202,8 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    s.parse::<T>().map_err(|err| {
-        Error::XmlParse(format!(
-            "invalid xs:dateTime: bad {field}: '{s}' ({err})"
-        ))
-    })
+    s.parse::<T>()
+        .map_err(|err| Error::XmlParse(format!("invalid xs:dateTime: bad {field}: '{s}' ({err})")))
 }
 
 fn parse_fraction_to_nanos(frac: &str) -> Result<u32, Error> {
@@ -274,11 +269,8 @@ fn split_offset(s: &str) -> Result<(&str, i64), Error> {
                     "invalid xs:dateTime: bad timezone offset '{candidate_repr}'"
                 )));
             }
-            let overflow = || {
-                Error::XmlParse(
-                    "invalid xs:dateTime: timezone offset out of range".to_string(),
-                )
-            };
+            let overflow =
+                || Error::XmlParse("invalid xs:dateTime: timezone offset out of range".to_string());
             let hh_secs = hh.checked_mul(3600).ok_or_else(overflow)?;
             let mm_secs = mm.checked_mul(60).ok_or_else(overflow)?;
             let mut offset = hh_secs.checked_add(mm_secs).ok_or_else(overflow)?;
@@ -316,7 +308,11 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
     let era_base = if y >= 0 { y } else { y.checked_sub(399)? };
     let era = era_base.checked_div(400)?;
     let yoe = y.checked_sub(era.checked_mul(400)?)?; // [0, 399]
-    let m_shifted = if m > 2 { m.checked_sub(3)? } else { m.checked_add(9)? };
+    let m_shifted = if m > 2 {
+        m.checked_sub(3)?
+    } else {
+        m.checked_add(9)?
+    };
     let doy = 153i64
         .checked_mul(m_shifted)?
         .checked_add(2)?
@@ -434,7 +430,10 @@ mod tests {
     #[test]
     fn parse_fractional_seconds_ms() {
         let t = parse_xs_datetime("2026-05-26T12:34:56.123Z").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2026-05-26T12:34:56.123Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2026-05-26T12:34:56.123Z"
+        );
     }
 
     #[test]
@@ -449,39 +448,57 @@ mod tests {
     fn parse_positive_offset() {
         // 2026-05-26T14:34:56+02:00 == 2026-05-26T12:34:56Z
         let t = parse_xs_datetime("2026-05-26T14:34:56+02:00").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2026-05-26T12:34:56Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2026-05-26T12:34:56Z"
+        );
     }
 
     #[test]
     fn parse_negative_offset() {
         // 2026-05-26T07:34:56-05:00 == 2026-05-26T12:34:56Z
         let t = parse_xs_datetime("2026-05-26T07:34:56-05:00").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2026-05-26T12:34:56Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2026-05-26T12:34:56Z"
+        );
     }
 
     #[test]
     fn parse_zero_offset() {
         let t = parse_xs_datetime("2026-05-26T12:34:56+00:00").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2026-05-26T12:34:56Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2026-05-26T12:34:56Z"
+        );
     }
 
     #[test]
     fn parse_no_offset_interpreted_as_utc() {
         let t = parse_xs_datetime("2026-05-26T12:34:56").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2026-05-26T12:34:56Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2026-05-26T12:34:56Z"
+        );
     }
 
     #[test]
     fn round_trip_unix_epoch() {
         let t = parse_xs_datetime("1970-01-01T00:00:00Z").expect("ok");
         assert_eq!(t, UNIX_EPOCH);
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "1970-01-01T00:00:00Z"
+        );
     }
 
     #[test]
     fn round_trip_leap_year_feb_29() {
         let t = parse_xs_datetime("2024-02-29T00:00:00Z").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2024-02-29T00:00:00Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2024-02-29T00:00:00Z"
+        );
     }
 
     #[test]
@@ -507,14 +524,20 @@ mod tests {
     #[test]
     fn end_of_year_round_trip() {
         let t = parse_xs_datetime("2099-12-31T23:59:59Z").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2099-12-31T23:59:59Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2099-12-31T23:59:59Z"
+        );
     }
 
     #[test]
     fn micro_offset_applied_to_date_boundary() {
         // 00:30 on 2026-05-27 in +01:00 is 23:30 on 2026-05-26 UTC.
         let t = parse_xs_datetime("2026-05-27T00:30:00+01:00").expect("ok");
-        assert_eq!(format_xs_datetime(t).expect("format ok"), "2026-05-26T23:30:00Z");
+        assert_eq!(
+            format_xs_datetime(t).expect("format ok"),
+            "2026-05-26T23:30:00Z"
+        );
     }
 
     #[test]

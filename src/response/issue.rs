@@ -9,9 +9,7 @@ use rsa::rand_core::{OsRng, RngCore as _};
 
 use crate::attribute::Attribute;
 use crate::authn_context::AuthnContextClassRef;
-use crate::binding::{
-    SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint,
-};
+use crate::binding::{SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint};
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
 use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
@@ -106,9 +104,12 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
     let assertion_or_encrypted = if should_encrypt {
         #[cfg(feature = "xmlenc")]
         {
-            let cert = input.sp.encryption_cert().ok_or(Error::InvalidConfiguration {
-                reason: "encryption requested but SP has no encryption_cert in metadata",
-            })?;
+            let cert = input
+                .sp
+                .encryption_cert()
+                .ok_or(Error::InvalidConfiguration {
+                    reason: "encryption requested but SP has no encryption_cert in metadata",
+                })?;
             crate::xmlenc::encrypt::encrypt_assertion(
                 &assertion_elem,
                 cert,
@@ -204,17 +205,13 @@ impl SamlStatusCode {
             Self::InvalidAttrNameOrValue => {
                 "urn:oasis:names:tc:SAML:2.0:status:InvalidAttrNameOrValue"
             }
-            Self::InvalidNameIdPolicy => {
-                "urn:oasis:names:tc:SAML:2.0:status:InvalidNameIDPolicy"
-            }
+            Self::InvalidNameIdPolicy => "urn:oasis:names:tc:SAML:2.0:status:InvalidNameIDPolicy",
             Self::NoAuthnContext => "urn:oasis:names:tc:SAML:2.0:status:NoAuthnContext",
             Self::NoAvailableIdp => "urn:oasis:names:tc:SAML:2.0:status:NoAvailableIDP",
             Self::NoPassive => "urn:oasis:names:tc:SAML:2.0:status:NoPassive",
             Self::NoSupportedIdp => "urn:oasis:names:tc:SAML:2.0:status:NoSupportedIDP",
             Self::PartialLogout => "urn:oasis:names:tc:SAML:2.0:status:PartialLogout",
-            Self::ProxyCountExceeded => {
-                "urn:oasis:names:tc:SAML:2.0:status:ProxyCountExceeded"
-            }
+            Self::ProxyCountExceeded => "urn:oasis:names:tc:SAML:2.0:status:ProxyCountExceeded",
             Self::RequestDenied => "urn:oasis:names:tc:SAML:2.0:status:RequestDenied",
             Self::RequestUnsupported => "urn:oasis:names:tc:SAML:2.0:status:RequestUnsupported",
             Self::RequestVersionDeprecated => {
@@ -223,20 +220,14 @@ impl SamlStatusCode {
             Self::RequestVersionTooHigh => {
                 "urn:oasis:names:tc:SAML:2.0:status:RequestVersionTooHigh"
             }
-            Self::RequestVersionTooLow => {
-                "urn:oasis:names:tc:SAML:2.0:status:RequestVersionTooLow"
-            }
+            Self::RequestVersionTooLow => "urn:oasis:names:tc:SAML:2.0:status:RequestVersionTooLow",
             Self::ResourceNotRecognized => {
                 "urn:oasis:names:tc:SAML:2.0:status:ResourceNotRecognized"
             }
             Self::TooManyResponses => "urn:oasis:names:tc:SAML:2.0:status:TooManyResponses",
-            Self::UnknownAttrProfile => {
-                "urn:oasis:names:tc:SAML:2.0:status:UnknownAttrProfile"
-            }
+            Self::UnknownAttrProfile => "urn:oasis:names:tc:SAML:2.0:status:UnknownAttrProfile",
             Self::UnknownPrincipal => "urn:oasis:names:tc:SAML:2.0:status:UnknownPrincipal",
-            Self::UnsupportedBinding => {
-                "urn:oasis:names:tc:SAML:2.0:status:UnsupportedBinding"
-            }
+            Self::UnsupportedBinding => "urn:oasis:names:tc:SAML:2.0:status:UnsupportedBinding",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -395,7 +386,10 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
 
     // ---- Subject ----
     let mut name_id_builder = Element::build(saml_qname("NameID"))
-        .with_attribute(QName::new(None, "Format"), name_id.format.as_uri().to_owned())
+        .with_attribute(
+            QName::new(None, "Format"),
+            name_id.format.as_uri().to_owned(),
+        )
         .with_text(name_id.value.clone());
     if let Some(nq) = &name_id.name_qualifier {
         name_id_builder =
@@ -407,8 +401,7 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
         matches!(name_id.format, NameIdFormat::Persistent).then(|| sp_entity_id.to_owned())
     });
     if let Some(spq) = sp_name_qualifier {
-        name_id_builder =
-            name_id_builder.with_attribute(QName::new(None, "SPNameQualifier"), spq);
+        name_id_builder = name_id_builder.with_attribute(QName::new(None, "SPNameQualifier"), spq);
     }
     if let Some(provided) = &name_id.sp_provided_id {
         name_id_builder =
@@ -428,8 +421,7 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
             format_xs_datetime(subject_confirmation_not_on_or_after)?,
         );
     if let Some(irt) = in_response_to {
-        scd_builder = scd_builder
-            .with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
+        scd_builder = scd_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
     }
     let scd = scd_builder.finish();
     let subject_confirmation = Element::build(saml_qname("SubjectConfirmation"))
@@ -452,11 +444,11 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     let audience_restriction = Element::build(saml_qname("AudienceRestriction"))
         .with_child(Node::Element(audience))
         .finish();
-    let conditions_not_before = now
-        .checked_sub(Duration::from_mins(1))
-        .ok_or(Error::InvalidConfiguration {
-            reason: "now - 1min underflows SystemTime",
-        })?;
+    let conditions_not_before =
+        now.checked_sub(Duration::from_mins(1))
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now - 1min underflows SystemTime",
+            })?;
     let conditions_not_on_or_after =
         now.checked_add(assertion_lifetime)
             .ok_or(Error::InvalidConfiguration {
@@ -559,8 +551,8 @@ fn build_response(
         status_code_builder = status_code_builder.with_child(Node::Element(nested));
     }
     let status_code = status_code_builder.finish();
-    let mut status_builder = Element::build(samlp_qname("Status"))
-        .with_child(Node::Element(status_code));
+    let mut status_builder =
+        Element::build(samlp_qname("Status")).with_child(Node::Element(status_code));
     if let Some(msg) = &status.message {
         let m = Element::build(samlp_qname("StatusMessage"))
             .with_text(msg.clone())
@@ -577,8 +569,8 @@ fn build_response(
         .with_attribute(QName::new(None, "IssueInstant"), format_xs_datetime(now)?)
         .with_attribute(QName::new(None, "Destination"), destination.to_owned());
     if let Some(irt) = in_response_to {
-        response_builder = response_builder
-            .with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
+        response_builder =
+            response_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
     }
     response_builder = response_builder
         .with_child(Node::Element(issuer))
@@ -601,13 +593,20 @@ fn dispatch_binding(
 ) -> Result<SsoResponseDispatch, Error> {
     match acs_endpoint.binding {
         SsoResponseBinding::HttpPost => {
-            let url = url::Url::parse(&acs_endpoint.url)
-                .map_err(|_url_parse_err| Error::InvalidConfiguration {
+            let url = url::Url::parse(&acs_endpoint.url).map_err(|_url_parse_err| {
+                Error::InvalidConfiguration {
                     reason: "ACS endpoint URL is not a valid URL",
-                })?;
-            Ok(crate::binding::post::encode_sso_response(&url, xml, relay_state))
+                }
+            })?;
+            Ok(crate::binding::post::encode_sso_response(
+                &url,
+                xml,
+                relay_state,
+            ))
         }
-        SsoResponseBinding::HttpArtifact => issue_artifact(acs_endpoint, xml, relay_state, idp_entity_id),
+        SsoResponseBinding::HttpArtifact => {
+            issue_artifact(acs_endpoint, xml, relay_state, idp_entity_id)
+        }
     }
 }
 
@@ -802,8 +801,9 @@ mod tests {
         assert_eq!(form.relay_state.as_deref(), Some("opaque-state"));
 
         // Round-trip the SAMLResponse base64.
-        let decoded = crate::binding::post::decode(&form.saml_response, form.relay_state.as_deref())
-            .expect("decode");
+        let decoded =
+            crate::binding::post::decode(&form.saml_response, form.relay_state.as_deref())
+                .expect("decode");
         let doc = Document::parse(&decoded.xml).expect("reparse");
         let (parsed, _) = parse_response(&doc).expect("parse");
 
@@ -881,12 +881,7 @@ mod tests {
     fn encryption_is_invoked_when_sp_has_encryption_cert() {
         let sp = sp_descriptor(true);
         let kp = rsa_signing_key();
-        let mut inputs = make_inputs(
-            &sp,
-            &kp,
-            vec![],
-            NameId::email("alice@example.com"),
-        );
+        let mut inputs = make_inputs(&sp, &kp, vec![], NameId::email("alice@example.com"));
         inputs.encrypt_assertions_when_possible = true;
         // Disable assertion-signing because signing inside an EncryptedAssertion
         // wrapper isn't meaningful — the signature lives inside the ciphertext.
@@ -1051,10 +1046,17 @@ mod tests {
         let dispatch = issue_response(inputs).expect("issue");
         match dispatch {
             SsoResponseDispatch::Artifact(redirect) => {
-                assert!(redirect.redirect_to.as_str().starts_with("https://sp.example.com/acs/art"));
+                assert!(
+                    redirect
+                        .redirect_to
+                        .as_str()
+                        .starts_with("https://sp.example.com/acs/art")
+                );
                 assert!(!redirect.artifact.is_empty());
-                assert!(redirect.response_xml.contains("<samlp:Response")
-                    || redirect.response_xml.contains("Response"));
+                assert!(
+                    redirect.response_xml.contains("<samlp:Response")
+                        || redirect.response_xml.contains("Response")
+                );
             }
             other @ SsoResponseDispatch::Post(_) => {
                 panic!("expected Artifact, got {other:?}")
@@ -1072,12 +1074,7 @@ mod tests {
             true,
         )];
         let kp = rsa_signing_key();
-        let inputs = make_inputs(
-            &sp,
-            &kp,
-            vec![],
-            NameId::email("alice@example.com"),
-        );
+        let inputs = make_inputs(&sp, &kp, vec![], NameId::email("alice@example.com"));
         let err = issue_response(inputs).unwrap_err();
         match err {
             Error::UnsupportedByPeer { binding } => {

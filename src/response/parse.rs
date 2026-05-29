@@ -123,9 +123,9 @@ pub(crate) fn parse_response(document: &Document) -> Result<(ParsedResponse, Ele
         .map(|i| i.text_content().trim().to_owned());
 
     // ---- <samlp:Status> ----
-    let status = root.child_element(Some(SAMLP_NS), "Status").ok_or_else(|| {
-        Error::XmlParse("Response missing samlp:Status".to_string())
-    })?;
+    let status = root
+        .child_element(Some(SAMLP_NS), "Status")
+        .ok_or_else(|| Error::XmlParse("Response missing samlp:Status".to_string()))?;
     let status_code_elem = status
         .child_element(Some(SAMLP_NS), "StatusCode")
         .ok_or_else(|| Error::XmlParse("Status missing StatusCode".to_string()))?;
@@ -227,12 +227,18 @@ pub(crate) fn parse_assertion(assertion: &Element) -> Result<ParsedAssertion, Er
     let subject_name_id = match subject.child_element(Some(SAML_NS), "NameID") {
         Some(name_id_elem) => parse_name_id(name_id_elem),
         #[cfg(feature = "xmlenc")]
-        None if subject.child_element(Some(SAML_NS), "EncryptedID").is_some() => {
+        None if subject
+            .child_element(Some(SAML_NS), "EncryptedID")
+            .is_some() =>
+        {
             NameId::new(String::new(), NameIdFormat::Unspecified)
         }
         None => {
             #[cfg(not(feature = "xmlenc"))]
-            if subject.child_element(Some(SAML_NS), "EncryptedID").is_some() {
+            if subject
+                .child_element(Some(SAML_NS), "EncryptedID")
+                .is_some()
+            {
                 return Err(Error::XmlParse(
                     "Subject <saml:EncryptedID> requires the `xmlenc` feature".to_string(),
                 ));
@@ -351,8 +357,12 @@ fn parse_subject_confirmation(elem: &Element) -> Result<SubjectConfirmation, Err
     let (recipient, not_on_or_after, not_before, in_response_to) = match data {
         Some(d) => (
             d.attribute(None, "Recipient").map(str::to_owned),
-            d.attribute(None, "NotOnOrAfter").map(parse_xs_datetime).transpose()?,
-            d.attribute(None, "NotBefore").map(parse_xs_datetime).transpose()?,
+            d.attribute(None, "NotOnOrAfter")
+                .map(parse_xs_datetime)
+                .transpose()?,
+            d.attribute(None, "NotBefore")
+                .map(parse_xs_datetime)
+                .transpose()?,
             d.attribute(None, "InResponseTo").map(str::to_owned),
         ),
         None => (None, None, None, None),
@@ -386,26 +396,25 @@ fn parse_conditions(elem: &Element) -> Result<Conditions, Error> {
 
     let one_time_use = elem.child_element(Some(SAML_NS), "OneTimeUse").is_some();
 
-    let (proxy_restriction_count, proxy_restriction_audiences) = match elem
-        .child_element(Some(SAML_NS), "ProxyRestriction")
-    {
-        Some(pr) => {
-            let count = pr
-                .attribute(None, "Count")
-                .map(|c| {
-                    c.parse::<u32>().map_err(|_parse_err| {
-                        Error::XmlParse(format!("ProxyRestriction/@Count not an integer: {c}"))
+    let (proxy_restriction_count, proxy_restriction_audiences) =
+        match elem.child_element(Some(SAML_NS), "ProxyRestriction") {
+            Some(pr) => {
+                let count = pr
+                    .attribute(None, "Count")
+                    .map(|c| {
+                        c.parse::<u32>().map_err(|_parse_err| {
+                            Error::XmlParse(format!("ProxyRestriction/@Count not an integer: {c}"))
+                        })
                     })
-                })
-                .transpose()?;
-            let mut auds = Vec::new();
-            for aud in pr.all_child_elements(Some(SAML_NS), "Audience") {
-                auds.push(aud.text_content().trim().to_owned());
+                    .transpose()?;
+                let mut auds = Vec::new();
+                for aud in pr.all_child_elements(Some(SAML_NS), "Audience") {
+                    auds.push(aud.text_content().trim().to_owned());
+                }
+                (count, auds)
             }
-            (count, auds)
-        }
-        None => (None, Vec::new()),
-    };
+            None => (None, Vec::new()),
+        };
 
     Ok(Conditions {
         not_before,
@@ -418,9 +427,9 @@ fn parse_conditions(elem: &Element) -> Result<Conditions, Error> {
 }
 
 fn parse_authn_statement(elem: &Element) -> Result<ParsedAuthnStatement, Error> {
-    let authn_instant_str = elem.attribute(None, "AuthnInstant").ok_or_else(|| {
-        Error::XmlParse("AuthnStatement missing AuthnInstant".to_string())
-    })?;
+    let authn_instant_str = elem
+        .attribute(None, "AuthnInstant")
+        .ok_or_else(|| Error::XmlParse("AuthnStatement missing AuthnInstant".to_string()))?;
     let authn_instant = parse_xs_datetime(authn_instant_str)?;
     let session_index = elem.attribute(None, "SessionIndex").map(str::to_owned);
     let session_not_on_or_after = elem
@@ -526,7 +535,10 @@ mod tests {
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let (resp, response_id) = parse_response(&doc).expect("parse_response");
 
-        assert_eq!(resp.destination.as_deref(), Some("https://sp.example.com/acs"));
+        assert_eq!(
+            resp.destination.as_deref(),
+            Some("https://sp.example.com/acs")
+        );
         assert_eq!(resp.in_response_to.as_deref(), Some("_req1"));
         assert_eq!(resp.issuer.as_deref(), Some("https://idp.example.com"));
         assert_eq!(resp.status_code, STATUS_SUCCESS);
@@ -604,7 +616,9 @@ mod tests {
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let err = parse_response(&doc).unwrap_err();
         match err {
-            Error::XmlParse(msg) => assert!(msg.contains("expected <samlp:Response>"), "got: {msg}"),
+            Error::XmlParse(msg) => {
+                assert!(msg.contains("expected <samlp:Response>"), "got: {msg}")
+            }
             other => panic!("expected XmlParse, got {other:?}"),
         }
     }
@@ -685,7 +699,10 @@ mod tests {
         );
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let (resp, _) = parse_response(&doc).expect("parse");
-        assert_eq!(resp.status_code, "urn:oasis:names:tc:SAML:2.0:status:Requester");
+        assert_eq!(
+            resp.status_code,
+            "urn:oasis:names:tc:SAML:2.0:status:Requester"
+        );
         assert_eq!(resp.status_message.as_deref(), Some("Consent declined"));
     }
 
@@ -722,7 +739,11 @@ mod tests {
         //                   attribute_with_nil_value,
         //                   attribute_with_nils_and_empty_strings.
         // Concatenated in document order = 7 Attribute entries total.
-        let names: Vec<&str> = assertion.attributes.iter().map(|a| a.name.as_str()).collect();
+        let names: Vec<&str> = assertion
+            .attributes
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
         assert_eq!(
             names,
             vec![
@@ -744,7 +765,10 @@ mod tests {
             .iter()
             .find(|a| a.name == "another_value")
             .expect("another_value attribute");
-        assert_eq!(another.values, vec!["value1".to_string(), "value2".to_string()]);
+        assert_eq!(
+            another.values,
+            vec!["value1".to_string(), "value2".to_string()]
+        );
 
         // Duplicate Name `role` is preserved as TWO separate Attribute
         // entries — first statement contributes role1, second contributes
@@ -756,9 +780,16 @@ mod tests {
             .iter()
             .filter(|a| a.name == "role")
             .collect();
-        assert_eq!(roles.len(), 2, "duplicate-Name attributes kept as separate entries");
+        assert_eq!(
+            roles.len(),
+            2,
+            "duplicate-Name attributes kept as separate entries"
+        );
         assert_eq!(roles[0].values, vec!["role1".to_string()]);
-        assert_eq!(roles[1].values, vec!["role2".to_string(), "role3".to_string()]);
+        assert_eq!(
+            roles[1].values,
+            vec!["role2".to_string(), "role3".to_string()]
+        );
 
         // Sanity: surname is single-valued, firstname is single-valued.
         let surname = assertion
@@ -843,7 +874,10 @@ mod tests {
               </saml:Assertion>"#,
             emit_element(&encrypted_id).unwrap()
         );
-        Document::parse(xml.as_bytes()).expect("parse assertion").root().clone()
+        Document::parse(xml.as_bytes())
+            .expect("parse assertion")
+            .root()
+            .clone()
     }
 
     /// `parse_assertion` defers a `<saml:EncryptedID>` subject: it parses with a
@@ -894,5 +928,4 @@ mod tests {
         let got = decrypt_subject_encrypted_id(assertion_el, &[&kp], &policy).unwrap();
         assert!(got.is_none());
     }
-
 }

@@ -207,7 +207,8 @@ async fn slo_redirects_to_fusionauth_and_clears_cookie() {
         session_index: Some("test-session-index".to_owned()),
         authn_instant_unix: 1_700_000_000,
         issued_at_unix: now_unix(),
-        idp_entity_id: "http://localhost:9011/samlv2/d7d09513-a3f5-401c-9685-34ab6c552453".to_owned(),
+        idp_entity_id: "http://localhost:9011/samlv2/d7d09513-a3f5-401c-9685-34ab6c552453"
+            .to_owned(),
         provider_id: "fusionauth".to_owned(),
         attributes: vec![],
     };
@@ -336,4 +337,3 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
-

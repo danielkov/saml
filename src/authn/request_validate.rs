@@ -121,10 +121,16 @@ pub(crate) fn validate_authn_request(
     };
     let (resolved, selection): (SsoResponseEndpoint, AcsSelection) =
         if let Some(index) = raw.assertion_consumer_service_index {
-            let endpoint = sp.acs_endpoint_by_index(index).cloned().ok_or_else(unregistered)?;
+            let endpoint = sp
+                .acs_endpoint_by_index(index)
+                .cloned()
+                .ok_or_else(unregistered)?;
             (endpoint, AcsSelection::Index(index))
         } else if let Some(url) = raw.assertion_consumer_service_url.as_deref() {
-            let endpoint = sp.acs_endpoint_by_url(url).cloned().ok_or_else(unregistered)?;
+            let endpoint = sp
+                .acs_endpoint_by_url(url)
+                .cloned()
+                .ok_or_else(unregistered)?;
             (endpoint, AcsSelection::Url(url.to_owned()))
         } else {
             let endpoint = sp.default_acs().cloned().ok_or_else(unregistered)?;
@@ -349,7 +355,10 @@ mod tests {
         .unwrap_err();
         match err {
             Error::InvalidConfiguration { reason } => {
-                assert_eq!(reason, "expected_destination is not a registered SSO endpoint");
+                assert_eq!(
+                    reason,
+                    "expected_destination is not a registered SSO endpoint"
+                );
             }
             other => panic!("expected InvalidConfiguration, got {other:?}"),
         }

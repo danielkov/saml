@@ -103,9 +103,7 @@ impl EntitiesDescriptor {
     pub fn find_sp(&self, entity_id: &str) -> Option<&SpDescriptor> {
         for entry in &self.entities {
             match entry {
-                MetadataEntry::Sp(sp) | MetadataEntry::Dual(_, sp)
-                    if sp.entity_id == entity_id =>
-                {
+                MetadataEntry::Sp(sp) | MetadataEntry::Dual(_, sp) if sp.entity_id == entity_id => {
                     return Some(sp);
                 }
                 _ => {}
@@ -149,8 +147,12 @@ fn collect_entities(
 }
 
 fn parse_entity_descriptor(entity: &Element) -> Result<MetadataEntry, Error> {
-    let has_idp = entity.child_element(Some(MD_NS), "IDPSSODescriptor").is_some();
-    let has_sp = entity.child_element(Some(MD_NS), "SPSSODescriptor").is_some();
+    let has_idp = entity
+        .child_element(Some(MD_NS), "IDPSSODescriptor")
+        .is_some();
+    let has_sp = entity
+        .child_element(Some(MD_NS), "SPSSODescriptor")
+        .is_some();
 
     match (has_idp, has_sp) {
         (true, true) => {
@@ -314,14 +316,16 @@ pub(crate) fn parse_endpoint(element: &Element) -> Result<crate::binding::Endpoi
         })?
         .to_owned();
     let index = match element.attribute(None, "index") {
-        Some(s) => Some(s.parse::<u16>().map_err(|_parse_err| {
-            Error::InvalidConfiguration {
-                reason: "endpoint index is not a u16",
-            }
-        })?),
+        Some(s) => Some(
+            s.parse::<u16>()
+                .map_err(|_parse_err| Error::InvalidConfiguration {
+                    reason: "endpoint index is not a u16",
+                })?,
+        ),
         None => None,
     };
-    let is_default = parse_optional_bool_value(element.attribute(None, "isDefault"))?.unwrap_or(false);
+    let is_default =
+        parse_optional_bool_value(element.attribute(None, "isDefault"))?.unwrap_or(false);
     Ok(crate::binding::Endpoint {
         url: location,
         binding,
@@ -355,11 +359,11 @@ pub(crate) fn parse_key_descriptors(
             });
         }
 
-        let key_info = kd
-            .child_element(Some(DS_NS), "KeyInfo")
-            .ok_or(Error::InvalidConfiguration {
-                reason: "KeyDescriptor missing KeyInfo",
-            })?;
+        let key_info =
+            kd.child_element(Some(DS_NS), "KeyInfo")
+                .ok_or(Error::InvalidConfiguration {
+                    reason: "KeyDescriptor missing KeyInfo",
+                })?;
 
         for x509_data in key_info.all_child_elements(Some(DS_NS), "X509Data") {
             for cert_elem in x509_data.all_child_elements(Some(DS_NS), "X509Certificate") {
@@ -590,7 +594,10 @@ mod tests {
 
     #[test]
     fn duration_pt3600s() {
-        assert_eq!(parse_xs_duration("PT3600S").unwrap(), Duration::from_hours(1));
+        assert_eq!(
+            parse_xs_duration("PT3600S").unwrap(),
+            Duration::from_hours(1)
+        );
     }
 
     #[test]
@@ -815,10 +822,7 @@ mod tests {
                   Location="https://x/acs" index="3" isDefault="true"/>
             </md:Wrapper>"#;
         let doc = Document::parse(xml.as_bytes()).unwrap();
-        let e = doc
-            .root()
-            .child_element(Some(MD_NS), "E")
-            .unwrap();
+        let e = doc.root().child_element(Some(MD_NS), "E").unwrap();
         let parsed = parse_endpoint(e).unwrap();
         assert_eq!(parsed.binding, Binding::HttpPost);
         assert_eq!(parsed.url, "https://x/acs");

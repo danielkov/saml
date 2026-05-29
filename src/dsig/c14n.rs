@@ -605,11 +605,7 @@ fn push_unique_opt(out: &mut Vec<Option<String>>, prefix: Option<String>) {
 }
 
 /// Insert-or-overwrite a prefix binding (last write wins).
-fn merge_rendered(
-    out: &mut Vec<(Option<String>, String)>,
-    prefix: Option<String>,
-    uri: String,
-) {
+fn merge_rendered(out: &mut Vec<(Option<String>, String)>, prefix: Option<String>, uri: String) {
     if let Some(slot) = out.iter_mut().find(|(p, _)| *p == prefix) {
         slot.1 = uri;
     } else {
@@ -695,12 +691,7 @@ mod tests {
     /// Parse XML, locate the element with the given local name (no namespace
     /// filter), and canonicalize it. The ancestor chain is computed by walking
     /// the document tree.
-    fn canon_named(
-        xml: &str,
-        local: &str,
-        algorithm: C14nAlgorithm,
-        prefixes: &[&str],
-    ) -> String {
+    fn canon_named(xml: &str, local: &str, algorithm: C14nAlgorithm, prefixes: &[&str]) -> String {
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let (target, chain) = find_with_chain(&doc, local).expect("find target");
         let bytes = canonicalize(&doc, target, &chain, algorithm, prefixes).expect("c14n");
@@ -784,10 +775,7 @@ mod tests {
     fn inclusive_example_3_keeps_unused_namespaces_on_apex() {
         let input = r#"<doc xmlns:unused="urn:unused"><e/></doc>"#;
         let got = canon_root(input, C14nAlgorithm::InclusiveCanonical, &[]);
-        assert_eq!(
-            got,
-            r#"<doc xmlns:unused="urn:unused"><e></e></doc>"#
-        );
+        assert_eq!(got, r#"<doc xmlns:unused="urn:unused"><e></e></doc>"#);
     }
 
     // ---------- Example 4: PrefixList inheritance ---------------------------
@@ -817,8 +805,7 @@ mod tests {
 
     #[test]
     fn exclusive_example_5_attribute_sorting() {
-        let input =
-            r#"<e xmlns:b="urn:b" xmlns:a="urn:a" b:z="1" a:y="2" x="3" b:w="4"><c/></e>"#;
+        let input = r#"<e xmlns:b="urn:b" xmlns:a="urn:a" b:z="1" a:y="2" x="3" b:w="4"><c/></e>"#;
         // Namespace decls sorted by prefix: a, b. Attributes sorted:
         // unqualified (`x`) first, then namespaced sorted by URI then local:
         // urn:a → a:y; urn:b → b:w then b:z.
@@ -831,8 +818,7 @@ mod tests {
 
     #[test]
     fn inclusive_example_5_attribute_sorting() {
-        let input =
-            r#"<e xmlns:b="urn:b" xmlns:a="urn:a" b:z="1" a:y="2" x="3" b:w="4"><c/></e>"#;
+        let input = r#"<e xmlns:b="urn:b" xmlns:a="urn:a" b:z="1" a:y="2" x="3" b:w="4"><c/></e>"#;
         let got = canon_root(input, C14nAlgorithm::InclusiveCanonical, &[]);
         assert_eq!(
             got,
@@ -916,10 +902,7 @@ mod tests {
         // attribute, since literal CR would be normalized to LF on parse.
         let input = r#"<e a="&#9;&#10;&#13;&quot;&amp;&lt;"/>"#;
         let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
-        assert_eq!(
-            got,
-            r#"<e a="&#x9;&#xA;&#xD;&quot;&amp;&lt;"></e>"#
-        );
+        assert_eq!(got, r#"<e a="&#x9;&#xA;&#xD;&quot;&amp;&lt;"></e>"#);
     }
 
     #[test]
@@ -947,10 +930,7 @@ mod tests {
         // binding declared again on a descendant is not re-emitted.
         let input = r#"<r xmlns:p="urn:p"><p:c><p:d/></p:c></r>"#;
         let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
-        assert_eq!(
-            got,
-            r#"<r><p:c xmlns:p="urn:p"><p:d></p:d></p:c></r>"#
-        );
+        assert_eq!(got, r#"<r><p:c xmlns:p="urn:p"><p:d></p:d></p:c></r>"#);
     }
 
     #[test]
@@ -960,10 +940,7 @@ mod tests {
         // by their respective elements and must appear in canonical output.
         let input = r#"<a xmlns="urn:a"><b xmlns="urn:b"/></a>"#;
         let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
-        assert_eq!(
-            got,
-            r#"<a xmlns="urn:a"><b xmlns="urn:b"></b></a>"#
-        );
+        assert_eq!(got, r#"<a xmlns="urn:a"><b xmlns="urn:b"></b></a>"#);
     }
 
     #[test]
@@ -1008,10 +985,7 @@ mod tests {
         );
         // apex is unprefixed and the default-ns from root is in scope; whether
         // by visibly-utilized or by #default, it must be rendered on apex.
-        assert_eq!(
-            got,
-            r#"<apex xmlns="urn:root"><leaf></leaf></apex>"#
-        );
+        assert_eq!(got, r#"<apex xmlns="urn:root"><leaf></leaf></apex>"#);
     }
 
     #[test]
@@ -1069,7 +1043,8 @@ mod tests {
         // Element <ds:Reference> with ds:URI attribute. Canonical output
         // keeps the `ds:` prefix on both, and only renders the `ds`
         // declaration once on the outer apex.
-        let input = r##"<ds:Signature xmlns:ds="urn:ds"><ds:Reference URI="#abc"/></ds:Signature>"##;
+        let input =
+            r##"<ds:Signature xmlns:ds="urn:ds"><ds:Reference URI="#abc"/></ds:Signature>"##;
         let got = canon_root(input, C14nAlgorithm::ExclusiveCanonical, &[]);
         assert_eq!(
             got,

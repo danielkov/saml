@@ -339,10 +339,7 @@ mod tests {
     fn key_info_skips_malformed_inline_blobs() {
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         let key_info = KeyInfo {
-            x509_certificates_base64: vec![
-                "this is not base64".to_string(),
-                cert.to_base64_x509(),
-            ],
+            x509_certificates_base64: vec!["this is not base64".to_string(), cert.to_base64_x509()],
             ..KeyInfo::default()
         };
         let filtered = key_info.trusted_inline_certs(std::slice::from_ref(&cert));
@@ -357,6 +354,9 @@ mod tests {
     fn public_key_algorithm_is_in_scope() {
         use crate::crypto::cert::PublicKeyAlgorithm;
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
-        assert_eq!(cert.public_key().algorithm_family(), PublicKeyAlgorithm::Rsa);
+        assert_eq!(
+            cert.public_key().algorithm_family(),
+            PublicKeyAlgorithm::Rsa
+        );
     }
 }

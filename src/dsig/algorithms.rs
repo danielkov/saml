@@ -234,8 +234,7 @@ pub struct PeerCryptoPolicy {
     pub allowed_signature_algorithms: Vec<SignatureAlgorithm>,
     /// Inbound XML-Enc data-encryption algorithms.
     #[cfg(feature = "xmlenc")]
-    pub allowed_data_encryption_algorithms:
-        Vec<crate::xmlenc::algorithms::DataEncryptionAlgorithm>,
+    pub allowed_data_encryption_algorithms: Vec<crate::xmlenc::algorithms::DataEncryptionAlgorithm>,
     /// Inbound XML-Enc key-transport algorithms.
     #[cfg(feature = "xmlenc")]
     pub allowed_key_transport_algorithms: Vec<crate::xmlenc::algorithms::KeyTransportAlgorithm>,
@@ -343,9 +342,18 @@ mod tests {
         let sha384_empty = "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b";
         let sha512_empty = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
 
-        assert_eq!(hex::encode(DigestAlgorithm::Sha256.digest(b"")), sha256_empty);
-        assert_eq!(hex::encode(DigestAlgorithm::Sha384.digest(b"")), sha384_empty);
-        assert_eq!(hex::encode(DigestAlgorithm::Sha512.digest(b"")), sha512_empty);
+        assert_eq!(
+            hex::encode(DigestAlgorithm::Sha256.digest(b"")),
+            sha256_empty
+        );
+        assert_eq!(
+            hex::encode(DigestAlgorithm::Sha384.digest(b"")),
+            sha384_empty
+        );
+        assert_eq!(
+            hex::encode(DigestAlgorithm::Sha512.digest(b"")),
+            sha512_empty
+        );
 
         #[cfg(feature = "weak-algos")]
         {

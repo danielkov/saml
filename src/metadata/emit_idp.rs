@@ -22,8 +22,8 @@ use super::MetadataExtras;
 #[cfg(feature = "xmlenc")]
 use super::emit_sp::build_encryption_key_descriptor;
 use super::emit_sp::{
-    DS_NS, MD_NS, SAML2_PROTOCOL, append_extras, bool_str,
-    build_signing_key_descriptor, format_cache_duration, generate_id, md_qname,
+    DS_NS, MD_NS, SAML2_PROTOCOL, append_extras, bool_str, build_signing_key_descriptor,
+    format_cache_duration, generate_id, md_qname,
 };
 
 /// Caller-supplied IdP metadata fields. Mirrors what RFC-006 §6.2 says are
@@ -102,14 +102,15 @@ fn build_idp_entity_descriptor(
         );
 
     // KeyDescriptors.
-    idp_descriptor = idp_descriptor.with_child(Node::Element(
-        build_signing_key_descriptor(inputs.signing_cert),
-    ));
+    idp_descriptor = idp_descriptor.with_child(Node::Element(build_signing_key_descriptor(
+        inputs.signing_cert,
+    )));
     #[cfg(feature = "xmlenc")]
     if let Some(cert) = inputs.encryption_cert {
-        idp_descriptor = idp_descriptor.with_child(Node::Element(
-            build_encryption_key_descriptor(cert, inputs.encryption_algorithms),
-        ));
+        idp_descriptor = idp_descriptor.with_child(Node::Element(build_encryption_key_descriptor(
+            cert,
+            inputs.encryption_algorithms,
+        )));
     }
 
     // NameIDFormats.
@@ -123,23 +124,20 @@ fn build_idp_entity_descriptor(
 
     // SingleSignOnService endpoints.
     for endpoint in inputs.sso {
-        idp_descriptor =
-            idp_descriptor.with_child(Node::Element(build_sso_endpoint(endpoint)));
+        idp_descriptor = idp_descriptor.with_child(Node::Element(build_sso_endpoint(endpoint)));
     }
 
     // SingleLogoutService endpoints.
     for endpoint in inputs.slo {
-        idp_descriptor =
-            idp_descriptor.with_child(Node::Element(build_slo_endpoint(endpoint)));
+        idp_descriptor = idp_descriptor.with_child(Node::Element(build_slo_endpoint(endpoint)));
     }
 
     // ArtifactResolutionService endpoints (indexed; the schema requires an
     // `index` attribute on each — we emit one even if the caller forgot, to
     // keep the output schema-valid).
     for endpoint in inputs.artifact_resolution {
-        idp_descriptor = idp_descriptor.with_child(Node::Element(
-            build_artifact_resolution_endpoint(endpoint),
-        ));
+        idp_descriptor =
+            idp_descriptor.with_child(Node::Element(build_artifact_resolution_endpoint(endpoint)));
     }
 
     let idp_descriptor = idp_descriptor.finish();
@@ -267,11 +265,7 @@ mod tests {
             Endpoint::redirect("https://idp.example.com/sso/redir", 1, false),
         ];
         let slo = [Endpoint::redirect("https://idp.example.com/slo", 0, false)];
-        let ars = [Endpoint::soap(
-            "https://idp.example.com/ars",
-            Some(0),
-            true,
-        )];
+        let ars = [Endpoint::soap("https://idp.example.com/ars", Some(0), true)];
         let formats = [NameIdFormat::Persistent, NameIdFormat::Transient];
         let algos = [DataEncryptionAlgorithm::Aes256Gcm];
         let inputs = baseline_inputs(&cert, &sso, &slo, &ars, &formats, &algos);
@@ -450,7 +444,10 @@ mod tests {
             .all_child_elements(Some(MD_NS), "ContactPerson")
             .collect();
         assert_eq!(contacts.len(), 2);
-        assert_eq!(contacts[0].attribute(None, "contactType"), Some("technical"));
+        assert_eq!(
+            contacts[0].attribute(None, "contactType"),
+            Some("technical")
+        );
         assert_eq!(contacts[1].attribute(None, "contactType"), Some("support"));
 
         // Second contact has two phone numbers, in input order.
@@ -495,9 +492,7 @@ mod tests {
         let signed_info = children[0]
             .child_element(Some(DS_NS), "SignedInfo")
             .unwrap();
-        let reference = signed_info
-            .child_element(Some(DS_NS), "Reference")
-            .unwrap();
+        let reference = signed_info.child_element(Some(DS_NS), "Reference").unwrap();
         assert_eq!(
             reference.attribute(None, "URI"),
             Some(format!("#{id_attr}").as_str())
@@ -513,7 +508,10 @@ mod tests {
         );
 
         // IDPSSODescriptor is still present after the signature.
-        assert!(root.child_element(Some(MD_NS), "IDPSSODescriptor").is_some());
+        assert!(
+            root.child_element(Some(MD_NS), "IDPSSODescriptor")
+                .is_some()
+        );
     }
 
     #[test]

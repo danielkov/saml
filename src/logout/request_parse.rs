@@ -482,8 +482,8 @@ mod tests {
     #[cfg(feature = "xmlenc")]
     #[test]
     fn decrypt_encrypted_name_id_noop_for_cleartext() {
-        use crate::crypto::keypair::KeyPair;
         use crate::crypto::cert::test_vectors::RSA_KEY_PKCS8_PEM;
+        use crate::crypto::keypair::KeyPair;
         use crate::dsig::algorithms::PeerCryptoPolicy;
 
         let xml = r#"<samlp:LogoutRequest

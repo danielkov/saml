@@ -364,23 +364,23 @@ pub use crate::dsig::algorithms::{
 };
 pub use crate::dsig::verify::VerifiedSignature;
 
-pub use crate::metadata::{
-    MetadataContact, MetadataContactType, MetadataExtras, MetadataOrganization,
-};
 pub use crate::metadata::parse::{
     EntitiesDescriptor, MetadataEntry, VerifyMetadata, parse_signed_entities_descriptor,
     parse_signed_idp_descriptor, parse_signed_sp_descriptor, verify_metadata_signature,
+};
+pub use crate::metadata::{
+    MetadataContact, MetadataContactType, MetadataExtras, MetadataOrganization,
 };
 
 pub use crate::response::Identity;
 pub use crate::response::issue::SamlStatusCode;
 
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+pub use crate::sp::ConsumeArtifactResponse;
 pub use crate::sp::{
     ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
     StartLogin, StartLoginResult,
 };
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
-pub use crate::sp::ConsumeArtifactResponse;
 #[cfg(feature = "slo")]
 pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};
 
@@ -398,11 +398,10 @@ pub use crate::idp::{
 };
 
 pub use crate::proxy::{
-    Aes256GcmCodec, AttributeReleasePolicy, AuthnContextComparator, BounceResult,
-    BounceToUpstream, NameIdFromAttribute, NameIdTransform, OpaqueHandleCodec, PassThroughNameId,
-    PerSpFormat, PersistentPerSpHmac, Proxy, ProxyContext, ProxyContextCodec, ProxyContextStore,
-    RelayToDownstream, ReleaseAll, ReleaseAllowList, ReleaseNone, ReleasePerSp,
-    StandardComparator,
+    Aes256GcmCodec, AttributeReleasePolicy, AuthnContextComparator, BounceResult, BounceToUpstream,
+    NameIdFromAttribute, NameIdTransform, OpaqueHandleCodec, PassThroughNameId, PerSpFormat,
+    PersistentPerSpHmac, Proxy, ProxyContext, ProxyContextCodec, ProxyContextStore,
+    RelayToDownstream, ReleaseAll, ReleaseAllowList, ReleaseNone, ReleasePerSp, StandardComparator,
 };
 #[cfg(feature = "slo")]
 pub use crate::proxy::{FrontChannelChain, FrontChannelState, FrontChannelTarget};

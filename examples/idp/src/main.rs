@@ -12,8 +12,7 @@
 
 use saml_idp_example::auth::UserStore;
 use saml_idp_example::{
-    AppConfig, AppState, build_identity_provider, build_router, fetch_all_sps, load_sps,
-    load_users,
+    AppConfig, AppState, build_identity_provider, build_router, fetch_all_sps, load_sps, load_users,
 };
 use tracing::{info, warn};
 
@@ -54,7 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             let entries = fetch_all_sps(&sps_for_refresh).await;
             if !entries.is_empty() {
-                info!(live = entries.len(), "SP metadata fetched; registry populated");
+                info!(
+                    live = entries.len(),
+                    "SP metadata fetched; registry populated"
+                );
                 for e in &entries {
                     info!(sp = %e.sp.entity_id, "live");
                 }

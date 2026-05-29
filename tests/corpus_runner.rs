@@ -39,7 +39,9 @@ use saml::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorit
 use saml::error::Error;
 use saml::nameid::NameIdFormat;
 use saml::replay::ReplayMode;
-use saml::sp::{ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned};
+use saml::sp::{
+    ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
+};
 use saml::time::parse_xs_datetime;
 
 // =============================================================================
@@ -166,12 +168,28 @@ const PY3_SP_KEY: &str = "python3-saml/certs/sp.key";
 
 const FIXTURES: &[Fixture] = &[
     // ---- Positive: ADFS captures (real Microsoft IdP) ----
-    Fixture::pos("ruby-saml/responses/adfs_response_sha256.xml", "adfs_sha256").strong(),
-    Fixture::pos("ruby-saml/responses/adfs_response_sha384.xml", "adfs_sha384").strong(),
-    Fixture::pos("ruby-saml/responses/adfs_response_sha512.xml", "adfs_sha512").strong(),
+    Fixture::pos(
+        "ruby-saml/responses/adfs_response_sha256.xml",
+        "adfs_sha256",
+    )
+    .strong(),
+    Fixture::pos(
+        "ruby-saml/responses/adfs_response_sha384.xml",
+        "adfs_sha384",
+    )
+    .strong(),
+    Fixture::pos(
+        "ruby-saml/responses/adfs_response_sha512.xml",
+        "adfs_sha512",
+    )
+    .strong(),
     Fixture::pos("ruby-saml/responses/adfs_response_sha1.xml", "adfs_sha1"),
     // ---- Negative: XSW attack vectors ----
-    Fixture::neg("ruby-saml/responses/response_wrapped.xml.base64", "xsw_wrapped").b64(),
+    Fixture::neg(
+        "ruby-saml/responses/response_wrapped.xml.base64",
+        "xsw_wrapped",
+    )
+    .b64(),
     Fixture::neg(
         "ruby-saml/responses/response_assertion_wrapped.xml.base64",
         "xsw_assertion_wrapped",
@@ -196,10 +214,22 @@ const FIXTURES: &[Fixture] = &[
     Fixture::neg("ruby-saml/responses/attackxee.xml", "xxe"),
     // ---- Negative: missing signature namespace ----
     Fixture::neg("ruby-saml/responses/no_signature_ns.xml", "no_signature_ns"),
-    Fixture::neg("ruby-saml/responses/response_unsigned_xml_base64", "unsigned").b64(),
+    Fixture::neg(
+        "ruby-saml/responses/response_unsigned_xml_base64",
+        "unsigned",
+    )
+    .b64(),
     // ---- python3-saml: encrypted + expired + audience ----
-    Fixture::neg("python3-saml/responses/expired_response.xml.base64", "expired").b64(),
-    Fixture::neg("python3-saml/responses/no_audience.xml.base64", "no_audience").b64(),
+    Fixture::neg(
+        "python3-saml/responses/expired_response.xml.base64",
+        "expired",
+    )
+    .b64(),
+    Fixture::neg(
+        "python3-saml/responses/no_audience.xml.base64",
+        "no_audience",
+    )
+    .b64(),
     // Real provider fixture: signed by a real cert (embedded matches the
     // signer), validates cleanly in python3-saml. Currently fails saml's
     // verify with `SignatureVerification { reason: "digest mismatch" }`,
@@ -453,8 +483,8 @@ struct Extracted {
 fn extract(xml: &[u8]) -> Result<Extracted, String> {
     let s = std::str::from_utf8(xml).map_err(|e| format!("utf8: {e}"))?;
 
-    let issuer = first_element_text(s, "Issuer")
-        .ok_or_else(|| "missing <Issuer> text".to_string())?;
+    let issuer =
+        first_element_text(s, "Issuer").ok_or_else(|| "missing <Issuer> text".to_string())?;
     let audience = first_element_text(s, "Audience");
     let destination = first_attribute(s, "Destination");
     let in_response_to = first_attribute(s, "InResponseTo");
@@ -482,11 +512,9 @@ fn extract(xml: &[u8]) -> Result<Extracted, String> {
                     .decode(cert_b64_clean.as_bytes())
                     .map_err(|e| format!("X509 first={first_err:?} b64 outer: {e:?}"))?;
                 if inner.starts_with(b"-----BEGIN") {
-                    X509Certificate::from_pem(&inner)
-                        .map_err(|e| format!("X509 PEM: {e:?}"))?
+                    X509Certificate::from_pem(&inner).map_err(|e| format!("X509 PEM: {e:?}"))?
                 } else {
-                    X509Certificate::from_der(&inner)
-                        .map_err(|e| format!("X509 DER: {e:?}"))?
+                    X509Certificate::from_der(&inner).map_err(|e| format!("X509 DER: {e:?}"))?
                 }
             }
         };
@@ -575,10 +603,9 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
     // otherwise use whatever was embedded in cleartext <ds:KeyInfo>.
     let idp_cert = match (fx.idp_cert_pem_path, meta.cert.clone()) {
         (Some(rel), _) => {
-            let pem = std::fs::read(corpus_path(rel))
-                .map_err(|e| format!("read idp cert {rel}: {e}"))?;
-            X509Certificate::from_pem(&pem)
-                .map_err(|e| format!("idp cert PEM {rel}: {e:?}"))?
+            let pem =
+                std::fs::read(corpus_path(rel)).map_err(|e| format!("read idp cert {rel}: {e}"))?;
+            X509Certificate::from_pem(&pem).map_err(|e| format!("idp cert PEM {rel}: {e:?}"))?
         }
         (None, Some(c)) => c,
         (None, None) => {
@@ -625,12 +652,9 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
     #[cfg(feature = "xmlenc")]
     let decryption_key = match fx.sp_decryption_key_pkcs1_pem_path {
         Some(rel) => {
-            let pem = std::fs::read(corpus_path(rel))
-                .map_err(|e| format!("read sp key {rel}: {e}"))?;
-            Some(
-                KeyPair::from_pkcs1_pem(&pem)
-                    .map_err(|e| format!("sp key PKCS#1 {rel}: {e:?}"))?,
-            )
+            let pem =
+                std::fs::read(corpus_path(rel)).map_err(|e| format!("read sp key {rel}: {e}"))?;
+            Some(KeyPair::from_pkcs1_pem(&pem).map_err(|e| format!("sp key PKCS#1 {rel}: {e:?}"))?)
         }
         None => None,
     };
@@ -670,16 +694,17 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         .checked_add(Duration::from_secs(1))
         .ok_or_else(|| "issue_instant + 1s overflowed SystemTime".to_string())?;
 
-    let tracker_owned = meta.in_response_to.as_deref().map(|in_response_to| {
-        LoginTracker {
+    let tracker_owned = meta
+        .in_response_to
+        .as_deref()
+        .map(|in_response_to| LoginTracker {
             request_id: in_response_to.to_owned(),
             issued_at: meta.issue_instant,
             idp_entity_id: meta.issuer.clone(),
             acs_endpoint: SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
             requested_authn_context: None,
             requested_name_id_format: None,
-        }
-    });
+        });
 
     sp.consume_response(ConsumeResponse {
         idp: &idp,
@@ -762,7 +787,10 @@ corpus_test!(c30_ruby_doubled_signed_assertion, POST_ENC + 8);
 corpus_test!(c31_py3_sig_wrap_attack, POST_ENC + 9);
 corpus_test!(c32_py3_sig_wrap_attack2, POST_ENC + 10);
 corpus_test!(c33_py3_bad_reference, POST_ENC + 11);
-corpus_test!(c34_xsw_pattern_5_assertion_in_signature_object, POST_ENC + 12);
+corpus_test!(
+    c34_xsw_pattern_5_assertion_in_signature_object,
+    POST_ENC + 12
+);
 corpus_test!(c35_xsw_pattern_6_substituted_subject, POST_ENC + 13);
 corpus_test!(c36_xsw_pattern_8_namespace_injection, POST_ENC + 14);
 
@@ -808,8 +836,7 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
     // Reuse the c01_adfs_sha256 fixture's wire bytes — a real, verified
     // ADFS Response with its own cert embedded.
     let abs_path = corpus_path("ruby-saml/responses/adfs_response_sha256.xml");
-    let xml = std::fs::read(&abs_path)
-        .unwrap_or_else(|e| panic!("read {abs_path}: {e}"));
+    let xml = std::fs::read(&abs_path).unwrap_or_else(|e| panic!("read {abs_path}: {e}"));
 
     // Extract the wire metadata so we use the right Audience / Destination
     // / IssueInstant — the only thing we DO NOT take from the wire is the
@@ -890,16 +917,17 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
     // signature check ever runs, which would let an attacker hide behind
     // the wrong error. Build a matching tracker so the signature check
     // *is* the gating condition.
-    let tracker_owned = meta.in_response_to.as_deref().map(|in_response_to| {
-        LoginTracker {
+    let tracker_owned = meta
+        .in_response_to
+        .as_deref()
+        .map(|in_response_to| LoginTracker {
             request_id: in_response_to.to_owned(),
             issued_at: meta.issue_instant,
             idp_entity_id: meta.issuer.clone(),
             acs_endpoint: SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
             requested_authn_context: None,
             requested_name_id_format: None,
-        }
-    });
+        });
 
     let result = sp.consume_response(ConsumeResponse {
         idp: &idp,

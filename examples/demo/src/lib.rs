@@ -89,8 +89,8 @@ impl AppConfig {
         let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
         let sp_base_url = std::env::var("SAML_DEMO_BASE_URL")
             .unwrap_or_else(|_| format!("http://localhost:{port}"));
-        let sp_entity_id = std::env::var("SAML_DEMO_SP_ENTITY_ID")
-            .unwrap_or_else(|_| "saml-axum-demo".to_owned());
+        let sp_entity_id =
+            std::env::var("SAML_DEMO_SP_ENTITY_ID").unwrap_or_else(|_| "saml-axum-demo".to_owned());
 
         let providers_toml_path = std::env::var("SAML_DEMO_PROVIDERS_TOML")
             .ok()
@@ -123,7 +123,10 @@ pub fn load_providers(path: Option<&std::path::Path>) -> Result<ProvidersFile, S
     let raw = if let Some(p) = path {
         std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))?
     } else {
-        let candidates = ["config/providers.toml", "examples/demo/config/providers.toml"];
+        let candidates = [
+            "config/providers.toml",
+            "examples/demo/config/providers.toml",
+        ];
         let mut found = None;
         for c in candidates {
             if let Ok(s) = std::fs::read_to_string(c) {
@@ -139,7 +142,8 @@ pub fn load_providers(path: Option<&std::path::Path>) -> Result<ProvidersFile, S
             DEFAULT_PROVIDERS_TOML.to_owned()
         }
     };
-    let mut file = ProvidersFile::from_toml(&raw).map_err(|e| format!("parse providers.toml: {e}"))?;
+    let mut file =
+        ProvidersFile::from_toml(&raw).map_err(|e| format!("parse providers.toml: {e}"))?;
     file.apply_env_overrides();
     Ok(file)
 }
@@ -426,7 +430,10 @@ pub async fn fetch_all_descriptors(index: &ProviderIndex) -> Vec<ProviderEntry> 
                         for path in &cfg.extra_signing_cert_paths {
                             match std::fs::read(path).and_then(|bytes| {
                                 X509Certificate::from_pem(&bytes).map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        e.to_string(),
+                                    )
                                 })
                             }) {
                                 Ok(cert) => idp.signing_certs.push(cert),
@@ -514,10 +521,7 @@ async fn handle_index(
     .into_response()
 }
 
-async fn handle_login(
-    State(state): State<AppState>,
-    Path(provider_id): Path<String>,
-) -> Response {
+async fn handle_login(State(state): State<AppState>, Path(provider_id): Path<String>) -> Response {
     let Some(entry) = state.by_id.get(&provider_id) else {
         // Either an unknown slug, or a configured provider whose metadata
         // wasn't reachable at startup. Render a useful error rather than
@@ -546,7 +550,10 @@ async fn handle_login(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, provider = %provider_id, "start_login failed");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, &format!("start_login: {e}"));
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("start_login: {e}"),
+            );
         }
     };
 
@@ -554,7 +561,10 @@ async fn handle_login(
         Ok(mut store) => store.insert(result.tracker),
         Err(e) => {
             warn!(error = %e, "tracker store poisoned");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, "tracker store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker store unavailable",
+            );
         }
     }
 
@@ -852,10 +862,9 @@ async fn handle_logout(State(state): State<AppState>, headers: HeaderMap) -> Res
     // Prefer Redirect (smaller, GET, no JS auto-form) over POST when the
     // IdP advertises both bindings on its SLO endpoint, unless the provider
     // config overrides the preference.
-    let Some(binding) = pick_slo_binding_with_pref(
-        &entry.idp,
-        entry.config.prefer_slo_binding.as_deref(),
-    ) else {
+    let Some(binding) =
+        pick_slo_binding_with_pref(&entry.idp, entry.config.prefer_slo_binding.as_deref())
+    else {
         warn!(
             provider = %session.provider_id,
             "logout: IdP does not advertise an HTTP-Redirect or HTTP-POST SLO endpoint; local logout only",
@@ -895,7 +904,10 @@ async fn handle_logout(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(mut store) => store.insert(dispatch_result.tracker),
         Err(e) => {
             warn!(error = %e, "logout: tracker store poisoned");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, "tracker store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker store unavailable",
+            );
         }
     }
 
@@ -954,10 +966,7 @@ fn handle_slo_response(
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(error = %e, "/saml/slo: SAMLResponse base64 decode failed");
-            return error_page(
-                StatusCode::BAD_REQUEST,
-                "SAMLResponse is not valid base64",
-            );
+            return error_page(StatusCode::BAD_REQUEST, "SAMLResponse is not valid base64");
         }
     };
     let Some(request_id) = peek_in_response_to(&decoded) else {
@@ -968,7 +977,10 @@ fn handle_slo_response(
         Ok(mut store) => store.take(&request_id),
         Err(e) => {
             warn!(error = %e, "/saml/slo: logout tracker store poisoned");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, "tracker store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker store unavailable",
+            );
         }
     };
     let Some(tracker) = tracker else {
@@ -1038,11 +1050,7 @@ fn handle_slo_response(
 /// Inbound `<samlp:LogoutRequest>` handler: respond to an IdP-initiated
 /// logout chain. v1: parse, verify, build a Success `<samlp:LogoutResponse>`,
 /// clear the local cookie, and send it back.
-fn handle_slo_request(
-    state: &AppState,
-    saml_request: &str,
-    relay_state: Option<&str>,
-) -> Response {
+fn handle_slo_request(state: &AppState, saml_request: &str, relay_state: Option<&str>) -> Response {
     // Peek at the Issuer to route the request to the right provider entry,
     // mirroring the trick at /saml/acs. We need the base64-decoded bytes
     // for the peek, but `consume_logout_request` re-decodes internally for
@@ -1051,10 +1059,7 @@ fn handle_slo_request(
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(error = %e, "/saml/slo: SAMLRequest base64 decode failed");
-            return error_page(
-                StatusCode::BAD_REQUEST,
-                "SAMLRequest is not valid base64",
-            );
+            return error_page(StatusCode::BAD_REQUEST, "SAMLRequest is not valid base64");
         }
     };
     let Some(issuer) = peek_issuer(&peek_bytes) else {
@@ -1228,7 +1233,10 @@ fn handle_slo_response_redirect(
         Ok(store) => store.find_by_peer(&entry.idp.entity_id),
         Err(e) => {
             warn!(error = %e, "/saml/slo GET: tracker store poisoned");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, "tracker store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker store unavailable",
+            );
         }
     };
     let Some(tracker) = tracker else {
@@ -1396,10 +1404,7 @@ fn finalize_logout_dispatch(
             }
             Err(e) => {
                 warn!(error = %e, "could not clear session cookie on logout dispatch");
-                return error_page(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not clear cookie",
-                );
+                return error_page(StatusCode::INTERNAL_SERVER_ERROR, "could not clear cookie");
             }
         }
     }
@@ -1496,9 +1501,7 @@ fn read_msg_query_param(raw_query: &str) -> Option<String> {
 }
 
 fn extract_session(state: &AppState, headers: &HeaderMap) -> Option<Session> {
-    let cookie_header = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())?;
+    let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())?;
     let value = session::extract_cookie_value(cookie_header)?;
     match session::decode(value, &state.config.session_signing_key, unix_now()) {
         Ok(s) => Some(s),

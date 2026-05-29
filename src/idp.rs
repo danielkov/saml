@@ -42,11 +42,9 @@ use crate::attribute::Attribute;
 use crate::authn::request_parse::parse_authn_request;
 use crate::authn::request_validate::validate_authn_request;
 use crate::authn_context::AuthnContextClassRef;
-use crate::binding::{
-    Binding, Endpoint, SsoResponseDispatch,
-};
 #[cfg(feature = "slo")]
 use crate::binding::Dispatch;
+use crate::binding::{Binding, Endpoint, SsoResponseDispatch};
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
 use crate::dsig::algorithms::{
@@ -190,9 +188,7 @@ impl IdentityProvider {
         // SAML 2.0 Core §8.3.6: entityID is xs:anyURI; URL shape is
         // RECOMMENDED but not REQUIRED. See ServiceProvider::new for the
         // ecosystem-compat reasoning.
-        if config.entity_id.is_empty()
-            || config.entity_id.chars().any(char::is_whitespace)
-        {
+        if config.entity_id.is_empty() || config.entity_id.chars().any(char::is_whitespace) {
             return Err(Error::InvalidConfiguration {
                 reason: "IdentityProviderConfig.entity_id must be a non-empty, whitespace-free xs:anyURI",
             });
@@ -471,8 +467,7 @@ fn verify_envelope_signature(
         None if required => Err(Error::SignatureMissing),
         None => Ok(()),
         Some(sig) => {
-            let verified =
-                verify_signature(doc, sig, candidate_certs, allowed_algorithms)?;
+            let verified = verify_signature(doc, sig, candidate_certs, allowed_algorithms)?;
             if verified.signed_element != root_id {
                 return Err(Error::SignatureVerification {
                     reason: "signature covers a different element than the message root (XSW)",
@@ -688,7 +683,12 @@ impl IdentityProvider {
         }
 
         // Destination binding (§5.1 step 4).
-        if !self.config.slo.iter().any(|e| e.url == expected_destination) {
+        if !self
+            .config
+            .slo
+            .iter()
+            .any(|e| e.url == expected_destination)
+        {
             return Err(Error::InvalidConfiguration {
                 reason: "expected_destination is not a registered SLO endpoint",
             });
@@ -717,8 +717,12 @@ impl IdentityProvider {
         // leave `parsed.name_id` untouched.
         #[cfg(feature = "xmlenc")]
         {
-            let decryption_keys: Vec<&KeyPair> =
-                self.config.decryption_key.as_ref().map(|k| vec![k]).unwrap_or_default();
+            let decryption_keys: Vec<&KeyPair> = self
+                .config
+                .decryption_key
+                .as_ref()
+                .map(|k| vec![k])
+                .unwrap_or_default();
             if let Some(name_id) = crate::logout::request_parse::decrypt_encrypted_name_id(
                 &doc,
                 &decryption_keys,
@@ -769,7 +773,8 @@ impl IdentityProvider {
             status_message: None,
         };
         let element = build_logout_response_element(&build)?;
-        let element = self.maybe_sign_outbound(element, self.config.logout_signing.sign_responses)?;
+        let element =
+            self.maybe_sign_outbound(element, self.config.logout_signing.sign_responses)?;
         let xml = serialize_element(element)?;
 
         encode_logout_dispatch_response(binding, &destination_endpoint.url, &xml, relay_state)
@@ -782,11 +787,11 @@ impl IdentityProvider {
         sp: &SpDescriptor,
         opts: StartLogout<'_>,
     ) -> Result<LogoutDispatch, Error> {
-        let destination_endpoint = sp
-            .slo_endpoint(opts.binding)
-            .ok_or(Error::UnsupportedByPeer {
-                binding: opts.binding,
-            })?;
+        let destination_endpoint =
+            sp.slo_endpoint(opts.binding)
+                .ok_or(Error::UnsupportedByPeer {
+                    binding: opts.binding,
+                })?;
 
         let id = generate_xml_id();
         let issue_instant = SystemTime::now();
@@ -818,7 +823,8 @@ impl IdentityProvider {
                 )?
             }
             Binding::HttpPost => {
-                let element = self.maybe_sign_outbound(element, self.config.logout_signing.sign_requests)?;
+                let element =
+                    self.maybe_sign_outbound(element, self.config.logout_signing.sign_requests)?;
                 let xml = serialize_element(element)?;
                 crate::binding::post::encode_request(
                     &parse_url(&destination_endpoint.url)?,
@@ -878,7 +884,12 @@ impl IdentityProvider {
         }
 
         // Destination binding (§5.2 step 4).
-        if !self.config.slo.iter().any(|e| e.url == expected_destination) {
+        if !self
+            .config
+            .slo
+            .iter()
+            .any(|e| e.url == expected_destination)
+        {
             return Err(Error::InvalidConfiguration {
                 reason: "expected_destination is not a registered SLO endpoint",
             });
@@ -1051,9 +1062,10 @@ impl IdentityProvider {
         }
 
         let destination_endpoint =
-            sp.slo_endpoint(Binding::Soap).ok_or(Error::UnsupportedByPeer {
-                binding: Binding::Soap,
-            })?;
+            sp.slo_endpoint(Binding::Soap)
+                .ok_or(Error::UnsupportedByPeer {
+                    binding: Binding::Soap,
+                })?;
 
         let id = generate_xml_id();
         let issue_instant = SystemTime::now();
@@ -1068,7 +1080,8 @@ impl IdentityProvider {
             session_index: opts.session_index,
         };
         let element = build_logout_request_element(&build)?;
-        let element = self.maybe_sign_outbound(element, self.config.logout_signing.sign_requests)?;
+        let element =
+            self.maybe_sign_outbound(element, self.config.logout_signing.sign_requests)?;
         let xml = serialize_element(element)?;
         let xml_str = std::str::from_utf8(&xml)
             .map_err(|_err| Error::XmlEmit("non-UTF-8 outbound XML".to_string()))?;
@@ -1120,11 +1133,7 @@ impl IdentityProvider {
 
     /// Sign `element` in place when `should_sign`. Helper that wires the
     /// outbound algorithm config into the dsig signer.
-    fn maybe_sign_outbound(
-        &self,
-        element: Element,
-        should_sign: bool,
-    ) -> Result<Element, Error> {
+    fn maybe_sign_outbound(&self, element: Element, should_sign: bool) -> Result<Element, Error> {
         if !should_sign {
             return Ok(element);
         }
@@ -1208,11 +1217,9 @@ fn verify_logout_signature(
             allowed_algorithms,
         ),
         Binding::HttpPost | Binding::Soap => {
-            let root = doc
-                .element(root_id)
-                .ok_or(Error::SignatureVerification {
-                    reason: "could not locate root element for signature check",
-                })?;
+            let root = doc.element(root_id).ok_or(Error::SignatureVerification {
+                reason: "could not locate root element for signature check",
+            })?;
             verify_envelope_signature(
                 required,
                 doc,
@@ -1256,9 +1263,7 @@ fn unwrap_soap_envelope(envelope_bytes: &[u8]) -> Result<Vec<u8>, Error> {
             let ns = e.qname().namespace();
             ns == Some(SAMLP_NS) || ns == Some(SAML_NS)
         })
-        .ok_or_else(|| {
-            Error::XmlParse("SOAP body contains no SAML payload element".to_string())
-        })?;
+        .ok_or_else(|| Error::XmlParse("SOAP body contains no SAML payload element".to_string()))?;
     let serialized = crate::xml::emit::emit_element(payload)?;
     Ok(serialized.into_bytes())
 }
@@ -1465,13 +1470,13 @@ mod tests {
     use crate::dsig::algorithms::{
         C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
     };
-    use crate::xml::emit::emit_document;
     #[cfg(feature = "slo")]
     use crate::logout::request_build::BuildLogoutRequest;
     #[cfg(feature = "slo")]
     use crate::logout::{LogoutOutcome, LogoutStatus, StartLogout};
     use crate::nameid::{NameId, NameIdFormat};
     use crate::response::issue::SamlStatusCode;
+    use crate::xml::emit::emit_document;
     use crate::xml::parse::Node;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1489,10 +1494,7 @@ mod tests {
         X509Certificate::from_pem(RSA_CERT_PEM).unwrap()
     }
 
-    fn idp_with(
-        want_authn_requests_signed: bool,
-        sign_responses: bool,
-    ) -> IdentityProvider {
+    fn idp_with(want_authn_requests_signed: bool, sign_responses: bool) -> IdentityProvider {
         IdentityProvider::new(IdentityProviderConfig {
             entity_id: "https://idp.example.com/saml".into(),
             sso: vec![
@@ -1501,10 +1503,7 @@ mod tests {
             ],
             slo: vec![Endpoint::post("https://idp.example.com/slo", 0, true)],
             artifact_resolution: vec![],
-            supported_name_id_formats: vec![
-                NameIdFormat::Persistent,
-                NameIdFormat::EmailAddress,
-            ],
+            supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
             default_name_id_format: NameIdFormat::Persistent,
             signing_key: rsa_keypair_with_cert(),
             decryption_key: None,
@@ -1544,11 +1543,7 @@ mod tests {
                 0,
                 true,
             )],
-            single_logout_services: vec![Endpoint::post(
-                "https://sp.example.com/slo",
-                0,
-                true,
-            )],
+            single_logout_services: vec![Endpoint::post("https://sp.example.com/slo", 0, true)],
             signing_certs: vec![rsa_cert()],
             encryption_certs: vec![],
             supported_name_id_formats: vec![],
@@ -1827,7 +1822,9 @@ mod tests {
 
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other @ SsoResponseDispatch::Artifact(_) => panic!("expected POST dispatch, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected POST dispatch, got {other:?}")
+            }
         };
         assert_eq!(form.action.as_str(), "https://sp.example.com/acs");
         assert_eq!(form.relay_state.as_deref(), Some("rs-token"));
@@ -1863,7 +1860,9 @@ mod tests {
             .expect("issue error");
         let form = match dispatch {
             SsoResponseDispatch::Post(f) => f,
-            other @ SsoResponseDispatch::Artifact(_) => panic!("expected POST dispatch, got {other:?}"),
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected POST dispatch, got {other:?}")
+            }
         };
         let decoded = crate::binding::post::decode(&form.saml_response, None).unwrap();
         let doc = Document::parse(&decoded.xml).unwrap();
@@ -1992,9 +1991,7 @@ mod tests {
     /// signed-query slice and the detached `Signature` / `SigAlg` values, in
     /// the shape the IdP-side caller would extract from the inbound URL.
     #[cfg(feature = "slo")]
-    fn build_signed_redirect_logout_request(
-        id: &str,
-    ) -> (Vec<u8>, String, Vec<u8>, String) {
+    fn build_signed_redirect_logout_request(id: &str) -> (Vec<u8>, String, Vec<u8>, String) {
         use crate::binding::redirect::{
             RedirectDirection, decode as redirect_decode, encode_signed,
         };
@@ -2060,7 +2057,12 @@ mod tests {
             .unwrap()
             .into_owned();
 
-        (decoded.xml, signed_query_string, signature_bytes, sig_alg_decoded)
+        (
+            decoded.xml,
+            signed_query_string,
+            signature_bytes,
+            sig_alg_decoded,
+        )
     }
 
     #[cfg(feature = "slo")]
@@ -2224,7 +2226,10 @@ mod tests {
                 },
             )
             .expect("start ok");
-        assert_eq!(dispatch.tracker.peer_entity_id, "https://sp.example.com/saml");
+        assert_eq!(
+            dispatch.tracker.peer_entity_id,
+            "https://sp.example.com/saml"
+        );
         assert!(matches!(dispatch.dispatch, Dispatch::Post(_)));
     }
 
@@ -2286,7 +2291,10 @@ mod tests {
             pick_name_id_format(Some(&NameIdFormat::Transient), &supported, &default),
             NameIdFormat::Persistent
         );
-        assert_eq!(pick_name_id_format(None, &supported, &default), NameIdFormat::Persistent);
+        assert_eq!(
+            pick_name_id_format(None, &supported, &default),
+            NameIdFormat::Persistent
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2443,8 +2451,7 @@ mod tests {
         // two-step path's behavior.
         let idp = idp_with(true, false);
         let sp = sp_descriptor(false);
-        let raw_query =
-            build_signed_redirect_authn_request_raw_query("_wire-authn-tamper");
+        let raw_query = build_signed_redirect_authn_request_raw_query("_wire-authn-tamper");
         let tampered = tamper_redirect_signature_param(&raw_query);
         let err = idp
             .consume_authn_request_wire(ConsumeAuthnRequestWire {
@@ -2569,10 +2576,7 @@ mod tests {
     }
 
     #[cfg(feature = "slo")]
-    fn build_signed_redirect_logout_response_raw_query(
-        id: &str,
-        in_response_to: &str,
-    ) -> String {
+    fn build_signed_redirect_logout_response_raw_query(id: &str, in_response_to: &str) -> String {
         use crate::binding::redirect::{RedirectDirection, encode_signed};
 
         let xml = crate::logout::response_build::build_logout_response_xml(&BuildLogoutResponse {
@@ -2672,10 +2676,8 @@ mod tests {
             issued_at: fixed_now(),
             peer_entity_id: sp.entity_id.clone(),
         };
-        let raw_query = build_signed_redirect_logout_response_raw_query(
-            "_wire-lo-resp-tamper",
-            in_response_to,
-        );
+        let raw_query =
+            build_signed_redirect_logout_response_raw_query("_wire-lo-resp-tamper", in_response_to);
         let tampered = tamper_redirect_signature_param(&raw_query);
         let err = idp
             .consume_logout_response_wire(ConsumeLogoutResponseWire {

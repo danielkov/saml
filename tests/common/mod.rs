@@ -133,10 +133,7 @@ pub fn make_idp(entity_id: &str, sso_url: &str) -> TestResult<IdentityProvider> 
         ],
         slo: vec![],
         artifact_resolution: vec![],
-        supported_name_id_formats: vec![
-            NameIdFormat::Persistent,
-            NameIdFormat::EmailAddress,
-        ],
+        supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
         default_name_id_format: NameIdFormat::EmailAddress,
         signing_key,
         decryption_key: None,
@@ -159,8 +156,7 @@ pub fn make_idp(entity_id: &str, sso_url: &str) -> TestResult<IdentityProvider> 
         outbound_data_encryption_algorithm:
             saml::xmlenc::algorithms::DataEncryptionAlgorithm::Aes256Gcm,
         #[cfg(feature = "xmlenc")]
-        outbound_key_transport_algorithm:
-            saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
+        outbound_key_transport_algorithm: saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
     })?)
 }
 

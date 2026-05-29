@@ -99,33 +99,32 @@ fn build_sp_entity_descriptor(
     entity_descriptor_id: &str,
 ) -> Result<Element, Error> {
     // ── <md:SPSSODescriptor> ─────────────────────────────────────────────
-    let mut sp_descriptor =
-        Element::build(md_qname("SPSSODescriptor"))
-            .with_attribute(
-                QName::new(None, "protocolSupportEnumeration"),
-                SAML2_PROTOCOL,
-            )
-            .with_attribute(
-                QName::new(None, "AuthnRequestsSigned"),
-                bool_str(inputs.authn_requests_signed),
-            )
-            .with_attribute(
-                QName::new(None, "WantAssertionsSigned"),
-                bool_str(inputs.want_assertions_signed),
-            );
+    let mut sp_descriptor = Element::build(md_qname("SPSSODescriptor"))
+        .with_attribute(
+            QName::new(None, "protocolSupportEnumeration"),
+            SAML2_PROTOCOL,
+        )
+        .with_attribute(
+            QName::new(None, "AuthnRequestsSigned"),
+            bool_str(inputs.authn_requests_signed),
+        )
+        .with_attribute(
+            QName::new(None, "WantAssertionsSigned"),
+            bool_str(inputs.want_assertions_signed),
+        );
 
     // KeyDescriptors (signing first, then encryption — order matches the
     // worked example in the spec and is the only ordering parsers in the
     // wild reliably tolerate).
     if let Some(cert) = inputs.signing_cert {
-        sp_descriptor = sp_descriptor
-            .with_child(Node::Element(build_signing_key_descriptor(cert)));
+        sp_descriptor = sp_descriptor.with_child(Node::Element(build_signing_key_descriptor(cert)));
     }
     #[cfg(feature = "xmlenc")]
     if let Some(cert) = inputs.encryption_cert {
-        sp_descriptor = sp_descriptor.with_child(Node::Element(
-            build_encryption_key_descriptor(cert, inputs.encryption_algorithms),
-        ));
+        sp_descriptor = sp_descriptor.with_child(Node::Element(build_encryption_key_descriptor(
+            cert,
+            inputs.encryption_algorithms,
+        )));
     }
 
     // NameIDFormats.
@@ -139,28 +138,25 @@ fn build_sp_entity_descriptor(
 
     // AssertionConsumerService endpoints.
     for endpoint in inputs.acs {
-        sp_descriptor = sp_descriptor
-            .with_child(Node::Element(build_acs_endpoint(endpoint)));
+        sp_descriptor = sp_descriptor.with_child(Node::Element(build_acs_endpoint(endpoint)));
     }
 
     // SingleLogoutService endpoints.
     for endpoint in inputs.slo {
-        sp_descriptor = sp_descriptor
-            .with_child(Node::Element(build_slo_endpoint(endpoint)));
+        sp_descriptor = sp_descriptor.with_child(Node::Element(build_slo_endpoint(endpoint)));
     }
 
     let sp_descriptor = sp_descriptor.finish();
 
     // ── <md:EntityDescriptor> wrapper ────────────────────────────────────
-    let mut entity_descriptor =
-        Element::build(md_qname("EntityDescriptor"))
-            .with_namespace(Some("md".to_owned()), MD_NS)
-            .with_namespace(Some("ds".to_owned()), DS_NS)
-            .with_attribute(QName::new(None, "entityID"), inputs.entity_id.to_owned())
-            // ID attribute is required by the signing pipeline (`Reference
-            // URI="#<id>"` resolution); we emit it unconditionally so signed
-            // and unsigned output remain structurally identical.
-            .with_attribute(QName::new(None, "ID"), entity_descriptor_id.to_owned());
+    let mut entity_descriptor = Element::build(md_qname("EntityDescriptor"))
+        .with_namespace(Some("md".to_owned()), MD_NS)
+        .with_namespace(Some("ds".to_owned()), DS_NS)
+        .with_attribute(QName::new(None, "entityID"), inputs.entity_id.to_owned())
+        // ID attribute is required by the signing pipeline (`Reference
+        // URI="#<id>"` resolution); we emit it unconditionally so signed
+        // and unsigned output remain structurally identical.
+        .with_attribute(QName::new(None, "ID"), entity_descriptor_id.to_owned());
 
     if let Some(valid_until) = inputs.valid_until {
         entity_descriptor = entity_descriptor.with_attribute(
@@ -319,8 +315,7 @@ pub(super) fn append_extras(
     extras: &MetadataExtras,
 ) -> crate::xml::emit::ElementBuilder {
     if let Some(org) = &extras.organization {
-        entity_descriptor =
-            entity_descriptor.with_child(Node::Element(build_organization(org)));
+        entity_descriptor = entity_descriptor.with_child(Node::Element(build_organization(org)));
     }
     for contact in &extras.contacts {
         entity_descriptor =
@@ -356,11 +351,10 @@ fn build_organization(org: &MetadataOrganization) -> Element {
 }
 
 fn build_contact_person(contact: &MetadataContact) -> Element {
-    let mut builder = Element::build(md_qname("ContactPerson"))
-        .with_attribute(
-            QName::new(None, "contactType"),
-            contact.contact_type.as_str(),
-        );
+    let mut builder = Element::build(md_qname("ContactPerson")).with_attribute(
+        QName::new(None, "contactType"),
+        contact.contact_type.as_str(),
+    );
 
     if let Some(company) = &contact.company {
         builder = builder.with_child(Node::Element(
@@ -490,7 +484,10 @@ mod tests {
             Some(SAML2_PROTOCOL)
         );
         assert_eq!(sp_desc.attribute(None, "AuthnRequestsSigned"), Some("true"));
-        assert_eq!(sp_desc.attribute(None, "WantAssertionsSigned"), Some("true"));
+        assert_eq!(
+            sp_desc.attribute(None, "WantAssertionsSigned"),
+            Some("true")
+        );
 
         // KeyDescriptors: one signing, one encryption (with EncryptionMethods).
         let key_descriptors: Vec<_> = sp_desc
@@ -611,12 +608,15 @@ mod tests {
     #[test]
     fn valid_until_and_cache_duration_emit_attributes() {
         let cert = rsa_cert();
-        let acs = [SsoResponseEndpoint::post("https://sp.example.com/acs", 0, true)];
+        let acs = [SsoResponseEndpoint::post(
+            "https://sp.example.com/acs",
+            0,
+            true,
+        )];
         let formats = [NameIdFormat::Persistent];
         let algos: [DataEncryptionAlgorithm; 0] = [];
         let mut inputs = baseline_inputs(&cert, &acs, &[], &formats, &algos);
-        let valid_until =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000); // 2033-05-18T03:33:20Z
+        let valid_until = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000); // 2033-05-18T03:33:20Z
         inputs.valid_until = Some(valid_until);
         inputs.cache_duration = Some(Duration::from_hours(1));
 
@@ -637,7 +637,11 @@ mod tests {
     #[test]
     fn extras_emit_organization_and_contact_person() {
         let cert = rsa_cert();
-        let acs = [SsoResponseEndpoint::post("https://sp.example.com/acs", 0, true)];
+        let acs = [SsoResponseEndpoint::post(
+            "https://sp.example.com/acs",
+            0,
+            true,
+        )];
         let formats = [NameIdFormat::EmailAddress];
         let algos: [DataEncryptionAlgorithm; 0] = [];
         let extras = MetadataExtras {
@@ -755,10 +759,11 @@ mod tests {
         let signed_info = children[0]
             .child_element(Some(DS_NS), "SignedInfo")
             .unwrap();
-        let reference = signed_info
-            .child_element(Some(DS_NS), "Reference")
-            .unwrap();
-        assert_eq!(reference.attribute(None, "URI"), Some(expected_uri.as_str()));
+        let reference = signed_info.child_element(Some(DS_NS), "Reference").unwrap();
+        assert_eq!(
+            reference.attribute(None, "URI"),
+            Some(expected_uri.as_str())
+        );
 
         // SPSSODescriptor still present (signing must not eat children).
         assert!(root.child_element(Some(MD_NS), "SPSSODescriptor").is_some());
@@ -767,7 +772,11 @@ mod tests {
     #[test]
     fn unsigned_metadata_has_no_ds_signature_child() {
         let cert = rsa_cert();
-        let acs = [SsoResponseEndpoint::post("https://sp.example.com/acs", 0, true)];
+        let acs = [SsoResponseEndpoint::post(
+            "https://sp.example.com/acs",
+            0,
+            true,
+        )];
         let formats = [NameIdFormat::Persistent];
         let algos: [DataEncryptionAlgorithm; 0] = [];
         let inputs = baseline_inputs(&cert, &acs, &[], &formats, &algos);
@@ -778,7 +787,11 @@ mod tests {
 
     #[test]
     fn omits_key_descriptors_when_certs_absent() {
-        let acs = [SsoResponseEndpoint::post("https://sp.example.com/acs", 0, true)];
+        let acs = [SsoResponseEndpoint::post(
+            "https://sp.example.com/acs",
+            0,
+            true,
+        )];
         let formats = [NameIdFormat::Transient];
         let algos: [DataEncryptionAlgorithm; 0] = [];
         // No certs — the SP may not sign AuthnRequests and may not accept
@@ -806,10 +819,15 @@ mod tests {
             .child_element(Some(MD_NS), "SPSSODescriptor")
             .unwrap();
         assert_eq!(
-            sp_desc.all_child_elements(Some(MD_NS), "KeyDescriptor").count(),
+            sp_desc
+                .all_child_elements(Some(MD_NS), "KeyDescriptor")
+                .count(),
             0
         );
-        assert_eq!(sp_desc.attribute(None, "AuthnRequestsSigned"), Some("false"));
+        assert_eq!(
+            sp_desc.attribute(None, "AuthnRequestsSigned"),
+            Some("false")
+        );
         assert_eq!(
             sp_desc.attribute(None, "WantAssertionsSigned"),
             Some("false")

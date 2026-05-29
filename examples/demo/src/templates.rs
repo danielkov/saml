@@ -323,10 +323,7 @@ mod tests {
     #[test]
     fn render_preserves_unmatched_keys() {
         let vars: BTreeMap<&str, String> = BTreeMap::new();
-        assert_eq!(
-            render("Hello, {{name}}!", &vars),
-            "Hello, {{name}}!"
-        );
+        assert_eq!(render("Hello, {{name}}!", &vars), "Hello, {{name}}!");
     }
 
     #[test]

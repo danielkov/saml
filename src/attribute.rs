@@ -6,8 +6,7 @@
 //! [`NAME_FORMAT_UNSPECIFIED`], [`NAME_FORMAT_URI`], [`NAME_FORMAT_BASIC`].
 
 /// `<saml:Attribute NameFormat>` value: opaque to the schema.
-pub const NAME_FORMAT_UNSPECIFIED: &str =
-    "urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified";
+pub const NAME_FORMAT_UNSPECIFIED: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified";
 
 /// `<saml:Attribute NameFormat>` value: `Name` is a URI.
 pub const NAME_FORMAT_URI: &str = "urn:oasis:names:tc:SAML:2.0:attrname-format:uri";

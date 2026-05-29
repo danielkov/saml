@@ -176,9 +176,13 @@ impl Element {
     pub(crate) fn attributes_with_source_prefix(
         &self,
     ) -> impl Iterator<Item = (&QName, Option<&str>, &str)> {
-        self.attributes
-            .iter()
-            .map(|attr| (&attr.qname, attr.source_prefix.as_deref(), attr.value.as_str()))
+        self.attributes.iter().map(|attr| {
+            (
+                &attr.qname,
+                attr.source_prefix.as_deref(),
+                attr.value.as_str(),
+            )
+        })
     }
 
     pub(crate) fn children(&self) -> impl Iterator<Item = &Node> {
@@ -238,7 +242,6 @@ impl Element {
     pub(crate) fn insert_child(&mut self, index: usize, node: Node) {
         self.children.insert(index, node);
     }
-
 }
 
 // =============================================================================
@@ -365,7 +368,11 @@ fn resolve_prefix<'a>(stack: &'a [NsLayer], prefix: Option<&[u8]>) -> Option<&'a
     for layer in stack.iter().rev() {
         for (decl_prefix, uri) in layer.bindings.iter().rev() {
             if decl_prefix.as_deref() == prefix {
-                return if uri.is_empty() { None } else { Some(uri.as_str()) };
+                return if uri.is_empty() {
+                    None
+                } else {
+                    Some(uri.as_str())
+                };
             }
         }
     }
@@ -620,9 +627,9 @@ fn open_element(
         let attr: QxAttribute<'_> =
             attr_result.map_err(|e| Error::XmlParse(format!("attribute: {e}")))?;
 
-        attribute_count = attribute_count.checked_add(1).ok_or_else(|| {
-            Error::XmlParse("max attributes per element exceeded".to_string())
-        })?;
+        attribute_count = attribute_count
+            .checked_add(1)
+            .ok_or_else(|| Error::XmlParse("max attributes per element exceeded".to_string()))?;
         if attribute_count > limits.max_attribute_count {
             return Err(Error::XmlParse(
                 "max attributes per element exceeded".to_string(),
@@ -642,9 +649,7 @@ fn open_element(
             }
             Some(PrefixDeclaration::Named(prefix_bytes)) => {
                 let prefix_str = std::str::from_utf8(prefix_bytes)
-                    .map_err(|err| {
-                        Error::XmlParse(format!("non-UTF-8 namespace prefix: {err}"))
-                    })?
+                    .map_err(|err| Error::XmlParse(format!("non-UTF-8 namespace prefix: {err}")))?
                     .to_owned();
                 declared.push((Some(prefix_str), value.clone()));
                 new_layer
@@ -767,11 +772,7 @@ fn extract_source_prefix(name: &[u8]) -> Result<Option<String>, Error> {
 /// For *element* names, an unprefixed name binds to the default namespace
 /// (if any). For *attribute* names, an unprefixed name has no namespace
 /// regardless of the default declaration (XML Namespaces 1.0 §6.2).
-fn resolve_qname(
-    name: &[u8],
-    ns_stack: &[NsLayer],
-    is_attribute: bool,
-) -> Result<QName, Error> {
+fn resolve_qname(name: &[u8], ns_stack: &[NsLayer], is_attribute: bool) -> Result<QName, Error> {
     let q = QxQName(name);
     let (local, prefix) = q.decompose();
     let local_str = std::str::from_utf8(local.as_ref())
@@ -1032,6 +1033,9 @@ mod tests {
         // Resolving each element's own ID should give back the same element.
         assert_eq!(doc.element(c.id()).unwrap().qname().local(), "c");
         assert_eq!(doc.element(b.id()).unwrap().qname().local(), "b");
-        assert_eq!(doc.element(doc.root().id()).unwrap().qname().local(), "root");
+        assert_eq!(
+            doc.element(doc.root().id()).unwrap().qname().local(),
+            "root"
+        );
     }
 }

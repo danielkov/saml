@@ -164,20 +164,14 @@ impl SpsFile {
                 tracing::info!(sp = %sp.entity_id, env = %key, "overriding metadata_url via env");
                 sp.metadata_url = v;
             }
-            let acs_key = format!(
-                "SAML_IDP_SP_{}_ACS_URL",
-                sanitize_env_key(&sp.entity_id),
-            );
+            let acs_key = format!("SAML_IDP_SP_{}_ACS_URL", sanitize_env_key(&sp.entity_id),);
             if let Ok(v) = std::env::var(&acs_key)
                 && !v.is_empty()
             {
                 tracing::info!(sp = %sp.entity_id, env = %acs_key, "overriding acs_url via env");
                 sp.acs_url = v;
             }
-            let slo_key = format!(
-                "SAML_IDP_SP_{}_SLO_URL",
-                sanitize_env_key(&sp.entity_id),
-            );
+            let slo_key = format!("SAML_IDP_SP_{}_SLO_URL", sanitize_env_key(&sp.entity_id),);
             if let Ok(v) = std::env::var(&slo_key)
                 && !v.is_empty()
             {
@@ -552,7 +546,9 @@ pub async fn fetch_all_sps(file: &SpsFile) -> Vec<SpEntry> {
 
 /// Best-effort humanization of an SP entity ID for the login screen.
 fn labelize(entity_id: &str) -> String {
-    let trimmed = entity_id.trim_start_matches("https://").trim_start_matches("http://");
+    let trimmed = entity_id
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
     let head = trimmed.split('/').next().unwrap_or(trimmed);
     let parts: Vec<&str> = head.split(['-', '_', '.']).collect();
     let mut out = String::new();
@@ -683,8 +679,8 @@ mod tests {
         };
         let idp = build_identity_provider(&cfg).expect("idp builds");
         let xml = idp.metadata_xml(true).expect("metadata emits");
-        let parsed = saml::IdpDescriptor::from_metadata_xml(xml.as_bytes())
-            .expect("metadata parses");
+        let parsed =
+            saml::IdpDescriptor::from_metadata_xml(xml.as_bytes()).expect("metadata parses");
         assert_eq!(parsed.entity_id, "http://test/idp");
         assert!(!parsed.sso_endpoints.is_empty());
         assert!(!parsed.slo_endpoints.is_empty());

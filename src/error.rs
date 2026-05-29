@@ -102,7 +102,9 @@ pub enum Error {
     /// [`ServiceProvider::consume_response`](crate::sp::ServiceProvider::consume_response)
     /// when a caller-supplied [`ReplayCache`](crate::replay::ReplayCache)
     /// reports the id as previously consumed.
-    #[error("Assertion replay detected: assertion_id was already consumed within its validity window")]
+    #[error(
+        "Assertion replay detected: assertion_id was already consumed within its validity window"
+    )]
     AssertionReplay,
     /// In-memory replay cache hit its hard capacity ceiling. Bigger
     /// capacity, a TTL shorter than the assertion lifetime, or a

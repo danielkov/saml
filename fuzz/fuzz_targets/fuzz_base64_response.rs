@@ -145,8 +145,7 @@ fn build_fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         outbound_data_encryption_algorithm:
             saml::xmlenc::algorithms::DataEncryptionAlgorithm::Aes256Gcm,
         #[cfg(feature = "xmlenc")]
-        outbound_key_transport_algorithm:
-            saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
+        outbound_key_transport_algorithm: saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
     })?;
     let idp_metadata = idp.metadata_xml(false)?;
     let idp_descriptor = IdpDescriptor::from_metadata_xml(idp_metadata.as_bytes())?;

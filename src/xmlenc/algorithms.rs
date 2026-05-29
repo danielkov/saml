@@ -165,8 +165,8 @@ mod tests {
     #[cfg(not(feature = "weak-algos"))]
     #[test]
     fn key_transport_rsa_pkcs1_v15_uri_rejected_without_weak_algos() {
-        let err =
-            KeyTransportAlgorithm::from_uri("http://www.w3.org/2001/04/xmlenc#rsa-1_5").unwrap_err();
+        let err = KeyTransportAlgorithm::from_uri("http://www.w3.org/2001/04/xmlenc#rsa-1_5")
+            .unwrap_err();
         match err {
             Error::DisallowedAlgorithm { alg } => {
                 assert_eq!(alg, "http://www.w3.org/2001/04/xmlenc#rsa-1_5");

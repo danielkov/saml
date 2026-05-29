@@ -370,4 +370,3 @@ fn assertion_subject_before_issuer_rejected() {
         other => panic!("expected SchemaViolation, got {other:?}"),
     }
 }
-

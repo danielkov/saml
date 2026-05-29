@@ -10,11 +10,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::authn_context::{
-    ComparatorOutcome, RequestedAuthnContext, StandardComparator,
-};
 #[cfg(test)]
 use crate::authn_context::{AuthnContextClassRef, AuthnContextComparison};
+use crate::authn_context::{ComparatorOutcome, RequestedAuthnContext, StandardComparator};
 #[cfg(any(test, feature = "xmlenc"))]
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::IdpDescriptor;
@@ -24,8 +22,8 @@ use crate::dsig::verify::{VerifiedSignature, verify_signature};
 use crate::error::Error;
 use crate::response::identity::Identity;
 use crate::response::parse::{
-    AssertionWrapper, ParsedAssertion, ParsedResponse, STATUS_SUCCESS,
-    SUBJECT_CONFIRMATION_BEARER, SubjectConfirmation, parse_assertion,
+    AssertionWrapper, ParsedAssertion, ParsedResponse, STATUS_SUCCESS, SUBJECT_CONFIRMATION_BEARER,
+    SubjectConfirmation, parse_assertion,
 };
 use crate::xml::parse::{Document, Element, ElementId};
 
@@ -155,21 +153,23 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
                     reason: "verified assertion element id not resolvable",
                 })?
                 .clone();
-            (verified.verifying_cert_fingerprint, assertion_elem, None::<Document>)
+            (
+                verified.verifying_cert_fingerprint,
+                assertion_elem,
+                None::<Document>,
+            )
         }
         #[cfg(feature = "xmlenc")]
-        AssertionWrapper::Encrypted(enc_id) => {
-            handle_encrypted(HandleEncryptedParams {
-                document,
-                response_root_id: response_root_element_id,
-                encrypted_assertion_id: *enc_id,
-                idp,
-                policy: peer_crypto_policy,
-                decryption_keys,
-                want_response_signed,
-                want_assertions_signed,
-            })?
-        }
+        AssertionWrapper::Encrypted(enc_id) => handle_encrypted(HandleEncryptedParams {
+            document,
+            response_root_id: response_root_element_id,
+            encrypted_assertion_id: *enc_id,
+            idp,
+            policy: peer_crypto_policy,
+            decryption_keys,
+            want_response_signed,
+            want_assertions_signed,
+        })?,
         #[cfg(not(feature = "xmlenc"))]
         AssertionWrapper::Encrypted(_enc_id) => {
             return Err(Error::InvalidConfiguration {
@@ -201,9 +201,9 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // --- Steps 12/13: time windows on Conditions -----------------------------
     if let Some(nb) = assertion.conditions.not_before {
         // Reject if NotBefore is in the future beyond clock_skew.
-        let now_plus_skew = now.checked_add(clock_skew).ok_or_else(|| {
-            Error::XmlParse("now + clock_skew overflows SystemTime".to_string())
-        })?;
+        let now_plus_skew = now
+            .checked_add(clock_skew)
+            .ok_or_else(|| Error::XmlParse("now + clock_skew overflows SystemTime".to_string()))?;
         if nb > now_plus_skew {
             return Err(Error::NotYetValid);
         }
@@ -211,9 +211,9 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     let conditions_not_on_or_after = assertion.conditions.not_on_or_after.ok_or(
         Error::XmlParse("Conditions missing NotOnOrAfter".to_string()),
     )?;
-    let now_minus_skew = now.checked_sub(clock_skew).ok_or_else(|| {
-        Error::XmlParse("now - clock_skew underflows SystemTime".to_string())
-    })?;
+    let now_minus_skew = now
+        .checked_sub(clock_skew)
+        .ok_or_else(|| Error::XmlParse("now - clock_skew underflows SystemTime".to_string()))?;
     if conditions_not_on_or_after <= now_minus_skew {
         return Err(Error::Expired);
     }
@@ -245,9 +245,10 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
 
     // --- Step 17: AuthnContext non-downgrade ---------------------------------
     if let Some(req) = requested_authn_context {
-        let first = assertion.authn_statements.first().ok_or(
-            Error::AuthnContextDowngrade,
-        )?;
+        let first = assertion
+            .authn_statements
+            .first()
+            .ok_or(Error::AuthnContextDowngrade)?;
         let actual_uri = first
             .authn_context_class_ref
             .as_deref()
@@ -305,10 +306,7 @@ const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 /// placed signature cannot influence the outcome — not even by being silently
 /// ignored.
 fn enforce_signature_positions(document: &Document) -> Result<(), Error> {
-    fn walk(
-        element: &Element,
-        parent: Option<&Element>,
-    ) -> Result<(), Error> {
+    fn walk(element: &Element, parent: Option<&Element>) -> Result<(), Error> {
         if element.qname().namespace() == Some(DS_NS) && element.qname().local() == "Signature" {
             // The implicit `<ds:Signature>` inside another `<ds:Signature>`'s
             // `<ds:KeyInfo>` is not legal SAML; we forbid it too by requiring
@@ -366,11 +364,12 @@ fn verify_response_and_or_assertion(
     let root = document.root();
     let response_signature = root.child_element(Some(DS_NS), "Signature");
 
-    let assertion_elem = document
-        .element(assertion_name_lookup_id)
-        .ok_or(Error::SignatureVerification {
-            reason: "assertion element id not resolvable",
-        })?;
+    let assertion_elem =
+        document
+            .element(assertion_name_lookup_id)
+            .ok_or(Error::SignatureVerification {
+                reason: "assertion element id not resolvable",
+            })?;
     let assertion_signature = assertion_elem.child_element(Some(DS_NS), "Signature");
 
     let verify_response = |sig: &Element| -> Result<VerifiedSignature, Error> {
@@ -409,8 +408,7 @@ fn verify_response_and_or_assertion(
         // prefer its fingerprint for the downstream Identity (the assertion
         // signature is the one that vouches for the user attributes).
         if want_assertions_signed {
-            let averified =
-                verify_assertion(assertion_signature.ok_or(Error::SignatureMissing)?)?;
+            let averified = verify_assertion(assertion_signature.ok_or(Error::SignatureMissing)?)?;
             return Ok((averified, assertion_name_lookup_id));
         }
         // Response-only signature: the Response root covers the assertion as
@@ -565,7 +563,6 @@ fn handle_encrypted(
     Err(Error::SignatureMissing)
 }
 
-
 // =============================================================================
 // SubjectConfirmation + AuthnContext checks
 // =============================================================================
@@ -596,12 +593,12 @@ fn find_valid_bearer_subject_confirmation<'a>(
     // that mismatches on a non-recipient axis so the caller's error code is
     // informative.
     let mut last_err: Option<Error> = None;
-    let now_minus_skew = now.checked_sub(clock_skew).ok_or_else(|| {
-        Error::XmlParse("now - clock_skew underflows SystemTime".to_string())
-    })?;
-    let now_plus_skew = now.checked_add(clock_skew).ok_or_else(|| {
-        Error::XmlParse("now + clock_skew overflows SystemTime".to_string())
-    })?;
+    let now_minus_skew = now
+        .checked_sub(clock_skew)
+        .ok_or_else(|| Error::XmlParse("now - clock_skew underflows SystemTime".to_string()))?;
+    let now_plus_skew = now
+        .checked_add(clock_skew)
+        .ok_or_else(|| Error::XmlParse("now + clock_skew overflows SystemTime".to_string()))?;
     for sc in &bearers {
         // Recipient must match the expected destination.
         match sc.recipient.as_deref() {
@@ -653,10 +650,7 @@ fn find_valid_bearer_subject_confirmation<'a>(
 /// tri-valued [`ComparatorOutcome`] onto the SP pipeline's binary
 /// `Result<(), Error>` surface by collapsing both `NotSatisfied` and
 /// `NotComparable` to [`Error::AuthnContextDowngrade`] (fail-closed).
-fn check_authn_context(
-    requested: &RequestedAuthnContext,
-    actual_uri: &str,
-) -> Result<(), Error> {
+fn check_authn_context(requested: &RequestedAuthnContext, actual_uri: &str) -> Result<(), Error> {
     match StandardComparator.evaluate(requested, actual_uri) {
         ComparatorOutcome::Satisfied => Ok(()),
         ComparatorOutcome::NotSatisfied | ComparatorOutcome::NotComparable => {
@@ -675,9 +669,7 @@ mod tests {
     use crate::binding::Endpoint;
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
-    use crate::dsig::algorithms::{
-        C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm,
-    };
+    use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
     use crate::dsig::sign::{SignOptions, sign_element};
     use crate::nameid::NameIdFormat;
     use crate::response::parse::parse_response;
@@ -763,8 +755,8 @@ mod tests {
                 sc_not_on_or_after.to_owned(),
             );
         if let Some(irt) = in_response_to {
-            scd_builder = scd_builder
-                .with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
+            scd_builder =
+                scd_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
         }
         let scd = scd_builder.finish();
 
@@ -789,10 +781,7 @@ mod tests {
             .finish();
         let conditions = Element::build(saml_qname("Conditions"))
             .with_attribute(QName::new(None, "NotBefore"), not_before.to_owned())
-            .with_attribute(
-                QName::new(None, "NotOnOrAfter"),
-                not_on_or_after.to_owned(),
-            )
+            .with_attribute(QName::new(None, "NotOnOrAfter"), not_on_or_after.to_owned())
             .with_child(Node::Element(restriction))
             .finish();
 
@@ -999,8 +988,8 @@ mod tests {
         let (parsed, _) = parse_response(&doc).expect("parse");
         let idp = fixture_idp();
         let policy = strong_policy();
-        let identity = validate_response(default_input(&doc, parsed, &idp, &policy))
-            .expect("validate");
+        let identity =
+            validate_response(default_input(&doc, parsed, &idp, &policy)).expect("validate");
 
         assert_eq!(identity.assertion_id, "_a1");
         assert_eq!(identity.name_id.value, "alice@example.com");
@@ -1012,7 +1001,10 @@ mod tests {
         );
         // Fingerprint matches the test cert.
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
-        assert_eq!(identity.verifying_cert_fingerprint, cert.fingerprint_sha256());
+        assert_eq!(
+            identity.verifying_cert_fingerprint,
+            cert.fingerprint_sha256()
+        );
     }
 
     #[test]
@@ -1459,8 +1451,7 @@ mod tests {
             .iter()
             .position(|n| match n {
                 Node::Element(e) => {
-                    e.qname().namespace() == Some(SAML_NS)
-                        && e.qname().local() == "Conditions"
+                    e.qname().namespace() == Some(SAML_NS) && e.qname().local() == "Conditions"
                 }
                 _ => false,
             })
@@ -1866,8 +1857,7 @@ mod tests {
             .iter()
             .position(|n| match n {
                 Node::Element(e) => {
-                    e.qname().namespace() == Some(SAML_NS)
-                        && e.qname().local() == "AuthnStatement"
+                    e.qname().namespace() == Some(SAML_NS) && e.qname().local() == "AuthnStatement"
                 }
                 _ => false,
             })
@@ -1880,8 +1870,7 @@ mod tests {
             .iter()
             .position(|n| match n {
                 Node::Element(e) => {
-                    e.qname().namespace() == Some(SAML_NS)
-                        && e.qname().local() == "AuthnContext"
+                    e.qname().namespace() == Some(SAML_NS) && e.qname().local() == "AuthnContext"
                 }
                 _ => false,
             })

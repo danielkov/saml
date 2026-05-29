@@ -54,8 +54,7 @@ impl ParsedLogoutResponse {
         }
         // PartialLogout can appear at top-level (technically wrong per spec
         // but observed in the wild) or as a second-level under Responder.
-        if self.status_code == PARTIAL
-            || self.second_level_status_code.as_deref() == Some(PARTIAL)
+        if self.status_code == PARTIAL || self.second_level_status_code.as_deref() == Some(PARTIAL)
         {
             return LogoutOutcome::PartialLogout {
                 message: self.status_message.clone(),
@@ -195,7 +194,10 @@ mod tests {
             Some("https://sp.example.com/slo")
         );
         assert_eq!(resp.in_response_to, "_req-1");
-        assert_eq!(resp.status_code, "urn:oasis:names:tc:SAML:2.0:status:Success");
+        assert_eq!(
+            resp.status_code,
+            "urn:oasis:names:tc:SAML:2.0:status:Success"
+        );
         assert!(resp.second_level_status_code.is_none());
         assert!(resp.status_message.is_none());
 

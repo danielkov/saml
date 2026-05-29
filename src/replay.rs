@@ -50,11 +50,7 @@ pub trait ReplayCache: Send + Sync {
     /// Returns `Ok(true)` if `assertion_id` was newly inserted; `Ok(false)`
     /// if it was already present (a replay). Errors propagate as
     /// `Error::ReplayCache` from `consume_response`.
-    fn check_and_insert(
-        &self,
-        assertion_id: &str,
-        expires_at: SystemTime,
-    ) -> Result<bool, Error>;
+    fn check_and_insert(&self, assertion_id: &str, expires_at: SystemTime) -> Result<bool, Error>;
 }
 
 /// Default in-memory [`ReplayCache`] implementation backed by a
@@ -167,17 +163,10 @@ pub enum ReplayMode {
 }
 
 impl ReplayCache for InMemoryReplayCache {
-    fn check_and_insert(
-        &self,
-        assertion_id: &str,
-        expires_at: SystemTime,
-    ) -> Result<bool, Error> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_err| Error::ReplayCache {
-                reason: "in-memory replay cache mutex poisoned",
-            })?;
+    fn check_and_insert(&self, assertion_id: &str, expires_at: SystemTime) -> Result<bool, Error> {
+        let mut guard = self.inner.lock().map_err(|_err| Error::ReplayCache {
+            reason: "in-memory replay cache mutex poisoned",
+        })?;
 
         // Lazy sweep: drop any entry whose expires_at is in the past.
         // We compute `now` once and reuse it for both the sweep and the

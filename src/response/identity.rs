@@ -81,7 +81,10 @@ mod tests {
         };
         let cloned = id.clone();
         assert_eq!(cloned.assertion_id, id.assertion_id);
-        assert_eq!(cloned.verifying_cert_fingerprint, id.verifying_cert_fingerprint);
+        assert_eq!(
+            cloned.verifying_cert_fingerprint,
+            id.verifying_cert_fingerprint
+        );
         assert_eq!(cloned.is_one_time_use, id.is_one_time_use);
         // Debug compiles + emits something non-empty.
         let _s = format!("{cloned:?}");

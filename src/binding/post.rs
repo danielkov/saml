@@ -28,11 +28,7 @@ const MAX_BASE64_INPUT_LEN: usize = MAX_DECODED_BYTES
 
 /// Encode an outbound XML payload for the HTTP-POST binding (request side).
 /// `xml` must already contain any enveloped XML-DSig signature.
-pub(crate) fn encode_request(
-    destination: &Url,
-    xml: &[u8],
-    relay_state: Option<&str>,
-) -> Dispatch {
+pub(crate) fn encode_request(destination: &Url, xml: &[u8], relay_state: Option<&str>) -> Dispatch {
     Dispatch::Post(PostForm {
         action: destination.clone(),
         saml_request: Some(BASE64.encode(xml)),

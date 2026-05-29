@@ -169,7 +169,10 @@ impl ProviderIndex {
         let mut by_id: BTreeMap<String, ProviderConfig> = BTreeMap::new();
         for p in &file.provider {
             if by_id.insert(p.id.clone(), p.clone()).is_some() {
-                return Err(format!("duplicate provider id `{}` in providers.toml", p.id));
+                return Err(format!(
+                    "duplicate provider id `{}` in providers.toml",
+                    p.id
+                ));
             }
         }
         Ok(Self { by_id })

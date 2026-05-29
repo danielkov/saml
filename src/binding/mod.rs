@@ -193,11 +193,10 @@ impl SsoResponseEndpoint {
     /// Fallible narrowing from a general `Endpoint`. Used by SP metadata
     /// parsers to reject non-conformant SP descriptors.
     pub fn try_from_endpoint(e: Endpoint) -> Result<Self, Error> {
-        let binding = SsoResponseBinding::from_binding(e.binding).ok_or(
-            Error::InvalidConfiguration {
+        let binding =
+            SsoResponseBinding::from_binding(e.binding).ok_or(Error::InvalidConfiguration {
                 reason: "ACS endpoint binding must be POST or Artifact",
-            },
-        )?;
+            })?;
         Ok(Self {
             url: e.url,
             binding,
@@ -460,10 +459,7 @@ mod tests {
 
     #[test]
     fn sso_response_binding_widen_narrow() {
-        assert_eq!(
-            SsoResponseBinding::HttpPost.as_binding(),
-            Binding::HttpPost
-        );
+        assert_eq!(SsoResponseBinding::HttpPost.as_binding(), Binding::HttpPost);
         assert_eq!(
             SsoResponseBinding::HttpArtifact.as_binding(),
             Binding::HttpArtifact
@@ -476,7 +472,10 @@ mod tests {
             SsoResponseBinding::from_binding(Binding::HttpArtifact),
             Some(SsoResponseBinding::HttpArtifact)
         );
-        assert_eq!(SsoResponseBinding::from_binding(Binding::HttpRedirect), None);
+        assert_eq!(
+            SsoResponseBinding::from_binding(Binding::HttpRedirect),
+            None
+        );
         assert_eq!(SsoResponseBinding::from_binding(Binding::Soap), None);
     }
 

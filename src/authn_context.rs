@@ -226,8 +226,7 @@ impl StandardComparator {
             return ComparatorOutcome::NotComparable;
         };
         // All requested refs that are rankable.
-        let mut requested_strengths =
-            requested.class_refs.iter().filter_map(class_ref_strength);
+        let mut requested_strengths = requested.class_refs.iter().filter_map(class_ref_strength);
         // If every requested ref is Custom/non-rankable, we cannot order at all.
         let Some(first) = requested_strengths.next() else {
             return ComparatorOutcome::NotComparable;
@@ -322,8 +321,14 @@ mod tests {
 
     #[test]
     fn comparison_variants_distinct() {
-        assert_ne!(AuthnContextComparison::Exact, AuthnContextComparison::Minimum);
-        assert_ne!(AuthnContextComparison::Maximum, AuthnContextComparison::Better);
+        assert_ne!(
+            AuthnContextComparison::Exact,
+            AuthnContextComparison::Minimum
+        );
+        assert_ne!(
+            AuthnContextComparison::Maximum,
+            AuthnContextComparison::Better
+        );
     }
 
     #[test]
@@ -430,7 +435,10 @@ mod tests {
         );
         let c = StandardComparator;
         assert_eq!(
-            c.evaluate(&req, AuthnContextClassRef::PasswordProtectedTransport.as_uri()),
+            c.evaluate(
+                &req,
+                AuthnContextClassRef::PasswordProtectedTransport.as_uri()
+            ),
             ComparatorOutcome::Satisfied,
         );
     }
@@ -476,7 +484,10 @@ mod tests {
         );
         let c = StandardComparator;
         assert_eq!(
-            c.evaluate(&req, AuthnContextClassRef::PasswordProtectedTransport.as_uri()),
+            c.evaluate(
+                &req,
+                AuthnContextClassRef::PasswordProtectedTransport.as_uri()
+            ),
             ComparatorOutcome::Satisfied,
         );
     }
@@ -544,7 +555,10 @@ mod tests {
         );
         let c = StandardComparator;
         assert_eq!(
-            c.evaluate(&req, AuthnContextClassRef::PasswordProtectedTransport.as_uri()),
+            c.evaluate(
+                &req,
+                AuthnContextClassRef::PasswordProtectedTransport.as_uri()
+            ),
             ComparatorOutcome::NotSatisfied,
         );
     }
@@ -609,7 +623,9 @@ mod tests {
     fn ordered_comparison_with_only_custom_requested_is_not_comparable() {
         let req = requested(
             AuthnContextComparison::Maximum,
-            &[AuthnContextClassRef::Custom("urn:example:vendor:weak".into())],
+            &[AuthnContextClassRef::Custom(
+                "urn:example:vendor:weak".into(),
+            )],
         );
         let c = StandardComparator;
         assert_eq!(
@@ -632,7 +648,10 @@ mod tests {
         );
         let c = StandardComparator;
         assert_eq!(
-            c.evaluate(&req, AuthnContextClassRef::PasswordProtectedTransport.as_uri()),
+            c.evaluate(
+                &req,
+                AuthnContextClassRef::PasswordProtectedTransport.as_uri()
+            ),
             ComparatorOutcome::Satisfied,
         );
     }

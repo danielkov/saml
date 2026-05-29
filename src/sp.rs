@@ -7,22 +7,18 @@ use std::time::{Duration, SystemTime};
 
 use rand::RngCore as _;
 
-use crate::authn::request_build::{
-    AcsRequest, BuildAuthnRequest, build_authn_request_xml,
-};
+use crate::authn::request_build::{AcsRequest, BuildAuthnRequest, build_authn_request_xml};
 use crate::authn_context::RequestedAuthnContext;
-use crate::binding::{
-    Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseEndpoint,
-};
 use crate::binding::post::encode_request as post_encode_request;
 #[cfg(feature = "slo")]
 use crate::binding::post::{decode as post_decode, encode_response as post_encode_response};
+#[cfg(feature = "slo")]
+use crate::binding::redirect::decode as redirect_decode;
 use crate::binding::redirect::{
     RedirectDirection, encode_signed as redirect_encode_signed,
     encode_unsigned as redirect_encode_unsigned,
 };
-#[cfg(feature = "slo")]
-use crate::binding::redirect::decode as redirect_decode;
+use crate::binding::{Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseEndpoint};
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::IdpDescriptor;
 use crate::dsig::algorithms::{
@@ -35,15 +31,11 @@ use crate::error::Error;
 #[cfg(feature = "slo")]
 use crate::http::{HttpClient, HttpRequest};
 #[cfg(feature = "slo")]
-use crate::logout::request_build::{
-    BuildLogoutRequest, build_logout_request_xml,
-};
+use crate::logout::request_build::{BuildLogoutRequest, build_logout_request_xml};
 #[cfg(feature = "slo")]
 use crate::logout::request_parse::parse_logout_request;
 #[cfg(feature = "slo")]
-use crate::logout::response_build::{
-    BuildLogoutResponse, build_logout_response_xml,
-};
+use crate::logout::response_build::{BuildLogoutResponse, build_logout_response_xml};
 #[cfg(feature = "slo")]
 use crate::logout::response_parse::parse_logout_response;
 #[cfg(feature = "slo")]
@@ -156,9 +148,7 @@ impl ServiceProvider {
         // accept bare identifiers like "example.com" or "saml-sp". Reject
         // only the cases that would actually break downstream Issuer /
         // Audience comparison: empty or whitespace-bearing.
-        if config.entity_id.is_empty()
-            || config.entity_id.chars().any(char::is_whitespace)
-        {
+        if config.entity_id.is_empty() || config.entity_id.chars().any(char::is_whitespace) {
             return Err(Error::InvalidConfiguration {
                 reason: "entity_id must be a non-empty, whitespace-free xs:anyURI",
             });
@@ -168,17 +158,16 @@ impl ServiceProvider {
                 reason: "acs must contain at least one endpoint",
             });
         }
-        let needs_signing_key = config.sign_authn_requests
-            || {
-                #[cfg(feature = "slo")]
-                {
-                    config.logout_signing.sign_requests || config.logout_signing.sign_responses
-                }
-                #[cfg(not(feature = "slo"))]
-                {
-                    false
-                }
-            };
+        let needs_signing_key = config.sign_authn_requests || {
+            #[cfg(feature = "slo")]
+            {
+                config.logout_signing.sign_requests || config.logout_signing.sign_responses
+            }
+            #[cfg(not(feature = "slo"))]
+            {
+                false
+            }
+        };
         if needs_signing_key && config.signing_key.is_none() {
             return Err(Error::InvalidConfiguration {
                 reason: "signing flag enabled but signing_key is None",
@@ -253,11 +242,10 @@ impl ServiceProvider {
             .ok_or(Error::UnsupportedByPeer {
                 binding: opts.binding,
             })?;
-        let destination_url = url::Url::parse(&sso_endpoint.url).map_err(|_err| {
-            Error::InvalidConfiguration {
+        let destination_url =
+            url::Url::parse(&sso_endpoint.url).map_err(|_err| Error::InvalidConfiguration {
                 reason: "IdP SSO endpoint URL is not a valid URL",
-            }
-        })?;
+            })?;
 
         // 2. Fresh request ID: `_<hex16>`.
         let request_id = generate_saml_id();
@@ -597,11 +585,10 @@ impl ServiceProvider {
             .ok_or(Error::UnsupportedByPeer {
                 binding: opts.binding,
             })?;
-        let destination_url = url::Url::parse(&slo_endpoint.url).map_err(|_err| {
-            Error::InvalidConfiguration {
+        let destination_url =
+            url::Url::parse(&slo_endpoint.url).map_err(|_err| Error::InvalidConfiguration {
                 reason: "IdP SLO endpoint URL is not a valid URL",
-            }
-        })?;
+            })?;
 
         let request_id = generate_saml_id();
         let issued_at = SystemTime::now();
@@ -700,7 +687,12 @@ impl ServiceProvider {
         let (parsed, _) = parse_logout_response(&document)?;
 
         // 3. Destination registration check.
-        if !self.config.slo.iter().any(|e| e.url == expected_destination) {
+        if !self
+            .config
+            .slo
+            .iter()
+            .any(|e| e.url == expected_destination)
+        {
             return Err(Error::InvalidConfiguration {
                 reason: "expected_destination is not a registered SLO URL",
             });
@@ -773,7 +765,12 @@ impl ServiceProvider {
         parsed.relay_state.clone_from(&decoded.relay_state);
 
         // Destination registration check.
-        if !self.config.slo.iter().any(|e| e.url == expected_destination) {
+        if !self
+            .config
+            .slo
+            .iter()
+            .any(|e| e.url == expected_destination)
+        {
             return Err(Error::InvalidConfiguration {
                 reason: "expected_destination is not a registered SLO URL",
             });
@@ -807,8 +804,12 @@ impl ServiceProvider {
         // leave `parsed.name_id` untouched.
         #[cfg(feature = "xmlenc")]
         {
-            let decryption_keys: Vec<&KeyPair> =
-                self.config.decryption_key.as_ref().map(|k| vec![k]).unwrap_or_default();
+            let decryption_keys: Vec<&KeyPair> = self
+                .config
+                .decryption_key
+                .as_ref()
+                .map(|k| vec![k])
+                .unwrap_or_default();
             if let Some(name_id) = crate::logout::request_parse::decrypt_encrypted_name_id(
                 &document,
                 &decryption_keys,
@@ -841,11 +842,10 @@ impl ServiceProvider {
         let slo_endpoint = idp
             .slo_endpoint(binding)
             .ok_or(Error::UnsupportedByPeer { binding })?;
-        let destination_url = url::Url::parse(&slo_endpoint.url).map_err(|_err| {
-            Error::InvalidConfiguration {
+        let destination_url =
+            url::Url::parse(&slo_endpoint.url).map_err(|_err| Error::InvalidConfiguration {
                 reason: "IdP SLO endpoint URL is not a valid URL",
-            }
-        })?;
+            })?;
 
         let response_id = generate_saml_id();
         let issue_instant = SystemTime::now();
@@ -937,9 +937,8 @@ impl ServiceProvider {
         };
 
         // Wrap in a SOAP envelope.
-        let logout_request_str = std::str::from_utf8(&logout_request_xml).map_err(|_err| {
-            Error::XmlEmit("logout request XML is not UTF-8".to_string())
-        })?;
+        let logout_request_str = std::str::from_utf8(&logout_request_xml)
+            .map_err(|_err| Error::XmlEmit("logout request XML is not UTF-8".to_string()))?;
         let soap_envelope = format!(
             "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
 <soap:Body>{logout_request_str}</soap:Body>\
@@ -993,10 +992,7 @@ impl ServiceProvider {
         if self.config.logout_want_signed.responses {
             let sig = inner_doc
                 .root()
-                .child_element(
-                    Some("http://www.w3.org/2000/09/xmldsig#"),
-                    "Signature",
-                )
+                .child_element(Some("http://www.w3.org/2000/09/xmldsig#"), "Signature")
                 .ok_or(Error::SignatureMissing)?;
             let verified = verify_signature(
                 &inner_doc,
@@ -1009,10 +1005,10 @@ impl ServiceProvider {
                     reason: "signature does not cover LogoutResponse root",
                 });
             }
-        } else if let Some(sig) = inner_doc.root().child_element(
-            Some("http://www.w3.org/2000/09/xmldsig#"),
-            "Signature",
-        ) {
+        } else if let Some(sig) = inner_doc
+            .root()
+            .child_element(Some("http://www.w3.org/2000/09/xmldsig#"), "Signature")
+        {
             // Signature present but not required: still verify if present.
             let _ = verify_signature(
                 &inner_doc,
@@ -1046,11 +1042,7 @@ impl ServiceProvider {
         self.emit_metadata(sign, Some(extras))
     }
 
-    fn emit_metadata(
-        &self,
-        sign: bool,
-        extras: Option<&MetadataExtras>,
-    ) -> Result<String, Error> {
+    fn emit_metadata(&self, sign: bool, extras: Option<&MetadataExtras>) -> Result<String, Error> {
         // Cert material from the keypair (if any).
         let signing_cert = self
             .config
@@ -1238,14 +1230,9 @@ fn decode_logout_wire(
                 "LogoutResponse"
             };
             let inner = envelope
-                .find_first(
-                    Some("urn:oasis:names:tc:SAML:2.0:protocol"),
-                    inner_local,
-                )
+                .find_first(Some("urn:oasis:names:tc:SAML:2.0:protocol"), inner_local)
                 .ok_or_else(|| {
-                    Error::XmlParse(format!(
-                        "SOAP envelope contained no <samlp:{inner_local}>"
-                    ))
+                    Error::XmlParse(format!("SOAP envelope contained no <samlp:{inner_local}>"))
                 })?;
             let xml = crate::xml::emit::emit_element(inner)?.into_bytes();
             Ok(DecodedSlo {
@@ -1273,7 +1260,11 @@ fn verify_inbound_signature(
 ) -> Result<(), Error> {
     match binding {
         Binding::HttpRedirect => {
-            match (&decoded.signed_query_string, &decoded.detached_signature, &decoded.detached_sig_alg) {
+            match (
+                &decoded.signed_query_string,
+                &decoded.detached_signature,
+                &decoded.detached_sig_alg,
+            ) {
                 (Some(qs), Some(sig), Some(alg)) => {
                     let sig_alg = SignatureAlgorithm::from_uri(alg)?;
                     verify_detached_signature(
@@ -1336,8 +1327,8 @@ mod tests {
     #[cfg(feature = "slo")]
     use crate::nameid::NameId;
     use crate::nameid::NameIdFormat;
-    use crate::response::SAMLP_NS as RESPONSE_SAMLP_NS;
     use crate::response::SAML_NS as RESPONSE_SAML_NS;
+    use crate::response::SAMLP_NS as RESPONSE_SAMLP_NS;
     use crate::response::parse::SUBJECT_CONFIRMATION_BEARER as RESPONSE_SUBJECT_CONFIRMATION_BEARER;
     use crate::xml::emit::emit_document;
     use crate::xml::parse::{Document, Element, Node, QName};
@@ -1505,7 +1496,10 @@ mod tests {
         assert!(result.tracker.request_id.starts_with('_'));
         assert!(result.tracker.request_id.len() > 1);
         assert_eq!(result.tracker.idp_entity_id, "https://idp.example.com");
-        assert_eq!(result.tracker.acs_endpoint.url, "https://sp.example.com/acs");
+        assert_eq!(
+            result.tracker.acs_endpoint.url,
+            "https://sp.example.com/acs"
+        );
         assert_eq!(
             result.tracker.acs_endpoint.binding,
             SsoResponseBinding::HttpPost
@@ -1840,11 +1834,18 @@ mod tests {
         let samlp_ns = RESPONSE_SAMLP_NS;
         let bearer = RESPONSE_SUBJECT_CONFIRMATION_BEARER;
 
-        let mut scd_builder = Element::build(QName::new(Some(saml_ns.to_owned()), "SubjectConfirmationData"))
-            .with_attribute(QName::new(None, "Recipient"), recipient_url.to_owned())
-            .with_attribute(QName::new(None, "NotOnOrAfter"), "2026-05-26T12:05:00Z".to_owned());
+        let mut scd_builder = Element::build(QName::new(
+            Some(saml_ns.to_owned()),
+            "SubjectConfirmationData",
+        ))
+        .with_attribute(QName::new(None, "Recipient"), recipient_url.to_owned())
+        .with_attribute(
+            QName::new(None, "NotOnOrAfter"),
+            "2026-05-26T12:05:00Z".to_owned(),
+        );
         if let Some(irt) = in_response_to {
-            scd_builder = scd_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
+            scd_builder =
+                scd_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
         }
         let scd = scd_builder.finish();
         let sc = Element::build(QName::new(Some(saml_ns.to_owned()), "SubjectConfirmation"))
@@ -1866,17 +1867,14 @@ mod tests {
         let aud_el = Element::build(QName::new(Some(saml_ns.to_owned()), "Audience"))
             .with_text(audience)
             .finish();
-        let aud_restr =
-            Element::build(QName::new(Some(saml_ns.to_owned()), "AudienceRestriction"))
-                .with_child(Node::Element(aud_el))
-                .finish();
-        let mut conditions_builder = Element::build(QName::new(Some(saml_ns.to_owned()), "Conditions"))
-            .with_attribute(QName::new(None, "NotBefore"), not_before.to_owned())
-            .with_attribute(
-                QName::new(None, "NotOnOrAfter"),
-                not_on_or_after.to_owned(),
-            )
-            .with_child(Node::Element(aud_restr));
+        let aud_restr = Element::build(QName::new(Some(saml_ns.to_owned()), "AudienceRestriction"))
+            .with_child(Node::Element(aud_el))
+            .finish();
+        let mut conditions_builder =
+            Element::build(QName::new(Some(saml_ns.to_owned()), "Conditions"))
+                .with_attribute(QName::new(None, "NotBefore"), not_before.to_owned())
+                .with_attribute(QName::new(None, "NotOnOrAfter"), not_on_or_after.to_owned())
+                .with_child(Node::Element(aud_restr));
         if one_time_use {
             let one_time_use_el =
                 Element::build(QName::new(Some(saml_ns.to_owned()), "OneTimeUse")).finish();
@@ -1897,10 +1895,9 @@ mod tests {
             .with_child(Node::Element(actx))
             .finish();
 
-        let assertion_issuer =
-            Element::build(QName::new(Some(saml_ns.to_owned()), "Issuer"))
-                .with_text("https://idp.example.com")
-                .finish();
+        let assertion_issuer = Element::build(QName::new(Some(saml_ns.to_owned()), "Issuer"))
+            .with_text("https://idp.example.com")
+            .finish();
         let assertion = Element::build(QName::new(Some(saml_ns.to_owned()), "Assertion"))
             .with_namespace(Some("saml".to_owned()), saml_ns)
             .with_attribute(QName::new(None, "ID"), assertion_id.to_owned())
@@ -1941,14 +1938,13 @@ mod tests {
         let response_issuer = Element::build(QName::new(Some(saml_ns.to_owned()), "Issuer"))
             .with_text("https://idp.example.com")
             .finish();
-        let mut response =
-            Element::build(QName::new(Some(samlp_ns.to_owned()), "Response"))
-                .with_namespace(Some("samlp".to_owned()), samlp_ns)
-                .with_namespace(Some("saml".to_owned()), saml_ns)
-                .with_attribute(QName::new(None, "ID"), "_resp1".to_owned())
-                .with_attribute(QName::new(None, "Version"), "2.0")
-                .with_attribute(QName::new(None, "IssueInstant"), "2026-05-26T12:00:00Z")
-                .with_attribute(QName::new(None, "Destination"), recipient_url.to_owned());
+        let mut response = Element::build(QName::new(Some(samlp_ns.to_owned()), "Response"))
+            .with_namespace(Some("samlp".to_owned()), samlp_ns)
+            .with_namespace(Some("saml".to_owned()), saml_ns)
+            .with_attribute(QName::new(None, "ID"), "_resp1".to_owned())
+            .with_attribute(QName::new(None, "Version"), "2.0")
+            .with_attribute(QName::new(None, "IssueInstant"), "2026-05-26T12:00:00Z")
+            .with_attribute(QName::new(None, "Destination"), recipient_url.to_owned());
         if let Some(irt) = in_response_to {
             response = response.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
         }
@@ -2278,7 +2274,11 @@ mod tests {
             .expect("first consume succeeds");
         assert_eq!(first.assertion_id, "_a-otu-skip");
         assert!(!first.is_one_time_use);
-        assert_eq!(cache.len(), 0, "non-OneTimeUse assertion bypasses the cache");
+        assert_eq!(
+            cache.len(),
+            0,
+            "non-OneTimeUse assertion bypasses the cache"
+        );
 
         // Second consume of the same assertion succeeds: not OneTimeUse, so
         // OneTimeUseOnly mode never offered it to the cache.
@@ -2347,7 +2347,11 @@ mod tests {
             })
             .expect("first OneTimeUse consume succeeds");
         assert!(first.is_one_time_use);
-        assert_eq!(cache.len(), 1, "OneTimeUse assertion was offered to the cache");
+        assert_eq!(
+            cache.len(),
+            1,
+            "OneTimeUse assertion was offered to the cache"
+        );
 
         let err = sp
             .consume_response(ConsumeResponse {
@@ -2574,10 +2578,7 @@ mod tests {
             issued_at: fixed_now(),
             peer_entity_id: idp.entity_id.clone(),
         };
-        let body = build_logout_response_post_form(
-            "_wrong",
-            "https://sp.example.com/slo/post",
-        );
+        let body = build_logout_response_post_form("_wrong", "https://sp.example.com/slo/post");
 
         let err = sp
             .consume_logout_response(
@@ -2725,8 +2726,8 @@ mod tests {
         let sp = ServiceProvider::new(cfg).unwrap();
 
         let xml = sp.metadata_xml(false).expect("metadata_xml");
-        let descriptor = crate::descriptor::SpDescriptor::from_metadata_xml(xml.as_bytes())
-            .expect("reparse");
+        let descriptor =
+            crate::descriptor::SpDescriptor::from_metadata_xml(xml.as_bytes()).expect("reparse");
         assert_eq!(descriptor.entity_id, "https://sp.example.com");
         assert_eq!(descriptor.assertion_consumer_services.len(), 1);
         assert_eq!(
@@ -2774,12 +2775,8 @@ mod tests {
         let doc = Document::parse(xml.as_bytes()).expect("parse");
         let org = doc
             .root()
-            .child_element(
-                Some("urn:oasis:names:tc:SAML:2.0:metadata"),
-                "Organization",
-            )
+            .child_element(Some("urn:oasis:names:tc:SAML:2.0:metadata"), "Organization")
             .expect("Organization");
         let _ = org;
     }
-
 }

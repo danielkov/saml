@@ -75,7 +75,7 @@ impl AllowedTransform {
         }
     }
 
-/// Map a transform to its corresponding [`C14nAlgorithm`], if any. The
+    /// Map a transform to its corresponding [`C14nAlgorithm`], if any. The
     /// enveloped-signature transform has no canonicalization counterpart and
     /// returns `None`.
     pub(crate) fn as_c14n_algorithm(self) -> Option<C14nAlgorithm> {
@@ -131,11 +131,11 @@ pub(crate) fn parse_reference(
 
     if let Some(transforms_elem) = reference.child_element(Some(DS_NS), "Transforms") {
         for transform_elem in transforms_elem.all_child_elements(Some(DS_NS), "Transform") {
-            let alg_uri = transform_elem
-                .attribute(None, "Algorithm")
-                .ok_or_else(|| Error::DisallowedTransform {
+            let alg_uri = transform_elem.attribute(None, "Algorithm").ok_or_else(|| {
+                Error::DisallowedTransform {
                     transform: String::new(),
-                })?;
+                }
+            })?;
             let kind = AllowedTransform::from_uri(alg_uri)?;
             transforms.push(kind);
 
@@ -177,25 +177,25 @@ pub(crate) fn parse_reference(
     }
 
     // ---- <ds:DigestMethod> -------------------------------------------------
-    let digest_method = reference
-        .child_element(Some(DS_NS), "DigestMethod")
-        .ok_or(Error::SignatureVerification {
+    let digest_method = reference.child_element(Some(DS_NS), "DigestMethod").ok_or(
+        Error::SignatureVerification {
             reason: "Reference missing DigestMethod",
-        })?;
-    let digest_alg_uri = digest_method
-        .attribute(None, "Algorithm")
-        .ok_or(Error::SignatureVerification {
-            reason: "DigestMethod missing Algorithm",
-        })?;
+        },
+    )?;
+    let digest_alg_uri =
+        digest_method
+            .attribute(None, "Algorithm")
+            .ok_or(Error::SignatureVerification {
+                reason: "DigestMethod missing Algorithm",
+            })?;
     let digest_algorithm = DigestAlgorithm::from_uri(digest_alg_uri)?;
 
     // ---- <ds:DigestValue> --------------------------------------------------
-    let digest_value_elem =
-        reference
-            .child_element(Some(DS_NS), "DigestValue")
-            .ok_or(Error::SignatureVerification {
-                reason: "Reference missing DigestValue",
-            })?;
+    let digest_value_elem = reference.child_element(Some(DS_NS), "DigestValue").ok_or(
+        Error::SignatureVerification {
+            reason: "Reference missing DigestValue",
+        },
+    )?;
     let digest_text = digest_value_elem.text_content();
     let digest_value = decode_base64_lenient(&digest_text)?;
 
@@ -339,10 +339,7 @@ pub(crate) fn compute_reference_digest(
 /// Implementation: walks the `paths` index — every `ElementId` resolves to a
 /// sequence of child-indices from the root. Walking all but the last index
 /// yields the parent chain.
-pub(crate) fn ancestor_chain(
-    document: &Document,
-    target: ElementId,
-) -> Option<Vec<&Element>> {
+pub(crate) fn ancestor_chain(document: &Document, target: ElementId) -> Option<Vec<&Element>> {
     let path = document.paths.get(target.0 as usize)?;
     let mut chain: Vec<&Element> = Vec::with_capacity(path.len());
     let mut current: &Element = &document.root;
@@ -443,8 +440,8 @@ mod tests {
 
     #[test]
     fn from_uri_rejects_xpath() {
-        let err = AllowedTransform::from_uri("http://www.w3.org/TR/1999/REC-xpath-19991116")
-            .unwrap_err();
+        let err =
+            AllowedTransform::from_uri("http://www.w3.org/TR/1999/REC-xpath-19991116").unwrap_err();
         assert!(matches!(err, Error::DisallowedTransform { .. }));
     }
 
@@ -657,14 +654,8 @@ mod tests {
         // the test's expected digest is computed by the same c14n path.
         let target = doc.root();
         let chain = ancestor_chain(&doc, target.id()).unwrap();
-        let bytes = canonicalize(
-            &doc,
-            target,
-            &chain,
-            C14nAlgorithm::ExclusiveCanonical,
-            &[],
-        )
-        .unwrap();
+        let bytes =
+            canonicalize(&doc, target, &chain, C14nAlgorithm::ExclusiveCanonical, &[]).unwrap();
         let expected_digest = DigestAlgorithm::Sha256.digest(&bytes);
 
         let parsed = ParsedReference {

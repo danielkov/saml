@@ -122,11 +122,10 @@ impl KeyPair {
         let pem_str = str::from_utf8(pem).map_err(|_e| Error::InvalidConfiguration {
             reason: "private key PEM is not valid UTF-8",
         })?;
-        let key = RsaPrivateKey::from_pkcs1_pem(pem_str).map_err(|_e| {
-            Error::InvalidConfiguration {
+        let key =
+            RsaPrivateKey::from_pkcs1_pem(pem_str).map_err(|_e| Error::InvalidConfiguration {
                 reason: "PKCS#1 PEM parse failed",
-            }
-        })?;
+            })?;
         Self::from_rsa_private_key(key)
     }
 
@@ -151,12 +150,12 @@ impl KeyPair {
         // keeps `PublicKey` construction in one place (cert.rs) and avoids
         // duplicating OID-handling logic here.
         use rsa::pkcs8::EncodePublicKey as _;
-        let pub_der = key
-            .to_public_key()
-            .to_public_key_der()
-            .map_err(|_e| Error::InvalidConfiguration {
-                reason: "failed to derive public key from RSA private key",
-            })?;
+        let pub_der =
+            key.to_public_key()
+                .to_public_key_der()
+                .map_err(|_e| Error::InvalidConfiguration {
+                    reason: "failed to derive public key from RSA private key",
+                })?;
         let public_key = PublicKey::from_spki_der(pub_der.as_bytes())?;
         Ok(Self {
             inner: KeyPairInner::Rsa(RsaSecret { key }),
@@ -168,11 +167,11 @@ impl KeyPair {
     fn from_p256_signing_key(key: p256::ecdsa::SigningKey) -> Result<Self, Error> {
         use p256::pkcs8::EncodePublicKey as _;
         let vk = key.verifying_key();
-        let pub_der =
-            vk.to_public_key_der()
-                .map_err(|_e| Error::InvalidConfiguration {
-                    reason: "failed to derive P-256 public key",
-                })?;
+        let pub_der = vk
+            .to_public_key_der()
+            .map_err(|_e| Error::InvalidConfiguration {
+                reason: "failed to derive P-256 public key",
+            })?;
         let public_key = PublicKey::from_spki_der(pub_der.as_bytes())?;
         Ok(Self {
             inner: KeyPairInner::EcdsaP256(P256Secret { key }),
@@ -184,11 +183,11 @@ impl KeyPair {
     fn from_p384_signing_key(key: p384::ecdsa::SigningKey) -> Result<Self, Error> {
         use p384::pkcs8::EncodePublicKey as _;
         let vk = key.verifying_key();
-        let pub_der =
-            vk.to_public_key_der()
-                .map_err(|_e| Error::InvalidConfiguration {
-                    reason: "failed to derive P-384 public key",
-                })?;
+        let pub_der = vk
+            .to_public_key_der()
+            .map_err(|_e| Error::InvalidConfiguration {
+                reason: "failed to derive P-384 public key",
+            })?;
         let public_key = PublicKey::from_spki_der(pub_der.as_bytes())?;
         Ok(Self {
             inner: KeyPairInner::EcdsaP384(P384Secret { key }),
@@ -469,8 +468,7 @@ mod tests {
 
     #[test]
     fn bad_pem_returns_invalid_config_error() {
-        let err =
-            KeyPair::from_pkcs8_pem(b"not a pem at all").expect_err("should reject garbage");
+        let err = KeyPair::from_pkcs8_pem(b"not a pem at all").expect_err("should reject garbage");
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 }

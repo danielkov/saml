@@ -14,7 +14,11 @@
 //! - SP calls `consume_response_artifact(http, ...)` which fetches via SOAP
 //!   and validates the recovered Response.
 
-#![cfg(all(feature = "artifact-binding", feature = "weak-algos", feature = "xmlenc"))]
+#![cfg(all(
+    feature = "artifact-binding",
+    feature = "weak-algos",
+    feature = "xmlenc"
+))]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -30,7 +34,9 @@ use saml::binding::{
     Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint,
 };
 use saml::descriptor::{IdpDescriptor, SpDescriptor};
-use saml::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
+use saml::dsig::algorithms::{
+    C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
+};
 use saml::http::{HttpClient, HttpRequest, HttpResponse};
 use saml::idp::{ConsumeAuthnRequest, IdentityProvider, IdentityProviderConfig, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
@@ -118,8 +124,8 @@ impl HttpClient for ArtifactResolutionService<'_> {
     fn send(
         &self,
         request: HttpRequest,
-    ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>>
-           + Send {
+    ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
+    {
         let parsed = self
             .idp
             .parse_artifact_resolve(self.sp_descriptor, &request.body)
@@ -140,9 +146,8 @@ impl HttpClient for ArtifactResolutionService<'_> {
         });
 
         async move {
-            let envelope = idp_response.map_err(|s| -> Box<dyn std::error::Error + Send + Sync> {
-                s.into()
-            })?;
+            let envelope = idp_response
+                .map_err(|s| -> Box<dyn std::error::Error + Send + Sync> { s.into() })?;
             Ok(HttpResponse {
                 status: 200,
                 headers: vec![("Content-Type".to_owned(), "text/xml".to_owned())],

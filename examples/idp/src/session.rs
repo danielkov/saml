@@ -81,7 +81,9 @@ pub fn encode(session: &Session, key: &[u8]) -> Result<String, SessionError> {
 }
 
 pub fn decode(cookie_value: &str, key: &[u8], now_unix: u64) -> Result<Session, SessionError> {
-    let (payload_b64, tag_b64) = cookie_value.split_once('.').ok_or(SessionError::Malformed)?;
+    let (payload_b64, tag_b64) = cookie_value
+        .split_once('.')
+        .ok_or(SessionError::Malformed)?;
 
     let mut mac = HmacSha256::new_from_slice(key).map_err(|_| SessionError::BadSignature)?;
     mac.update(payload_b64.as_bytes());
@@ -92,7 +94,9 @@ pub fn decode(cookie_value: &str, key: &[u8], now_unix: u64) -> Result<Session, 
         return Err(SessionError::BadSignature);
     }
 
-    let payload = B64.decode(payload_b64).map_err(|_| SessionError::Malformed)?;
+    let payload = B64
+        .decode(payload_b64)
+        .map_err(|_| SessionError::Malformed)?;
     let session: Session =
         serde_json::from_slice(&payload).map_err(|_| SessionError::BadPayload)?;
 

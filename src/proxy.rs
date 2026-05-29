@@ -6,8 +6,8 @@
 
 use std::time::{Duration, SystemTime};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
@@ -138,15 +138,15 @@ impl Aes256GcmCodec {
 
 impl ProxyContextCodec for Aes256GcmCodec {
     fn encode(&self, context: &ProxyContext) -> Result<String, Error> {
-        let plaintext = bincode::serialize(context).map_err(|_err| Error::InvalidConfiguration {
-            reason: "proxy context serialize",
-        })?;
+        let plaintext =
+            bincode::serialize(context).map_err(|_err| Error::InvalidConfiguration {
+                reason: "proxy context serialize",
+            })?;
 
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_err| {
-            Error::InvalidConfiguration {
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_err| Error::InvalidConfiguration {
                 reason: "AES-256-GCM key size mismatch",
-            }
-        })?;
+            })?;
 
         // Random 12-byte nonce.
         let mut nonce_bytes = [0u8; 12];
@@ -172,11 +172,12 @@ impl ProxyContextCodec for Aes256GcmCodec {
     }
 
     fn decode(&self, blob: &str) -> Result<ProxyContext, Error> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(blob.as_bytes())
-            .map_err(|_err| Error::DecryptFailed {
-                reason: "proxy context",
-            })?;
+        let bytes =
+            URL_SAFE_NO_PAD
+                .decode(blob.as_bytes())
+                .map_err(|_err| Error::DecryptFailed {
+                    reason: "proxy context",
+                })?;
         if bytes.len() < 12 + 16 {
             return Err(Error::DecryptFailed {
                 reason: "proxy context",
@@ -184,11 +185,10 @@ impl ProxyContextCodec for Aes256GcmCodec {
         }
         let (nonce_bytes, ct_with_tag) = bytes.split_at(12);
 
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_err| {
-            Error::InvalidConfiguration {
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_err| Error::InvalidConfiguration {
                 reason: "AES-256-GCM key size mismatch",
-            }
-        })?;
+            })?;
         let plaintext = cipher
             .decrypt(
                 aes_gcm::Nonce::from_slice(nonce_bytes),
@@ -250,12 +250,9 @@ impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
     }
 
     fn decode(&self, blob: &str) -> Result<ProxyContext, Error> {
-        let ctx = self
-            .store
-            .take(blob)?
-            .ok_or(Error::InvalidConfiguration {
-                reason: "proxy context not found (expired or replay)",
-            })?;
+        let ctx = self.store.take(blob)?.ok_or(Error::InvalidConfiguration {
+            reason: "proxy context not found (expired or replay)",
+        })?;
         Ok(ctx)
     }
 }
@@ -308,10 +305,7 @@ impl Proxy<'_> {
     /// Build an upstream AuthnRequest from the downstream one, stash the
     /// downstream-round-trip state in `RelayState`, and return the dispatch.
     /// See RFC-005 §4.1.
-    pub fn bounce_to_upstream(
-        &self,
-        input: BounceToUpstream<'_>,
-    ) -> Result<BounceResult, Error> {
+    pub fn bounce_to_upstream(&self, input: BounceToUpstream<'_>) -> Result<BounceResult, Error> {
         let downstream = input.downstream_request;
 
         // 1. Build StartLogin honoring propagate flags.
@@ -404,10 +398,9 @@ impl Proxy<'_> {
         }
 
         // 2. Attribute release.
-        let attributes = input.attribute_release.release(
-            &input.upstream_identity.attributes,
-            input.downstream_sp,
-        );
+        let attributes = input
+            .attribute_release
+            .release(&input.upstream_identity.attributes, input.downstream_sp);
 
         // 3. NameID transformation.
         let downstream_name_id = input.name_id_transform.transform(
@@ -433,9 +426,8 @@ impl Proxy<'_> {
         // 5. Build a synthetic ParsedAuthnRequest from the proxy context.
         //    The `assertion_consumer_service` field is type-narrowed to
         //    `SsoResponseEndpoint`; narrow the stashed `Endpoint` accordingly.
-        let acs_endpoint = SsoResponseEndpoint::try_from_endpoint(
-            input.context.downstream_acs.clone(),
-        )?;
+        let acs_endpoint =
+            SsoResponseEndpoint::try_from_endpoint(input.context.downstream_acs.clone())?;
         let protocol_binding = Some(acs_endpoint.binding);
         let synthetic = ParsedAuthnRequest {
             id: input.context.downstream_request_id.clone(),
@@ -454,12 +446,13 @@ impl Proxy<'_> {
 
         // 6. Hand off to the IdP role for `<samlp:Response>` issuance.
         let session_index = make_session_index();
-        let session_not_on_or_after = input
-            .now
-            .checked_add(input.session_lifetime)
-            .ok_or(Error::InvalidConfiguration {
-                reason: "session_not_on_or_after overflow",
-            })?;
+        let session_not_on_or_after =
+            input
+                .now
+                .checked_add(input.session_lifetime)
+                .ok_or(Error::InvalidConfiguration {
+                    reason: "session_not_on_or_after overflow",
+                })?;
         self.idp.issue_response(IssueResponse {
             sp: input.downstream_sp,
             in_response_to: &synthetic,
@@ -491,8 +484,8 @@ fn inject_relay_state(dispatch: Dispatch, relay_state: &str) -> Dispatch {
         Dispatch::Redirect(mut url) => {
             // Use `url::form_urlencoded` to percent-encode the value
             // consistently with the binding layer.
-            let encoded = url::form_urlencoded::byte_serialize(relay_state.as_bytes())
-                .collect::<String>();
+            let encoded =
+                url::form_urlencoded::byte_serialize(relay_state.as_bytes()).collect::<String>();
             // Splice `RelayState=<encoded>` into the existing query. The
             // SP-emitted query never carries RelayState (we passed None), so
             // a plain append is safe.
@@ -535,11 +528,7 @@ fn hex_nibble(nibble: u8) -> char {
 
 /// Filter / rewrite upstream attributes for a given downstream SP.
 pub trait AttributeReleasePolicy: Send + Sync {
-    fn release(
-        &self,
-        upstream: &[Attribute],
-        downstream_sp: &SpDescriptor,
-    ) -> Vec<Attribute>;
+    fn release(&self, upstream: &[Attribute], downstream_sp: &SpDescriptor) -> Vec<Attribute>;
 }
 
 /// Release nothing — safest default.
@@ -674,13 +663,12 @@ impl NameIdTransform for NameIdFromAttribute {
         upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
     ) -> Result<NameId, Error> {
-        let attr =
-            upstream_attributes
-                .iter()
-                .find(|a| a.name == self.attribute_name)
-                .ok_or(Error::InvalidConfiguration {
-                    reason: "NameIdFromAttribute: named attribute not present",
-                })?;
+        let attr = upstream_attributes
+            .iter()
+            .find(|a| a.name == self.attribute_name)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "NameIdFromAttribute: named attribute not present",
+            })?;
         let value = attr
             .values
             .first()
@@ -790,10 +778,7 @@ pub enum FrontChannelState {
 impl FrontChannelChain {
     /// Build the LogoutRequest for the first target (Redirect binding).
     /// Empty `targets` collapses immediately to `Done { outcomes: [] }`.
-    pub fn start(
-        idp: &IdentityProvider,
-        targets: Vec<FrontChannelTarget>,
-    ) -> Result<Self, Error> {
+    pub fn start(idp: &IdentityProvider, targets: Vec<FrontChannelTarget>) -> Result<Self, Error> {
         if targets.is_empty() {
             return Ok(Self {
                 targets,
@@ -847,14 +832,14 @@ impl FrontChannelChain {
         let target = self.targets.get(index).ok_or(Error::InvalidConfiguration {
             reason: "FrontChannelChain: target index out of range",
         })?;
-        let expected_destination = idp
-            .config()
-            .slo
-            .first()
-            .map(|e| e.url.clone())
-            .ok_or(Error::InvalidConfiguration {
-                reason: "FrontChannelChain: IdP has no SLO endpoint",
-            })?;
+        let expected_destination =
+            idp.config()
+                .slo
+                .first()
+                .map(|e| e.url.clone())
+                .ok_or(Error::InvalidConfiguration {
+                    reason: "FrontChannelChain: IdP has no SLO endpoint",
+                })?;
 
         // Record this target's outcome (errors collapse to an `Err` so the
         // caller still gets a parallel-shaped `outcomes` vector at Done).
@@ -883,9 +868,12 @@ impl FrontChannelChain {
             return Ok(());
         }
 
-        let next = self.targets.get(next_index).ok_or(Error::InvalidConfiguration {
-            reason: "FrontChannelChain: next target index out of range",
-        })?;
+        let next = self
+            .targets
+            .get(next_index)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "FrontChannelChain: next target index out of range",
+            })?;
         let logout = idp.start_logout(
             &next.sp,
             StartLogout {
@@ -971,10 +959,7 @@ mod tests {
             sso: vec![Endpoint::post("https://proxy.example.com/sso", 0, true)],
             slo: vec![Endpoint::redirect("https://proxy.example.com/slo", 0, true)],
             artifact_resolution: vec![],
-            supported_name_id_formats: vec![
-                NameIdFormat::Persistent,
-                NameIdFormat::EmailAddress,
-            ],
+            supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
             default_name_id_format: NameIdFormat::Persistent,
             signing_key: rsa_keypair(),
             decryption_key: None,
@@ -1051,11 +1036,7 @@ mod tests {
         ProxyContext {
             downstream_request_id: "_req-downstream".into(),
             downstream_sp_entity_id: "https://downstream-sp.example.com".into(),
-            downstream_acs: Endpoint::post(
-                "https://downstream-sp.example.com/acs",
-                0,
-                true,
-            ),
+            downstream_acs: Endpoint::post("https://downstream-sp.example.com/acs", 0, true),
             downstream_relay_state: Some("opaque-downstream-state".into()),
             requested_authn_context: Some(RequestedAuthnContext {
                 class_refs: vec![AuthnContextClassRef::PasswordProtectedTransport],
@@ -1066,11 +1047,7 @@ mod tests {
                 request_id: "_upstream-1".into(),
                 issued_at: tracker_issued_at,
                 idp_entity_id: "https://upstream-idp.example.com".into(),
-                acs_endpoint: SsoResponseEndpoint::post(
-                    "https://proxy.example.com/acs",
-                    0,
-                    true,
-                ),
+                acs_endpoint: SsoResponseEndpoint::post("https://proxy.example.com/acs", 0, true),
                 requested_authn_context: None,
                 requested_name_id_format: None,
             },
@@ -1156,29 +1133,30 @@ mod tests {
     }
 
     impl ProxyContextStore for InMemoryStore {
-        fn put(
-            &self,
-            handle: &str,
-            context: &ProxyContext,
-            ttl: Duration,
-        ) -> Result<(), Error> {
+        fn put(&self, handle: &str, context: &ProxyContext, ttl: Duration) -> Result<(), Error> {
             let expires_at =
                 SystemTime::now()
                     .checked_add(ttl)
                     .ok_or(Error::InvalidConfiguration {
                         reason: "InMemoryStore: expires_at overflow",
                     })?;
-            let mut guard = self.inner.lock().map_err(|_err| Error::InvalidConfiguration {
-                reason: "InMemoryStore: lock poisoned",
-            })?;
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_err| Error::InvalidConfiguration {
+                    reason: "InMemoryStore: lock poisoned",
+                })?;
             guard.insert(handle.to_string(), (context.clone(), expires_at));
             Ok(())
         }
 
         fn take(&self, handle: &str) -> Result<Option<ProxyContext>, Error> {
-            let mut guard = self.inner.lock().map_err(|_err| Error::InvalidConfiguration {
-                reason: "InMemoryStore: lock poisoned",
-            })?;
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_err| Error::InvalidConfiguration {
+                    reason: "InMemoryStore: lock poisoned",
+                })?;
             match guard.remove(handle) {
                 Some((ctx, expires_at)) if expires_at > SystemTime::now() => Ok(Some(ctx)),
                 Some(_) | None => Ok(None), // expired or absent
@@ -1283,7 +1261,10 @@ mod tests {
             .decode(&bounce.upstream_relay_state)
             .expect("decode context");
         assert_eq!(decoded.downstream_request_id, "_req-downstream");
-        assert_eq!(decoded.downstream_relay_state.as_deref(), Some("downstream-rs"));
+        assert_eq!(
+            decoded.downstream_relay_state.as_deref(),
+            Some("downstream-rs")
+        );
         assert_eq!(
             decoded.downstream_sp_entity_id,
             "https://downstream-sp.example.com",
@@ -1391,10 +1372,7 @@ mod tests {
                     form.action.as_str(),
                     "https://downstream-sp.example.com/acs",
                 );
-                assert_eq!(
-                    form.relay_state.as_deref(),
-                    Some("opaque-downstream-state"),
-                );
+                assert_eq!(form.relay_state.as_deref(), Some("opaque-downstream-state"),);
                 // The body is a base64-encoded Response; we just smoke-check
                 // non-empty here (full parse coverage lives in idp.rs).
                 assert!(!form.saml_response.is_empty());
@@ -1416,8 +1394,7 @@ mod tests {
         // Downstream requested PasswordProtectedTransport (minimum), upstream
         // returned plain Password — downgrade.
         let context = sample_context();
-        let identity =
-            make_upstream_identity("urn:oasis:names:tc:SAML:2.0:ac:classes:Password");
+        let identity = make_upstream_identity("urn:oasis:names:tc:SAML:2.0:ac:classes:Password");
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
@@ -1464,7 +1441,10 @@ mod tests {
     #[test]
     fn release_all_returns_clone() {
         let sp = downstream_sp_descriptor();
-        let attrs = vec![Attribute::email("x@example.com"), Attribute::display_name("X")];
+        let attrs = vec![
+            Attribute::email("x@example.com"),
+            Attribute::display_name("X"),
+        ];
         let out = ReleaseAll.release(&attrs, &sp);
         assert_eq!(out.len(), 2);
     }
@@ -1498,7 +1478,10 @@ mod tests {
             allow_lists,
             default: Box::new(ReleaseAll),
         };
-        let attrs = vec![Attribute::email("x@example.com"), Attribute::display_name("X")];
+        let attrs = vec![
+            Attribute::email("x@example.com"),
+            Attribute::display_name("X"),
+        ];
         let out = policy.release(&attrs, &sp);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "urn:oid:0.9.2342.19200300.100.1.3");
@@ -1529,7 +1512,10 @@ mod tests {
         // Format honored.
         assert_eq!(a1.format, NameIdFormat::Persistent);
         // SP qualifier set.
-        assert_eq!(a1.sp_name_qualifier.as_deref(), Some(sp_a.entity_id.as_str()));
+        assert_eq!(
+            a1.sp_name_qualifier.as_deref(),
+            Some(sp_a.entity_id.as_str())
+        );
     }
 
     #[test]
@@ -1620,8 +1606,7 @@ mod tests {
             AuthnContextClassRef::Password,
             AuthnContextClassRef::Smartcard,
         ]);
-        let identity =
-            make_upstream_identity(AuthnContextClassRef::Kerberos.as_uri());
+        let identity = make_upstream_identity(AuthnContextClassRef::Kerberos.as_uri());
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
@@ -1653,9 +1638,7 @@ mod tests {
             AuthnContextClassRef::Password,
             AuthnContextClassRef::Smartcard,
         ]);
-        let identity = make_upstream_identity(
-            AuthnContextClassRef::MultiFactorAuth.as_uri(),
-        );
+        let identity = make_upstream_identity(AuthnContextClassRef::MultiFactorAuth.as_uri());
 
         proxy
             .relay_to_downstream(RelayToDownstream {

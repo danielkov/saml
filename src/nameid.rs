@@ -91,10 +91,7 @@ impl NameId {
     /// `SPNameQualifier` is the SAML mechanism that prevents downstream SPs
     /// from correlating users across audiences. RFC-004 §3.1 calls this out
     /// as a required privacy property for persistent IDs.
-    pub fn persistent_for_sp(
-        value: impl Into<String>,
-        sp_entity_id: impl Into<String>,
-    ) -> Self {
+    pub fn persistent_for_sp(value: impl Into<String>, sp_entity_id: impl Into<String>) -> Self {
         Self {
             value: value.into(),
             format: NameIdFormat::Persistent,
@@ -147,7 +144,10 @@ mod tests {
     fn persistent_for_sp_sets_sp_qualifier() {
         let n = NameId::persistent_for_sp("opaque-user-id", "https://sp.example.com");
         assert_eq!(n.format, NameIdFormat::Persistent);
-        assert_eq!(n.sp_name_qualifier.as_deref(), Some("https://sp.example.com"));
+        assert_eq!(
+            n.sp_name_qualifier.as_deref(),
+            Some("https://sp.example.com")
+        );
         assert!(n.name_qualifier.is_none());
     }
 

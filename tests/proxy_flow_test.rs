@@ -22,8 +22,8 @@ use saml::binding::{Binding, Dispatch, SsoResponseBinding, SsoResponseDispatch};
 use saml::idp::{ConsumeAuthnRequest, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
 use saml::proxy::{
-    Aes256GcmCodec, BounceToUpstream, PersistentPerSpHmac, Proxy, ProxyContext,
-    RelayToDownstream, ReleaseAllowList,
+    Aes256GcmCodec, BounceToUpstream, PersistentPerSpHmac, Proxy, ProxyContext, RelayToDownstream,
+    ReleaseAllowList,
 };
 use saml::replay::ReplayMode;
 use saml::sp::{ConsumeResponse, StartLogin};
@@ -61,8 +61,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     // real deployment would use.
     let downstream_sp_descriptor =
         common::sp_descriptor(&downstream_sp).expect("downstream sp descriptor");
-    let proxy_idp_descriptor =
-        common::idp_descriptor(&proxy_idp).expect("proxy idp descriptor");
+    let proxy_idp_descriptor = common::idp_descriptor(&proxy_idp).expect("proxy idp descriptor");
     let proxy_sp_descriptor = common::sp_descriptor(&proxy_sp).expect("proxy sp descriptor");
     let upstream_idp_descriptor =
         common::idp_descriptor(&upstream_idp).expect("upstream idp descriptor");
@@ -74,8 +73,8 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     // clock); our test mints `ProxyContext.issued_at` from `fixed_now()`
     // which is pinned, so widen the window to swallow that delta — a
     // century is more than enough.
-    let codec = Aes256GcmCodec::new([0x42u8; 32])
-        .with_max_age(Duration::from_hours(100 * 365 * 24));
+    let codec =
+        Aes256GcmCodec::new([0x42u8; 32]).with_max_age(Duration::from_hours(100 * 365 * 24));
     let proxy = Proxy::new(&proxy_sp, &proxy_idp, Box::new(codec));
 
     // ---- 1. Downstream SP starts login against the proxy. ---------------
@@ -314,10 +313,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     assert_eq!(email_attr.values, vec![USER_EMAIL.to_owned()]);
 
     // ---- Assertions: NameID is scoped to the downstream SP. -------------
-    assert_eq!(
-        downstream_identity.name_id.format,
-        NameIdFormat::Persistent,
-    );
+    assert_eq!(downstream_identity.name_id.format, NameIdFormat::Persistent,);
     assert_eq!(
         downstream_identity.name_id.sp_name_qualifier.as_deref(),
         Some(DOWN_SP_ENTITY_ID),

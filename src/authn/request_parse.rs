@@ -22,9 +22,7 @@
 use std::time::SystemTime;
 
 use crate::authn::{SAML_NS, SAMLP_NS};
-use crate::authn_context::{
-    AuthnContextClassRef, AuthnContextComparison, RequestedAuthnContext,
-};
+use crate::authn_context::{AuthnContextClassRef, AuthnContextComparison, RequestedAuthnContext};
 use crate::binding::SsoResponseBinding;
 use crate::error::Error;
 use crate::nameid::NameIdFormat;
@@ -108,16 +106,14 @@ pub(crate) fn parse_authn_request(
         .attribute(None, "AssertionConsumerServiceIndex")
         .map(|s| {
             s.parse::<u16>().map_err(|source| {
-                Error::XmlParse(format!(
-                    "AssertionConsumerServiceIndex not u16: {source}"
-                ))
+                Error::XmlParse(format!("AssertionConsumerServiceIndex not u16: {source}"))
             })
         })
         .transpose()?;
 
-    let issuer_elem = root.child_element(Some(SAML_NS), "Issuer").ok_or_else(|| {
-        Error::XmlParse("AuthnRequest missing saml:Issuer".to_string())
-    })?;
+    let issuer_elem = root
+        .child_element(Some(SAML_NS), "Issuer")
+        .ok_or_else(|| Error::XmlParse("AuthnRequest missing saml:Issuer".to_string()))?;
     let issuer = issuer_elem.text_content().trim().to_owned();
     if issuer.is_empty() {
         return Err(Error::XmlParse(
@@ -148,9 +144,7 @@ pub(crate) fn parse_authn_request(
     Ok((parsed, root))
 }
 
-fn parse_requested_authn_context(
-    root: &Element,
-) -> Result<Option<RequestedAuthnContext>, Error> {
+fn parse_requested_authn_context(root: &Element) -> Result<Option<RequestedAuthnContext>, Error> {
     let Some(rac) = root.child_element(Some(SAMLP_NS), "RequestedAuthnContext") else {
         return Ok(None);
     };
@@ -230,7 +224,10 @@ mod tests {
     fn parses_valid_request() {
         let p = parse(VALID_REQUEST).expect("ok");
         assert_eq!(p.id, "_abc123");
-        assert_eq!(p.destination.as_deref(), Some("https://idp.example.com/sso"));
+        assert_eq!(
+            p.destination.as_deref(),
+            Some("https://idp.example.com/sso")
+        );
         assert_eq!(p.issuer, "https://sp.example.com/saml");
         assert_eq!(p.assertion_consumer_service_index, Some(0));
         assert!(p.assertion_consumer_service_url.is_none());
@@ -238,7 +235,9 @@ mod tests {
         assert!(p.force_authn);
         assert!(!p.is_passive);
         assert_eq!(
-            p.requested_name_id_format.as_ref().map(NameIdFormat::as_uri),
+            p.requested_name_id_format
+                .as_ref()
+                .map(NameIdFormat::as_uri),
             Some("urn:oasis:names:tc:SAML:2.0:nameid-format:persistent")
         );
         assert!(p.requested_authn_context.is_none());
@@ -417,7 +416,9 @@ mod tests {
         let err = parse(xml).unwrap_err();
         match err {
             Error::XmlParse(msg) => assert!(msg.contains("ID"), "got: {msg}"),
-            Error::SchemaViolation { reason, .. } => assert!(reason.contains("ID"), "got: {reason}"),
+            Error::SchemaViolation { reason, .. } => {
+                assert!(reason.contains("ID"), "got: {reason}")
+            }
             other => panic!("expected XmlParse or SchemaViolation, got {other:?}"),
         }
     }

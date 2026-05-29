@@ -194,6 +194,11 @@ impl LogoutStatus {
 #[derive(Debug, Clone)]
 pub enum LogoutOutcome {
     Success,
-    PartialLogout { message: Option<String> },
-    Failure { status: String, message: Option<String> },
+    PartialLogout {
+        message: Option<String>,
+    },
+    Failure {
+        status: String,
+        message: Option<String>,
+    },
 }

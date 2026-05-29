@@ -96,12 +96,13 @@ impl SpDescriptor {
         let mut assertion_consumer_services = Vec::new();
         for child in sp.all_child_elements(Some(MD_NS), "AssertionConsumerService") {
             let endpoint = parse_endpoint(child)?;
-            let narrowed = SsoResponseEndpoint::try_from_endpoint(endpoint).map_err(|e| match e {
-                Error::InvalidConfiguration { .. } => Error::InvalidConfiguration {
-                    reason: "SP metadata advertises ACS with non-POST/Artifact binding",
-                },
-                other => other,
-            })?;
+            let narrowed =
+                SsoResponseEndpoint::try_from_endpoint(endpoint).map_err(|e| match e {
+                    Error::InvalidConfiguration { .. } => Error::InvalidConfiguration {
+                        reason: "SP metadata advertises ACS with non-POST/Artifact binding",
+                    },
+                    other => other,
+                })?;
             assertion_consumer_services.push(narrowed);
         }
 
@@ -261,7 +262,10 @@ mod tests {
                 .index,
             Some(0)
         );
-        assert!(sp.acs_endpoint_by_url("https://other.example/acs").is_none());
+        assert!(
+            sp.acs_endpoint_by_url("https://other.example/acs")
+                .is_none()
+        );
 
         let default = sp.default_acs().unwrap();
         assert_eq!(default.url, "https://sp.example.com/acs/post");

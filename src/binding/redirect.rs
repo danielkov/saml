@@ -392,8 +392,7 @@ mod tests {
         // The percent-encoded query string MUST NOT contain raw `+`, `/`, or
         // `=` from base64 — they must be percent-encoded.
         let xml = vec![0u8; 256]; // forces base64 with `=` padding and likely `+/`
-        let dispatch =
-            encode_unsigned(&dest(), RedirectDirection::Request, &xml, None).unwrap();
+        let dispatch = encode_unsigned(&dest(), RedirectDirection::Request, &xml, None).unwrap();
         let query = extract_query(&dispatch);
         // After the `SAMLRequest=` literal, no raw `+`, `/`, or `=` should
         // appear (the literal `=` after `SAMLRequest` is the only one).

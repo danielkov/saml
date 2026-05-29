@@ -36,9 +36,8 @@ impl HttpClient for MockHttpClient {
     fn send(
         &self,
         request: HttpRequest,
-    ) -> impl Future<
-        Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
-    > + Send {
+    ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
+    {
         let body = self.canned_response.clone();
         let status = self.canned_status;
         // `PoisonError::into_inner` lets us keep recording on a poisoned mutex

@@ -26,7 +26,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use saml::{
-    AuthnContextClassRef, Attribute, Binding, ConsumeAuthnRequest, ConsumeLogoutRequest,
+    Attribute, AuthnContextClassRef, Binding, ConsumeAuthnRequest, ConsumeLogoutRequest,
     DetachedSignature, Dispatch, IssueResponse, LogoutStatus, NameId, NameIdFormat,
     ParsedAuthnRequest, SsoResponseDispatch, WireDirection, decode_wire,
 };
@@ -222,7 +222,10 @@ fn handle_sso_xml(
     };
     if let Err(e) = state.insert_pending(request_id.clone(), pending) {
         warn!(error = %e, "/saml/sso: pending store unavailable");
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "pending store unavailable");
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pending store unavailable",
+        );
     }
 
     // If we already have a session and the request didn't ask for
@@ -332,7 +335,11 @@ fn render_login_form(state: &AppState, request_id: &str, banner: Option<&str>) -
                 p.parsed.assertion_consumer_service.url.clone(),
             ),
         },
-        None => ("(no pending request)".to_owned(), String::new(), String::new()),
+        None => (
+            "(no pending request)".to_owned(),
+            String::new(),
+            String::new(),
+        ),
     };
 
     Html(templates::render_login(&LoginView {
@@ -390,14 +397,16 @@ fn finalize_continue(state: &AppState, headers: &HeaderMap, request_id: String) 
     }
     let Some(session) = extract_session_from_headers(state, headers) else {
         warn!(request_id, "/saml/sso/continue: no session cookie");
-        return Redirect::to(&format!("/saml/sso/login?request_id={request_id}"))
-            .into_response();
+        return Redirect::to(&format!("/saml/sso/login?request_id={request_id}")).into_response();
     };
 
     let pending = match state.take_pending(&request_id) {
         Ok(Some(p)) => p,
         Ok(None) => {
-            warn!(request_id, "/saml/sso/continue: no pending request (TTL elapsed?)");
+            warn!(
+                request_id,
+                "/saml/sso/continue: no pending request (TTL elapsed?)"
+            );
             return error_page(
                 StatusCode::GONE,
                 "Sign-in request is no longer pending. Restart the flow from the SP.",
@@ -405,7 +414,10 @@ fn finalize_continue(state: &AppState, headers: &HeaderMap, request_id: String) 
         }
         Err(e) => {
             warn!(error = %e, "/saml/sso/continue: pending store unavailable");
-            return error_page(StatusCode::INTERNAL_SERVER_ERROR, "pending store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pending store unavailable",
+            );
         }
     };
 
@@ -524,9 +536,7 @@ pub struct SloForm {
 
 pub async fn handle_slo_post(State(state): State<AppState>, Form(form): Form<SloForm>) -> Response {
     match (form.saml_request.as_deref(), form.saml_response.as_deref()) {
-        (Some(req), None) => {
-            handle_slo_request_post(&state, req, form.relay_state.as_deref())
-        }
+        (Some(req), None) => handle_slo_request_post(&state, req, form.relay_state.as_deref()),
         (None, Some(_)) => {
             // The IdP example doesn't initiate SLO toward SPs, so a
             // SAMLResponse arriving here is unexpected. Log and 200 so
@@ -545,7 +555,10 @@ pub async fn handle_slo_post(State(state): State<AppState>, Form(form): Form<Slo
     }
 }
 
-pub async fn handle_slo_get(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
+pub async fn handle_slo_get(
+    State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
     let Some(raw_query) = raw_query.filter(|q| !q.is_empty()) else {
         return error_page(
             StatusCode::BAD_REQUEST,
@@ -729,10 +742,7 @@ fn pick_slo_binding(entry: &SpEntry) -> Option<Binding> {
 pub struct ArtifactBody(pub Vec<u8>);
 
 #[cfg(feature = "artifact-binding")]
-pub async fn handle_artifact(
-    State(_state): State<AppState>,
-    body: axum::body::Bytes,
-) -> Response {
+pub async fn handle_artifact(State(_state): State<AppState>, body: axum::body::Bytes) -> Response {
     let _ = body;
     error_page(
         StatusCode::NOT_IMPLEMENTED,
@@ -931,11 +941,9 @@ mod tests {
         enc.write_all(xml).unwrap();
         let deflated = enc.finish().unwrap();
         let b64 = B64.encode(deflated);
-        let pct: String = percent_encoding::utf8_percent_encode(
-            &b64,
-            percent_encoding::NON_ALPHANUMERIC,
-        )
-        .to_string();
+        let pct: String =
+            percent_encoding::utf8_percent_encode(&b64, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
         let query = format!("SAMLRequest={pct}&RelayState=hello");
         let decoded = decode_wire(
             query.as_bytes(),

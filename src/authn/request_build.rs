@@ -62,9 +62,7 @@ pub(crate) enum AcsRequest<'a> {
 /// Build the `<samlp:AuthnRequest>` element. The returned [`Element`] is NOT
 /// yet wrapped in a [`Document`]; the caller wraps via `Document::new` and may
 /// then call `dsig::sign::sign_element` before emitting.
-pub(crate) fn build_authn_request_element(
-    input: &BuildAuthnRequest<'_>,
-) -> Result<Element, Error> {
+pub(crate) fn build_authn_request_element(input: &BuildAuthnRequest<'_>) -> Result<Element, Error> {
     // Element ordering inside <samlp:AuthnRequest> is fixed by the schema:
     //   <saml:Issuer> → <samlp:NameIDPolicy> → <samlp:RequestedAuthnContext>.
     // (Other optional children exist — Conditions, Scoping, Extensions — but
@@ -139,11 +137,10 @@ pub(crate) fn build_authn_request_element(
 
     // <samlp:RequestedAuthnContext Comparison="...">
     if let Some(rac) = input.requested_authn_context {
-        let mut rac_el = Element::build(samlp_qname("RequestedAuthnContext"))
-            .with_attribute(
-                QName::new(None, "Comparison"),
-                comparison_attr(&rac.comparison),
-            );
+        let mut rac_el = Element::build(samlp_qname("RequestedAuthnContext")).with_attribute(
+            QName::new(None, "Comparison"),
+            comparison_attr(&rac.comparison),
+        );
         for class_ref in &rac.class_refs {
             rac_el = rac_el.with_child(Node::Element(
                 Element::build(saml_qname("AuthnContextClassRef"))
@@ -161,9 +158,7 @@ pub(crate) fn build_authn_request_element(
 /// serialize. Returns the raw XML bytes — NOT yet base64-encoded; the binding
 /// layer is responsible for any wire encoding (DEFLATE+base64 for Redirect,
 /// base64 for POST).
-pub(crate) fn build_authn_request_xml(
-    input: &BuildAuthnRequest<'_>,
-) -> Result<Vec<u8>, Error> {
+pub(crate) fn build_authn_request_xml(input: &BuildAuthnRequest<'_>) -> Result<Vec<u8>, Error> {
     let element = build_authn_request_element(input)?;
     let doc = Document::new(element)?;
     let xml = emit_document(&doc)?;

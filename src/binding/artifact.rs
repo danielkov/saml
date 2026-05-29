@@ -68,10 +68,7 @@ const ARTIFACT_TYPE_CODE: u16 = 0x0004;
 /// - 20 bytes `MessageHandle` = cryptographically random.
 ///
 /// The result is base64-encoded with the standard alphabet (padded).
-pub fn make_artifact(
-    issuer_entity_id: &str,
-    endpoint_index: u16,
-) -> Result<String, Error> {
+pub fn make_artifact(issuer_entity_id: &str, endpoint_index: u16) -> Result<String, Error> {
     let mut buf = [0u8; 44];
 
     // Bytes 0..2: type code.
@@ -226,9 +223,7 @@ pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
     let status_code = status
         .child_element(Some(SAMLP_NS), "StatusCode")
         .ok_or_else(|| {
-            Error::XmlParse(
-                "ArtifactResponse: missing samlp:StatusCode inside Status".to_string(),
-            )
+            Error::XmlParse("ArtifactResponse: missing samlp:StatusCode inside Status".to_string())
         })?;
     let code_value = status_code.attribute(None, "Value").ok_or_else(|| {
         Error::XmlParse("ArtifactResponse: StatusCode missing @Value".to_string())
@@ -252,13 +247,10 @@ pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
     let payload = artifact_response
         .child_elements()
         .find(|child| {
-            child.qname().namespace() == Some(SAMLP_NS)
-                && child.qname().local() != "Status"
+            child.qname().namespace() == Some(SAMLP_NS) && child.qname().local() != "Status"
         })
         .ok_or_else(|| {
-            Error::XmlParse(
-                "ArtifactResponse: no samlp:* payload message present".to_string(),
-            )
+            Error::XmlParse("ArtifactResponse: no samlp:* payload message present".to_string())
         })?;
 
     let serialized = emit_element(payload)?;
@@ -398,10 +390,7 @@ pub fn build_artifact_response(
             .with_attribute(QName::new(None, "ID"), id)
             .with_attribute(QName::new(None, "Version"), "2.0")
             .with_attribute(QName::new(None, "IssueInstant"), issue_instant)
-            .with_attribute(
-                QName::new(None, "InResponseTo"),
-                in_response_to.to_owned(),
-            )
+            .with_attribute(QName::new(None, "InResponseTo"), in_response_to.to_owned())
             .with_child(Node::Element(issuer_elem))
             .with_child(Node::Element(status))
             .with_child(Node::Element(payload_elem))
@@ -566,14 +555,8 @@ mod tests {
     #[test]
     fn build_artifact_redirect_percent_encodes_relay_state_with_specials() {
         let acs = Url::parse("https://sp.example.com/acs").unwrap();
-        let redirect = build_artifact_redirect(
-            &acs,
-            "issuer",
-            0,
-            String::new(),
-            Some("a&b=c d"),
-        )
-        .unwrap();
+        let redirect =
+            build_artifact_redirect(&acs, "issuer", 0, String::new(), Some("a&b=c d")).unwrap();
         // url::Url percent-encodes `&`, `=`, and ` ` in the value.
         let raw_query = redirect.redirect_to.query().unwrap();
         assert!(raw_query.contains("RelayState="), "{raw_query}");
@@ -749,9 +732,8 @@ mod tests {
         fn send(
             &self,
             request: HttpRequest,
-        ) -> impl Future<
-            Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
-        > + Send {
+        ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
+        {
             *self.last_request.lock().unwrap() = Some(request);
             let body = self.response.clone();
             async move {
@@ -786,10 +768,7 @@ mod tests {
 
         let doc = Document::parse(&inner).expect("inner re-parse");
         assert_eq!(doc.root().qname().local(), "Response");
-        assert_eq!(
-            doc.root().attribute(None, "ID"),
-            Some("_inner-roundtrip")
-        );
+        assert_eq!(doc.root().attribute(None, "ID"), Some("_inner-roundtrip"));
 
         // Verify the outbound request looked correct.
         let sent = client.last_request.lock().unwrap().clone().unwrap();

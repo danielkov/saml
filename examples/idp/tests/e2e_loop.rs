@@ -27,16 +27,14 @@ use std::time::Duration;
 use reqwest::Client;
 use reqwest::redirect::Policy;
 
-use saml_demo::providers::ProviderIndex;
 use saml_demo as demo;
+use saml_demo::providers::ProviderIndex;
 use saml_idp_example as idp;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rust_idp_loop_with_demo_sp() {
     if std::env::var("SAML_DEMO_E2E_RUST_IDP").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping rust-idp e2e loop: set SAML_DEMO_E2E_RUST_IDP=1 to enable",
-        );
+        eprintln!("skipping rust-idp e2e loop: set SAML_DEMO_E2E_RUST_IDP=1 to enable",);
         return;
     }
 
@@ -151,8 +149,14 @@ async fn rust_idp_loop_with_demo_sp() {
     let resp = client.get(&login_target).send().await.expect("login form");
     assert_eq!(resp.status().as_u16(), 200, "step 2b: login form 200");
     let html = resp.text().await.expect("login form body");
-    assert!(html.contains("name=\"username\""), "step 2b: username field");
-    assert!(html.contains("name=\"password\""), "step 2b: password field");
+    assert!(
+        html.contains("name=\"username\""),
+        "step 2b: username field"
+    );
+    assert!(
+        html.contains("name=\"password\""),
+        "step 2b: password field"
+    );
     assert!(
         html.contains(&request_id_query),
         "step 2b: hidden request_id present",
@@ -209,8 +213,8 @@ async fn rust_idp_loop_with_demo_sp() {
         "step 4: SAMLResponse field present",
     );
     let action = extract_form_action(&html).expect("step 4: form action");
-    let saml_response = extract_hidden_value(&html, "SAMLResponse")
-        .expect("step 4: SAMLResponse value");
+    let saml_response =
+        extract_hidden_value(&html, "SAMLResponse").expect("step 4: SAMLResponse value");
     let relay_state = extract_hidden_value(&html, "RelayState");
     assert!(
         action.starts_with(&sp_base) && action.contains("/saml/acs"),
@@ -296,8 +300,8 @@ async fn rust_idp_loop_with_demo_sp() {
             // hidden SAMLRequest and submit it.
             let html = resp.text().await.expect("step 7: HTML body");
             let action = extract_form_action(&html).expect("step 7: form action");
-            let saml_request = extract_hidden_value(&html, "SAMLRequest")
-                .expect("step 7: SAMLRequest value");
+            let saml_request =
+                extract_hidden_value(&html, "SAMLRequest").expect("step 7: SAMLRequest value");
             let relay = extract_hidden_value(&html, "RelayState");
             let mut fields: Vec<(&str, &str)> = vec![("SAMLRequest", &saml_request)];
             if let Some(r) = relay.as_deref() {
@@ -318,8 +322,8 @@ async fn rust_idp_loop_with_demo_sp() {
             if post_status == 200 {
                 let html = post_resp.text().await.expect("step 7b: HTML body");
                 let action = extract_form_action(&html).expect("step 7b: action");
-                let saml_response = extract_hidden_value(&html, "SAMLResponse")
-                    .expect("step 7b: SAMLResponse");
+                let saml_response =
+                    extract_hidden_value(&html, "SAMLResponse").expect("step 7b: SAMLResponse");
                 let relay = extract_hidden_value(&html, "RelayState");
                 let mut fields: Vec<(&str, &str)> = vec![("SAMLResponse", &saml_response)];
                 if let Some(r) = relay.as_deref() {
@@ -354,65 +358,64 @@ async fn rust_idp_loop_with_demo_sp() {
     eprintln!("step 7 ok: logout chain landed on {logout_target}");
 
     // --- Step 8: dispatch the IdP's response (if not already handled above) ---
-    let landed_target = if logout_target.starts_with(&sp_base)
-        && logout_target.contains("/?msg=signed-out")
-    {
-        logout_target
-    } else if logout_target.starts_with(&idp_base) {
-        // Redirect-binding LogoutRequest to the IdP. Follow it.
-        let resp = client.get(&logout_target).send().await.expect("IdP slo");
-        let status = resp.status().as_u16();
-        if status == 200 {
-            // POST-binding LogoutResponse back to the SP.
-            let html = resp.text().await.expect("logout response body");
-            let action = extract_form_action(&html).expect("logout: action");
-            let saml_response = extract_hidden_value(&html, "SAMLResponse")
-                .expect("logout: SAMLResponse");
-            let relay = extract_hidden_value(&html, "RelayState");
-            let mut fields: Vec<(&str, &str)> = vec![("SAMLResponse", &saml_response)];
-            if let Some(r) = relay.as_deref() {
-                fields.push(("RelayState", r));
+    let landed_target =
+        if logout_target.starts_with(&sp_base) && logout_target.contains("/?msg=signed-out") {
+            logout_target
+        } else if logout_target.starts_with(&idp_base) {
+            // Redirect-binding LogoutRequest to the IdP. Follow it.
+            let resp = client.get(&logout_target).send().await.expect("IdP slo");
+            let status = resp.status().as_u16();
+            if status == 200 {
+                // POST-binding LogoutResponse back to the SP.
+                let html = resp.text().await.expect("logout response body");
+                let action = extract_form_action(&html).expect("logout: action");
+                let saml_response =
+                    extract_hidden_value(&html, "SAMLResponse").expect("logout: SAMLResponse");
+                let relay = extract_hidden_value(&html, "RelayState");
+                let mut fields: Vec<(&str, &str)> = vec![("SAMLResponse", &saml_response)];
+                if let Some(r) = relay.as_deref() {
+                    fields.push(("RelayState", r));
+                }
+                let resp = client
+                    .post(&action)
+                    .form(&fields)
+                    .send()
+                    .await
+                    .expect("POST LogoutResponse");
+                assert!(
+                    matches!(resp.status().as_u16(), 302 | 303),
+                    "step 8: SP should 303 after LogoutResponse",
+                );
+                resp.headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("step 8: Location")
+                    .to_owned()
+            } else if matches!(status, 302 | 303) {
+                // Redirect-binding LogoutResponse to SP.
+                let next = resp
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("step 8: Location")
+                    .to_owned();
+                let resp = client.get(&next).send().await.expect("SP slo redirect");
+                assert!(
+                    matches!(resp.status().as_u16(), 302 | 303),
+                    "step 8: SP should 303 after redirect LogoutResponse (got {})",
+                    resp.status(),
+                );
+                resp.headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .expect("step 8: Location after SP slo")
+                    .to_owned()
+            } else {
+                panic!("step 8: unexpected IdP /saml/slo status {status}");
             }
-            let resp = client
-                .post(&action)
-                .form(&fields)
-                .send()
-                .await
-                .expect("POST LogoutResponse");
-            assert!(
-                matches!(resp.status().as_u16(), 302 | 303),
-                "step 8: SP should 303 after LogoutResponse",
-            );
-            resp.headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .expect("step 8: Location")
-                .to_owned()
-        } else if matches!(status, 302 | 303) {
-            // Redirect-binding LogoutResponse to SP.
-            let next = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .expect("step 8: Location")
-                .to_owned();
-            let resp = client.get(&next).send().await.expect("SP slo redirect");
-            assert!(
-                matches!(resp.status().as_u16(), 302 | 303),
-                "step 8: SP should 303 after redirect LogoutResponse (got {})",
-                resp.status(),
-            );
-            resp.headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .expect("step 8: Location after SP slo")
-                .to_owned()
         } else {
-            panic!("step 8: unexpected IdP /saml/slo status {status}");
-        }
-    } else {
-        logout_target
-    };
+            logout_target
+        };
     assert!(
         landed_target.contains("/?msg=signed-out") || landed_target.contains("?msg=signed-out"),
         "step 8: should land on /?msg=signed-out, got {landed_target}",
@@ -437,7 +440,11 @@ async fn rust_idp_loop_with_demo_sp() {
         .and_then(|v| v.to_str().ok())
         .expect("step 9: Location")
         .to_owned();
-    let resp = client.get(&loc).send().await.expect("step 9: follow to IdP");
+    let resp = client
+        .get(&loc)
+        .send()
+        .await
+        .expect("step 9: follow to IdP");
     let status = resp.status().as_u16();
     // The IdP should send us BACK to the login form, not directly to
     // continue. So 3xx with /saml/sso/login? or 200 of the login page
@@ -459,7 +466,11 @@ async fn rust_idp_loop_with_demo_sp() {
         } else {
             format!("{idp_base}{loc}")
         };
-        let resp = client.get(&form_url).send().await.expect("step 9: login form");
+        let resp = client
+            .get(&form_url)
+            .send()
+            .await
+            .expect("step 9: login form");
         assert_eq!(resp.status().as_u16(), 200, "step 9: login form 200");
         let html = resp.text().await.expect("step 9: body");
         assert!(
@@ -603,4 +614,3 @@ fn extract_hidden_value(html: &str, name: &str) -> Option<String> {
     let end = rest.find('"')?;
     Some(rest.get(..end)?.to_owned())
 }
-

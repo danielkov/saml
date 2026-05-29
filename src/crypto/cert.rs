@@ -302,36 +302,36 @@ impl PublicKey {
     ) -> Result<(), Error> {
         match (&self.inner, algorithm) {
             (PublicKeyInner::Rsa(rsa), SignatureAlgorithm::RsaSha256) => {
-                let vk: RsaPkcs1v15VerifyingKey<Sha256> =
-                    RsaPkcs1v15VerifyingKey::new(rsa.clone());
-                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_e| Error::SignatureVerification {
+                let vk: RsaPkcs1v15VerifyingKey<Sha256> = RsaPkcs1v15VerifyingKey::new(rsa.clone());
+                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes).map_err(|_e| {
+                    Error::SignatureVerification {
                         reason: "signature parse failed",
-                    })?;
+                    }
+                })?;
                 vk.verify(signed_bytes, &sig)
                     .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha256 verify failed",
                     })
             }
             (PublicKeyInner::Rsa(rsa), SignatureAlgorithm::RsaSha384) => {
-                let vk: RsaPkcs1v15VerifyingKey<Sha384> =
-                    RsaPkcs1v15VerifyingKey::new(rsa.clone());
-                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_e| Error::SignatureVerification {
+                let vk: RsaPkcs1v15VerifyingKey<Sha384> = RsaPkcs1v15VerifyingKey::new(rsa.clone());
+                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes).map_err(|_e| {
+                    Error::SignatureVerification {
                         reason: "signature parse failed",
-                    })?;
+                    }
+                })?;
                 vk.verify(signed_bytes, &sig)
                     .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha384 verify failed",
                     })
             }
             (PublicKeyInner::Rsa(rsa), SignatureAlgorithm::RsaSha512) => {
-                let vk: RsaPkcs1v15VerifyingKey<Sha512> =
-                    RsaPkcs1v15VerifyingKey::new(rsa.clone());
-                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_e| Error::SignatureVerification {
+                let vk: RsaPkcs1v15VerifyingKey<Sha512> = RsaPkcs1v15VerifyingKey::new(rsa.clone());
+                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes).map_err(|_e| {
+                    Error::SignatureVerification {
                         reason: "signature parse failed",
-                    })?;
+                    }
+                })?;
                 vk.verify(signed_bytes, &sig)
                     .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha512 verify failed",
@@ -341,10 +341,11 @@ impl PublicKey {
             (PublicKeyInner::Rsa(rsa), SignatureAlgorithm::RsaSha1) => {
                 let vk: RsaPkcs1v15VerifyingKey<sha1::Sha1> =
                     RsaPkcs1v15VerifyingKey::new(rsa.clone());
-                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
-                    .map_err(|_e| Error::SignatureVerification {
+                let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes).map_err(|_e| {
+                    Error::SignatureVerification {
                         reason: "signature parse failed",
-                    })?;
+                    }
+                })?;
                 vk.verify(signed_bytes, &sig)
                     .map_err(|_e| Error::SignatureVerification {
                         reason: "rsa-sha1 verify failed",
@@ -505,7 +506,10 @@ mod tests {
     #[test]
     fn rsa_cert_pem_parses() {
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("parse PEM");
-        assert_eq!(cert.public_key().algorithm_family(), PublicKeyAlgorithm::Rsa);
+        assert_eq!(
+            cert.public_key().algorithm_family(),
+            PublicKeyAlgorithm::Rsa
+        );
         assert!(cert.subject().contains("saml-test"));
         assert!(cert.issuer().contains("saml-test"));
     }

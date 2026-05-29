@@ -189,11 +189,11 @@ fn parse_c14n_method(signed_info: &Element) -> Result<C14nAlgorithm, Error> {
         .ok_or(Error::SignatureVerification {
             reason: "missing CanonicalizationMethod",
         })?;
-    let uri = elem.attribute(None, "Algorithm").ok_or(
-        Error::SignatureVerification {
+    let uri = elem
+        .attribute(None, "Algorithm")
+        .ok_or(Error::SignatureVerification {
             reason: "CanonicalizationMethod missing Algorithm",
-        },
-    )?;
+        })?;
     C14nAlgorithm::from_uri(uri)
 }
 
@@ -439,13 +439,8 @@ mod tests {
         let doc = Document::parse(tampered.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
 
-        let err = verify_signature(
-            &doc,
-            sig_elem,
-            &[cert],
-            &[SignatureAlgorithm::RsaSha256],
-        )
-        .expect_err("should reject tampered digest");
+        let err = verify_signature(&doc, sig_elem, &[cert], &[SignatureAlgorithm::RsaSha256])
+            .expect_err("should reject tampered digest");
         assert!(
             matches!(
                 err,
@@ -684,13 +679,8 @@ mod tests {
         );
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
-        let verified = verify_signature(
-            &doc,
-            sig_elem,
-            &[cert],
-            &[SignatureAlgorithm::RsaSha256],
-        )
-        .expect("should verify");
+        let verified = verify_signature(&doc, sig_elem, &[cert], &[SignatureAlgorithm::RsaSha256])
+            .expect("should verify");
 
         let resolved = doc.element(verified.signed_element).expect("element by id");
         assert_eq!(resolved.qname().local(), "Root");

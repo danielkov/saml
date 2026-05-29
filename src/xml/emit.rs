@@ -28,9 +28,7 @@ use std::collections::HashMap;
 
 use crate::error::Error;
 
-use super::parse::{
-    Attribute, Document, Element, ElementId, ElementPath, Node, QName, XML_NS,
-};
+use super::parse::{Attribute, Document, Element, ElementId, ElementPath, Node, QName, XML_NS};
 
 // =============================================================================
 // Constructor API: build documents programmatically for outbound XML.
@@ -134,11 +132,7 @@ impl ElementBuilder {
         self
     }
 
-    pub(crate) fn with_namespace(
-        mut self,
-        prefix: Option<String>,
-        uri: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn with_namespace(mut self, prefix: Option<String>, uri: impl Into<String>) -> Self {
         self.namespaces.push((prefix, uri.into()));
         self
     }
@@ -474,10 +468,7 @@ mod tests {
         // Re-parse and structurally check.
         let doc2 = Document::parse(out.as_bytes()).unwrap();
         assert_eq!(doc2.root().qname().namespace(), Some("urn:a"));
-        let child2 = doc2
-            .root()
-            .child_element(Some("urn:a"), "child")
-            .unwrap();
+        let child2 = doc2.root().child_element(Some("urn:a"), "child").unwrap();
         assert_eq!(child2.attribute(Some("urn:a"), "k"), Some("v"));
     }
 

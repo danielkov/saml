@@ -80,8 +80,10 @@ pub(crate) fn build_logout_request_element(
     builder = builder.with_child(Node::Element(issuer));
 
     // <saml:NameID Format="..." NameQualifier="..." SPNameQualifier="...">value</saml:NameID>
-    let mut nameid_b = Element::build(saml_qname("NameID"))
-        .with_attribute(QName::new(None, "Format"), input.name_id.format.as_uri().to_owned());
+    let mut nameid_b = Element::build(saml_qname("NameID")).with_attribute(
+        QName::new(None, "Format"),
+        input.name_id.format.as_uri().to_owned(),
+    );
     if let Some(nq) = &input.name_id.name_qualifier {
         nameid_b = nameid_b.with_attribute(QName::new(None, "NameQualifier"), nq.clone());
     }
@@ -108,9 +110,7 @@ pub(crate) fn build_logout_request_element(
 /// Build the `<samlp:LogoutRequest>` element, wrap it in a [`Document`], and
 /// serialize. Returns the raw XML bytes — NOT yet base64-encoded; the binding
 /// layer is responsible for any wire encoding.
-pub(crate) fn build_logout_request_xml(
-    input: &BuildLogoutRequest<'_>,
-) -> Result<Vec<u8>, Error> {
+pub(crate) fn build_logout_request_xml(input: &BuildLogoutRequest<'_>) -> Result<Vec<u8>, Error> {
     let element = build_logout_request_element(input)?;
     let doc = Document::new(element)?;
     let xml = emit_document(&doc)?;
@@ -209,8 +209,7 @@ mod tests {
         let nid = NameId::email("bob@example.com");
         let mut input = minimal_input(&nid);
         // +5 minutes from fixed_instant.
-        input.not_on_or_after =
-            Some(fixed_instant() + Duration::from_mins(5));
+        input.not_on_or_after = Some(fixed_instant() + Duration::from_mins(5));
 
         let doc = emit_and_reparse(&input);
         assert_eq!(
@@ -290,16 +289,8 @@ mod tests {
         // Re-parse must succeed and the structural elements must be present.
         let doc = Document::parse(&xml).unwrap();
         assert_eq!(doc.root().qname().local(), "LogoutRequest");
-        assert!(
-            doc.root()
-                .child_element(Some(SAML_NS), "Issuer")
-                .is_some()
-        );
-        assert!(
-            doc.root()
-                .child_element(Some(SAML_NS), "NameID")
-                .is_some()
-        );
+        assert!(doc.root().child_element(Some(SAML_NS), "Issuer").is_some());
+        assert!(doc.root().child_element(Some(SAML_NS), "NameID").is_some());
         assert!(
             doc.root()
                 .child_element(Some(SAMLP_NS), "SessionIndex")

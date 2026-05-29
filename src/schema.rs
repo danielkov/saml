@@ -159,10 +159,26 @@ static SHAPE_ISSUER: ElementShape = ElementShape {
     // NameIDType inherits Format / NameQualifier / SPNameQualifier /
     // SPProvidedID — all optional.
     attrs: &[
-        AttrShape { namespace: None, local: "Format", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "NameQualifier", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "SPNameQualifier", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "SPProvidedID", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "Format",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "NameQualifier",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "SPNameQualifier",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "SPProvidedID",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Any,
     wildcard_namespaces: &[],
@@ -173,10 +189,26 @@ static SHAPE_NAMEID: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "NameID",
     attrs: &[
-        AttrShape { namespace: None, local: "Format", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "NameQualifier", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "SPNameQualifier", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "SPProvidedID", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "Format",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "NameQualifier",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "SPNameQualifier",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "SPProvidedID",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Any,
     wildcard_namespaces: &[],
@@ -186,25 +218,25 @@ static SHAPE_NAMEID: ElementShape = ElementShape {
 static SHAPE_STATUS_CODE: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "StatusCode",
-    attrs: &[
-        AttrShape { namespace: None, local: "Value", presence: AttrPresence::Required },
-    ],
-    children: ChildModel::Sequence(&[
-        ChildShape {
-            namespace: Some(SAMLP_NS),
-            local: "StatusCode",
-            min_occurs: 0,
-            // Recursive: SAML supports a second-level nested StatusCode. We
-            // intentionally do NOT recurse the shape here (would need a
-            // separate static; recursion via &'static is fine for
-            // self-reference but the catalog assembler is awkward). The
-            // walker treats `shape: None` as "structure not further
-            // descended" — sufficient since the only constraint on the
-            // inner StatusCode is "has @Value", which the dsig pipeline
-            // re-checks on read.
-            shape: None,
-        },
-    ]),
+    attrs: &[AttrShape {
+        namespace: None,
+        local: "Value",
+        presence: AttrPresence::Required,
+    }],
+    children: ChildModel::Sequence(&[ChildShape {
+        namespace: Some(SAMLP_NS),
+        local: "StatusCode",
+        min_occurs: 0,
+        // Recursive: SAML supports a second-level nested StatusCode. We
+        // intentionally do NOT recurse the shape here (would need a
+        // separate static; recursion via &'static is fine for
+        // self-reference but the catalog assembler is awkward). The
+        // walker treats `shape: None` as "structure not further
+        // descended" — sufficient since the only constraint on the
+        // inner StatusCode is "has @Value", which the dsig pipeline
+        // re-checks on read.
+        shape: None,
+    }]),
     wildcard_namespaces: &[],
 };
 
@@ -268,14 +300,12 @@ static SHAPE_AUDIENCE_RESTRICTION: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "AudienceRestriction",
     attrs: &[],
-    children: ChildModel::Sequence(&[
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "Audience",
-            min_occurs: 1,
-            shape: Some(&SHAPE_AUDIENCE),
-        },
-    ]),
+    children: ChildModel::Sequence(&[ChildShape {
+        namespace: Some(SAML_NS),
+        local: "Audience",
+        min_occurs: 1,
+        shape: Some(&SHAPE_AUDIENCE),
+    }]),
     wildcard_namespaces: &[],
 };
 
@@ -292,17 +322,17 @@ static SHAPE_ONE_TIME_USE: ElementShape = ElementShape {
 static SHAPE_PROXY_RESTRICTION: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "ProxyRestriction",
-    attrs: &[
-        AttrShape { namespace: None, local: "Count", presence: AttrPresence::Optional },
-    ],
-    children: ChildModel::Sequence(&[
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "Audience",
-            min_occurs: 0,
-            shape: Some(&SHAPE_AUDIENCE),
-        },
-    ]),
+    attrs: &[AttrShape {
+        namespace: None,
+        local: "Count",
+        presence: AttrPresence::Optional,
+    }],
+    children: ChildModel::Sequence(&[ChildShape {
+        namespace: Some(SAML_NS),
+        local: "Audience",
+        min_occurs: 0,
+        shape: Some(&SHAPE_AUDIENCE),
+    }]),
     wildcard_namespaces: &[],
 };
 
@@ -321,8 +351,16 @@ static SHAPE_CONDITIONS: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "Conditions",
     attrs: &[
-        AttrShape { namespace: None, local: "NotBefore", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "NotOnOrAfter", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "NotBefore",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "NotOnOrAfter",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[
         ChildShape {
@@ -356,11 +394,31 @@ static SHAPE_SUBJECT_CONFIRMATION_DATA: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "SubjectConfirmationData",
     attrs: &[
-        AttrShape { namespace: None, local: "NotBefore", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "NotOnOrAfter", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Recipient", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "InResponseTo", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Address", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "NotBefore",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "NotOnOrAfter",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Recipient",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "InResponseTo",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Address",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Any,
     wildcard_namespaces: &[],
@@ -370,9 +428,11 @@ static SHAPE_SUBJECT_CONFIRMATION_DATA: ElementShape = ElementShape {
 static SHAPE_SUBJECT_CONFIRMATION: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "SubjectConfirmation",
-    attrs: &[
-        AttrShape { namespace: None, local: "Method", presence: AttrPresence::Required },
-    ],
+    attrs: &[AttrShape {
+        namespace: None,
+        local: "Method",
+        presence: AttrPresence::Required,
+    }],
     children: ChildModel::Sequence(&[
         // Optional NameID / BaseID / EncryptedID for non-bearer confirmations.
         // For bearer (the only Method we actually consume) the spec allows it
@@ -492,8 +552,16 @@ static SHAPE_SUBJECT_LOCALITY: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "SubjectLocality",
     attrs: &[
-        AttrShape { namespace: None, local: "Address", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "DNSName", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "Address",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "DNSName",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[]),
     wildcard_namespaces: &[],
@@ -504,9 +572,21 @@ static SHAPE_AUTHN_STATEMENT: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "AuthnStatement",
     attrs: &[
-        AttrShape { namespace: None, local: "AuthnInstant", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "SessionIndex", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "SessionNotOnOrAfter", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "AuthnInstant",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "SessionIndex",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "SessionNotOnOrAfter",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[
         ChildShape {
@@ -545,18 +625,28 @@ static SHAPE_ATTRIBUTE: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "Attribute",
     attrs: &[
-        AttrShape { namespace: None, local: "Name", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "NameFormat", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "FriendlyName", presence: AttrPresence::Optional },
-    ],
-    children: ChildModel::Sequence(&[
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "AttributeValue",
-            min_occurs: 0,
-            shape: Some(&SHAPE_ATTRIBUTE_VALUE),
+        AttrShape {
+            namespace: None,
+            local: "Name",
+            presence: AttrPresence::Required,
         },
-    ]),
+        AttrShape {
+            namespace: None,
+            local: "NameFormat",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "FriendlyName",
+            presence: AttrPresence::Optional,
+        },
+    ],
+    children: ChildModel::Sequence(&[ChildShape {
+        namespace: Some(SAML_NS),
+        local: "AttributeValue",
+        min_occurs: 0,
+        shape: Some(&SHAPE_ATTRIBUTE_VALUE),
+    }]),
     wildcard_namespaces: &[],
 };
 
@@ -602,9 +692,21 @@ static SHAPE_ASSERTION: ElementShape = ElementShape {
     namespace: Some(SAML_NS),
     local: "Assertion",
     attrs: &[
-        AttrShape { namespace: None, local: "ID", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "Version", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "IssueInstant", presence: AttrPresence::Required },
+        AttrShape {
+            namespace: None,
+            local: "ID",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Version",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "IssueInstant",
+            presence: AttrPresence::Required,
+        },
     ],
     children: ChildModel::Sequence(&[
         ChildShape {
@@ -691,12 +793,36 @@ static SHAPE_RESPONSE: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "Response",
     attrs: &[
-        AttrShape { namespace: None, local: "ID", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "Version", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "IssueInstant", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "InResponseTo", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Destination", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Consent", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "ID",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Version",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "IssueInstant",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "InResponseTo",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Destination",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Consent",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[
         ChildShape {
@@ -745,9 +871,21 @@ static SHAPE_NAMEID_POLICY: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "NameIDPolicy",
     attrs: &[
-        AttrShape { namespace: None, local: "Format", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "SPNameQualifier", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "AllowCreate", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "Format",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "SPNameQualifier",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "AllowCreate",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[]),
     wildcard_namespaces: &[],
@@ -757,9 +895,11 @@ static SHAPE_NAMEID_POLICY: ElementShape = ElementShape {
 static SHAPE_REQUESTED_AUTHN_CONTEXT: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "RequestedAuthnContext",
-    attrs: &[
-        AttrShape { namespace: None, local: "Comparison", presence: AttrPresence::Optional },
-    ],
+    attrs: &[AttrShape {
+        namespace: None,
+        local: "Comparison",
+        presence: AttrPresence::Optional,
+    }],
     children: ChildModel::Sequence(&[
         ChildShape {
             namespace: Some(SAML_NS),
@@ -781,9 +921,11 @@ static SHAPE_REQUESTED_AUTHN_CONTEXT: ElementShape = ElementShape {
 static SHAPE_SCOPING: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "Scoping",
-    attrs: &[
-        AttrShape { namespace: None, local: "ProxyCount", presence: AttrPresence::Optional },
-    ],
+    attrs: &[AttrShape {
+        namespace: None,
+        local: "ProxyCount",
+        presence: AttrPresence::Optional,
+    }],
     children: ChildModel::Any,
     wildcard_namespaces: &[],
 };
@@ -814,18 +956,66 @@ static SHAPE_AUTHN_REQUEST: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "AuthnRequest",
     attrs: &[
-        AttrShape { namespace: None, local: "ID", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "Version", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "IssueInstant", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "Destination", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Consent", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "ForceAuthn", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "IsPassive", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "ProtocolBinding", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "AssertionConsumerServiceIndex", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "AssertionConsumerServiceURL", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "AttributeConsumingServiceIndex", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "ProviderName", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "ID",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Version",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "IssueInstant",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Destination",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Consent",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "ForceAuthn",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "IsPassive",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "ProtocolBinding",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "AssertionConsumerServiceIndex",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "AssertionConsumerServiceURL",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "AttributeConsumingServiceIndex",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "ProviderName",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[
         ChildShape {
@@ -903,13 +1093,41 @@ static SHAPE_LOGOUT_REQUEST: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "LogoutRequest",
     attrs: &[
-        AttrShape { namespace: None, local: "ID", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "Version", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "IssueInstant", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "Destination", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Consent", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "NotOnOrAfter", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Reason", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "ID",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Version",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "IssueInstant",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Destination",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Consent",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "NotOnOrAfter",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Reason",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[
         ChildShape {
@@ -963,12 +1181,36 @@ static SHAPE_LOGOUT_RESPONSE: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "LogoutResponse",
     attrs: &[
-        AttrShape { namespace: None, local: "ID", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "Version", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "IssueInstant", presence: AttrPresence::Required },
-        AttrShape { namespace: None, local: "InResponseTo", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Destination", presence: AttrPresence::Optional },
-        AttrShape { namespace: None, local: "Consent", presence: AttrPresence::Optional },
+        AttrShape {
+            namespace: None,
+            local: "ID",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Version",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "IssueInstant",
+            presence: AttrPresence::Required,
+        },
+        AttrShape {
+            namespace: None,
+            local: "InResponseTo",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Destination",
+            presence: AttrPresence::Optional,
+        },
+        AttrShape {
+            namespace: None,
+            local: "Consent",
+            presence: AttrPresence::Optional,
+        },
     ],
     children: ChildModel::Sequence(&[
         ChildShape {
@@ -1168,9 +1410,7 @@ fn walk_choice(
     let mut any_matched = false;
     for child in parent.child_elements() {
         let cq = child.qname();
-        let matched = slots
-            .iter()
-            .find(|s| matches(cq, s.namespace, s.local));
+        let matched = slots.iter().find(|s| matches(cq, s.namespace, s.local));
         match matched {
             Some(slot) => {
                 any_matched = true;
@@ -1292,7 +1532,9 @@ mod tests {
         let doc = parse(&xml);
         let err = validate_response(doc.root()).unwrap_err();
         match err {
-            Error::SchemaViolation { reason, .. } => assert!(reason.contains("@ID"), "got: {reason}"),
+            Error::SchemaViolation { reason, .. } => {
+                assert!(reason.contains("@ID"), "got: {reason}")
+            }
             other => panic!("expected SchemaViolation, got {other:?}"),
         }
     }

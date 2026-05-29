@@ -131,9 +131,8 @@ fn fill_random(buf: &mut [u8]) -> Result<(), Error> {
     let mut rng = OsRng;
     // Discarded intentionally: RNG failure detail is platform-specific and
     // not useful to callers; collapse to a generic reason.
-    rng.try_fill_bytes(buf).map_err(|_err| Error::DecryptFailed {
-        reason: "rng",
-    })
+    rng.try_fill_bytes(buf)
+        .map_err(|_err| Error::DecryptFailed { reason: "rng" })
 }
 
 /// Encrypt `plaintext` under `session_key`, returning `(iv_or_nonce, ct)`.
@@ -144,8 +143,12 @@ fn encrypt_data(
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), Error> {
     match algorithm {
-        DataEncryptionAlgorithm::Aes128Cbc => encrypt_cbc_with_random_iv::<aes::Aes128>(session_key, plaintext),
-        DataEncryptionAlgorithm::Aes256Cbc => encrypt_cbc_with_random_iv::<aes::Aes256>(session_key, plaintext),
+        DataEncryptionAlgorithm::Aes128Cbc => {
+            encrypt_cbc_with_random_iv::<aes::Aes128>(session_key, plaintext)
+        }
+        DataEncryptionAlgorithm::Aes256Cbc => {
+            encrypt_cbc_with_random_iv::<aes::Aes256>(session_key, plaintext)
+        }
         DataEncryptionAlgorithm::Aes128Gcm => encrypt_gcm::<Aes128Gcm>(session_key, plaintext),
         DataEncryptionAlgorithm::Aes256Gcm => encrypt_gcm::<Aes256Gcm>(session_key, plaintext),
     }
@@ -193,11 +196,10 @@ where
     C: aes::cipher::BlockCipher + aes::cipher::BlockEncrypt + aes::cipher::KeyInit,
 {
     // Discarded intentionally: cipher-init detail would leak key shape.
-    let encryptor = cbc::Encryptor::<C>::new_from_slices(key, iv).map_err(|_err| {
-        Error::DecryptFailed {
+    let encryptor =
+        cbc::Encryptor::<C>::new_from_slices(key, iv).map_err(|_err| Error::DecryptFailed {
             reason: "key size mismatch",
-        }
-    })?;
+        })?;
     // Allocate enough room for the plaintext + one full padding block (PKCS#7
     // always appends 1..=block_size padding bytes). Block size is 16 for AES.
     let mut out = vec![
@@ -316,7 +318,10 @@ fn build_encrypted_assertion_element(
 
     // ----- <xenc:EncryptionMethod> for the data-encryption algorithm -----
     let data_em = Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptionMethod"))
-        .with_attribute(QName::new(None, "Algorithm"), data_algorithm.uri().to_owned())
+        .with_attribute(
+            QName::new(None, "Algorithm"),
+            data_algorithm.uri().to_owned(),
+        )
         .finish();
 
     // ----- <xenc:CipherValue> for the encrypted payload -----
@@ -349,9 +354,7 @@ fn build_encrypted_assertion_element(
         // `<xenc11:MGF>` element below resolves to a prefix.
         wrapper = wrapper.with_namespace(Some("xenc11".to_owned()), XENC11_NS);
     }
-    wrapper
-        .with_child(Node::Element(encrypted_data))
-        .finish()
+    wrapper.with_child(Node::Element(encrypted_data)).finish()
 }
 
 /// Build the `<xenc:EncryptionMethod>` subtree inside `<xenc:EncryptedKey>`,
@@ -378,10 +381,7 @@ fn build_key_transport_encryption_method(algorithm: KeyTransportAlgorithm) -> El
                 .with_attribute(QName::new(None, "Algorithm"), MGF1_SHA1_URI.to_owned())
                 .finish();
             Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptionMethod"))
-                .with_attribute(
-                    QName::new(None, "Algorithm"),
-                    algorithm.uri().to_owned(),
-                )
+                .with_attribute(QName::new(None, "Algorithm"), algorithm.uri().to_owned())
                 .with_child(Node::Element(digest))
                 .with_child(Node::Element(mgf))
                 .finish()
@@ -393,10 +393,7 @@ fn build_key_transport_encryption_method(algorithm: KeyTransportAlgorithm) -> El
                 .with_attribute(QName::new(None, "Algorithm"), SHA1_DIGEST_URI.to_owned())
                 .finish();
             Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptionMethod"))
-                .with_attribute(
-                    QName::new(None, "Algorithm"),
-                    algorithm.uri().to_owned(),
-                )
+                .with_attribute(QName::new(None, "Algorithm"), algorithm.uri().to_owned())
                 .with_child(Node::Element(digest))
                 .finish()
         }
@@ -404,10 +401,7 @@ fn build_key_transport_encryption_method(algorithm: KeyTransportAlgorithm) -> El
         KeyTransportAlgorithm::RsaPkcs1V15 => {
             // PKCS#1 v1.5 has no associated digest in the XML-Enc syntax.
             Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptionMethod"))
-                .with_attribute(
-                    QName::new(None, "Algorithm"),
-                    algorithm.uri().to_owned(),
-                )
+                .with_attribute(QName::new(None, "Algorithm"), algorithm.uri().to_owned())
                 .finish()
         }
     }

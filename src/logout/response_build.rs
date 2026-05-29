@@ -66,7 +66,10 @@ pub(crate) fn build_logout_response_element(
     builder = builder.with_child(Node::Element(issuer));
 
     // <samlp:Status>
-    builder = builder.with_child(Node::Element(build_status(input.status, input.status_message)));
+    builder = builder.with_child(Node::Element(build_status(
+        input.status,
+        input.status_message,
+    )));
 
     Ok(builder.finish())
 }
@@ -82,8 +85,8 @@ fn build_status(status: LogoutStatus, message: Option<&str>) -> Element {
             .finish();
         top_code = top_code.with_child(Node::Element(nested));
     }
-    let mut status_el = Element::build(samlp_qname("Status"))
-        .with_child(Node::Element(top_code.finish()));
+    let mut status_el =
+        Element::build(samlp_qname("Status")).with_child(Node::Element(top_code.finish()));
     if let Some(msg) = message {
         let m = Element::build(samlp_qname("StatusMessage"))
             .with_text(msg.to_owned())
@@ -94,9 +97,7 @@ fn build_status(status: LogoutStatus, message: Option<&str>) -> Element {
 }
 
 /// Build, wrap in a [`Document`], and serialize.
-pub(crate) fn build_logout_response_xml(
-    input: &BuildLogoutResponse<'_>,
-) -> Result<Vec<u8>, Error> {
+pub(crate) fn build_logout_response_xml(input: &BuildLogoutResponse<'_>) -> Result<Vec<u8>, Error> {
     let element = build_logout_response_element(input)?;
     let doc = Document::new(element)?;
     let xml = emit_document(&doc)?;
@@ -252,11 +253,7 @@ mod tests {
         let doc = Document::parse(&xml).unwrap();
         assert_eq!(doc.root().qname().local(), "LogoutResponse");
         let status = doc.root().child_element(Some(SAMLP_NS), "Status").unwrap();
-        assert!(
-            status
-                .child_element(Some(SAMLP_NS), "StatusCode")
-                .is_some()
-        );
+        assert!(status.child_element(Some(SAMLP_NS), "StatusCode").is_some());
         assert!(
             status
                 .child_element(Some(SAMLP_NS), "StatusMessage")

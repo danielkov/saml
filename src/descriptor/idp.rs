@@ -39,13 +39,12 @@ impl IdpDescriptor {
     /// returned).
     pub fn from_metadata_xml(xml: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(xml)?;
-        let entity =
-            find_entity_descriptor(doc.root(), |e| {
-                e.child_element(Some(MD_NS), "IDPSSODescriptor").is_some()
-            })
-            .ok_or(Error::InvalidConfiguration {
-                reason: "metadata does not contain an IdP entity",
-            })?;
+        let entity = find_entity_descriptor(doc.root(), |e| {
+            e.child_element(Some(MD_NS), "IDPSSODescriptor").is_some()
+        })
+        .ok_or(Error::InvalidConfiguration {
+            reason: "metadata does not contain an IdP entity",
+        })?;
         Self::from_entity_descriptor_element(entity)
     }
 
@@ -126,7 +125,11 @@ impl IdpDescriptor {
     /// no binding to disambiguate.
     pub fn artifact_resolution_endpoint(&self) -> Option<&Endpoint> {
         // Prefer the endpoint flagged isDefault if any.
-        if let Some(d) = self.artifact_resolution_endpoints.iter().find(|e| e.is_default) {
+        if let Some(d) = self
+            .artifact_resolution_endpoints
+            .iter()
+            .find(|e| e.is_default)
+        {
             return Some(d);
         }
         self.artifact_resolution_endpoints.first()
@@ -205,10 +208,7 @@ mod tests {
         assert_eq!(idp.signing_certs.len(), 1);
         assert_eq!(idp.encryption_certs.len(), 1);
         assert_eq!(idp.supported_name_id_formats.len(), 2);
-        assert_eq!(
-            idp.supported_name_id_formats[0],
-            NameIdFormat::EmailAddress
-        );
+        assert_eq!(idp.supported_name_id_formats[0], NameIdFormat::EmailAddress);
     }
 
     #[test]

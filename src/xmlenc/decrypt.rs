@@ -66,12 +66,11 @@ pub(crate) fn decrypt_encrypted_assertion(
         .ok_or(Error::DecryptFailed {
             reason: "missing EncryptedData/EncryptionMethod",
         })?;
-    let data_alg_uri =
-        data_em
-            .attribute(None, "Algorithm")
-            .ok_or(Error::DecryptFailed {
-                reason: "missing EncryptionMethod/@Algorithm",
-            })?;
+    let data_alg_uri = data_em
+        .attribute(None, "Algorithm")
+        .ok_or(Error::DecryptFailed {
+            reason: "missing EncryptionMethod/@Algorithm",
+        })?;
     let data_algorithm = DataEncryptionAlgorithm::from_uri(data_alg_uri)?;
     if !allowed_data_algorithms.contains(&data_algorithm) {
         return Err(Error::DisallowedAlgorithm {
@@ -80,11 +79,12 @@ pub(crate) fn decrypt_encrypted_assertion(
     }
 
     // -- 3. Locate <ds:KeyInfo>/<xenc:EncryptedKey>. --
-    let key_info = encrypted_data
-        .child_element(Some(DS_NS), "KeyInfo")
-        .ok_or(Error::DecryptFailed {
-            reason: "missing KeyInfo",
-        })?;
+    let key_info =
+        encrypted_data
+            .child_element(Some(DS_NS), "KeyInfo")
+            .ok_or(Error::DecryptFailed {
+                reason: "missing KeyInfo",
+            })?;
     let encrypted_key = key_info
         .child_element(Some(XENC_NS), "EncryptedKey")
         .ok_or(Error::DecryptFailed {
@@ -95,9 +95,11 @@ pub(crate) fn decrypt_encrypted_assertion(
         .ok_or(Error::DecryptFailed {
             reason: "missing EncryptedKey/EncryptionMethod",
         })?;
-    let key_alg_uri = key_em.attribute(None, "Algorithm").ok_or(Error::DecryptFailed {
-        reason: "missing EncryptedKey/EncryptionMethod/@Algorithm",
-    })?;
+    let key_alg_uri = key_em
+        .attribute(None, "Algorithm")
+        .ok_or(Error::DecryptFailed {
+            reason: "missing EncryptedKey/EncryptionMethod/@Algorithm",
+        })?;
     let key_transport_algorithm = KeyTransportAlgorithm::from_uri(key_alg_uri)?;
     if !allowed_key_transport_algorithms.contains(&key_transport_algorithm) {
         return Err(Error::DisallowedAlgorithm {
@@ -174,17 +176,17 @@ fn oaep_digest_from_method(encryption_method: &Element) -> Result<OaepDigest, Er
 /// Extract and base64-decode the text content of
 /// `<.../xenc:CipherData/xenc:CipherValue>`.
 fn extract_cipher_value(parent: &Element) -> Result<Vec<u8>, Error> {
-    let cipher_data = parent
-        .child_element(Some(XENC_NS), "CipherData")
-        .ok_or(Error::DecryptFailed {
-            reason: "missing CipherData",
-        })?;
-    let cipher_value =
-        cipher_data
-            .child_element(Some(XENC_NS), "CipherValue")
+    let cipher_data =
+        parent
+            .child_element(Some(XENC_NS), "CipherData")
             .ok_or(Error::DecryptFailed {
-                reason: "missing CipherValue",
+                reason: "missing CipherData",
             })?;
+    let cipher_value = cipher_data
+        .child_element(Some(XENC_NS), "CipherValue")
+        .ok_or(Error::DecryptFailed {
+            reason: "missing CipherValue",
+        })?;
     decode_base64_ws_tolerant(&cipher_value.text_content())
 }
 
