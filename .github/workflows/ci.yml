@@ -137,8 +137,12 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz@0.13.1
+      # Pin the gnu target explicitly: the prebuilt cargo-fuzz defaults to the
+      # musl host triple, whose std isn't installed on the nightly toolchain
+      # (E0463 can't find `core`). gnu is the standard ASan fuzzing target and
+      # ships std with the toolchain.
       - name: cargo fuzz build
-        run: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
 
   # ---------------------------------------------------------------------------
   # Cross-platform smoke test: default features only, stable only.
