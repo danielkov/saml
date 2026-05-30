@@ -365,8 +365,9 @@ pub use crate::dsig::algorithms::{
 pub use crate::dsig::verify::VerifiedSignature;
 
 pub use crate::metadata::parse::{
-    EntitiesDescriptor, MetadataEntry, VerifyMetadata, parse_signed_entities_descriptor,
-    parse_signed_idp_descriptor, parse_signed_sp_descriptor, verify_metadata_signature,
+    EntitiesDescriptor, MetadataEntry, StreamControl, VerifyMetadata,
+    parse_signed_entities_descriptor, parse_signed_idp_descriptor, parse_signed_sp_descriptor,
+    stream_entities, stream_signed_entities, verify_metadata_signature,
 };
 pub use crate::metadata::{
     MetadataContact, MetadataContactType, MetadataExtras, MetadataOrganization,

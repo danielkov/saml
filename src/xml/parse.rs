@@ -91,6 +91,45 @@ impl Default for XmlLimits {
     }
 }
 
+impl XmlLimits {
+    /// Resource limits sized for federation **aggregates**
+    /// (`<md:EntitiesDescriptor>` from InCommon / eduGAIN), which routinely
+    /// exceed the [`default`](Self::default) 100k-node ceiling.
+    ///
+    /// A real InCommon aggregate is on the order of ~50 MB and tens of
+    /// thousands of entities; each entity contributes hundreds of nodes
+    /// (role descriptors, endpoints, key descriptors, base64 cert text), so a
+    /// full aggregate lands in the low-tens-of-millions of nodes. We raise
+    /// `max_total_nodes` to 50 million to admit the largest published
+    /// aggregates with headroom, while keeping every other dimension at the
+    /// default: `max_depth` (100) and `max_attribute_count` (100) are
+    /// structural and do not scale with aggregate size, and `max_text_length`
+    /// (1 MiB) already covers any single base64 certificate blob.
+    ///
+    /// # DoS tradeoff
+    ///
+    /// The node ceiling is the parser's bound on attacker-controlled
+    /// allocation: a hostile document is rejected once it exceeds it rather
+    /// than exhausting memory. 50M nodes is **bounded** — it is emphatically
+    /// not unbounded parsing — but it is a deliberately higher bound than the
+    /// default, so callers that parse *aggregates from untrusted sources*
+    /// trade a larger worst-case transient allocation for the ability to
+    /// process real-world federation metadata. Callers who know their
+    /// aggregate is smaller should pass tighter limits via
+    /// [`from_metadata_xml_with_limits`].
+    ///
+    /// [`from_metadata_xml_with_limits`]:
+    ///     crate::metadata::parse::EntitiesDescriptor::from_metadata_xml_with_limits
+    pub const fn aggregate() -> Self {
+        Self {
+            max_depth: 100,
+            max_total_nodes: 50_000_000,
+            max_attribute_count: 100,
+            max_text_length: 1_048_576,
+        }
+    }
+}
+
 // =============================================================================
 // Element / Node / ElementId
 // =============================================================================
@@ -405,6 +444,66 @@ fn normalize_line_endings(xml: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+/// Configure a `quick-xml` reader the way every parse path in this crate
+/// requires: distinguish `<x/>` (Empty) from `<x></x>` (Start+End) so a
+/// namespace layer is only pushed for non-self-closing elements, preserve
+/// whitespace exactly (c14n needs faithful text content), and validate that
+/// end tags match their opens.
+///
+/// Shared between [`parse_inner`] and the metadata streaming reader so the two
+/// event loops cannot drift apart in their treatment of empty elements /
+/// whitespace.
+pub(crate) fn configure_reader<R>(reader: &mut Reader<R>) {
+    let cfg = reader.config_mut();
+    cfg.expand_empty_elements = false;
+    cfg.trim_text_start = false;
+    cfg.trim_text_end = false;
+    cfg.check_end_names = true;
+}
+
+/// Map a `DocType` / `PI` event to the rejection error every parse path in
+/// this crate shares (RFC-002 §1.1). Returns `None` for any other event kind.
+///
+/// Both the full DOM parser and the metadata streaming reader reject DTDs and
+/// processing instructions identically; centralizing the error strings here
+/// keeps that policy in one place.
+pub(crate) fn reject_doctype_or_pi(event: &Event<'_>) -> Option<Error> {
+    match event {
+        Event::DocType(_) => Some(Error::XmlParse("DTDs not allowed".to_string())),
+        Event::PI(_) => Some(Error::XmlParse(
+            "processing instructions not allowed".to_string(),
+        )),
+        _ => None,
+    }
+}
+
+/// Collect the `xmlns(:prefix)?="…"` declarations on a start tag as
+/// `(key_bytes, value_bytes)` pairs, preserving source order. The key is the
+/// full raw attribute name (`xmlns` or `xmlns:prefix`); the value is the
+/// already-entity-escaped declaration value, copied verbatim. Non-namespace
+/// attributes are skipped.
+///
+/// Returning pairs (rather than a pre-joined blob) lets callers that replay
+/// declarations across *nested* scopes deduplicate by key — re-emitting the
+/// same `xmlns:prefix` twice on one synthetic element would be malformed XML.
+pub(crate) fn collect_namespace_decls(
+    start: &quick_xml::events::BytesStart<'_>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for attr in start.attributes().with_checks(false).flatten() {
+        let key = attr.key.into_inner();
+        let is_ns = matches!(
+            QxQName(key).as_namespace_binding(),
+            Some(PrefixDeclaration::Default | PrefixDeclaration::Named(_))
+        );
+        if !is_ns {
+            continue;
+        }
+        out.push((key.to_vec(), attr.value.to_vec()));
+    }
+    out
+}
+
 fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
     // XML 1.0 §2.11 line-end normalization: translate every `#xD #xA` two-byte
     // sequence and every standalone `#xD` to a single `#xA` before parsing.
@@ -418,16 +517,7 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
     // We use `Cow` so that the common LF-only case stays zero-copy.
     let normalized = normalize_line_endings(xml);
     let mut reader = Reader::from_reader(normalized.as_ref());
-    {
-        let cfg = reader.config_mut();
-        // Distinguish `<x/>` (Empty) from `<x></x>` (Start+End). We use this
-        // to avoid pushing a namespace layer for self-closing elements.
-        cfg.expand_empty_elements = false;
-        // Preserve whitespace exactly; c14n needs faithful text content.
-        cfg.trim_text_start = false;
-        cfg.trim_text_end = false;
-        cfg.check_end_names = true;
-    }
+    configure_reader(&mut reader);
 
     let mut stack: Vec<StackFrame> = Vec::new();
     let mut ns_stack: Vec<NsLayer> = Vec::new();
@@ -446,13 +536,9 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
             Event::Decl(_) => {
                 // XML declaration: skipped. We don't preserve `<?xml ...?>`.
             }
-            Event::DocType(_) => {
-                return Err(Error::XmlParse("DTDs not allowed".to_string()));
-            }
-            Event::PI(_) => {
-                return Err(Error::XmlParse(
-                    "processing instructions not allowed".to_string(),
-                ));
+            ref evt @ (Event::DocType(_) | Event::PI(_)) => {
+                return Err(reject_doctype_or_pi(evt)
+                    .unwrap_or_else(|| Error::XmlParse("unexpected event".to_string())));
             }
             Event::Start(start) => {
                 total_nodes = total_nodes
@@ -748,6 +834,15 @@ fn close_element(
         *completed_root = Some(element);
         Ok(())
     }
+}
+
+/// Local part of a raw (possibly prefixed) element/attribute name, as bytes.
+/// Returns `b"EntityDescriptor"` for `b"md:EntityDescriptor"` and the whole
+/// input when there is no `prefix:` segment. Shared with the metadata
+/// streaming reader, which matches element local names against raw event
+/// bytes without building a full `QName`.
+pub(crate) fn raw_local_name(name: &[u8]) -> &[u8] {
+    QxQName(name).local_name().into_inner()
 }
 
 /// Extract the literal prefix substring (if any) from a raw QName byte slice.

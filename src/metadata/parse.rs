@@ -7,6 +7,7 @@
 //! XML walks means the `<md:KeyDescriptor>` cert-use partitioning rule
 //! (RFC-006 §4) and the xs:duration grammar live in exactly one place.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::crypto::cert::X509Certificate;
@@ -17,7 +18,10 @@ use crate::dsig::verify::verify_signature;
 use crate::error::Error;
 use crate::nameid::NameIdFormat;
 use crate::time::parse_xs_datetime;
-use crate::xml::parse::{Document, Element, Node};
+use crate::xml::parse::{
+    Document, Element, Node, XmlLimits, collect_namespace_decls, configure_reader, raw_local_name,
+    reject_doctype_or_pi,
+};
 
 // =============================================================================
 // Namespace constants
@@ -48,10 +52,42 @@ pub enum MetadataEntry {
     Other,
 }
 
+impl MetadataEntry {
+    /// The `entityID` this entry describes, or `None` for an [`Other`] entry
+    /// (an `<md:EntityDescriptor>` carrying only role descriptors this crate
+    /// does not model, whose `entityID` we never parsed).
+    ///
+    /// [`Other`]: MetadataEntry::Other
+    pub fn entity_id(&self) -> Option<&str> {
+        match self {
+            // For a Dual entry both halves carry the same entityID by
+            // construction (they are parsed from the same EntityDescriptor).
+            MetadataEntry::Idp(idp) | MetadataEntry::Dual(idp, _) => Some(&idp.entity_id),
+            MetadataEntry::Sp(sp) => Some(&sp.entity_id),
+            MetadataEntry::Other => None,
+        }
+    }
+}
+
 impl EntitiesDescriptor {
     /// Parse a federation aggregate or a single-entity metadata document.
+    ///
+    /// Uses an aggregate-sized node ceiling ([`XmlLimits::aggregate`]) so real
+    /// InCommon / eduGAIN aggregates — which exceed the default ~100k-node
+    /// limit — parse successfully. To parse under tighter (or looser) limits,
+    /// use [`from_metadata_xml_with_limits`](Self::from_metadata_xml_with_limits).
     pub fn from_metadata_xml(xml: &[u8]) -> Result<Self, Error> {
-        let doc = Document::parse(xml)?;
+        Self::from_metadata_xml_with_limits(xml, XmlLimits::aggregate())
+    }
+
+    /// Parse a federation aggregate or single-entity metadata document under
+    /// caller-supplied resource limits.
+    ///
+    /// [`from_metadata_xml`](Self::from_metadata_xml) calls this with
+    /// [`XmlLimits::aggregate`]; pass a tighter [`XmlLimits`] when the input is
+    /// known to be small and you want a smaller worst-case allocation bound.
+    pub fn from_metadata_xml_with_limits(xml: &[u8], limits: XmlLimits) -> Result<Self, Error> {
+        let doc = Document::parse_with_limits(xml, limits)?;
         Self::from_root_element(doc.root())
     }
 
@@ -84,32 +120,62 @@ impl EntitiesDescriptor {
         })
     }
 
-    /// Find an IdP entity by entity ID.
-    pub fn find_idp(&self, entity_id: &str) -> Option<&IdpDescriptor> {
+    /// Find an entry by its `entityID`, regardless of role. Returns the first
+    /// match in document order.
+    ///
+    /// This is a linear scan over [`entities`](Self::entities). For repeated
+    /// lookups against a large aggregate (InCommon publishes thousands of
+    /// entities), build an index once with [`index_by_entity_id`] and query
+    /// that instead.
+    ///
+    /// [`index_by_entity_id`]: Self::index_by_entity_id
+    pub fn by_entity_id(&self, entity_id: &str) -> Option<&MetadataEntry> {
+        self.entities
+            .iter()
+            .find(|entry| entry.entity_id() == Some(entity_id))
+    }
+
+    /// Build a `HashMap` from `entityID` to entry for O(1) repeated lookups.
+    ///
+    /// Federation aggregates with thousands of entities make the linear
+    /// [`by_entity_id`] / [`find_idp`] / [`find_sp`] scans expensive when a
+    /// caller resolves many entityIDs; constructing this index once amortizes
+    /// the cost. [`Other`] entries (no `entityID`) are skipped. When a
+    /// duplicate `entityID` appears the first entry in document order wins,
+    /// matching the linear accessors.
+    ///
+    /// [`by_entity_id`]: Self::by_entity_id
+    /// [`find_idp`]: Self::find_idp
+    /// [`find_sp`]: Self::find_sp
+    /// [`Other`]: MetadataEntry::Other
+    pub fn index_by_entity_id(&self) -> HashMap<&str, &MetadataEntry> {
+        let mut index = HashMap::with_capacity(self.entities.len());
         for entry in &self.entities {
-            match entry {
-                MetadataEntry::Idp(idp) | MetadataEntry::Dual(idp, _)
-                    if idp.entity_id == entity_id =>
-                {
-                    return Some(idp);
-                }
-                _ => {}
+            if let Some(id) = entry.entity_id() {
+                index.entry(id).or_insert(entry);
             }
         }
-        None
+        index
+    }
+
+    /// Find an IdP entity by entity ID.
+    pub fn find_idp(&self, entity_id: &str) -> Option<&IdpDescriptor> {
+        self.entities.iter().find_map(|entry| match entry {
+            MetadataEntry::Idp(idp) | MetadataEntry::Dual(idp, _) if idp.entity_id == entity_id => {
+                Some(idp)
+            }
+            _ => None,
+        })
     }
 
     /// Find an SP entity by entity ID.
     pub fn find_sp(&self, entity_id: &str) -> Option<&SpDescriptor> {
-        for entry in &self.entities {
-            match entry {
-                MetadataEntry::Sp(sp) | MetadataEntry::Dual(_, sp) if sp.entity_id == entity_id => {
-                    return Some(sp);
-                }
-                _ => {}
+        self.entities.iter().find_map(|entry| match entry {
+            MetadataEntry::Sp(sp) | MetadataEntry::Dual(_, sp) if sp.entity_id == entity_id => {
+                Some(sp)
             }
-        }
-        None
+            _ => None,
+        })
     }
 
     /// Iterate over all IdP descriptors (including the IdP half of Dual entries).
@@ -127,6 +193,377 @@ impl EntitiesDescriptor {
             _ => None,
         })
     }
+}
+
+// =============================================================================
+// Streaming / bounded parse
+// =============================================================================
+
+/// Control-flow signal returned by a [`stream_entities`] / [`stream_signed_entities`]
+/// visitor: keep going or stop early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamControl {
+    /// Continue to the next entity.
+    Continue,
+    /// Stop iterating; the stream parser returns `Ok(())` without visiting
+    /// any further entities (useful for "find the one entityID I care about
+    /// and bail" over a multi-megabyte aggregate).
+    Stop,
+}
+
+/// Parse a federation aggregate one `<md:EntityDescriptor>` at a time,
+/// invoking `visit` for each, **without** building the whole `Vec` of
+/// entities or a single DOM over the entire file.
+///
+/// Memory characteristics: the parser scans the input with a streaming XML
+/// reader and materializes a DOM for **one** `<md:EntityDescriptor>` subtree
+/// at a time (re-wrapped with the aggregate root's namespace declarations so
+/// prefixes resolve), parses it into a [`MetadataEntry`], hands it to the
+/// visitor, and drops it before advancing. Peak additional memory is therefore
+/// bounded by the largest single entity, not the ~50 MB aggregate — the use
+/// case called out in the ROADMAP for InCommon / eduGAIN. The input slice
+/// itself is still held by the caller; this API does not stream off a socket.
+///
+/// Nested `<md:EntitiesDescriptor>` blocks are flattened, matching the
+/// eager [`EntitiesDescriptor::from_metadata_xml`] path.
+///
+/// # Security
+///
+/// This is the **unverified** entry point — it parses attacker-influenced XML
+/// directly. When the aggregate is signed and you are establishing trust off
+/// that signature, use [`stream_signed_entities`], which verifies the
+/// wrapping signature before any entity is yielded.
+pub fn stream_entities<F>(metadata_xml: &[u8], visit: F) -> Result<(), Error>
+where
+    F: FnMut(MetadataEntry) -> StreamControl,
+{
+    stream_entities_inner(metadata_xml, visit)
+}
+
+/// Verify the aggregate's wrapping XML-DSig signature, then visit its entities
+/// one at a time, stopping early when the visitor returns
+/// [`StreamControl::Stop`].
+///
+/// Mirrors [`parse_signed_entities_descriptor`] for the visitor-driven path:
+/// the signature over the `<md:EntitiesDescriptor>` root is checked **before**
+/// any child entity is yielded, so a visitor never observes an entity from an
+/// unverified aggregate.
+///
+/// # Trust model & memory
+///
+/// Verifying an enveloped signature over the aggregate root requires the whole
+/// document as a unit (the signature covers the entire tree), so this path
+/// parses the full DOM once — the same full-DOM cost the eager
+/// [`parse_signed_entities_descriptor`] already pays. It then verifies the
+/// wrapper signature on that parsed `Document` (including the XSW root-coverage
+/// check in [`verify_metadata_signature`]) and walks the **already-parsed**
+/// tree, handing each entity to the visitor. There is no second parser and no
+/// raw-byte re-scan: re-streaming the bytes after a full parse would buy no
+/// memory saving while forking a parallel parsing path. Peak memory is the
+/// parsed aggregate DOM, which is unavoidable for signature verification.
+///
+/// When unverified, bounded-memory streaming is what you need (you are not
+/// establishing trust off the wrapper signature), use [`stream_entities`].
+pub fn stream_signed_entities<F>(
+    metadata_xml: &[u8],
+    trusted_signing_cert: &X509Certificate,
+    mut visit: F,
+) -> Result<(), Error>
+where
+    F: FnMut(MetadataEntry) -> StreamControl,
+{
+    // Verification happens on the parsed DOM before any entity is yielded; the
+    // walk below only ever sees a tree whose wrapper signature already checked
+    // out, so the visitor cannot observe an entity from an unverified
+    // aggregate.
+    let doc = Document::parse_with_limits(metadata_xml, XmlLimits::aggregate())?;
+    verify_metadata_signature_on_document(&doc, trusted_signing_cert)?;
+    visit_entities(doc.root(), &mut visit).map(|_control| ())
+}
+
+/// Walk an already-parsed (and, on the signed path, already-verified) root,
+/// flattening nested `<md:EntitiesDescriptor>` blocks and invoking `visit` for
+/// each `<md:EntityDescriptor>`. Propagates [`StreamControl::Stop`] outward so
+/// the caller halts the whole walk.
+fn visit_entities<F>(root: &Element, visit: &mut F) -> Result<StreamControl, Error>
+where
+    F: FnMut(MetadataEntry) -> StreamControl,
+{
+    if is_md_element(root, "EntityDescriptor") {
+        return Ok(visit(parse_entity_descriptor(root)?));
+    }
+    if is_md_element(root, "EntitiesDescriptor") {
+        for child in root.children() {
+            let Node::Element(elem) = child else { continue };
+            let control = if is_md_element(elem, "EntityDescriptor") {
+                visit(parse_entity_descriptor(elem)?)
+            } else if is_md_element(elem, "EntitiesDescriptor") {
+                visit_entities(elem, visit)?
+            } else {
+                StreamControl::Continue
+            };
+            if control == StreamControl::Stop {
+                return Ok(StreamControl::Stop);
+            }
+        }
+        return Ok(StreamControl::Continue);
+    }
+    Err(Error::InvalidConfiguration {
+        reason: "root is not <md:EntityDescriptor> or <md:EntitiesDescriptor>",
+    })
+}
+
+/// Upper bound on the number of nested `<md:EntitiesDescriptor>` /
+/// `<md:EntityDescriptor>` levels the unverified streaming scan will descend,
+/// and on the total entities it will visit. The eager DOM path is bounded by
+/// [`XmlLimits`]; this streaming path builds no whole-document DOM, so it
+/// carries its own explicit ceilings to keep an adversarial aggregate (deeply
+/// nested wrappers, or an unbounded entity count) from exhausting the
+/// namespace stack or running unboundedly. Both are generous relative to real
+/// federation metadata (eduGAIN nests a handful of levels; InCommon publishes
+/// tens of thousands of entities) yet finite.
+const MAX_STREAM_DEPTH: usize = 100;
+const MAX_STREAM_ENTITIES: usize = 10_000_000;
+
+/// One frame of the unverified streaming reader's namespace stack: the
+/// `(key, value)` `xmlns(:prefix)?` declarations literally written on an open
+/// `<md:EntitiesDescriptor>` wrapper, plus the element depth at which that
+/// wrapper sits (so the frame is popped exactly when the wrapper closes).
+type NsFrame = (Vec<(Vec<u8>, Vec<u8>)>, usize);
+
+fn stream_entities_inner<F>(metadata_xml: &[u8], mut visit: F) -> Result<(), Error>
+where
+    F: FnMut(MetadataEntry) -> StreamControl,
+{
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_reader(metadata_xml);
+    configure_reader(&mut reader);
+
+    // In-scope namespace declarations, one frame per open
+    // `<md:EntitiesDescriptor>` wrapper (plus the root). When an entity is
+    // re-wrapped for isolated parsing it must see every prefix the original
+    // document had in scope at that point — not just the outermost root's —
+    // so a nested wrapper that introduces a prefix a child relies on still
+    // resolves (RFC-006 §3 nested aggregates). Each frame holds the
+    // `(key, value)` namespace declarations on that wrapper plus the element
+    // depth at which it opened, so it is popped exactly when that wrapper
+    // closes.
+    let mut ns_stack: Vec<NsFrame> = Vec::new();
+    let mut root_seen = false;
+    let mut root_is_aggregate = false;
+
+    // Element depth at which the entity currently being captured started, plus
+    // the absolute byte offset of the `<` that opened its start tag. `None`
+    // when not inside a captured entity. `capture_byte_offset` is recorded at
+    // the moment `capture_start` is set, from the reader position *before* the
+    // read that produced the opening `Start`, so no backward byte scan is ever
+    // needed to find where the entity began.
+    let mut capture_start: Option<usize> = None;
+    let mut capture_byte_offset: usize = 0;
+    let mut element_depth: usize = 0;
+    let mut entities_visited: usize = 0;
+
+    // Reader position before the upcoming `read_event`, i.e. the byte offset of
+    // the token it is about to yield.
+    let mut offset_before_read: usize = 0;
+
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| Error::XmlParse(format!("quick-xml: {e}")))?;
+        match &event {
+            Event::Eof => break,
+            evt @ (Event::DocType(_) | Event::PI(_)) => {
+                return Err(reject_doctype_or_pi(evt)
+                    .unwrap_or_else(|| Error::XmlParse("unexpected event".to_string())));
+            }
+            Event::Start(start) => {
+                let local = raw_local_name(start.name().into_inner());
+                if !root_seen {
+                    root_seen = true;
+                    root_is_aggregate = local == b"EntitiesDescriptor";
+                    if !root_is_aggregate && local != b"EntityDescriptor" {
+                        return Err(Error::InvalidConfiguration {
+                            reason: "root is not <md:EntityDescriptor> or <md:EntitiesDescriptor>",
+                        });
+                    }
+                    if root_is_aggregate {
+                        ns_stack.push((collect_namespace_decls(start), element_depth));
+                    } else {
+                        // A single EntityDescriptor root is itself the one
+                        // entry; capture from its opening `<`.
+                        capture_start = Some(0);
+                        capture_byte_offset = offset_before_read;
+                    }
+                    element_depth = element_depth.checked_add(1).ok_or_else(depth_overflow)?;
+                    offset_before_read = usize::try_from(reader.buffer_position())
+                        .map_err(|_e| position_overflow())?;
+                    continue;
+                }
+                if capture_start.is_none() {
+                    if local == b"EntityDescriptor" {
+                        capture_start = Some(element_depth);
+                        capture_byte_offset = offset_before_read;
+                    } else if local == b"EntitiesDescriptor" {
+                        // Descended into a nested wrapper: push its declarations
+                        // (tagged with this element's sit-depth) so children
+                        // inherit the full in-scope prefix set.
+                        if ns_stack.len() >= MAX_STREAM_DEPTH {
+                            return Err(Error::XmlParse(
+                                "nested EntitiesDescriptor depth limit exceeded".to_string(),
+                            ));
+                        }
+                        ns_stack.push((collect_namespace_decls(start), element_depth));
+                    }
+                }
+                element_depth = element_depth.checked_add(1).ok_or_else(depth_overflow)?;
+            }
+            Event::Empty(empty) => {
+                let local = raw_local_name(empty.name().into_inner());
+                if !root_seen {
+                    // An empty-element root carries no entities; nothing to do.
+                    if local != b"EntitiesDescriptor" && local != b"EntityDescriptor" {
+                        return Err(Error::InvalidConfiguration {
+                            reason: "root is not <md:EntityDescriptor> or <md:EntitiesDescriptor>",
+                        });
+                    }
+                    break;
+                }
+            }
+            Event::End(_) => {
+                element_depth = element_depth
+                    .checked_sub(1)
+                    .ok_or_else(|| Error::XmlParse("unmatched end tag".to_string()))?;
+                let end_pos =
+                    usize::try_from(reader.buffer_position()).map_err(|_e| position_overflow())?;
+                if Some(element_depth) == capture_start {
+                    let entity = parse_captured_entity(
+                        metadata_xml,
+                        capture_byte_offset,
+                        end_pos,
+                        &ns_stack,
+                    )?;
+                    capture_start = None;
+                    entities_visited = entities_visited
+                        .checked_add(1)
+                        .ok_or_else(|| Error::XmlParse("entity count overflow".to_string()))?;
+                    if entities_visited > MAX_STREAM_ENTITIES {
+                        return Err(Error::XmlParse(
+                            "aggregate entity count limit exceeded".to_string(),
+                        ));
+                    }
+                    if let Some(entry) = entity
+                        && visit(entry) == StreamControl::Stop
+                    {
+                        return Ok(());
+                    }
+                    if !root_is_aggregate {
+                        // Single-entity root: only ever one entry.
+                        break;
+                    }
+                } else if capture_start.is_none()
+                    && ns_stack.len() > 1
+                    && ns_stack
+                        .last()
+                        .is_some_and(|(_, depth)| *depth == element_depth)
+                {
+                    // Ascended out of a nested wrapper sitting at this depth;
+                    // its declarations leave scope. The root frame (index 0)
+                    // always stays in scope until EOF.
+                    ns_stack.pop();
+                }
+            }
+            _ => {}
+        }
+        offset_before_read =
+            usize::try_from(reader.buffer_position()).map_err(|_e| position_overflow())?;
+    }
+    Ok(())
+}
+
+fn depth_overflow() -> Error {
+    Error::XmlParse("depth overflow".to_string())
+}
+
+fn position_overflow() -> Error {
+    Error::XmlParse("buffer position overflow".to_string())
+}
+
+/// Extract the `<md:EntityDescriptor>` byte span `[start_idx, end_pos)`, re-wrap
+/// it with the in-scope namespace declarations from every open ancestor
+/// wrapper, parse it with the full DOM parser (so XSW / line-ending
+/// normalization / resource limits still apply), and convert it to a
+/// [`MetadataEntry`]. `start_idx` is the absolute offset of the entity's
+/// opening `<`, recorded when capture began — no backward scan, robust to
+/// comments / CDATA / attribute text that merely *contain* an
+/// `<md:EntityDescriptor` token.
+fn parse_captured_entity(
+    metadata_xml: &[u8],
+    start_idx: usize,
+    end_pos: usize,
+    ns_stack: &[NsFrame],
+) -> Result<Option<MetadataEntry>, Error> {
+    let entity_bytes = metadata_xml
+        .get(start_idx..end_pos)
+        .ok_or_else(|| Error::XmlParse("entity span out of range".to_string()))?;
+
+    // Collapse the in-scope declarations from every open ancestor wrapper into
+    // one set, innermost wins: a nested wrapper that redeclares a prefix
+    // shadows the outer binding, exactly as in the original document. Emitting
+    // a prefix twice on the synthetic wrapper would be malformed XML, so we
+    // dedupe by key while preserving first-seen (outermost) order for the
+    // surviving bindings.
+    let mut decls: Vec<(&[u8], &[u8])> = Vec::new();
+    for (frame, _depth) in ns_stack {
+        for (key, value) in frame {
+            if let Some(slot) = decls.iter_mut().find(|(k, _)| *k == key.as_slice()) {
+                slot.1 = value.as_slice();
+            } else {
+                decls.push((key.as_slice(), value.as_slice()));
+            }
+        }
+    }
+
+    let decls_len: usize = decls
+        .iter()
+        .map(|(k, v)| k.len().saturating_add(v.len()).saturating_add(4))
+        .sum();
+    let mut wrapped: Vec<u8> = Vec::with_capacity(
+        entity_bytes
+            .len()
+            .saturating_add(decls_len)
+            .saturating_add(64),
+    );
+    wrapped.extend_from_slice(b"<md:EntitiesDescriptor");
+    if decls.is_empty() {
+        // No ancestor declared anything (a bare single-entity root whose own
+        // tag carries the `xmlns`): the child bytes already declare everything,
+        // so fall back to a minimal `md:` binding just so the synthetic wrapper
+        // element itself is well-formed.
+        wrapped.extend_from_slice(b" xmlns:md=\"");
+        wrapped.extend_from_slice(MD_NS.as_bytes());
+        wrapped.push(b'"');
+    } else {
+        for (key, value) in &decls {
+            wrapped.push(b' ');
+            wrapped.extend_from_slice(key);
+            wrapped.extend_from_slice(b"=\"");
+            wrapped.extend_from_slice(value);
+            wrapped.push(b'"');
+        }
+    }
+    wrapped.push(b'>');
+    wrapped.extend_from_slice(entity_bytes);
+    wrapped.extend_from_slice(b"</md:EntitiesDescriptor>");
+
+    let doc = Document::parse_with_limits(&wrapped, XmlLimits::aggregate())?;
+    let entity_elem = doc
+        .root()
+        .child_element(Some(MD_NS), "EntityDescriptor")
+        .ok_or_else(|| Error::XmlParse("captured span is not an EntityDescriptor".to_string()))?;
+    Ok(Some(parse_entity_descriptor(entity_elem)?))
 }
 
 /// Recursively flatten nested `<md:EntitiesDescriptor>` blocks (RFC-006 §3).
@@ -224,7 +661,10 @@ pub fn parse_signed_entities_descriptor(
     metadata_xml: &[u8],
     trusted_signing_cert: &X509Certificate,
 ) -> Result<EntitiesDescriptor, Error> {
-    let doc = Document::parse(metadata_xml)?;
+    // Aggregate-sized node ceiling: a signed InCommon / eduGAIN aggregate
+    // exceeds the default ~100k-node limit, and the signature covers the whole
+    // wrapper so the document must be parsed as a unit before verification.
+    let doc = Document::parse_with_limits(metadata_xml, XmlLimits::aggregate())?;
     verify_metadata_signature_on_document(&doc, trusted_signing_cert)?;
     EntitiesDescriptor::from_root_element(doc.root())
 }
@@ -936,5 +1376,274 @@ mod tests {
         let (xml, cert) = sign_metadata("md-1", &body);
         let sp = parse_signed_sp_descriptor(xml.as_bytes(), &cert).unwrap();
         assert_eq!(sp.entity_id, "https://sp.example.com/saml");
+    }
+
+    // ---- entityID index ----
+
+    #[test]
+    fn by_entity_id_and_index_resolve_all_roles() {
+        let xml = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                                       xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                {idp}
+                {sp}
+                {dual}
+              </md:EntitiesDescriptor>"#,
+            idp = idp_entity_xml("https://idp.example.com/saml"),
+            sp = sp_entity_xml("https://sp.example.com/saml"),
+            dual = dual_entity_xml("https://shib.example.com/saml"),
+        );
+        let fed = EntitiesDescriptor::from_metadata_xml(xml.as_bytes()).unwrap();
+
+        // Linear accessor.
+        assert!(matches!(
+            fed.by_entity_id("https://idp.example.com/saml"),
+            Some(MetadataEntry::Idp(_))
+        ));
+        assert!(matches!(
+            fed.by_entity_id("https://sp.example.com/saml"),
+            Some(MetadataEntry::Sp(_))
+        ));
+        assert!(matches!(
+            fed.by_entity_id("https://shib.example.com/saml"),
+            Some(MetadataEntry::Dual(_, _))
+        ));
+        assert!(fed.by_entity_id("nope").is_none());
+
+        // HashMap index returns the same entries.
+        let index = fed.index_by_entity_id();
+        assert_eq!(index.len(), 3);
+        assert!(matches!(
+            index.get("https://idp.example.com/saml"),
+            Some(MetadataEntry::Idp(_))
+        ));
+        assert!(matches!(
+            index.get("https://shib.example.com/saml"),
+            Some(MetadataEntry::Dual(_, _))
+        ));
+    }
+
+    #[test]
+    fn other_entry_has_no_entity_id() {
+        let xml = r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">
+                <md:EntityDescriptor entityID="https://aa.example.com/saml">
+                  <md:AttributeAuthorityDescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"/>
+                </md:EntityDescriptor>
+              </md:EntitiesDescriptor>"#;
+        let fed = EntitiesDescriptor::from_metadata_xml(xml.as_bytes()).unwrap();
+        assert_eq!(fed.entities[0].entity_id(), None);
+        // `Other` entries are skipped by the index.
+        assert!(fed.index_by_entity_id().is_empty());
+    }
+
+    // ---- streaming parse ----
+
+    #[test]
+    fn stream_entities_visits_each_child_lazily() {
+        let xml = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                                       xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+                                       Name="urn:example:federation">
+                {idp}
+                {sp}
+                {dual}
+              </md:EntitiesDescriptor>"#,
+            idp = idp_entity_xml("https://idp.example.com/saml"),
+            sp = sp_entity_xml("https://sp.example.com/saml"),
+            dual = dual_entity_xml("https://shib.example.com/saml"),
+        );
+        let mut ids = Vec::new();
+        stream_entities(xml.as_bytes(), |entry| {
+            ids.push(entry.entity_id().map(str::to_owned));
+            StreamControl::Continue
+        })
+        .expect("stream ok");
+        assert_eq!(
+            ids,
+            vec![
+                Some("https://idp.example.com/saml".to_owned()),
+                Some("https://sp.example.com/saml".to_owned()),
+                Some("https://shib.example.com/saml".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_entities_stop_short_circuits() {
+        let xml = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                                       xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                {a}
+                {b}
+                {c}
+              </md:EntitiesDescriptor>"#,
+            a = idp_entity_xml("https://a.example.com/saml"),
+            b = idp_entity_xml("https://b.example.com/saml"),
+            c = idp_entity_xml("https://c.example.com/saml"),
+        );
+        let mut count = 0usize;
+        let mut found = None;
+        stream_entities(xml.as_bytes(), |entry| {
+            count = count.checked_add(1).unwrap();
+            if entry.entity_id() == Some("https://b.example.com/saml") {
+                found = entry.entity_id().map(str::to_owned);
+                StreamControl::Stop
+            } else {
+                StreamControl::Continue
+            }
+        })
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("https://b.example.com/saml"));
+        // Visited a and b only — c was never parsed.
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn stream_entities_flattens_nested_aggregate() {
+        let xml = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                                       xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                {outer}
+                <md:EntitiesDescriptor>
+                  {inner}
+                </md:EntitiesDescriptor>
+              </md:EntitiesDescriptor>"#,
+            outer = idp_entity_xml("https://outer.example.com/saml"),
+            inner = idp_entity_xml("https://inner.example.com/saml"),
+        );
+        let mut ids = Vec::new();
+        stream_entities(xml.as_bytes(), |entry| {
+            ids.push(entry.entity_id().map(str::to_owned));
+            StreamControl::Continue
+        })
+        .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&Some("https://outer.example.com/saml".to_owned())));
+        assert!(ids.contains(&Some("https://inner.example.com/saml".to_owned())));
+    }
+
+    #[test]
+    fn stream_entities_single_entity_root() {
+        let xml = format!(
+            r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                                     xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+                                     entityID="https://solo.example.com/saml">
+              <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+                <md:KeyDescriptor use="signing">
+                  <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>
+                </md:KeyDescriptor>
+                <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+                                        Location="https://solo.example.com/sso"/>
+              </md:IDPSSODescriptor>
+            </md:EntityDescriptor>"#,
+            cert = rsa_cert_b64()
+        );
+        let mut ids = Vec::new();
+        stream_entities(xml.as_bytes(), |entry| {
+            ids.push(entry.entity_id().map(str::to_owned));
+            StreamControl::Continue
+        })
+        .unwrap();
+        assert_eq!(ids, vec![Some("https://solo.example.com/saml".to_owned())]);
+    }
+
+    #[test]
+    fn stream_entities_entity_containing_entitydescriptor_comment_parses() {
+        // A legal comment inside an entity that contains a literal
+        // `<md:EntityDescriptor` token must NOT confuse span capture: the
+        // entity's real opening `<` is recorded when capture starts, so the
+        // comment text is just bytes inside the span, never a new start.
+        let xml = r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                                            xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                <md:EntityDescriptor entityID="https://commented.example.com/saml">
+                  <!-- spoof: <md:EntityDescriptor entityID="https://evil.example/saml"> -->
+                  <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+                    <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+                                            Location="https://commented.example.com/sso"/>
+                  </md:IDPSSODescriptor>
+                </md:EntityDescriptor>
+              </md:EntitiesDescriptor>"#;
+        let mut ids = Vec::new();
+        stream_entities(xml.as_bytes(), |entry| {
+            ids.push(entry.entity_id().map(str::to_owned));
+            StreamControl::Continue
+        })
+        .expect("comment-spoof entity must still parse");
+        assert_eq!(
+            ids,
+            vec![Some("https://commented.example.com/saml".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stream_entities_nested_aggregate_inherits_inner_namespace_prefix() {
+        // The `ds:` prefix a child relies on is declared on the *inner*
+        // EntitiesDescriptor, not the root. Re-wrap must replay the inner
+        // wrapper's declarations too (RFC-006 §3 nested aggregates), otherwise
+        // the child's `ds:KeyInfo` fails to resolve its prefix.
+        let xml = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">
+                <md:EntitiesDescriptor xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                  <md:EntityDescriptor entityID="https://nested.example.com/saml">
+                    <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+                      <md:KeyDescriptor use="signing">
+                        <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>
+                      </md:KeyDescriptor>
+                      <md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+                                              Location="https://nested.example.com/sso"/>
+                    </md:IDPSSODescriptor>
+                  </md:EntityDescriptor>
+                </md:EntitiesDescriptor>
+              </md:EntitiesDescriptor>"#,
+            cert = rsa_cert_b64()
+        );
+        let mut ids = Vec::new();
+        stream_entities(xml.as_bytes(), |entry| {
+            ids.push(entry.entity_id().map(str::to_owned));
+            StreamControl::Continue
+        })
+        .expect("nested-namespace entity must parse");
+        assert_eq!(
+            ids,
+            vec![Some("https://nested.example.com/saml".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stream_signed_entities_verifies_before_yield() {
+        let body = idp_entity_xml("https://idp.example.com/saml");
+        let (xml, cert) = sign_metadata("md-1", &body);
+
+        let mut ids = Vec::new();
+        stream_signed_entities(xml.as_bytes(), &cert, |entry| {
+            ids.push(entry.entity_id().map(str::to_owned));
+            StreamControl::Continue
+        })
+        .expect("verify + stream");
+        assert_eq!(ids, vec![Some("https://idp.example.com/saml".to_owned())]);
+    }
+
+    #[test]
+    fn stream_signed_entities_rejects_bad_signature_without_yielding() {
+        let body = idp_entity_xml("https://idp.example.com/saml");
+        let (xml, cert) = sign_metadata("md-1", &body);
+        let tampered = xml.replacen(
+            "https://idp.example.com/sso",
+            "https://idp.evil.example/sso",
+            1,
+        );
+        assert_ne!(tampered, xml);
+
+        let mut visited = false;
+        let err = stream_signed_entities(tampered.as_bytes(), &cert, |_entry| {
+            visited = true;
+            StreamControl::Continue
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::SignatureVerification { .. }));
+        assert!(
+            !visited,
+            "no entity may be yielded from an unverified aggregate"
+        );
     }
 }

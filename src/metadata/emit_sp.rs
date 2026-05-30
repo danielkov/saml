@@ -94,7 +94,7 @@ pub fn emit_sp_metadata(
 // Builders
 // =============================================================================
 
-fn build_sp_entity_descriptor(
+pub(super) fn build_sp_entity_descriptor(
     inputs: &SpMetadataInputs<'_>,
     entity_descriptor_id: &str,
 ) -> Result<Element, Error> {

@@ -86,7 +86,7 @@ pub fn emit_idp_metadata(
 // Builders
 // =============================================================================
 
-fn build_idp_entity_descriptor(
+pub(super) fn build_idp_entity_descriptor(
     inputs: &IdpMetadataInputs<'_>,
     entity_descriptor_id: &str,
 ) -> Result<Element, Error> {

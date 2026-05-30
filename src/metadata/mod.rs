@@ -2,6 +2,7 @@
 //!
 //! See `docs/rfcs/RFC-006-metadata.md`.
 
+pub mod emit_aggregate;
 pub mod emit_idp;
 pub mod emit_sp;
 pub mod parse;
