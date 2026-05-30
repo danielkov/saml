@@ -1,6 +1,7 @@
 # saml
 
 [![CI](https://img.shields.io/badge/ci-pending-lightgrey.svg)](#)
+[![codecov](https://codecov.io/gh/danielkov/saml/branch/main/graph/badge.svg)](https://codecov.io/gh/danielkov/saml)
 [![crates.io](https://img.shields.io/crates/v/saml.svg)](https://crates.io/crates/saml)
 [![docs.rs](https://img.shields.io/docsrs/saml)](https://docs.rs/saml)
 

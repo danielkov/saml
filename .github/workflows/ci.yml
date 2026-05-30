@@ -145,6 +145,35 @@ jobs:
         run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
 
   # ---------------------------------------------------------------------------
+  # Coverage: instrument the workspace with cargo-llvm-cov, emit lcov, and push
+  # to Codecov. Mirrors the test job's keycloak-example exclusion. Tokenless
+  # upload (public repo); never fail CI on an upload hiccup.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + llvm-tools)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --workspace --exclude saml-keycloak-example --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+  # ---------------------------------------------------------------------------
   # Cross-platform smoke test: default features only, stable only.
   # Keeps CI minutes reasonable; full matrix lives on Linux.
   # ---------------------------------------------------------------------------

@@ -11,6 +11,8 @@ if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
   echo "cargo-llvm-cov not found. Install with:" >&2
   echo "  cargo install cargo-llvm-cov" >&2
   echo "  rustup component add llvm-tools-preview" >&2
+  echo "or, to match the pinned toolchain:" >&2
+  echo "  mise install" >&2
   exit 1
 fi
 

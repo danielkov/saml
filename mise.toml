@@ -22,8 +22,16 @@ rust = "1.95.0"
 # Coverage-guided fuzzing harnesses (`cargo fuzz run …`). Requires a nightly
 # toolchain at run time, which it picks up from rustup.
 "cargo:cargo-fuzz" = "0.13.1"
+# Source-based coverage (`cargo llvm-cov …`). Drives `scripts/coverage.sh`
+# locally and the `coverage` CI job. Needs the `llvm-tools-preview` rustup
+# component, which the pinned rust toolchain ships.
+"cargo:cargo-llvm-cov" = "0.8.7"
 
 [tasks.fuzz]
 description = "Run a libfuzzer target (default 30m). Usage: mise run fuzz fuzz_xml_parse"
 dir = "fuzz"
 run = "cargo +nightly fuzz run \"${1:-fuzz_xml_parse}\" -- -max_total_time=${FUZZ_SECONDS:-1800}"
+
+[tasks.coverage]
+description = "Generate an HTML coverage report for the workspace"
+run = "scripts/coverage.sh"
