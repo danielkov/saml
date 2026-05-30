@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Crate metadata for crates.io (`repository`, `homepage`, `documentation`,
   `readme`, `keywords`, `categories`).
 - `LICENSE-MIT`, `LICENSE-APACHE`, `SECURITY.md`, `CHANGELOG.md`,
-  `ROADMAP.md`, `docs/interop.md`.
+  `docs/interop.md`.
 - `scripts/coverage.sh` (cargo-llvm-cov HTML report helper) and
   `examples/idps/fusionauth/regen_cert.sh` (rotate the FA IdP signing
   keypair).

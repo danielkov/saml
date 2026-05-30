@@ -2,7 +2,7 @@
 //! XML Security Library verifier that Shibboleth, SimpleSAMLphp and
 //! mod_auth_mellon build on. Our own round-trip tests are self-consistent; this
 //! proves a *foreign* verifier accepts our output, which is the stronger interop
-//! claim (ROADMAP "Live `xmlsec1` cross-check on metadata signing").
+//! claim.
 //!
 //! The test self-skips when `xmlsec1` is not on `PATH`, so it is a no-op on
 //! machines without the tool. CI installs the `xmlsec1` package before running.

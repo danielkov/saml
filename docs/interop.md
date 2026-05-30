@@ -146,7 +146,7 @@ single-use, others SHOULD be, with caller discretion.
 The crate's default is the strict reading because the safer mode is
 the right default when the application cannot reason about its own
 assertion-replay semantics. A tiered `ReplayMode::{All, OneTimeUseOnly,
-Off}` opt-out is tracked in `ROADMAP.md`.
+Off}` opt-out is available for callers that can reason about it.
 
 ### `xs:dateTime` year range
 
@@ -154,15 +154,8 @@ Off}` opt-out is tracked in `ROADMAP.md`.
 `1..=9999`. This is defensive against pathological inputs and is
 deliberate; SAML deployments do not need years outside this range.
 
-### No SOAP / HoK / ECP / inclusive-C14N
+### Canonicalization
 
-The following bindings, profiles, and canonicalization variants are
-out of scope for the current release and tracked in `ROADMAP.md`:
-
-- SOAP binding (artifact resolution, backchannel SLO over SOAP)
-- Holder-of-Key Web SSO profile
-- Enhanced Client or Proxy (ECP) profile
-- Inclusive Canonical XML (`xml-c14n`, non-exclusive)
-
-The crate ships exclusive Canonical XML (`exc-c14n`), HTTP-Redirect,
-HTTP-POST, and HTTP-Artifact (front-channel) only.
+The crate ships both exclusive Canonical XML (`exc-c14n`) and inclusive
+Canonical XML (`xml-c14n`); exclusive is the default for emitted
+signatures.
