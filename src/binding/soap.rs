@@ -179,6 +179,30 @@ impl UnwrappedBody {
 /// it is the SOAP layer's only job; SAML-level checks (status, signature,
 /// issuer) belong to the binding that called in.
 pub fn unwrap(envelope_bytes: &[u8]) -> Result<UnwrappedBody, Error> {
+    unwrap_inner(envelope_bytes)
+}
+
+/// Extract the single payload element of a `<soap:Body>`, rejecting a body that
+/// carries no element child or more than one. The SOAP RPC-style SAML messages
+/// this module handles (ArtifactResolve/Response, LogoutRequest/Response, the
+/// ECP AuthnRequest / Response) always carry exactly one body child; enforcing
+/// that closes a decoy-sibling gap where a first-element-child read would
+/// silently ignore — and never verify — a second element sitting alongside the
+/// one acted on.
+fn single_body_payload(body: &Element) -> Result<&Element, Error> {
+    let mut children = body.child_elements();
+    let payload = children.next().ok_or_else(|| {
+        Error::XmlParse("SOAP: soap:Body contains no payload element".to_string())
+    })?;
+    if children.next().is_some() {
+        return Err(Error::XmlParse(
+            "SOAP: soap:Body must contain exactly one payload element".to_string(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn unwrap_inner(envelope_bytes: &[u8]) -> Result<UnwrappedBody, Error> {
     let doc = Document::parse(envelope_bytes)?;
     let envelope = doc.root();
     if envelope.qname().namespace() != Some(SOAP_NS) || envelope.qname().local() != "Envelope" {
@@ -212,9 +236,7 @@ pub fn unwrap(envelope_bytes: &[u8]) -> Result<UnwrappedBody, Error> {
         });
     }
 
-    let payload = body.child_elements().next().ok_or_else(|| {
-        Error::XmlParse("SOAP: soap:Body contains no payload element".to_string())
-    })?;
+    let payload = single_body_payload(body)?;
 
     // Security: re-root the payload as a *standalone document* by emitting it
     // and reparsing, rather than handing back the payload element in place
@@ -322,6 +344,9 @@ pub(crate) fn unwrap_envelope(envelope_bytes: &[u8]) -> Result<UnwrappedEnvelope
             faultstring: faultstring.filter(|s| !s.is_empty()),
         });
     }
+    // Reject a body with zero or multiple payload children (defence-in-depth,
+    // same rule as `unwrap`); `body_payload` then reads the validated child.
+    single_body_payload(body)?;
     Ok(UnwrappedEnvelope { document: doc })
 }
 
@@ -358,6 +383,20 @@ mod tests {
     fn unwrap_rejects_non_envelope_root() {
         let err = unwrap(b"<not-soap/>").unwrap_err();
         assert!(matches!(err, Error::XmlParse(_)));
+    }
+
+    #[test]
+    fn unwrap_rejects_multiple_body_payloads() {
+        // A decoy element sitting alongside the real payload must be rejected,
+        // not silently ignored by a first-element-child read.
+        let xml = format!(
+            r#"<soap:Envelope xmlns:soap="{SOAP_NS}"><soap:Body><samlp:LogoutResponse xmlns:samlp="{SAMLP_NS}" ID="_a"/><decoy/></soap:Body></soap:Envelope>"#
+        );
+        let err = unwrap(xml.as_bytes()).unwrap_err();
+        match err {
+            Error::XmlParse(m) => assert!(m.contains("exactly one payload"), "got: {m}"),
+            other => panic!("expected XmlParse, got {other:?}"),
+        }
     }
 
     #[test]
