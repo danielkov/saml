@@ -1,6 +1,6 @@
 # saml
 
-[![CI](https://img.shields.io/badge/ci-pending-lightgrey.svg)](#)
+[![CI](https://github.com/danielkov/saml/actions/workflows/ci.yml/badge.svg)](https://github.com/danielkov/saml/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/danielkov/saml/branch/main/graph/badge.svg)](https://codecov.io/gh/danielkov/saml)
 [![crates.io](https://img.shields.io/crates/v/saml.svg)](https://crates.io/crates/saml)
 [![docs.rs](https://img.shields.io/docsrs/saml)](https://docs.rs/saml)
@@ -38,8 +38,10 @@ See [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-001-architecture.md) §1
 | `ecdsa-sha` | yes | ECDSA-SHA256 / 384 / 512 signature algorithms (P-256, P-384). |
 | `xmlenc` | yes | XML Encryption (`EncryptedAssertion`, `EncryptedID`, AES-CBC / AES-GCM, RSA-OAEP). |
 | `slo` | yes | Single Logout (Redirect / POST, with optional back-channel SOAP). |
-| `metadata-emit` | yes | `metadata_xml` / `metadata_xml_with_extras` for SP and IdP. |
-| `artifact-binding` | no | HTTP-Artifact binding (SOAP `ArtifactResolve`). Requires `weak-algos` for the SHA-1 SourceID. |
+| `metadata-emit` | yes | `metadata_xml` / `metadata_xml_with_extras` for SP and IdP, plus federation `EntitiesDescriptor` aggregate emit. |
+| `xsd-validate` | yes | Structural XSD-style schema validation of inbound messages before any crypto runs. Opt out for permissive interop with borderline-conformant IdPs. |
+| `artifact-binding` | no | HTTP-Artifact binding (SOAP `ArtifactResolve`) + `BackchannelClient`. Requires `weak-algos` for the SHA-1 SourceID. |
+| `ecp` | no | ECP / PAOS profile (Enhanced Client or Proxy) for non-browser clients. Reuses the `binding::soap` envelope; no extra dependencies. |
 | `weak-algos` | no | SHA-1 digest, RSA-PKCS1-v1.5 key transport, DSA-SHA1. Off by default; opt in only for legacy peer interop. |
 
 The protocol layer compiles for any target `rustc` supports, including `wasm32-unknown-unknown` with `default-features = false`.
@@ -147,18 +149,17 @@ Implemented:
 
 - Web-Browser-SSO profile (HTTP-Redirect, HTTP-POST) — SP and IdP sides.
 - Single Logout (`slo` feature) — Redirect and POST bindings, signed in both directions.
-- HTTP-Artifact binding (`artifact-binding` feature) — `ArtifactResolve` / `ArtifactResponse` over SOAP.
-- XML-Encryption (`xmlenc` feature) — `EncryptedAssertion`, AES-128/256-CBC, AES-128/256-GCM, RSA-OAEP-MGF1-SHA1/256/384/512 key transport.
+- HTTP-Artifact binding (`artifact-binding` feature) — `ArtifactResolve` / `ArtifactResponse` over SOAP, with a first-class `BackchannelClient` (signs the resolve, verifies the response) built on a shared, binding-agnostic `binding::soap` envelope module.
+- ECP / PAOS profile (`ecp` feature) — Enhanced Client or Proxy for non-browser clients: SP, client, and IdP primitives over the Reverse-SOAP (PAOS) binding, including the spec §4.2.4.2 `AssertionConsumerServiceURL` anti-redirect check.
+- Holder-of-Key subject confirmation — SP-side match of the caller-supplied presenter TLS certificate against the assertion's `<ds:KeyInfo>` (`SubjectPublicKeyInfo`, constant-time) plus IdP-side issuance; opt-in, with bearer remaining the default.
+- XML-Encryption (`xmlenc` feature) — `EncryptedAssertion`, `EncryptedID`, AES-128/256-CBC, AES-128/256-GCM, RSA-OAEP-MGF1-SHA1/256/384/512 key transport.
 - XML-DSig — Exclusive and Inclusive C14N (with and without comments), enveloped-signature transform; multi-Reference signatures rejected by default; transform whitelist enforced.
-- Metadata parse (`EntityDescriptor` and `EntitiesDescriptor`) and signed-aggregate verification.
-- Metadata emit (`metadata-emit` feature) for SP and IdP descriptors.
+- Metadata parse and emit (`metadata-emit` feature) for single `EntityDescriptor`s and federation `EntitiesDescriptor` aggregates — signed-aggregate verification, an `entityID` index, and bounded streaming for large (InCommon / eduGAIN-scale) aggregates.
 - Identity proxy composition with stateless `ProxyContext`, opaque-handle Redirect codec, NameID transforms, and attribute release policies.
 - Pluggable signature verification via the `SignatureVerifier` trait (for HSM- or KMS-backed keys).
 
 Out of scope for v0.1 (see [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-001-architecture.md) §12):
 
-- ECP / PAOS profile (Enhanced Client or Proxy).
-- Holder-of-Key subject confirmation — bearer only.
 - SAML 1.x compatibility.
 - Attribute Query profile.
 - Name Identifier Management profile.
