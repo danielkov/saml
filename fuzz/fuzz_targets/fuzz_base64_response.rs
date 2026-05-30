@@ -219,6 +219,7 @@ fuzz_target!(|data: &[u8]| {
         clock_skew: Duration::from_secs(60),
         replay_cache: None,
         replay_mode: saml::ReplayMode::All,
+        holder_of_key_cert: None,
     });
 });
 
