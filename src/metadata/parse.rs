@@ -19,8 +19,8 @@ use crate::error::Error;
 use crate::nameid::NameIdFormat;
 use crate::time::parse_xs_datetime;
 use crate::xml::parse::{
-    Document, Element, Node, XmlLimits, collect_namespace_decls, configure_reader, raw_local_name,
-    reject_doctype_or_pi,
+    Document, Element, Node, TreeBuilder, XmlLimits, collect_namespace_decls, configure_reader,
+    normalize_line_endings, raw_local_name, reject_doctype_or_pi,
 };
 
 // =============================================================================
@@ -217,12 +217,15 @@ pub enum StreamControl {
 ///
 /// Memory characteristics: the parser scans the input with a streaming XML
 /// reader and materializes a DOM for **one** `<md:EntityDescriptor>` subtree
-/// at a time (re-wrapped with the aggregate root's namespace declarations so
-/// prefixes resolve), parses it into a [`MetadataEntry`], hands it to the
+/// at a time (built by a tree builder whose namespace scope is seeded with the
+/// in-scope declarations of the ancestor `<md:EntitiesDescriptor>` wrappers, so
+/// the lifted subtree's prefixes resolve), parses it into a [`MetadataEntry`],
+/// hands it to the
 /// visitor, and drops it before advancing. Peak additional memory is therefore
-/// bounded by the largest single entity, not the ~50 MB aggregate — the use
-/// case called out in the ROADMAP for InCommon / eduGAIN. The input slice
-/// itself is still held by the caller; this API does not stream off a socket.
+/// bounded by one normalized copy of the input (XML 1.0 §2.11 line-end
+/// normalization, matching the eager path) plus the largest single entity
+/// tree — never the full aggregate DOM. The input slice itself is still held by
+/// the caller; this API does not stream off a socket.
 ///
 /// Nested `<md:EntitiesDescriptor>` blocks are flattened, matching the
 /// eager [`EntitiesDescriptor::from_metadata_xml`] path.
@@ -335,48 +338,78 @@ fn stream_entities_inner<F>(metadata_xml: &[u8], mut visit: F) -> Result<(), Err
 where
     F: FnMut(MetadataEntry) -> StreamControl,
 {
+    stream_entity_elements(metadata_xml, |entity_root| {
+        Ok(visit(parse_entity_descriptor(entity_root)?))
+    })
+}
+
+/// Core of the unverified streaming scan: drive a streaming XML reader over the
+/// (line-end-normalized) aggregate, build each `<md:EntityDescriptor>` subtree
+/// into an [`Element`] one at a time via a seed-scoped [`TreeBuilder`], and hand
+/// the finished entity tree to `visit` before dropping it.
+///
+/// [`stream_entities_inner`] layers entity parsing on top; tests use it directly
+/// to inspect the lifted entity tree (e.g. to prove line-end normalization
+/// matches the eager path).
+fn stream_entity_elements<F>(metadata_xml: &[u8], mut visit: F) -> Result<(), Error>
+where
+    F: FnMut(&Element) -> Result<StreamControl, Error>,
+{
     use quick_xml::Reader;
     use quick_xml::events::Event;
 
-    let mut reader = Reader::from_reader(metadata_xml);
+    // XML 1.0 §2.11 end-of-line normalization, applied to the whole input up
+    // front exactly as the eager DOM path does in `parse_inner`. Without it a
+    // streamed entity carrying `\r`/`\r\n` in a text node or attribute value
+    // would build a tree that differs from the eager one — this crate's c14n
+    // escapes a literal `\r` as `&#xD;`, so the divergence is signature-relevant.
+    // `normalize_line_endings` stays zero-copy on the common LF-only input.
+    let normalized = normalize_line_endings(metadata_xml);
+    let mut reader = Reader::from_reader(normalized.as_ref());
     configure_reader(&mut reader);
 
     // In-scope namespace declarations, one frame per open
-    // `<md:EntitiesDescriptor>` wrapper (plus the root). When an entity is
-    // re-wrapped for isolated parsing it must see every prefix the original
-    // document had in scope at that point — not just the outermost root's —
-    // so a nested wrapper that introduces a prefix a child relies on still
-    // resolves (RFC-006 §3 nested aggregates). Each frame holds the
-    // `(key, value)` namespace declarations on that wrapper plus the element
-    // depth at which it opened, so it is popped exactly when that wrapper
-    // closes.
+    // `<md:EntitiesDescriptor>` wrapper (plus the root). When an entity subtree
+    // is lifted out for isolated parsing it must see every prefix the original
+    // document had in scope at that point — not just the outermost root's — so a
+    // nested wrapper that introduces a prefix a child relies on still resolves
+    // (RFC-006 §3 nested aggregates). Each frame holds the `(key, value)`
+    // namespace declarations on that wrapper plus the element depth at which it
+    // opened, so it is popped exactly when that wrapper closes.
     let mut ns_stack: Vec<NsFrame> = Vec::new();
     let mut root_seen = false;
     let mut root_is_aggregate = false;
 
-    // Element depth at which the entity currently being captured started, plus
-    // the absolute byte offset of the `<` that opened its start tag. `None`
-    // when not inside a captured entity. `capture_byte_offset` is recorded at
-    // the moment `capture_start` is set, from the reader position *before* the
-    // read that produced the opening `Start`, so no backward byte scan is ever
-    // needed to find where the entity began.
+    // Element depth at which the entity currently being captured started, and
+    // the in-progress [`TreeBuilder`] accumulating that entity's subtree. Both
+    // are `None`/empty when not inside an entity. The builder is seeded with the
+    // ancestor wrappers' in-scope declarations and fed the entity's own events
+    // (`Start` .. matching `End`) so prefixes resolve through the crate's single
+    // namespace implementation — no byte-span capture or synthetic re-wrap.
     let mut capture_start: Option<usize> = None;
-    let mut capture_byte_offset: usize = 0;
+    let mut builder: Option<TreeBuilder> = None;
     let mut element_depth: usize = 0;
     let mut entities_visited: usize = 0;
-
-    // Reader position before the upcoming `read_event`, i.e. the byte offset of
-    // the token it is about to yield.
-    let mut offset_before_read: usize = 0;
 
     loop {
         let event = reader
             .read_event()
             .map_err(|e| Error::XmlParse(format!("quick-xml: {e}")))?;
+        if matches!(event, Event::Eof) {
+            break;
+        }
+
+        // While inside an entity, every event is fed to the builder verbatim so
+        // the lifted subtree is constructed identically to the eager DOM path.
+        if let Some(b) = builder.as_mut() {
+            b.feed(&event)?;
+        }
+
         match &event {
-            Event::Eof => break,
-            evt @ (Event::DocType(_) | Event::PI(_)) => {
-                return Err(reject_doctype_or_pi(evt)
+            Event::DocType(_) | Event::PI(_) => {
+                // The builder (when active) already rejected these; reject on
+                // the bare-aggregate path too.
+                return Err(reject_doctype_or_pi(&event)
                     .unwrap_or_else(|| Error::XmlParse("unexpected event".to_string())));
             }
             Event::Start(start) => {
@@ -393,19 +426,19 @@ where
                         ns_stack.push((collect_namespace_decls(start), element_depth));
                     } else {
                         // A single EntityDescriptor root is itself the one
-                        // entry; capture from its opening `<`.
+                        // entry; begin capturing from this opening tag.
                         capture_start = Some(0);
-                        capture_byte_offset = offset_before_read;
+                        builder = Some(new_entity_builder(&ns_stack)?);
+                        feed_open(&mut builder, &event)?;
                     }
                     element_depth = element_depth.checked_add(1).ok_or_else(depth_overflow)?;
-                    offset_before_read = usize::try_from(reader.buffer_position())
-                        .map_err(|_e| position_overflow())?;
                     continue;
                 }
                 if capture_start.is_none() {
                     if local == b"EntityDescriptor" {
                         capture_start = Some(element_depth);
-                        capture_byte_offset = offset_before_read;
+                        builder = Some(new_entity_builder(&ns_stack)?);
+                        feed_open(&mut builder, &event)?;
                     } else if local == b"EntitiesDescriptor" {
                         // Descended into a nested wrapper: push its declarations
                         // (tagged with this element's sit-depth) so children
@@ -436,15 +469,15 @@ where
                 element_depth = element_depth
                     .checked_sub(1)
                     .ok_or_else(|| Error::XmlParse("unmatched end tag".to_string()))?;
-                let end_pos =
-                    usize::try_from(reader.buffer_position()).map_err(|_e| position_overflow())?;
                 if Some(element_depth) == capture_start {
-                    let entity = parse_captured_entity(
-                        metadata_xml,
-                        capture_byte_offset,
-                        end_pos,
-                        &ns_stack,
-                    )?;
+                    // The entity's closing tag was just fed to the builder
+                    // above; finalize its tree, hand it to the visitor, and drop
+                    // it before advancing — only one entity is ever materialized
+                    // at once.
+                    let entity_root = builder
+                        .take()
+                        .ok_or_else(|| Error::XmlParse("entity builder missing".to_string()))?
+                        .finish_root()?;
                     capture_start = None;
                     entities_visited = entities_visited
                         .checked_add(1)
@@ -454,9 +487,7 @@ where
                             "aggregate entity count limit exceeded".to_string(),
                         ));
                     }
-                    if let Some(entry) = entity
-                        && visit(entry) == StreamControl::Stop
-                    {
+                    if visit(&entity_root)? == StreamControl::Stop {
                         return Ok(());
                     }
                     if !root_is_aggregate {
@@ -477,8 +508,6 @@ where
             }
             _ => {}
         }
-        offset_before_read =
-            usize::try_from(reader.buffer_position()).map_err(|_e| position_overflow())?;
     }
     Ok(())
 }
@@ -487,83 +516,36 @@ fn depth_overflow() -> Error {
     Error::XmlParse("depth overflow".to_string())
 }
 
-fn position_overflow() -> Error {
-    Error::XmlParse("buffer position overflow".to_string())
-}
-
-/// Extract the `<md:EntityDescriptor>` byte span `[start_idx, end_pos)`, re-wrap
-/// it with the in-scope namespace declarations from every open ancestor
-/// wrapper, parse it with the full DOM parser (so XSW / line-ending
-/// normalization / resource limits still apply), and convert it to a
-/// [`MetadataEntry`]. `start_idx` is the absolute offset of the entity's
-/// opening `<`, recorded when capture began — no backward scan, robust to
-/// comments / CDATA / attribute text that merely *contain* an
-/// `<md:EntityDescriptor` token.
-fn parse_captured_entity(
-    metadata_xml: &[u8],
-    start_idx: usize,
-    end_pos: usize,
-    ns_stack: &[NsFrame],
-) -> Result<Option<MetadataEntry>, Error> {
-    let entity_bytes = metadata_xml
-        .get(start_idx..end_pos)
-        .ok_or_else(|| Error::XmlParse("entity span out of range".to_string()))?;
-
-    // Collapse the in-scope declarations from every open ancestor wrapper into
-    // one set, innermost wins: a nested wrapper that redeclares a prefix
-    // shadows the outer binding, exactly as in the original document. Emitting
-    // a prefix twice on the synthetic wrapper would be malformed XML, so we
-    // dedupe by key while preserving first-seen (outermost) order for the
-    // surviving bindings.
-    let mut decls: Vec<(&[u8], &[u8])> = Vec::new();
+/// Build a fresh [`TreeBuilder`] for one captured entity, seeded with the
+/// in-scope namespace declarations of every open ancestor `<md:EntitiesDescriptor>`
+/// wrapper. The declarations are collapsed innermost-wins (a nested wrapper that
+/// redeclares a prefix shadows the outer binding, exactly as in the source
+/// document) and deduped by key while preserving outermost-first order.
+fn new_entity_builder(ns_stack: &[NsFrame]) -> Result<TreeBuilder, Error> {
+    let mut seed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for (frame, _depth) in ns_stack {
         for (key, value) in frame {
-            if let Some(slot) = decls.iter_mut().find(|(k, _)| *k == key.as_slice()) {
-                slot.1 = value.as_slice();
+            if let Some(slot) = seed.iter_mut().find(|(k, _)| k == key) {
+                slot.1.clone_from(value);
             } else {
-                decls.push((key.as_slice(), value.as_slice()));
+                seed.push((key.clone(), value.clone()));
             }
         }
     }
+    TreeBuilder::with_seed_scope(XmlLimits::aggregate(), &seed)
+}
 
-    let decls_len: usize = decls
-        .iter()
-        .map(|(k, v)| k.len().saturating_add(v.len()).saturating_add(4))
-        .sum();
-    let mut wrapped: Vec<u8> = Vec::with_capacity(
-        entity_bytes
-            .len()
-            .saturating_add(decls_len)
-            .saturating_add(64),
-    );
-    wrapped.extend_from_slice(b"<md:EntitiesDescriptor");
-    if decls.is_empty() {
-        // No ancestor declared anything (a bare single-entity root whose own
-        // tag carries the `xmlns`): the child bytes already declare everything,
-        // so fall back to a minimal `md:` binding just so the synthetic wrapper
-        // element itself is well-formed.
-        wrapped.extend_from_slice(b" xmlns:md=\"");
-        wrapped.extend_from_slice(MD_NS.as_bytes());
-        wrapped.push(b'"');
-    } else {
-        for (key, value) in &decls {
-            wrapped.push(b' ');
-            wrapped.extend_from_slice(key);
-            wrapped.extend_from_slice(b"=\"");
-            wrapped.extend_from_slice(value);
-            wrapped.push(b'"');
-        }
-    }
-    wrapped.push(b'>');
-    wrapped.extend_from_slice(entity_bytes);
-    wrapped.extend_from_slice(b"</md:EntitiesDescriptor>");
-
-    let doc = Document::parse_with_limits(&wrapped, XmlLimits::aggregate())?;
-    let entity_elem = doc
-        .root()
-        .child_element(Some(MD_NS), "EntityDescriptor")
-        .ok_or_else(|| Error::XmlParse("captured span is not an EntityDescriptor".to_string()))?;
-    Ok(Some(parse_entity_descriptor(entity_elem)?))
+/// Feed the opening `Start` event of a just-detected entity into the freshly
+/// created builder. Factored out so the root and nested-child capture sites
+/// share one place that asserts the builder is present.
+fn feed_open(
+    builder: &mut Option<TreeBuilder>,
+    event: &quick_xml::events::Event<'_>,
+) -> Result<(), Error> {
+    builder
+        .as_mut()
+        .ok_or_else(|| Error::XmlParse("entity builder missing".to_string()))?
+        .feed(event)
 }
 
 /// Recursively flatten nested `<md:EntitiesDescriptor>` blocks (RFC-006 §3).
@@ -1578,9 +1560,10 @@ mod tests {
     #[test]
     fn stream_entities_nested_aggregate_inherits_inner_namespace_prefix() {
         // The `ds:` prefix a child relies on is declared on the *inner*
-        // EntitiesDescriptor, not the root. Re-wrap must replay the inner
-        // wrapper's declarations too (RFC-006 §3 nested aggregates), otherwise
-        // the child's `ds:KeyInfo` fails to resolve its prefix.
+        // EntitiesDescriptor, not the root. The entity builder's seed scope must
+        // inherit the inner wrapper's declarations too (RFC-006 §3 nested
+        // aggregates), otherwise the child's `ds:KeyInfo` fails to resolve its
+        // prefix.
         let xml = format!(
             r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata">
                 <md:EntitiesDescriptor xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -1606,6 +1589,115 @@ mod tests {
         assert_eq!(
             ids,
             vec![Some("https://nested.example.com/saml".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stream_entities_normalizes_carriage_returns_like_eager_path() {
+        // An entity whose certificate text node carries `\r\n` and a bare `\r`.
+        // XML 1.0 §2.11 requires both to normalize to `\n` before parsing; the
+        // eager DOM path does this in `parse_inner`, and the streaming path must
+        // too — otherwise a literal `\r` survives into the entity tree's text
+        // node and this crate's c14n escapes it as `&#xD;`, producing a
+        // different digest than the eager tree the signer's bytes match.
+        let cert = rsa_cert_b64();
+        let cert_with_cr = format!("{cert}\r\nTRAILER\rEND");
+        let xml = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><md:EntityDescriptor entityID="https://cr.example.com/saml"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert_with_cr}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://cr.example.com/sso"/></md:IDPSSODescriptor></md:EntityDescriptor></md:EntitiesDescriptor>"#
+        );
+
+        // Pull the cert text node out of the eager DOM entity tree.
+        let eager_doc = Document::parse(xml.as_bytes()).unwrap();
+        let eager_cert_text = eager_doc
+            .find_first(Some(DS_NS), "X509Certificate")
+            .unwrap()
+            .text_content();
+
+        // And out of the streamed entity tree, via the same streaming machinery
+        // `stream_entities` uses.
+        let mut streamed_cert_text = None;
+        stream_entity_elements(xml.as_bytes(), |entity| {
+            let text = find_first_in(entity, Some(DS_NS), "X509Certificate")
+                .unwrap()
+                .text_content();
+            streamed_cert_text = Some(text);
+            Ok(StreamControl::Continue)
+        })
+        .expect("stream ok");
+        let streamed_cert_text = streamed_cert_text.expect("one entity visited");
+
+        // Both paths normalized `\r\n` and bare `\r` to `\n`, identically.
+        assert!(
+            !eager_cert_text.contains('\r'),
+            "eager path left a carriage return"
+        );
+        assert!(
+            !streamed_cert_text.contains('\r'),
+            "streaming path left a carriage return"
+        );
+        assert!(streamed_cert_text.contains("\nTRAILER\nEND"));
+        assert_eq!(
+            streamed_cert_text, eager_cert_text,
+            "streamed entity text node must match the eager tree byte-for-byte"
+        );
+    }
+
+    /// Test-only recursive search for the first descendant element with the
+    /// given expanded name, mirroring `Document::find_first` but rooted at an
+    /// arbitrary [`Element`] (the streamed entity tree has no surrounding
+    /// `Document`).
+    fn find_first_in<'a>(
+        element: &'a Element,
+        namespace: Option<&str>,
+        local: &str,
+    ) -> Option<&'a Element> {
+        if element.qname().local() == local && element.qname().namespace() == namespace {
+            return Some(element);
+        }
+        for child in element.child_elements() {
+            if let Some(found) = find_first_in(child, namespace, local) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn stream_entities_unescapes_seeded_ancestor_namespace_uri() {
+        // An ancestor wrapper binds prefix `foo` to a URI containing an XML
+        // entity (`&amp;`). A child element inside the entity uses that prefix.
+        // The seeded-scope path must unescape the URI to `urn:a&b` exactly as
+        // the eager path would for an element's own namespace decls — otherwise
+        // the child resolves to the raw `urn:a&amp;b`, diverging from eager.
+        let cert = rsa_cert_b64();
+        let xml = format!(
+            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><md:EntitiesDescriptor xmlns:foo="urn:a&amp;b"><md:EntityDescriptor entityID="https://esc.example.com/saml"><md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:KeyDescriptor use="signing"><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor><md:SingleSignOnService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://esc.example.com/sso"/><foo:Marker/></md:IDPSSODescriptor></md:EntityDescriptor></md:EntitiesDescriptor></md:EntitiesDescriptor>"#
+        );
+
+        // Eager path: the entity tree resolves `foo:Marker` to the unescaped URI.
+        let eager_doc = Document::parse(xml.as_bytes()).unwrap();
+        let eager_marker_ns = eager_doc
+            .find_first(Some("urn:a&b"), "Marker")
+            .expect("eager path must resolve foo: to unescaped urn:a&b")
+            .qname()
+            .namespace()
+            .map(str::to_owned);
+        assert_eq!(eager_marker_ns.as_deref(), Some("urn:a&b"));
+
+        // Streaming path: the seed scope inherits the inner wrapper's `foo`
+        // binding and must unescape it identically.
+        let mut streamed_marker_ns = None;
+        stream_entity_elements(xml.as_bytes(), |entity| {
+            streamed_marker_ns = find_first_in(entity, Some("urn:a&b"), "Marker")
+                .map(|m| m.qname().namespace().map(str::to_owned));
+            Ok(StreamControl::Continue)
+        })
+        .expect("stream ok");
+
+        assert_eq!(
+            streamed_marker_ns,
+            Some(Some("urn:a&b".to_owned())),
+            "streamed seed scope must unescape the ancestor URI to match eager"
         );
     }
 

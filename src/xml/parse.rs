@@ -422,7 +422,11 @@ fn resolve_prefix<'a>(stack: &'a [NsLayer], prefix: Option<&[u8]>) -> Option<&'a
 /// translate every two-byte `#xD #xA` sequence and every standalone `#xD` to
 /// a single `#xA`. Returns a borrowed slice when the input has no `#xD` bytes
 /// (the common LF-terminated case) so the fast path is zero-copy.
-fn normalize_line_endings(xml: &[u8]) -> Cow<'_, [u8]> {
+///
+/// Shared between [`parse_inner`] (the eager DOM path) and the metadata
+/// streaming reader so a streamed entity sees exactly the normalized infoset
+/// the eager parse would, keeping their c14n / digest output byte-identical.
+pub(crate) fn normalize_line_endings(xml: &[u8]) -> Cow<'_, [u8]> {
     if !xml.contains(&b'\r') {
         return Cow::Borrowed(xml);
     }
@@ -442,6 +446,23 @@ fn normalize_line_endings(xml: &[u8]) -> Cow<'_, [u8]> {
         }
     }
     Cow::Owned(out)
+}
+
+/// Decode a raw attribute-value byte slice as UTF-8 and apply XML 1.0
+/// entity unescaping (`&amp;` → `&`, `&#xD;` → `\r`, etc.), matching exactly
+/// what `quick_xml::events::attributes::Attribute::unescape_value` does on an
+/// element's own attributes in [`open_element`].
+///
+/// Shared so the seeded-ancestor namespace path ([`TreeBuilder::with_seed_scope`])
+/// resolves a prefix bound to an escaped URI (e.g. `xmlns:foo="urn:a&amp;b"`)
+/// to the same string the eager path would record on the element that literally
+/// declares it.
+pub(crate) fn unescape_value(raw: &[u8]) -> Result<String, Error> {
+    let decoded = std::str::from_utf8(raw)
+        .map_err(|err| Error::XmlParse(format!("non-UTF-8 attribute value: {err}")))?;
+    quick_xml::escape::unescape(decoded)
+        .map(Cow::into_owned)
+        .map_err(|e| Error::XmlParse(format!("attribute value decode: {e}")))
 }
 
 /// Configure a `quick-xml` reader the way every parse path in this crate
@@ -519,71 +540,150 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
     let mut reader = Reader::from_reader(normalized.as_ref());
     configure_reader(&mut reader);
 
-    let mut stack: Vec<StackFrame> = Vec::new();
-    let mut ns_stack: Vec<NsLayer> = Vec::new();
-    let mut paths: Vec<ElementPath> = Vec::new();
-    let mut id_index: HashMap<String, ElementId> = HashMap::new();
-    let mut completed_root: Option<Element> = None;
-    let mut total_nodes: usize = 0;
-
+    let mut builder = TreeBuilder::new(*limits);
     loop {
         let event = reader
             .read_event()
             .map_err(|e| Error::XmlParse(format!("quick-xml: {e}")))?;
+        if matches!(event, Event::Eof) {
+            break;
+        }
+        builder.feed(&event)?;
+    }
+    builder.finish()
+}
 
+/// Incremental XML tree builder over the crate's single element + namespace
+/// implementation (`StackFrame` / `NsLayer` / [`open_element`] / [`close_element`]).
+///
+/// Both parse paths in the crate feed quick-xml events into this one builder so
+/// they cannot drift apart in their treatment of namespace scoping, ID
+/// indexing, or resource limits:
+///
+/// - [`parse_inner`] (the eager DOM parser) drives a fresh builder over the
+///   whole normalized input and calls [`finish`](Self::finish) to obtain the
+///   full [`Document`].
+/// - the metadata streaming reader builds **one** `<md:EntityDescriptor>`
+///   subtree at a time by creating a builder with [`with_seed_scope`] — seeding
+///   the in-scope namespace declarations of the ancestor `<md:EntitiesDescriptor>`
+///   wrappers so a child that uses a prefix declared on an intermediate wrapper
+///   still resolves — feeding just that subtree's events, and taking the
+///   resulting root [`Element`] via [`finish_root`](Self::finish_root).
+///
+/// The builder is fed [`Event::Start`], [`Event::End`], [`Event::Empty`],
+/// [`Event::Text`], [`Event::CData`], and [`Event::Comment`] events through
+/// [`feed`](Self::feed); [`Event::DocType`] / [`Event::PI`] are rejected and
+/// [`Event::Decl`] is ignored, exactly as both event loops require. The caller
+/// is responsible for stopping at [`Event::Eof`].
+pub(crate) struct TreeBuilder {
+    limits: XmlLimits,
+    stack: Vec<StackFrame>,
+    ns_stack: Vec<NsLayer>,
+    paths: Vec<ElementPath>,
+    id_index: HashMap<String, ElementId>,
+    completed_root: Option<Element>,
+    total_nodes: usize,
+}
+
+impl TreeBuilder {
+    /// Create a builder with an empty namespace scope, for parsing a standalone
+    /// document whose root declares its own namespaces.
+    pub(crate) fn new(limits: XmlLimits) -> Self {
+        Self {
+            limits,
+            stack: Vec::new(),
+            ns_stack: Vec::new(),
+            paths: Vec::new(),
+            id_index: HashMap::new(),
+            completed_root: None,
+            total_nodes: 0,
+        }
+    }
+
+    /// Create a builder seeded with an outer in-scope namespace mapping.
+    ///
+    /// `seed` is the collapsed `(key_bytes, value_bytes)` `xmlns(:prefix)?`
+    /// declarations inherited from ancestor elements (innermost binding last per
+    /// key wins, as in the source document). The first element fed to the
+    /// builder becomes the output root but resolves its prefixes against this
+    /// seed, so a subtree lifted out of an aggregate still sees prefixes that
+    /// were declared on wrappers above it. The seed declarations do **not**
+    /// appear in any element's `namespaces_declared_here` and consume no node
+    /// budget — they are scope only.
+    pub(crate) fn with_seed_scope(
+        limits: XmlLimits,
+        seed: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<Self, Error> {
+        let mut layer = NsLayer::default();
+        for (key, value) in seed {
+            // Unescape exactly as `open_element` does for an element's own
+            // namespace decls, so a seeded ancestor prefix bound to a URI
+            // containing an XML entity resolves identically on both paths.
+            let value_str = unescape_value(value)?;
+            match QxQName(key).as_namespace_binding() {
+                Some(PrefixDeclaration::Default) => layer.bindings.push((None, value_str)),
+                Some(PrefixDeclaration::Named(prefix)) => {
+                    layer.bindings.push((Some(prefix.to_vec()), value_str));
+                }
+                None => {}
+            }
+        }
+        let mut builder = Self::new(limits);
+        // The seed layer sits at the bottom of the namespace stack and has no
+        // corresponding `StackFrame`, so no `Event::End` ever pops it: the fed
+        // subtree's single root pops only its own layer when it closes.
+        builder.ns_stack.push(layer);
+        Ok(builder)
+    }
+
+    /// Feed a single quick-xml event into the builder. The caller must not feed
+    /// [`Event::Eof`] (it has no element-tree meaning); stop the read loop on it
+    /// instead.
+    pub(crate) fn feed(&mut self, event: &Event<'_>) -> Result<(), Error> {
         match event {
-            Event::Eof => break,
+            Event::Eof => Ok(()),
             Event::Decl(_) => {
                 // XML declaration: skipped. We don't preserve `<?xml ...?>`.
+                Ok(())
             }
-            ref evt @ (Event::DocType(_) | Event::PI(_)) => {
-                return Err(reject_doctype_or_pi(evt)
-                    .unwrap_or_else(|| Error::XmlParse("unexpected event".to_string())));
-            }
+            Event::DocType(_) | Event::PI(_) => Err(reject_doctype_or_pi(event)
+                .unwrap_or_else(|| Error::XmlParse("unexpected event".to_string()))),
             Event::Start(start) => {
-                total_nodes = total_nodes
-                    .checked_add(1)
-                    .ok_or_else(|| Error::XmlParse("max nodes exceeded".to_string()))?;
-                if total_nodes > limits.max_total_nodes {
-                    return Err(Error::XmlParse("max nodes exceeded".to_string()));
-                }
+                self.bump_nodes()?;
                 let (element, path) = open_element(
-                    &start,
+                    start,
                     /* self_closing */ false,
-                    &stack,
-                    &mut ns_stack,
-                    &mut paths,
-                    &mut id_index,
-                    limits,
+                    &self.stack,
+                    &mut self.ns_stack,
+                    &mut self.paths,
+                    &mut self.id_index,
+                    &self.limits,
                 )?;
-                stack.push(StackFrame { element, path });
-                if stack.len() > limits.max_depth {
+                self.stack.push(StackFrame { element, path });
+                if self.stack.len() > self.limits.max_depth {
                     return Err(Error::XmlParse("max depth exceeded".to_string()));
                 }
+                Ok(())
             }
             Event::Empty(start) => {
-                total_nodes = total_nodes
-                    .checked_add(1)
-                    .ok_or_else(|| Error::XmlParse("max nodes exceeded".to_string()))?;
-                if total_nodes > limits.max_total_nodes {
-                    return Err(Error::XmlParse("max nodes exceeded".to_string()));
-                }
+                self.bump_nodes()?;
                 let (element, _path) = open_element(
-                    &start,
+                    start,
                     /* self_closing */ true,
-                    &stack,
-                    &mut ns_stack,
-                    &mut paths,
-                    &mut id_index,
-                    limits,
+                    &self.stack,
+                    &mut self.ns_stack,
+                    &mut self.paths,
+                    &mut self.id_index,
+                    &self.limits,
                 )?;
-                close_element(element, &mut stack, &mut completed_root)?;
+                close_element(element, &mut self.stack, &mut self.completed_root)
             }
             Event::End(end) => {
-                let frame = stack
+                let frame = self
+                    .stack
                     .pop()
                     .ok_or_else(|| Error::XmlParse("unmatched end tag".to_string()))?;
-                ns_stack.pop();
+                self.ns_stack.pop();
                 let expected_local = &frame.element.qname.local;
                 let actual = end.name();
                 let actual_local_name = actual.local_name();
@@ -594,90 +694,104 @@ fn parse_inner(xml: &[u8], limits: &XmlLimits) -> Result<Document, Error> {
                         "end tag mismatch: expected </{expected_local}>, got </{actual_local}>"
                     )));
                 }
-                close_element(frame.element, &mut stack, &mut completed_root)?;
+                close_element(frame.element, &mut self.stack, &mut self.completed_root)
             }
             Event::Text(text) => {
                 let value = text
                     .unescape()
                     .map_err(|e| Error::XmlParse(format!("text decode: {e}")))?
                     .into_owned();
-                if value.len() > limits.max_text_length {
+                if value.len() > self.limits.max_text_length {
                     return Err(Error::XmlParse("max text length exceeded".to_string()));
                 }
                 if value.is_empty() {
-                    continue;
+                    return Ok(());
                 }
-                push_text(&mut stack, value, &mut total_nodes, limits)?;
+                self.push_text(value)
             }
             Event::CData(cdata) => {
-                let bytes = cdata.into_inner();
-                let value = std::str::from_utf8(&bytes)
+                let value = std::str::from_utf8(cdata.as_ref())
                     .map_err(|err| Error::XmlParse(format!("non-UTF-8 CDATA: {err}")))?
                     .to_owned();
-                if value.len() > limits.max_text_length {
+                if value.len() > self.limits.max_text_length {
                     return Err(Error::XmlParse("max text length exceeded".to_string()));
                 }
                 if value.is_empty() {
-                    continue;
+                    return Ok(());
                 }
-                push_text(&mut stack, value, &mut total_nodes, limits)?;
+                self.push_text(value)
             }
             Event::Comment(comment) => {
-                let bytes = comment.into_inner();
-                let value = std::str::from_utf8(&bytes)
+                let value = std::str::from_utf8(comment.as_ref())
                     .map_err(|err| Error::XmlParse(format!("non-UTF-8 comment: {err}")))?
                     .to_owned();
-                if value.len() > limits.max_text_length {
+                if value.len() > self.limits.max_text_length {
                     return Err(Error::XmlParse("max text length exceeded".to_string()));
                 }
-                total_nodes = total_nodes
-                    .checked_add(1)
-                    .ok_or_else(|| Error::XmlParse("max nodes exceeded".to_string()))?;
-                if total_nodes > limits.max_total_nodes {
-                    return Err(Error::XmlParse("max nodes exceeded".to_string()));
-                }
+                self.bump_nodes()?;
                 // Comments outside the root element (e.g. before the document
                 // element) are silently dropped — they have nowhere to live in
                 // our tree, and SAML never relies on them.
-                if let Some(frame) = stack.last_mut() {
+                if let Some(frame) = self.stack.last_mut() {
                     frame.element.children.push(Node::Comment(value));
                 }
+                Ok(())
             }
         }
     }
 
-    if !stack.is_empty() {
-        return Err(Error::XmlParse("unclosed element at EOF".to_string()));
+    /// Finalize the builder into a [`Document`]. Errors if any element is still
+    /// open or if no root element was seen.
+    pub(crate) fn finish(self) -> Result<Document, Error> {
+        if !self.stack.is_empty() {
+            return Err(Error::XmlParse("unclosed element at EOF".to_string()));
+        }
+        let root = self
+            .completed_root
+            .ok_or_else(|| Error::XmlParse("empty document".to_string()))?;
+        Ok(Document {
+            root,
+            id_index: self.id_index,
+            paths: self.paths,
+        })
     }
 
-    let root = completed_root.ok_or_else(|| Error::XmlParse("empty document".to_string()))?;
-    Ok(Document {
-        root,
-        id_index,
-        paths,
-    })
-}
-
-fn push_text(
-    stack: &mut [StackFrame],
-    value: String,
-    total_nodes: &mut usize,
-    limits: &XmlLimits,
-) -> Result<(), Error> {
-    let Some(frame) = stack.last_mut() else {
-        // Whitespace / text outside the root is silently dropped by quick-xml's
-        // event stream behavior; non-whitespace before the root would surface
-        // as a parse error before reaching here.
-        return Ok(());
-    };
-    *total_nodes = total_nodes
-        .checked_add(1)
-        .ok_or_else(|| Error::XmlParse("max nodes exceeded".to_string()))?;
-    if *total_nodes > limits.max_total_nodes {
-        return Err(Error::XmlParse("max nodes exceeded".to_string()));
+    /// Finalize a seeded builder into just its root [`Element`], discarding the
+    /// per-subtree `id_index` / `paths` side indices. Used by the streaming
+    /// metadata path, which only needs the entity element tree and walks it
+    /// directly. Errors if any element is still open or if no root was seen.
+    pub(crate) fn finish_root(self) -> Result<Element, Error> {
+        if !self.stack.is_empty() {
+            return Err(Error::XmlParse("unclosed element at EOF".to_string()));
+        }
+        self.completed_root
+            .ok_or_else(|| Error::XmlParse("empty document".to_string()))
     }
-    frame.element.children.push(Node::Text(value));
-    Ok(())
+
+    fn bump_nodes(&mut self) -> Result<(), Error> {
+        self.total_nodes = self
+            .total_nodes
+            .checked_add(1)
+            .ok_or_else(|| Error::XmlParse("max nodes exceeded".to_string()))?;
+        if self.total_nodes > self.limits.max_total_nodes {
+            return Err(Error::XmlParse("max nodes exceeded".to_string()));
+        }
+        Ok(())
+    }
+
+    fn push_text(&mut self, value: String) -> Result<(), Error> {
+        if self.stack.is_empty() {
+            // Whitespace / text outside the root is silently dropped by
+            // quick-xml's event stream behavior; non-whitespace before the root
+            // would surface as a parse error before reaching here.
+            return Ok(());
+        }
+        self.bump_nodes()?;
+        if let Some(frame) = self.stack.last_mut() {
+            frame.element.children.push(Node::Text(value));
+        }
+        Ok(())
+    }
 }
 
 /// Build an [`Element`] from a `<Start>` or `<Empty>` event.
