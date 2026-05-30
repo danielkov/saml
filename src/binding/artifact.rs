@@ -157,7 +157,7 @@ fn build_artifact_resolve_element(
     destination: &str,
     artifact: &str,
 ) -> Result<Element, Error> {
-    let id = random_xml_id()?;
+    let id = crate::binding::random_xml_id()?;
     let issue_instant = format_xs_datetime(SystemTime::now())?;
 
     // <samlp:Artifact>{artifact}</samlp:Artifact>
@@ -576,7 +576,7 @@ pub fn build_artifact_response(
     in_response_to: &str,
     payload_xml: &str,
 ) -> Result<String, Error> {
-    let id = random_xml_id()?;
+    let id = crate::binding::random_xml_id()?;
     let issue_instant = format_xs_datetime(SystemTime::now())?;
 
     // Parse the payload XML so we can graft its element subtree into the
@@ -614,37 +614,6 @@ pub fn build_artifact_response(
 // =============================================================================
 // Helpers
 // =============================================================================
-
-/// Generate a fresh XML `ID` value of the shape `_<32 hex chars>` (16 random
-/// bytes, hex-encoded with a leading underscore so the value is a valid XML
-/// `xs:ID`, which must start with a letter or `_`).
-fn random_xml_id() -> Result<String, Error> {
-    let mut bytes = [0u8; 16];
-    // Propagate RNG failures so the outer flow can surface a configuration
-    // error rather than emitting an ID built from uninitialized entropy.
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_err| Error::InvalidConfiguration {
-            reason: "RNG failure generating random XML ID",
-        })?;
-
-    // Two-char lowercase hex for each byte, no formatter overhead.
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut out = String::with_capacity(1 + 32);
-    out.push('_');
-    for b in bytes {
-        let hi = usize::from(b >> 4);
-        let lo = usize::from(b & 0x0f);
-        // hi and lo are both <16, so .get() always returns Some. We avoid
-        // panicking indexing by using .get() + a defensive fallback.
-        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
-            out.push(h as char);
-            out.push(l as char);
-        }
-    }
-    Ok(out)
-}
 
 // =============================================================================
 // Tests
@@ -1279,7 +1248,7 @@ mod tests {
 
     #[test]
     fn random_xml_id_shape_underscore_plus_32_hex_lowercase() {
-        let id = random_xml_id().unwrap();
+        let id = crate::binding::random_xml_id().unwrap();
         assert_eq!(id.len(), 33);
         assert!(id.starts_with('_'));
         assert!(

@@ -35,14 +35,16 @@
 
 use std::time::{Duration, SystemTime};
 
+#[cfg(feature = "slo")]
 use base64::Engine as _;
+#[cfg(feature = "slo")]
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::attribute::Attribute;
 use crate::authn::request_parse::parse_authn_request;
 use crate::authn::request_validate::validate_authn_request;
 use crate::authn_context::AuthnContextClassRef;
-#[cfg(feature = "slo")]
+#[cfg(any(feature = "slo", test))]
 use crate::binding::Dispatch;
 use crate::binding::{Binding, Endpoint, SsoResponseDispatch};
 use crate::crypto::keypair::KeyPair;

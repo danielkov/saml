@@ -3,12 +3,55 @@
 //! See `docs/rfcs/RFC-003-service-provider.md` §2 for the type-level structure.
 
 pub mod artifact;
+#[cfg(feature = "ecp")]
+pub mod ecp;
 pub mod post;
 pub mod redirect;
-#[cfg(any(feature = "artifact-binding", feature = "slo"))]
+#[cfg(any(feature = "artifact-binding", feature = "slo", feature = "ecp"))]
 pub mod soap;
 
 use crate::error::Error;
+
+// ── shared helpers ────────────────────────────────────────────────────
+
+/// Generate a fresh XML `ID` value of the shape `_<32 hex chars>` (16 random
+/// bytes, hex-encoded with a leading underscore so the value is a valid XML
+/// `xs:ID`, which must start with a letter or `_`). The same shape is also a
+/// valid PAOS `messageID` (ECP, Profiles §4.2).
+///
+/// Lives in this always-compiled parent module so the cfg-gated binding
+/// submodules (`artifact`, `ecp`) share one implementation instead of each
+/// carrying a copy. RNG failures propagate as
+/// [`Error::InvalidConfiguration`] rather than emitting an ID built from
+/// uninitialized entropy.
+#[cfg(any(
+    all(feature = "artifact-binding", feature = "weak-algos"),
+    feature = "ecp"
+))]
+pub(crate) fn random_xml_id() -> Result<String, Error> {
+    use std::fmt::Write as _;
+
+    use rsa::rand_core::{OsRng, RngCore as _};
+
+    let mut bytes = [0u8; 16];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_err| Error::InvalidConfiguration {
+            reason: "RNG failure generating random XML ID",
+        })?;
+
+    // Lowercase two-char hex per byte. `{:02x}` is total over `u8`, so there is
+    // no fallible nibble lookup and no silent-truncation branch (and no
+    // panicking slice index, which the workspace lints forbid). The only error
+    // `write!` into a `String` can yield is a `fmt::Error`, surfaced via `?`.
+    let mut out = String::with_capacity(1 + 32);
+    out.push('_');
+    for b in bytes {
+        write!(out, "{b:02x}")
+            .map_err(|_err| Error::XmlEmit("formatting XML ID hex".to_string()))?;
+    }
+    Ok(out)
+}
 
 // ── enums ─────────────────────────────────────────────────────────────
 

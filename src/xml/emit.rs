@@ -106,6 +106,20 @@ impl Element {
             children: Vec::new(),
         }
     }
+
+    /// Append an attribute to an already-built [`Element`] in place, with no
+    /// recorded source prefix (so c14n falls back to whichever in-scope
+    /// binding resolves the URI, matching [`ElementBuilder::with_attribute`]).
+    /// Lets a caller set a single attribute on a finished element without
+    /// tearing the whole tree down and rebuilding it.
+    #[cfg(feature = "ecp")]
+    pub(crate) fn push_attribute(&mut self, name: QName, value: impl Into<String>) {
+        self.attributes.push(Attribute {
+            qname: name,
+            source_prefix: None,
+            value: value.into(),
+        });
+    }
 }
 
 /// Fluent builder for an [`Element`] subtree. Returned from

@@ -100,6 +100,46 @@ pub enum Error {
     #[error("Requested AuthnContextClassRef not satisfied")]
     AuthnContextDowngrade,
 
+    // --- ECP / PAOS profile (SAML 2.0 Profiles §4.2, Bindings §3.3) ---
+    /// **The** ECP security check (Profiles §4.2.4.2). The
+    /// `AssertionConsumerServiceURL` the IdP returned in `<ecp:Response>`
+    /// (step 4) does not equal the `responseConsumerURL` the SP supplied in
+    /// `<paos:Request>` (step 2). A malicious IdP or man-in-the-middle is
+    /// attempting to redirect the assertion to an attacker-controlled endpoint.
+    /// The ECP client refuses to deliver the assertion and surfaces this error
+    /// instead; `soap_fault` is the ready-to-POST `<soap:Fault>` envelope the
+    /// client MUST send to `response_consumer_url` per §4.2.4.2. No assertion
+    /// is ever placed in a deliverable envelope when this fires.
+    #[error(
+        "ECP AssertionConsumerServiceURL mismatch: IdP returned {assertion_consumer_service_url}, \
+         SP requested {response_consumer_url} (SAML 2.0 Profiles §4.2.4.2)"
+    )]
+    EcpAcsUrlMismatch {
+        response_consumer_url: String,
+        assertion_consumer_service_url: String,
+        soap_fault: String,
+    },
+    /// An ECP PAOS POST's `<paos:Response>/@refToMessageID` (step 6) did not
+    /// match the `messageID` the SP issued in its `<paos:Request>` (step 2).
+    /// Surfaced by
+    /// [`SpEcp::consume_paos_response`](crate::binding::ecp::SpEcp::consume_paos_response)
+    /// before the inner `<samlp:Response>` reaches the consume path.
+    #[error("ECP PAOS refToMessageID does not match the issued messageID")]
+    EcpMessageIdMismatch,
+    /// A required ECP / PAOS SOAP header block (or one of its attributes) was
+    /// missing from an ECP envelope. `header` names the absent block / attribute
+    /// (e.g. `Request`, `Request/@responseConsumerURL`, `ecp:Response`).
+    #[error("ECP message missing required PAOS/ECP header: {header}")]
+    EcpMissingPaosHeader { header: &'static str },
+    /// An ECP envelope carried more than one of a trust-bearing PAOS/ECP header
+    /// block (e.g. two `<paos:Request>` or two `<ecp:Response>` blocks). A
+    /// duplicate is malformed and would let a second, attacker-supplied value
+    /// hide behind the first-match header read, so the envelope is rejected
+    /// outright rather than silently taking the first block. `header` names the
+    /// duplicated block.
+    #[error("ECP message carries a duplicate PAOS/ECP header: {header}")]
+    EcpDuplicatePaosHeader { header: &'static str },
+
     // --- Trust / metadata ---
     #[error("Unknown peer entity: {entity_id}")]
     UnknownEntity { entity_id: String },

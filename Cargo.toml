@@ -71,6 +71,11 @@ xmlenc = []
 slo = []
 metadata-emit = []
 artifact-binding = []
+# Enhanced Client or Proxy profile (SAML 2.0 Profiles §4.2) + the Reverse-SOAP
+# (PAOS) binding (SAML 2.0 Bindings §3.3). The non-browser SSO flow used by
+# desktop apps and federated CLI tooling. Layers a SOAP envelope + PAOS header
+# blocks on top of the existing assertion machinery; reuses `binding::soap`.
+ecp = []
 weak-algos = ["dep:sha1"]
 # Structural XSD-style schema validation of inbound SAML messages. On by
 # default; opt-out via `default-features = false` for permissive interop with

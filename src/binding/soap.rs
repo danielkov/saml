@@ -20,12 +20,23 @@
 //! # Feature gating
 //!
 //! This module compiles whenever a binding that uses it is enabled — the
-//! HTTP-Artifact binding (`artifact-binding`) or back-channel SLO (`slo`). It
-//! does **not** require `weak-algos`: the envelope itself carries no SHA-1
-//! dependency (only the artifact `SourceID` does), so a future ECP/PAOS
-//! feature can reuse it without opting into weak algorithms.
+//! HTTP-Artifact binding (`artifact-binding`), back-channel SLO (`slo`), or the
+//! ECP / PAOS profile (`ecp`). It does **not** require `weak-algos`: the
+//! envelope itself carries no SHA-1 dependency (only the artifact `SourceID`
+//! does), so ECP reuses it without opting into weak algorithms.
+//!
+//! # SOAP headers
+//!
+//! Most callers (artifact, SLO) wrap a bare `<soap:Body>` with no
+//! `<soap:Header>`. ECP (Profiles §4.2) needs header blocks — `<paos:Request>`,
+//! `<ecp:Request>`, `<ecp:Response>`, `<paos:Response>` — so this module also
+//! exposes `wrap_with_header` (build an envelope carrying caller-supplied
+//! header element blocks) and `UnwrappedEnvelope` (recover both the header
+//! blocks and the body payload), both `pub(crate)` and gated on `ecp`. They
+//! reuse the same element/parse machinery as [`wrap`] / [`unwrap`]; ECP does
+//! not fork a second envelope builder.
 
-#![cfg(any(feature = "artifact-binding", feature = "slo"))]
+#![cfg(any(feature = "artifact-binding", feature = "slo", feature = "ecp"))]
 
 use crate::error::Error;
 use crate::xml::emit::{emit_document, emit_element};
@@ -79,6 +90,40 @@ pub(crate) fn wrap_element(payload: Element) -> Result<String, Error> {
         .finish();
     let envelope = Element::build(QName::new(Some(SOAP_NS.to_owned()), "Envelope"))
         .with_namespace(Some("soap".to_owned()), SOAP_NS)
+        .with_child(Node::Element(body))
+        .finish();
+    let doc = Document::new(envelope)?;
+    emit_document(&doc)
+}
+
+/// Wrap a payload [`Element`] in a SOAP 1.1 envelope that also carries a
+/// `<soap:Header>` with the given header element blocks, then serialize.
+///
+/// `header_blocks` are grafted, in order, as children of `<soap:Header>`; the
+/// `payload` becomes the single `<soap:Body>` child. The `soap` prefix is
+/// declared once on `<soap:Envelope>`; header blocks that reference the SOAP
+/// namespace (for `soap:mustUnderstand` / `soap:actor`, ECP Profiles §4.2)
+/// resolve it from that in-scope declaration, so callers do **not** redeclare
+/// it on each block.
+///
+/// `Element` is crate-internal, so this is `pub(crate)`; the ECP module is the
+/// only caller and always holds its header blocks and payload as trees.
+#[cfg(feature = "ecp")]
+pub(crate) fn wrap_with_header(
+    header_blocks: Vec<Element>,
+    payload: Element,
+) -> Result<String, Error> {
+    let mut header = Element::build(QName::new(Some(SOAP_NS.to_owned()), "Header"));
+    for block in header_blocks {
+        header = header.with_child(Node::Element(block));
+    }
+    let header = header.finish();
+    let body = Element::build(QName::new(Some(SOAP_NS.to_owned()), "Body"))
+        .with_child(Node::Element(payload))
+        .finish();
+    let envelope = Element::build(QName::new(Some(SOAP_NS.to_owned()), "Envelope"))
+        .with_namespace(Some("soap".to_owned()), SOAP_NS)
+        .with_child(Node::Element(header))
         .with_child(Node::Element(body))
         .finish();
     let doc = Document::new(envelope)?;
@@ -186,6 +231,98 @@ pub fn unwrap(envelope_bytes: &[u8]) -> Result<UnwrappedBody, Error> {
     let payload_xml = emit_element(payload)?;
     let document = Document::parse(payload_xml.as_bytes())?;
     Ok(UnwrappedBody { document })
+}
+
+/// A parsed SOAP 1.1 envelope that retains its `<soap:Header>` blocks as well
+/// as its `<soap:Body>` payload. Used by the ECP profile (Profiles §4.2),
+/// which carries SAML control information in header blocks (`<paos:Request>`,
+/// `<ecp:Request>`, `<ecp:Response>`, `<paos:Response>`) alongside the SAML
+/// protocol message in the body.
+///
+/// The owned [`Document`] keeps the arena alive so callers can borrow header
+/// elements and re-serialize the body payload.
+#[cfg(feature = "ecp")]
+#[derive(Debug)]
+pub(crate) struct UnwrappedEnvelope {
+    document: Document,
+}
+
+#[cfg(feature = "ecp")]
+impl UnwrappedEnvelope {
+    /// First `<soap:Header>` child element matching the expanded name, or
+    /// `None` if there is no header or no such block.
+    pub(crate) fn header_block(&self, namespace: &str, local: &str) -> Option<&Element> {
+        self.document
+            .root()
+            .child_element(Some(SOAP_NS), "Header")
+            .and_then(|h| h.child_element(Some(namespace), local))
+    }
+
+    /// Count of `<soap:Header>` child blocks matching the expanded name. Used
+    /// to reject envelopes carrying more than one trust-bearing block (a
+    /// duplicate `<paos:Request>` / `<ecp:Response>` is malformed and could
+    /// hide a second value from the first-match [`Self::header_block`] read).
+    pub(crate) fn header_block_count(&self, namespace: &str, local: &str) -> usize {
+        self.document
+            .root()
+            .child_element(Some(SOAP_NS), "Header")
+            .map_or(0, |h| h.all_child_elements(Some(namespace), local).count())
+    }
+
+    /// The first element child of `<soap:Body>` — the SAML protocol message.
+    pub(crate) fn body_payload(&self) -> Option<&Element> {
+        self.document
+            .root()
+            .child_element(Some(SOAP_NS), "Body")
+            .and_then(|b| b.child_elements().next())
+    }
+
+    /// Re-serialize the body payload element to standalone XML bytes.
+    ///
+    /// As with [`unwrap`], the payload is emitted and reparsed so its canonical
+    /// bytes match how the signer produced it (no `soap:Envelope` ancestor
+    /// namespace context in scope). This is load-bearing for signature
+    /// verification of a signed `<samlp:Response>` carried in the ECP body.
+    pub(crate) fn body_payload_xml(&self) -> Result<Vec<u8>, Error> {
+        let payload = self.body_payload().ok_or_else(|| {
+            Error::XmlParse("SOAP: soap:Body contains no payload element".to_string())
+        })?;
+        Ok(emit_element(payload)?.into_bytes())
+    }
+}
+
+/// Parse an inbound SOAP 1.1 envelope, retaining its header blocks.
+///
+/// Unlike [`unwrap`] (which discards the header and re-roots only the body
+/// payload), this keeps the whole parsed envelope so ECP callers can read
+/// `<soap:Header>` control blocks. A `<soap:Fault>` body is still surfaced as
+/// [`Error::SoapFault`] before any payload handling.
+#[cfg(feature = "ecp")]
+pub(crate) fn unwrap_envelope(envelope_bytes: &[u8]) -> Result<UnwrappedEnvelope, Error> {
+    let doc = Document::parse(envelope_bytes)?;
+    let envelope = doc.root();
+    if envelope.qname().namespace() != Some(SOAP_NS) || envelope.qname().local() != "Envelope" {
+        return Err(Error::XmlParse(
+            "SOAP: envelope root is not soap:Envelope".to_string(),
+        ));
+    }
+    let body = envelope
+        .child_element(Some(SOAP_NS), "Body")
+        .ok_or_else(|| Error::XmlParse("SOAP: missing soap:Body".to_string()))?;
+    if let Some(fault) = body.child_element(Some(SOAP_NS), "Fault") {
+        let faultcode = fault
+            .child_element(None, "faultcode")
+            .map(Element::text_content)
+            .unwrap_or_default();
+        let faultstring = fault
+            .child_element(None, "faultstring")
+            .map(Element::text_content);
+        return Err(Error::SoapFault {
+            faultcode,
+            faultstring: faultstring.filter(|s| !s.is_empty()),
+        });
+    }
+    Ok(UnwrappedEnvelope { document: doc })
 }
 
 #[cfg(test)]

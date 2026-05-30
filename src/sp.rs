@@ -24,6 +24,7 @@ use crate::descriptor::IdpDescriptor;
 use crate::dsig::algorithms::{
     C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
 };
+#[cfg(feature = "slo")]
 use crate::dsig::reference::DS_NS;
 use crate::dsig::sign::{SignOptions, sign_detached_query, sign_element};
 #[cfg(feature = "slo")]

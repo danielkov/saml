@@ -296,6 +296,7 @@
 //! - `slo` (default) — Single Logout.
 //! - `metadata-emit` (default) — `metadata_xml` / `metadata_xml_with_extras`.
 //! - `artifact-binding` — HTTP-Artifact binding (requires `weak-algos`).
+//! - `ecp` — Enhanced Client or Proxy profile + PAOS binding (off by default).
 //! - `weak-algos` — SHA-1 / RSA-PKCS#1-v1.5 / DSA-SHA1 (off by default).
 //!
 //! See `docs/rfcs/RFC-001-architecture.md` for the full design discussion.
@@ -390,6 +391,13 @@ pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};
 
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
 pub use crate::binding::artifact::ArtifactResolveRequest;
+
+#[cfg(feature = "ecp")]
+pub use crate::binding::ecp::{
+    BuildEcpAuthnRequest, ClientEcp, ECP_NS, IdpEcp, PAOS_BINDING, PAOS_NS, ParsedIdpResponse,
+    ParsedSpRequest, SpAuthnRequest, SpEcp, SpEcpEndpoints, is_paos_binding,
+    paos_content_type_headers, paos_request_headers,
+};
 
 pub use crate::idp::{
     AcsSelection, ConsumeAuthnRequest, ConsumeAuthnRequestWire, DetachedSignature,
