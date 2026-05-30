@@ -57,6 +57,10 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "CC0-1.0",
+    # webpki-roots ships the Mozilla CA bundle; its *data* is licensed
+    # CDLA-Permissive-2.0 (a permissive, no-copyleft data license). Pulled
+    # transitively via reqwest -> rustls.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
@@ -85,9 +89,19 @@ external-default-features = "allow"
 # the dep graph today via transitive deps and aren't worth blocking releases
 # on. Re-evaluate periodically — ideally this list shrinks.
 skip = [
-    # RustCrypto crates often span 0.x boundaries via transitive deps.
-    # Add specific `{ name = "...", version = "=0.x.y" }` entries here as
-    # they arise rather than blanket-allowing the whole tree.
+    # `rand` / `rand_core` / `rand_chacha` / `getrandom` span multiple major
+    # versions across INDEPENDENT transitive chains we don't control:
+    #   - older line: the RustCrypto signature stack (elliptic-curve ->
+    #     rand_core 0.6 -> getrandom 0.2) and rsa (num-bigint-dig -> rand 0.8);
+    #   - newer line: our own rand 0.9 (proxy nonce generation) -> rand_core 0.9
+    #     -> getrandom 0.3.
+    # None are ours to unify; the rsa-side ones clear when rsa migrates off
+    # num-bigint-dig in its 0.10 release (see [advisories] note). Skip the
+    # older versions so the duplicate guard stays active elsewhere.
+    { name = "rand", version = "0.8" },
+    { name = "rand_chacha", version = "0.3" },
+    { name = "rand_core", version = "0.6" },
+    { name = "getrandom", version = "0.2" },
 ]
 skip-tree = []
 
