@@ -23,7 +23,7 @@ use super::MetadataExtras;
 use super::emit_sp::build_encryption_key_descriptor;
 use super::emit_sp::{
     DS_NS, MD_NS, SAML2_PROTOCOL, append_extras, bool_str, build_signing_key_descriptor,
-    format_cache_duration, generate_id, md_qname,
+    format_cache_duration, md_qname,
 };
 
 /// Caller-supplied IdP metadata fields. Mirrors what RFC-006 §6.2 says are
@@ -57,7 +57,7 @@ pub fn emit_idp_metadata(
     inputs: &IdpMetadataInputs<'_>,
     signer: Option<(&KeyPair, SignatureAlgorithm, DigestAlgorithm, C14nAlgorithm)>,
 ) -> Result<String, Error> {
-    let entity_descriptor_id = generate_id();
+    let entity_descriptor_id = crate::binding::random_xml_id()?;
     let root = build_idp_entity_descriptor(inputs, &entity_descriptor_id)?;
 
     let final_root = if let Some((key, sig_alg, digest, c14n)) = signer {

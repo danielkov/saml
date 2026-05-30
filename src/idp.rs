@@ -768,7 +768,7 @@ impl IdentityProvider {
             .slo_endpoint(binding)
             .ok_or(Error::UnsupportedByPeer { binding })?;
 
-        let id = generate_xml_id();
+        let id = crate::binding::random_xml_id()?;
         let build = BuildLogoutResponse {
             id: &id,
             issue_instant: SystemTime::now(),
@@ -799,7 +799,7 @@ impl IdentityProvider {
                     binding: opts.binding,
                 })?;
 
-        let id = generate_xml_id();
+        let id = crate::binding::random_xml_id()?;
         let issue_instant = SystemTime::now();
         let build = BuildLogoutRequest {
             id: &id,
@@ -1073,7 +1073,7 @@ impl IdentityProvider {
                     binding: Binding::Soap,
                 })?;
 
-        let id = generate_xml_id();
+        let id = crate::binding::random_xml_id()?;
         let issue_instant = SystemTime::now();
         let build = BuildLogoutRequest {
             id: &id,
@@ -1340,36 +1340,6 @@ fn parse_url(url: &str) -> Result<url::Url, Error> {
 fn serialize_element(element: Element) -> Result<Vec<u8>, Error> {
     let doc = Document::new(element)?;
     Ok(emit_document(&doc)?.into_bytes())
-}
-
-/// Generate a `_<32 hex>` XML `ID` value for outbound messages. Same shape as
-/// `crate::response::issue::generate_xml_id` (kept local to avoid a
-/// pub(crate) leak from `response::issue`).
-#[cfg(feature = "slo")]
-fn generate_xml_id() -> String {
-    use rsa::rand_core::{OsRng, RngCore as _};
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut bytes = [0u8; 16];
-    // `try_fill_bytes` failure is treated as catastrophic for ID minting; fall
-    // back to a deterministic placeholder rather than `unwrap()` to keep this
-    // call path panic-free. Returning a (very unlikely) zero-byte ID is
-    // acceptable: callers treat the value as opaque and the surrounding
-    // protocol layer never relies on entropy beyond uniqueness within the
-    // session window.
-    if OsRng.try_fill_bytes(&mut bytes).is_err() {
-        bytes = [0u8; 16];
-    }
-    let mut out = String::with_capacity(33);
-    out.push('_');
-    for b in bytes {
-        let hi = usize::from(b >> 4);
-        let lo = usize::from(b & 0x0f);
-        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
-            out.push(h as char);
-            out.push(l as char);
-        }
-    }
-    out
 }
 
 // =============================================================================

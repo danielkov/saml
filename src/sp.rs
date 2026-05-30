@@ -5,8 +5,6 @@
 
 use std::time::{Duration, SystemTime};
 
-use rand::RngCore as _;
-
 use crate::authn::request_build::{AcsRequest, BuildAuthnRequest, build_authn_request_xml};
 use crate::authn_context::RequestedAuthnContext;
 use crate::binding::post::encode_request as post_encode_request;
@@ -250,7 +248,7 @@ impl ServiceProvider {
             })?;
 
         // 2. Fresh request ID: `_<hex16>`.
-        let request_id = generate_saml_id();
+        let request_id = crate::binding::random_xml_id()?;
         let issued_at = SystemTime::now();
 
         // 3. Resolve the SP ACS endpoint.
@@ -658,7 +656,7 @@ impl ServiceProvider {
                 reason: "IdP SLO endpoint URL is not a valid URL",
             })?;
 
-        let request_id = generate_saml_id();
+        let request_id = crate::binding::random_xml_id()?;
         let issued_at = SystemTime::now();
 
         let build = BuildLogoutRequest {
@@ -915,7 +913,7 @@ impl ServiceProvider {
                 reason: "IdP SLO endpoint URL is not a valid URL",
             })?;
 
-        let response_id = generate_saml_id();
+        let response_id = crate::binding::random_xml_id()?;
         let issue_instant = SystemTime::now();
 
         let build = BuildLogoutResponse {
@@ -985,7 +983,7 @@ impl ServiceProvider {
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
 
         // Build the LogoutRequest XML.
-        let request_id = generate_saml_id();
+        let request_id = crate::binding::random_xml_id()?;
         let issue_instant = SystemTime::now();
         let build = BuildLogoutRequest {
             id: &request_id,
@@ -1183,31 +1181,6 @@ impl ServiceProvider {
         let signed_doc = Document::new(signed_root)?;
         Ok(emit_document(&signed_doc)?.into_bytes())
     }
-}
-
-/// `_<hex16>` SAML message ID. XML Schema `xs:ID` forbids leading digits, so
-/// the leading `_` is mandatory by convention.
-fn generate_saml_id() -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    // 1 ('_') + 2 hex chars per byte: bounded constant, no overflow possible
-    // for the fixed-size `bytes` array.
-    let capacity = 1usize.saturating_add(bytes.len().saturating_mul(2));
-    let mut out = String::with_capacity(capacity);
-    out.push('_');
-    for b in bytes {
-        let hi = usize::from(b >> 4);
-        let lo = usize::from(b & 0x0f);
-        // `hi` and `lo` are constrained to 0..16 by masking; both indices are
-        // guaranteed in-bounds for the 16-byte HEX table. Use `.get()` to
-        // avoid `indexing_slicing`.
-        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
-            out.push(h as char);
-            out.push(l as char);
-        }
-    }
-    out
 }
 
 /// Output of the SLO wire-format decoder. Holds the decoded XML alongside any

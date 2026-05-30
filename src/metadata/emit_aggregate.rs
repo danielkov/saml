@@ -18,8 +18,7 @@ use crate::xml::parse::{Document, Element, Node, QName};
 
 use super::emit_idp::{IdpMetadataInputs, build_idp_entity_descriptor};
 use super::emit_sp::{
-    DS_NS, MD_NS, SpMetadataInputs, build_sp_entity_descriptor, format_cache_duration, generate_id,
-    md_qname,
+    DS_NS, MD_NS, SpMetadataInputs, build_sp_entity_descriptor, format_cache_duration, md_qname,
 };
 
 /// One child entity to place in the aggregate. Each variant carries the same
@@ -53,7 +52,7 @@ pub fn emit_entities_descriptor(
     inputs: &EntitiesDescriptorInputs<'_>,
     signer: Option<(&KeyPair, SignatureAlgorithm, DigestAlgorithm, C14nAlgorithm)>,
 ) -> Result<String, Error> {
-    let aggregate_id = generate_id();
+    let aggregate_id = crate::binding::random_xml_id()?;
     let root = build_entities_descriptor(inputs, &aggregate_id)?;
 
     let final_root = if let Some((key, sig_alg, digest, c14n)) = signer {
@@ -111,7 +110,7 @@ fn build_entities_descriptor(
         // wrapping signature covers them transitively via the parent
         // reference; child `ID`s are still useful so the emitted XML is a
         // valid input for the single-entity verify path if extracted.
-        let child_id = generate_id();
+        let child_id = crate::binding::random_xml_id()?;
         let child = match member {
             AggregateMember::Idp(idp) => build_idp_entity_descriptor(idp, &child_id)?,
             AggregateMember::Sp(sp) => build_sp_entity_descriptor(sp, &child_id)?,

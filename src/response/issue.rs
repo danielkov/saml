@@ -5,8 +5,6 @@
 
 use std::time::{Duration, SystemTime};
 
-use rsa::rand_core::{OsRng, RngCore as _};
-
 use crate::attribute::Attribute;
 use crate::authn_context::AuthnContextClassRef;
 use crate::binding::{SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint};
@@ -72,8 +70,8 @@ pub(crate) struct IssueResponseInputs<'a> {
 
 /// Build the SSO Response and return a binding-encoded dispatch.
 pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoResponseDispatch, Error> {
-    let response_id = generate_xml_id();
-    let assertion_id = generate_xml_id();
+    let response_id = crate::binding::random_xml_id()?;
+    let assertion_id = crate::binding::random_xml_id()?;
 
     let assertion_elem = build_assertion(&BuildAssertionParams {
         assertion_id: &assertion_id,
@@ -262,7 +260,7 @@ pub(crate) struct IssueErrorResponseInputs<'a> {
 pub(crate) fn issue_error_response(
     input: IssueErrorResponseInputs<'_>,
 ) -> Result<SsoResponseDispatch, Error> {
-    let response_id = generate_xml_id();
+    let response_id = crate::binding::random_xml_id()?;
 
     let status = Status {
         code_uri: input.status_code.uri().to_owned(),
@@ -673,33 +671,6 @@ fn issue_artifact(
     Err(Error::UnsupportedByPeer {
         binding: crate::binding::Binding::HttpArtifact,
     })
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-/// Generate an XML `ID` of the shape `_<32 hex chars>` (16 random bytes,
-/// hex-encoded with a leading underscore for XML `xs:ID` legality).
-fn generate_xml_id() -> String {
-    let mut bytes = [0u8; 16];
-    // OsRng essentially never fails on production OSes; on the rare failure
-    // path we still emit a well-formed (if low-entropy) ID rather than panic.
-    let _fill_result = OsRng.try_fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(33);
-    out.push('_');
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for b in bytes {
-        let hi = usize::from(b >> 4);
-        let lo = usize::from(b & 0x0f);
-        // SAFETY-via-construction: `hi` and `lo` are in 0..16 by definition of
-        // the right-shift and mask, and `HEX` is a 16-byte table.
-        if let (Some(&h), Some(&l)) = (HEX.get(hi), HEX.get(lo)) {
-            out.push(h as char);
-            out.push(l as char);
-        }
-    }
-    out
 }
 
 // =============================================================================

@@ -7,8 +7,6 @@
 //! wraps this into the `ServiceProvider::metadata_xml(_with_extras)` role
 //! methods declared in RFC-006 §6.
 
-use rand::RngCore as _;
-
 use crate::binding::{Endpoint, SsoResponseEndpoint};
 use crate::crypto::cert::X509Certificate;
 use crate::crypto::keypair::KeyPair;
@@ -60,7 +58,7 @@ pub fn emit_sp_metadata(
     inputs: &SpMetadataInputs<'_>,
     signer: Option<(&KeyPair, SignatureAlgorithm, DigestAlgorithm, C14nAlgorithm)>,
 ) -> Result<String, Error> {
-    let entity_descriptor_id = generate_id();
+    let entity_descriptor_id = crate::binding::random_xml_id()?;
     let root = build_sp_entity_descriptor(inputs, &entity_descriptor_id)?;
 
     let final_root = if let Some((key, sig_alg, digest, c14n)) = signer {
@@ -183,45 +181,6 @@ pub(super) fn build_sp_entity_descriptor(
 // =============================================================================
 // Shared helpers (re-used by `emit_idp`)
 // =============================================================================
-
-/// Generate a hex-encoded random `ID` suitable for an `xs:ID` attribute. The
-/// leading underscore guarantees the value starts with a name-start character
-/// (xs:ID forbids leading digits).
-pub(super) fn generate_id() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    // Capacity: 1 leading underscore + two hex nibbles per byte. Computed via
-    // checked arithmetic so the strict-lint crate-wide ban on `+`/`*` panics
-    // is honoured; on overflow we fall back to the default `String::new()`.
-    let capacity = bytes
-        .len()
-        .checked_mul(2)
-        .and_then(|n| n.checked_add(1))
-        .unwrap_or(0);
-    let mut out = String::with_capacity(capacity);
-    out.push('_');
-    for b in bytes {
-        // hex, lower-case.
-        let hi = b >> 4;
-        let lo = b & 0x0f;
-        out.push(hex_nibble(hi));
-        out.push(hex_nibble(lo));
-    }
-    out
-}
-
-fn hex_nibble(n: u8) -> char {
-    // `n` is always a 4-bit value (0..=15) by construction in `generate_id`,
-    // but we still convert via the standard ASCII offsets without arithmetic
-    // operations that could panic under strict lints.
-    match n {
-        0..=9 => char::from(b'0'.saturating_add(n)),
-        10..=15 => char::from(b'a'.saturating_add(n.saturating_sub(10))),
-        // 4-bit input precludes any other value; fall back to '0' to keep the
-        // function infallible without invoking `unreachable!`.
-        _ => '0',
-    }
-}
 
 /// `xs:duration` in the simple "seconds-only" form `PT<n>S`. SAML deployments
 /// universally produce / accept this shape; we deliberately do not emit weeks

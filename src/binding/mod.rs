@@ -19,15 +19,13 @@ use crate::error::Error;
 /// `xs:ID`, which must start with a letter or `_`). The same shape is also a
 /// valid PAOS `messageID` (ECP, Profiles §4.2).
 ///
-/// Lives in this always-compiled parent module so the cfg-gated binding
-/// submodules (`artifact`, `ecp`) share one implementation instead of each
-/// carrying a copy. RNG failures propagate as
-/// [`Error::InvalidConfiguration`] rather than emitting an ID built from
-/// uninitialized entropy.
-#[cfg(any(
-    all(feature = "artifact-binding", feature = "weak-algos"),
-    feature = "ecp"
-))]
+/// This is the single XML-ID minter for the whole crate — IdP, SP, response,
+/// metadata and binding code all route through it. It lives in this
+/// always-compiled parent module so every caller (cfg-gated or not) shares one
+/// implementation instead of carrying a copy. It is **fail-closed**: RNG
+/// failures propagate as [`Error::InvalidConfiguration`] rather than emitting a
+/// predictable ID built from uninitialized entropy (a colliding ID would
+/// corrupt one-time-use replay detection and `InResponseTo` correlation).
 pub(crate) fn random_xml_id() -> Result<String, Error> {
     use std::fmt::Write as _;
 
