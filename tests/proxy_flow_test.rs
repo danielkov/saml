@@ -195,6 +195,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             now,
             assertion_lifetime: Duration::from_mins(10),
             subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
         })
         .expect("upstream issue_response");
 
@@ -224,6 +225,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect("proxy sp consume_response");
 
@@ -289,6 +291,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect("downstream consume_response");
 

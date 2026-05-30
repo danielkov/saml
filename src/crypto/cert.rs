@@ -30,6 +30,7 @@ use rsa::RsaPublicKey;
 use rsa::pkcs1v15::VerifyingKey as RsaPkcs1v15VerifyingKey;
 use signature::Verifier as _;
 use spki::SubjectPublicKeyInfoRef;
+use subtle::ConstantTimeEq as _;
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, DecodePem, Encode as _};
 
@@ -52,6 +53,11 @@ pub struct X509Certificate {
     /// Lazily-computed cached public key (parsing the SPKI bit-string is
     /// non-trivial; the cache makes `public_key()` essentially free).
     public_key: PublicKey,
+    /// Cached DER of the `SubjectPublicKeyInfo`. Computed once at parse time
+    /// (the same encoding already feeds `PublicKey::from_spki_der`) so the
+    /// Holder-of-Key match loop — which compares SPKI across `O(candidates ×
+    /// certs)` pairs — doesn't re-encode the same bytes on every call.
+    spki_der: Vec<u8>,
     /// Cached RFC 4514 subject DN string.
     subject_str: String,
     /// Cached RFC 4514 issuer DN string.
@@ -71,6 +77,7 @@ impl fmt::Debug for X509Certificate {
             inner: _,
             der,
             public_key: _,
+            spki_der: _,
             subject_str,
             issuer_str,
             fingerprint: _,
@@ -142,6 +149,7 @@ impl X509Certificate {
             inner: cert,
             der,
             public_key,
+            spki_der,
             subject_str,
             issuer_str,
             fingerprint,
@@ -197,6 +205,41 @@ impl X509Certificate {
     /// Public key extracted from the certificate's `SubjectPublicKeyInfo`.
     pub fn public_key(&self) -> &PublicKey {
         &self.public_key
+    }
+
+    /// DER encoding of the certificate's `SubjectPublicKeyInfo`.
+    ///
+    /// This is the canonical, algorithm-tagged public-key blob (the
+    /// `AlgorithmIdentifier` + `subjectPublicKey` BIT STRING). Two certs that
+    /// carry the same key — even if re-issued, re-encoded, or with different
+    /// validity / extensions — produce byte-equal SPKI DER. Used by the
+    /// Holder-of-Key confirmation check, which binds to the subject's *key*
+    /// rather than to a specific certificate wrapper.
+    ///
+    /// The DER is encoded once at parse time and returned by reference, so
+    /// repeated calls (e.g. the HoK match loop) don't re-encode.
+    pub fn subject_public_key_info_der(&self) -> &[u8] {
+        &self.spki_der
+    }
+
+    /// Constant-time test of whether this certificate carries the same public
+    /// key (`SubjectPublicKeyInfo`) as `other`.
+    ///
+    /// Holder-of-Key (SAML V2.0 HoK SSO Profile §2.5) confirms that the
+    /// presenter holds the key named in the assertion's `<ds:KeyInfo>`. We
+    /// compare the SubjectPublicKeyInfo — not the subject DN (forgeable, not a
+    /// proof of key possession) and not the full cert DER (would reject a
+    /// re-issued cert bearing the same key, which the presenter legitimately
+    /// holds). The comparison is constant-time via `subtle`, consistent with
+    /// how the crate compares other crypto material, so a partial-match timing
+    /// side channel cannot leak the expected key bytes.
+    pub fn same_public_key_as(&self, other: &Self) -> bool {
+        let a = self.subject_public_key_info_der();
+        let b = other.subject_public_key_info_der();
+        if a.len() != b.len() {
+            return false;
+        }
+        a.ct_eq(b).into()
     }
 }
 

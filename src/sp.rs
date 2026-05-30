@@ -401,6 +401,19 @@ pub struct ConsumeResponse<'a> {
     /// trade-offs each variant makes. Ignored when `replay_cache` is
     /// `None`.
     pub replay_mode: ReplayMode,
+    /// Opt-in Holder-of-Key confirmation (SAML 2.0 Profiles §3.1; SAML V2.0
+    /// HoK SSO Profile). Supply the client certificate presented on the
+    /// mutually-authenticated TLS connection that delivered this Response; the
+    /// library does not own the socket, so the caller extracts it from their
+    /// TLS terminator. When `Some`, a `<saml:SubjectConfirmation>` whose
+    /// `@Method` is `urn:oasis:names:tc:SAML:2.0:cm:holder-of-key` is accepted
+    /// only if this cert's public key matches the confirmation's `<ds:KeyInfo>`
+    /// (in addition to the usual SubjectConfirmationData constraints). When
+    /// `None` (the default), HoK confirmations are unusable and the assertion
+    /// must carry a satisfying bearer confirmation — preserving the pre-HoK
+    /// behavior exactly. An assertion offering ONLY HoK with `None` here is
+    /// rejected with [`Error::HolderOfKeyConfirmation`].
+    pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
 }
 
 /// Inputs for [`ServiceProvider::consume_response_artifact`]. The artifact
@@ -430,6 +443,10 @@ pub struct ConsumeArtifactResponse<'a> {
     /// after artifact resolution. See [`ConsumeResponse::replay_mode`] for
     /// semantics.
     pub replay_mode: ReplayMode,
+    /// Presenter certificate for Holder-of-Key confirmation, threaded into the
+    /// inner [`ConsumeResponse`] after artifact resolution. See
+    /// [`ConsumeResponse::holder_of_key_cert`] for semantics.
+    pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
     /// Optional SOAP back-channel hardening for the artifact-resolution
     /// exchange itself. When `None` (the default), the outbound
     /// `<samlp:ArtifactResolve>` is sent unsigned and the inbound
@@ -527,6 +544,7 @@ impl ServiceProvider {
             requested_authn_context: input
                 .tracker
                 .and_then(|t| t.requested_authn_context.as_ref()),
+            holder_of_key_cert: input.holder_of_key_cert,
         })?;
 
         // Replay-cache check, AFTER signature + all spec checks succeed.
@@ -600,6 +618,7 @@ impl ServiceProvider {
             clock_skew: input.clock_skew,
             replay_cache: input.replay_cache,
             replay_mode: input.replay_mode,
+            holder_of_key_cert: input.holder_of_key_cert,
         })
     }
 }
@@ -2021,6 +2040,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
             })
             .expect("consume_response");
 
@@ -2060,6 +2080,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
             })
             .expect("consume_response (unsolicited)");
         assert_eq!(identity.assertion_id, "_a1");
@@ -2104,6 +2125,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
             })
             .unwrap_err();
         assert!(matches!(err, Error::InResponseToMismatch));
@@ -2147,6 +2169,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
             })
             .unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
@@ -2214,6 +2237,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
             })
             .expect("first consume_response succeeds");
         assert_eq!(identity.assertion_id, "_a1");
@@ -2233,6 +2257,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
             })
             .expect_err("second consume_response is a replay");
         assert!(
@@ -2287,6 +2312,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
                 replay_mode: ReplayMode::OneTimeUseOnly,
+                holder_of_key_cert: None,
             })
             .expect("first consume succeeds");
         assert_eq!(first.assertion_id, "_a-otu-skip");
@@ -2312,6 +2338,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
                 replay_mode: ReplayMode::OneTimeUseOnly,
+                holder_of_key_cert: None,
             })
             .expect("second consume must succeed under OneTimeUseOnly");
         assert_eq!(second.assertion_id, "_a-otu-skip");
@@ -2361,6 +2388,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
                 replay_mode: ReplayMode::OneTimeUseOnly,
+                holder_of_key_cert: None,
             })
             .expect("first OneTimeUse consume succeeds");
         assert!(first.is_one_time_use);
@@ -2383,6 +2411,7 @@ mod tests {
                 clock_skew: Duration::from_secs(30),
                 replay_cache: Some(&cache),
                 replay_mode: ReplayMode::OneTimeUseOnly,
+                holder_of_key_cert: None,
             })
             .expect_err("replay of OneTimeUse assertion must reject");
         assert!(
@@ -2433,6 +2462,7 @@ mod tests {
             clock_skew: Duration::from_secs(30),
             replay_cache: Some(&cache),
             replay_mode: ReplayMode::Off,
+            holder_of_key_cert: None,
         })
         .expect("first consume under Off mode succeeds");
 
@@ -2448,6 +2478,7 @@ mod tests {
             clock_skew: Duration::from_secs(30),
             replay_cache: Some(&cache),
             replay_mode: ReplayMode::Off,
+            holder_of_key_cert: None,
         })
         .expect("second consume under Off mode also succeeds — cache never consulted");
 
@@ -2928,6 +2959,7 @@ mod tests {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
                 backchannel,
             }
         }

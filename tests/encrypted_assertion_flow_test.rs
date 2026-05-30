@@ -184,6 +184,7 @@ fn idp_encrypts_assertion_and_sp_decrypts_it() {
             now,
             assertion_lifetime: Duration::from_mins(10),
             subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
         })
         .expect("idp issue_response");
 
@@ -220,6 +221,7 @@ fn idp_encrypts_assertion_and_sp_decrypts_it() {
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
             replay_mode: saml::replay::ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect("SP decrypts and consumes the encrypted Response");
 

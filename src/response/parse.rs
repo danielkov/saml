@@ -22,6 +22,12 @@ pub(crate) const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Succ
 /// SAML 2.0 bearer SubjectConfirmation method URI.
 pub(crate) const SUBJECT_CONFIRMATION_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 
+/// SAML 2.0 Holder-of-Key SubjectConfirmation method URI (SAML 2.0 Profiles
+/// §3.1; SAML V2.0 HoK SSO Profile). The presenter proves possession of the
+/// key carried in the confirmation's `<ds:KeyInfo>` via the client TLS cert.
+pub(crate) const SUBJECT_CONFIRMATION_HOLDER_OF_KEY: &str =
+    "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key";
+
 /// Typed view of a parsed `<samlp:Response>` (without signature verification).
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedResponse {
@@ -61,12 +67,21 @@ pub(crate) struct ParsedAssertion {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SubjectConfirmation {
-    /// `@Method` URI. Bearer is `urn:oasis:names:tc:SAML:2.0:cm:bearer`.
+    /// `@Method` URI. Bearer is `urn:oasis:names:tc:SAML:2.0:cm:bearer`;
+    /// Holder-of-Key is [`SUBJECT_CONFIRMATION_HOLDER_OF_KEY`].
     pub method: String,
     pub recipient: Option<String>,
     pub not_on_or_after: Option<SystemTime>,
     pub not_before: Option<SystemTime>,
     pub in_response_to: Option<String>,
+    /// Certificates carried in the confirmation's
+    /// `<saml:SubjectConfirmationData>/<ds:KeyInfo>` — the subject key material
+    /// for a Holder-of-Key confirmation (SAML V2.0 HoK SSO Profile §2.3). Only
+    /// `<ds:X509Certificate>` blobs that decode to a valid certificate are
+    /// retained; malformed inline blobs are skipped so a bad KeyInfo on one
+    /// confirmation never hard-fails an otherwise-valid bearer assertion.
+    /// Empty for a bearer confirmation (which carries no `<ds:KeyInfo>`).
+    pub key_info_certs: Vec<crate::crypto::cert::X509Certificate>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,7 +369,7 @@ fn parse_subject_confirmation(elem: &Element) -> Result<SubjectConfirmation, Err
         .to_owned();
 
     let data = elem.child_element(Some(SAML_NS), "SubjectConfirmationData");
-    let (recipient, not_on_or_after, not_before, in_response_to) = match data {
+    let (recipient, not_on_or_after, not_before, in_response_to, key_info_certs) = match data {
         Some(d) => (
             d.attribute(None, "Recipient").map(str::to_owned),
             d.attribute(None, "NotOnOrAfter")
@@ -364,8 +379,9 @@ fn parse_subject_confirmation(elem: &Element) -> Result<SubjectConfirmation, Err
                 .map(parse_xs_datetime)
                 .transpose()?,
             d.attribute(None, "InResponseTo").map(str::to_owned),
+            extract_subject_confirmation_certs(d),
         ),
-        None => (None, None, None, None),
+        None => (None, None, None, None, Vec::new()),
     };
 
     Ok(SubjectConfirmation {
@@ -374,7 +390,29 @@ fn parse_subject_confirmation(elem: &Element) -> Result<SubjectConfirmation, Err
         not_on_or_after,
         not_before,
         in_response_to,
+        key_info_certs,
     })
+}
+
+/// Decode the `<ds:X509Certificate>` blobs in a Holder-of-Key
+/// `<saml:SubjectConfirmationData>/<ds:KeyInfo>` into parsed certificates,
+/// reusing the shared `<ds:KeyInfo>` parser (the element shape is identical to
+/// the one inside a `<ds:Signature>`). Malformed blobs are skipped rather than
+/// surfaced as errors: an attacker who slips a garbage `<ds:X509Certificate>`
+/// into a confirmation should not be able to hard-fail an otherwise-valid
+/// assertion, and the HoK key-match in the validator is what actually gates
+/// acceptance.
+fn extract_subject_confirmation_certs(data: &Element) -> Vec<crate::crypto::cert::X509Certificate> {
+    let Some(key_info_elem) = data.child_element(Some(crate::dsig::reference::DS_NS), "KeyInfo")
+    else {
+        return Vec::new();
+    };
+    let key_info = crate::dsig::verify::parse_key_info_element(key_info_elem);
+    key_info
+        .x509_certificates_base64
+        .iter()
+        .filter_map(|b64| crate::crypto::cert::X509Certificate::from_base64_x509(b64).ok())
+        .collect()
 }
 
 fn parse_conditions(elem: &Element) -> Result<Conditions, Error> {

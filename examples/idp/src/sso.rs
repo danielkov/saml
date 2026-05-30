@@ -473,6 +473,7 @@ fn finalize_login(
         now,
         assertion_lifetime: Duration::from_mins(5),
         subject_confirmation_lifetime: Duration::from_mins(5),
+        holder_of_key_cert: None,
     }) {
         Ok(d) => d,
         Err(e) => {

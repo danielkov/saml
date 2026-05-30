@@ -10,12 +10,14 @@ use rsa::rand_core::{OsRng, RngCore as _};
 use crate::attribute::Attribute;
 use crate::authn_context::AuthnContextClassRef;
 use crate::binding::{SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint};
+use crate::crypto::cert::X509Certificate;
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
 use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
-use crate::dsig::sign::{SignOptions, sign_element};
+use crate::dsig::sign::{SignOptions, build_x509_key_info, sign_element};
 use crate::error::Error;
 use crate::nameid::{NameId, NameIdFormat};
+use crate::response::parse::{SUBJECT_CONFIRMATION_BEARER, SUBJECT_CONFIRMATION_HOLDER_OF_KEY};
 use crate::response::{SAML_NS, SAMLP_NS, saml_qname, samlp_qname};
 use crate::time::format_xs_datetime;
 use crate::xml::emit::emit_document;
@@ -25,8 +27,6 @@ use crate::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
 
 /// SAML 2.0 status URI for Success.
 const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
-/// SAML 2.0 SubjectConfirmation Method URI for bearer.
-const SUBJECT_CONFIRMATION_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 
 /// Inputs for [`issue_response`]. See RFC-004 §3.
 pub(crate) struct IssueResponseInputs<'a> {
@@ -62,6 +62,12 @@ pub(crate) struct IssueResponseInputs<'a> {
     /// Resolved ACS endpoint (from the SP descriptor); determines POST vs Artifact.
     pub acs_endpoint: &'a SsoResponseEndpoint,
     pub relay_state: Option<&'a str>,
+    /// Opt-in Holder-of-Key (SAML V2.0 HoK SSO Profile). When `Some`, the
+    /// assertion's `<saml:SubjectConfirmation>` uses the holder-of-key method
+    /// and embeds this subject certificate in
+    /// `<saml:SubjectConfirmationData>/<ds:KeyInfo>/<ds:X509Data>/<ds:X509Certificate>`.
+    /// When `None` (the default), a bearer confirmation is emitted.
+    pub holder_of_key_cert: Option<&'a X509Certificate>,
 }
 
 /// Build the SSO Response and return a binding-encoded dispatch.
@@ -84,6 +90,7 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
         authn_context_class_ref: &input.authn_context_class_ref,
         authn_instant: input.authn_instant,
         attributes: &input.attributes,
+        holder_of_key_cert: input.holder_of_key_cert,
     })?;
 
     // ---- Optionally sign the assertion in-place. ---------------------------
@@ -360,6 +367,7 @@ struct BuildAssertionParams<'a> {
     authn_context_class_ref: &'a AuthnContextClassRef,
     authn_instant: SystemTime,
     attributes: &'a [Attribute],
+    holder_of_key_cert: Option<&'a X509Certificate>,
 }
 
 fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> {
@@ -378,6 +386,7 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
         authn_context_class_ref,
         authn_instant,
         attributes,
+        holder_of_key_cert,
     } = params;
 
     let issuer = Element::build(saml_qname("Issuer"))
@@ -423,12 +432,22 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     if let Some(irt) = in_response_to {
         scd_builder = scd_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
     }
+    // Holder-of-Key (SAML V2.0 HoK SSO Profile §2.3): embed the subject cert in
+    // a `<ds:KeyInfo>` inside the SubjectConfirmationData and switch the method
+    // URI; otherwise emit a plain bearer confirmation. Reuse the same
+    // `<ds:KeyInfo>/<ds:X509Data>/<ds:X509Certificate>` shape the sign path
+    // emits.
+    let confirmation_method = if holder_of_key_cert.is_some() {
+        SUBJECT_CONFIRMATION_HOLDER_OF_KEY
+    } else {
+        SUBJECT_CONFIRMATION_BEARER
+    };
+    if let Some(cert) = holder_of_key_cert {
+        scd_builder = scd_builder.with_child(Node::Element(build_hok_key_info(cert)));
+    }
     let scd = scd_builder.finish();
     let subject_confirmation = Element::build(saml_qname("SubjectConfirmation"))
-        .with_attribute(
-            QName::new(None, "Method"),
-            SUBJECT_CONFIRMATION_BEARER.to_owned(),
-        )
+        .with_attribute(QName::new(None, "Method"), confirmation_method.to_owned())
         .with_child(Node::Element(scd))
         .finish();
 
@@ -509,6 +528,15 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     }
 
     Ok(assertion_builder.finish())
+}
+
+/// Build the Holder-of-Key `<ds:KeyInfo>` subtree carrying the subject cert.
+///
+/// Declares `xmlns:ds` on the `<ds:KeyInfo>` itself (`declare_ds_ns = true`):
+/// unlike a `<ds:Signature>`, a `<saml:SubjectConfirmationData>` has no in-scope
+/// `ds` binding, so the declaration must travel with this subtree.
+fn build_hok_key_info(cert: &X509Certificate) -> Element {
+    build_x509_key_info(cert, true)
 }
 
 fn build_attribute(attr: &Attribute) -> Element {
@@ -775,6 +803,7 @@ mod tests {
             outbound_key_transport_algorithm: KeyTransportAlgorithm::RsaOaep,
             acs_endpoint: &sp.assertion_consumer_services[0],
             relay_state: Some("opaque-state"),
+            holder_of_key_cert: None,
         }
     }
 
@@ -825,11 +854,72 @@ mod tests {
             now: fixed_now() + Duration::from_secs(30),
             clock_skew: Duration::from_mins(1),
             requested_authn_context: None,
+            holder_of_key_cert: None,
         };
         let identity = validate_response(validate_input).expect("validate");
         assert_eq!(identity.name_id.value, "alice@example.com");
         assert_eq!(identity.session_index.as_deref(), Some("sess-7"));
         assert_eq!(identity.attributes.len(), 1);
+    }
+
+    #[test]
+    fn holder_of_key_round_trip_issue_then_validate() {
+        // IdP issues a HoK assertion embedding cert C; the SP validates it
+        // successfully when the presenter cert == C. Asserts the full wire
+        // round trip (emit → parse → validate) for the HoK profile.
+        let sp = sp_descriptor(false);
+        let kp = rsa_signing_key();
+        let hok_cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let mut inputs = make_inputs(
+            &sp,
+            &kp,
+            vec![Attribute::email("alice@example.com")],
+            NameId::email("alice@example.com"),
+        );
+        inputs.holder_of_key_cert = Some(&hok_cert);
+        // Sign the Response root instead of the assertion: signing the
+        // assertion would change its canonical form, but the HoK KeyInfo lives
+        // in the (covered) subject and round-trips either way. We sign the
+        // assertion here exactly as the bearer round-trip does.
+        let dispatch = issue_response(inputs).expect("issue HoK");
+
+        let form = match dispatch {
+            SsoResponseDispatch::Post(f) => f,
+            other @ SsoResponseDispatch::Artifact(_) => panic!("expected Post, got {other:?}"),
+        };
+        let decoded =
+            crate::binding::post::decode(&form.saml_response, form.relay_state.as_deref())
+                .expect("decode");
+        let xml_str = std::str::from_utf8(&decoded.xml).expect("utf8");
+        assert!(
+            xml_str.contains("urn:oasis:names:tc:SAML:2.0:cm:holder-of-key"),
+            "wire must carry the HoK method URI"
+        );
+        let doc = Document::parse(&decoded.xml).expect("reparse");
+        let (parsed, _) = parse_response(&doc).expect("parse");
+
+        let idp = idp_descriptor();
+        let policy = crate::dsig::algorithms::PeerCryptoPolicy::strong_defaults();
+        let validate_input = ValidateResponse {
+            document: &doc,
+            parsed,
+            idp: &idp,
+            peer_crypto_policy: &policy,
+            #[cfg(feature = "xmlenc")]
+            decryption_keys: &[],
+            sp_entity_id: "https://sp.example.com",
+            expected_destination: "https://sp.example.com/acs",
+            tracker_request_id: Some("_req1"),
+            allow_unsolicited: false,
+            want_response_signed: false,
+            want_assertions_signed: true,
+            now: fixed_now() + Duration::from_secs(30),
+            clock_skew: Duration::from_mins(1),
+            requested_authn_context: None,
+            holder_of_key_cert: Some(&hok_cert),
+        };
+        let identity = validate_response(validate_input).expect("HoK validate");
+        assert_eq!(identity.name_id.value, "alice@example.com");
     }
 
     #[test]

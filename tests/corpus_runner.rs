@@ -718,6 +718,7 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         clock_skew: Duration::from_mins(30),
         replay_cache: None,
         replay_mode: ReplayMode::All,
+        holder_of_key_cert: None,
     })
     .map_err(|e| format!("consume_response: {e:?}"))
 }
@@ -941,6 +942,7 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
         clock_skew: Duration::from_mins(30),
         replay_cache: None,
         replay_mode: ReplayMode::All,
+        holder_of_key_cert: None,
     });
 
     match result {

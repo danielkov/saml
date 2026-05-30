@@ -466,6 +466,7 @@ impl Proxy<'_> {
             now: input.now,
             assertion_lifetime: input.session_lifetime,
             subject_confirmation_lifetime: input.subject_confirmation_lifetime,
+            holder_of_key_cert: None,
         })
     }
 }

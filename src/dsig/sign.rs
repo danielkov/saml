@@ -42,6 +42,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
+use crate::crypto::cert::X509Certificate;
 use crate::crypto::keypair::KeyPair;
 use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
 use crate::dsig::c14n::canonicalize;
@@ -318,19 +319,35 @@ fn build_signature_element(
             .ok_or(Error::InvalidConfiguration {
                 reason: "include_x509_cert requested but signing key has no certificate",
             })?;
-        let x509_certificate = Element::build(ds("X509Certificate"))
-            .with_text(cert.to_base64_x509())
-            .finish();
-        let x509_data = Element::build(ds("X509Data"))
-            .with_child(Node::Element(x509_certificate))
-            .finish();
-        let key_info = Element::build(ds("KeyInfo"))
-            .with_child(Node::Element(x509_data))
-            .finish();
+        // `ds` is inherited from the enclosing `<ds:Signature>`, so this KeyInfo
+        // must not re-declare it.
+        let key_info = build_x509_key_info(cert, false);
         signature_builder = signature_builder.with_child(Node::Element(key_info));
     }
 
     Ok(signature_builder.finish())
+}
+
+/// Build a `<ds:KeyInfo><ds:X509Data><ds:X509Certificate>` subtree carrying
+/// `cert`.
+///
+/// `declare_ds_ns` controls whether `xmlns:ds` is declared on the `<ds:KeyInfo>`
+/// element itself. The `<ds:Signature>` path passes `false` (the prefix is
+/// inherited from the signature root); the Holder-of-Key
+/// `<saml:SubjectConfirmationData>` path passes `true` because that subtree has
+/// no in-scope `ds` binding to inherit.
+pub(crate) fn build_x509_key_info(cert: &X509Certificate, declare_ds_ns: bool) -> Element {
+    let x509_certificate = Element::build(ds("X509Certificate"))
+        .with_text(cert.to_base64_x509())
+        .finish();
+    let x509_data = Element::build(ds("X509Data"))
+        .with_child(Node::Element(x509_certificate))
+        .finish();
+    let mut key_info = Element::build(ds("KeyInfo"));
+    if declare_ds_ns {
+        key_info = key_info.with_namespace(Some("ds".to_owned()), DSIG_NS);
+    }
+    key_info.with_child(Node::Element(x509_data)).finish()
 }
 
 /// Clone `element` and prepend a namespace declaration to its

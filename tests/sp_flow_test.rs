@@ -104,6 +104,7 @@ fn sp_consumes_real_idp_response() {
             now,
             assertion_lifetime: Duration::from_mins(10),
             subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
         })
         .expect("idp issue_response");
 
@@ -124,6 +125,7 @@ fn sp_consumes_real_idp_response() {
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect("sp consume_response");
 
@@ -212,6 +214,7 @@ fn sp_rejects_tampered_response() {
             now,
             assertion_lifetime: Duration::from_mins(10),
             subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
         })
         .expect("idp issue_response");
 
@@ -241,6 +244,7 @@ fn sp_rejects_tampered_response() {
             clock_skew: Duration::from_mins(2),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect_err("tampered response must fail");
 

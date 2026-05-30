@@ -495,6 +495,13 @@ pub struct IssueResponse<'a> {
     pub now: SystemTime,
     pub assertion_lifetime: Duration,
     pub subject_confirmation_lifetime: Duration,
+    /// Opt-in Holder-of-Key (SAML V2.0 HoK SSO Profile). When `Some`, the
+    /// issued assertion's `<saml:SubjectConfirmation>` uses the holder-of-key
+    /// method and embeds this subject certificate in its `<ds:KeyInfo>`. The
+    /// SP later confirms the presenter holds the matching key via its client
+    /// TLS certificate. When `None` (the default), a bearer confirmation is
+    /// emitted.
+    pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
 }
 
 /// Inputs to [`IdentityProvider::issue_error_response`]. See RFC-004 §4.
@@ -551,6 +558,7 @@ impl IdentityProvider {
             outbound_key_transport_algorithm: self.config.outbound_key_transport_algorithm,
             acs_endpoint,
             relay_state,
+            holder_of_key_cert: input.holder_of_key_cert,
         };
 
         issue_response(inputs)
@@ -1791,6 +1799,7 @@ mod tests {
                 now: fixed_now(),
                 assertion_lifetime: Duration::from_mins(10),
                 subject_confirmation_lifetime: Duration::from_mins(5),
+                holder_of_key_cert: None,
             })
             .expect("issue ok");
 

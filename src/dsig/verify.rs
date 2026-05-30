@@ -246,6 +246,16 @@ fn extract_key_info(signature_element: &Element) -> KeyInfo {
     let Some(key_info_elem) = signature_element.child_element(Some(DS_NS), "KeyInfo") else {
         return KeyInfo::default();
     };
+    parse_key_info_element(key_info_elem)
+}
+
+/// Parse a `<ds:KeyInfo>` element (already located) into a [`KeyInfo`].
+///
+/// A `<ds:KeyInfo>` is the same element shape wherever it appears in the SAML
+/// profiles — inside a `<ds:Signature>` or inside a Holder-of-Key
+/// `<saml:SubjectConfirmationData>` (SAML V2.0 HoK SSO Profile §2.3). Sharing
+/// this parser keeps the two call sites byte-for-byte consistent.
+pub(crate) fn parse_key_info_element(key_info_elem: &Element) -> KeyInfo {
     let mut out = KeyInfo::default();
 
     if let Some(name_elem) = key_info_elem.child_element(Some(DS_NS), "KeyName") {

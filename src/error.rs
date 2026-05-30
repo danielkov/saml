@@ -70,6 +70,15 @@ pub enum Error {
     Expired,
     #[error("SubjectConfirmation Recipient mismatch")]
     RecipientMismatch,
+    /// A Holder-of-Key SubjectConfirmation (SAML V2.0 HoK SSO Profile) could
+    /// not be confirmed. `reason` distinguishes the failure mode: the presenter
+    /// key did not match the confirmation's `<ds:KeyInfo>`, no presenter cert
+    /// was configured so HoK could not be checked, or the `<ds:KeyInfo>`
+    /// carried no usable key material. Never returned when a bearer
+    /// confirmation on the same assertion already satisfied all its
+    /// constraints — HoK is only consulted as a fallback.
+    #[error("Holder-of-Key SubjectConfirmation not confirmed: {reason}")]
+    HolderOfKeyConfirmation { reason: &'static str },
     #[error("Status not Success: {code}")]
     StatusNotSuccess {
         code: String,

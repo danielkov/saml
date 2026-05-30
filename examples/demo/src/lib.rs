@@ -662,6 +662,7 @@ async fn handle_acs(State(state): State<AppState>, Form(form): Form<AcsForm>) ->
         clock_skew: Duration::from_mins(2),
         replay_cache: Some(state.replay_cache.as_ref()),
         replay_mode: ReplayMode::All,
+        holder_of_key_cert: None,
     }) {
         Ok(id) => id,
         Err(e) => {

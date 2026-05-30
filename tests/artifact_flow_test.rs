@@ -236,6 +236,7 @@ async fn artifact_flow_end_to_end() {
             now,
             assertion_lifetime: Duration::from_mins(10),
             subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
         })
         .expect("idp issue_response");
 
@@ -289,6 +290,7 @@ async fn artifact_flow_end_to_end() {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
                 backchannel: None,
             },
         )
@@ -337,6 +339,7 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
                 backchannel: None,
             },
         )

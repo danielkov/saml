@@ -89,6 +89,7 @@
 //!     clock_skew: Duration::from_secs(60),
 //!     replay_cache: None,
 //!     replay_mode: ReplayMode::All,
+//!     holder_of_key_cert: None,
 //! })?;
 //! // Dedupe identity.assertion_id against your replay store, or pass
 //! // `Some(&InMemoryReplayCache::default())` in the field above.
@@ -185,6 +186,7 @@
 //!     now: SystemTime::now(),
 //!     assertion_lifetime: Duration::from_secs(300),
 //!     subject_confirmation_lifetime: Duration::from_secs(300),
+//!     holder_of_key_cert: None,
 //! })?;
 //! # Ok(())
 //! # }
@@ -262,6 +264,7 @@
 //!     clock_skew: Duration::from_secs(60),
 //!     replay_cache: None,
 //!     replay_mode: ReplayMode::All,
+//!     holder_of_key_cert: None,
 //! })?;
 //!
 //! let _dispatch = proxy.relay_to_downstream(RelayToDownstream {

@@ -23,7 +23,7 @@ use crate::error::Error;
 use crate::response::identity::Identity;
 use crate::response::parse::{
     AssertionWrapper, ParsedAssertion, ParsedResponse, STATUS_SUCCESS, SUBJECT_CONFIRMATION_BEARER,
-    SubjectConfirmation, parse_assertion,
+    SUBJECT_CONFIRMATION_HOLDER_OF_KEY, SubjectConfirmation, parse_assertion,
 };
 use crate::xml::parse::{Document, Element, ElementId};
 
@@ -51,6 +51,16 @@ pub(crate) struct ValidateResponse<'a> {
     pub clock_skew: Duration,
     /// Optional requested AuthnContext for downgrade-prevention check.
     pub requested_authn_context: Option<&'a RequestedAuthnContext>,
+    /// Caller-supplied presenter certificate from the mutually-authenticated
+    /// client-TLS connection, enabling Holder-of-Key confirmation (SAML V2.0
+    /// HoK SSO Profile). When `Some`, a HoK `<saml:SubjectConfirmation>` is
+    /// accepted only if this cert's public key matches the confirmation's
+    /// `<ds:KeyInfo>` (in addition to the usual SubjectConfirmationData
+    /// constraints). When `None` (the default), HoK confirmations are not
+    /// usable and the assertion must carry a satisfying bearer confirmation —
+    /// this preserves the pre-HoK behavior exactly. The library does not own
+    /// the TLS socket, so the presenter cert is always supplied by the caller.
+    pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
 }
 
 /// Validate a parsed Response and return the extracted `Identity` on success.
@@ -71,6 +81,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         now,
         clock_skew,
         requested_authn_context,
+        holder_of_key_cert,
     } = input;
 
     // --- Step 3: Destination cross-check when present. -----------------------
@@ -232,15 +243,19 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         return Err(Error::AudienceMismatch);
     }
 
-    // --- Steps 15/16: locate a bearer SubjectConfirmation that passes --------
+    // --- Steps 15/16: locate a SubjectConfirmation that passes ---------------
     // The helper returns the satisfying confirmation, but no data from it
-    // flows into Identity — its only role here is to validate-or-reject.
-    find_valid_bearer_subject_confirmation(
+    // flows into Identity — its only role here is to validate-or-reject. A
+    // bearer confirmation satisfies on its SubjectConfirmationData constraints
+    // alone; a Holder-of-Key confirmation additionally requires the presenter
+    // key to match its `<ds:KeyInfo>` (SAML V2.0 HoK SSO Profile).
+    find_valid_subject_confirmation(
         &assertion,
         expected_destination,
         tracker_request_id,
         now,
         clock_skew,
+        holder_of_key_cert,
     )?;
 
     // --- Step 17: AuthnContext non-downgrade ---------------------------------
@@ -567,31 +582,52 @@ fn handle_encrypted(
 // SubjectConfirmation + AuthnContext checks
 // =============================================================================
 
-fn find_valid_bearer_subject_confirmation<'a>(
+fn find_valid_subject_confirmation<'a>(
     assertion: &'a ParsedAssertion,
     expected_destination: &str,
     tracker_request_id: Option<&str>,
     now: SystemTime,
     clock_skew: Duration,
+    holder_of_key_cert: Option<&crate::crypto::cert::X509Certificate>,
 ) -> Result<&'a SubjectConfirmation, Error> {
-    // Collect bearer-method confirmations.
-    let bearers: Vec<&SubjectConfirmation> = assertion
+    // Collect confirmations we know how to confirm: bearer always, and
+    // Holder-of-Key only when the caller supplied a presenter cert (otherwise
+    // a HoK confirmation cannot be confirmed and must not be treated as usable
+    // — see the dedicated error below). This keeps bearer back-compat exact:
+    // with `holder_of_key_cert == None` the candidate set is identical to the
+    // pre-HoK bearer-only set.
+    let candidates: Vec<&SubjectConfirmation> = assertion
         .subject_confirmations
         .iter()
-        .filter(|sc| sc.method == SUBJECT_CONFIRMATION_BEARER)
+        .filter(|sc| {
+            sc.method == SUBJECT_CONFIRMATION_BEARER
+                || (holder_of_key_cert.is_some() && sc.method == SUBJECT_CONFIRMATION_HOLDER_OF_KEY)
+        })
         .collect();
 
-    if bearers.is_empty() {
+    if candidates.is_empty() {
+        // An assertion that offers ONLY Holder-of-Key but no presenter cert was
+        // configured cannot be confirmed — reject loudly rather than silently
+        // accept. Distinguish that from the plain no-bearer case so the caller
+        // knows HoK was on offer but unusable.
+        let offers_hok = assertion
+            .subject_confirmations
+            .iter()
+            .any(|sc| sc.method == SUBJECT_CONFIRMATION_HOLDER_OF_KEY);
+        if offers_hok && holder_of_key_cert.is_none() {
+            return Err(Error::HolderOfKeyConfirmation {
+                reason: "assertion offers only Holder-of-Key but no presenter certificate was configured",
+            });
+        }
         return Err(Error::SignatureVerification {
             reason: "no bearer SubjectConfirmation",
         });
     }
 
-    // First pick a candidate whose recipient matches. The spec allows
-    // multiple SubjectConfirmation elements, only one needs to satisfy ALL
-    // the bearer constraints — but errors are surfaced for the FIRST bearer
-    // that mismatches on a non-recipient axis so the caller's error code is
-    // informative.
+    // The spec allows multiple SubjectConfirmation elements; only ONE needs to
+    // satisfy ALL its constraints. We surface the error from the FIRST
+    // candidate that mismatches on a non-recipient axis so the caller's error
+    // code is informative.
     let mut last_err: Option<Error> = None;
     let now_minus_skew = now
         .checked_sub(clock_skew)
@@ -599,7 +635,7 @@ fn find_valid_bearer_subject_confirmation<'a>(
     let now_plus_skew = now
         .checked_add(clock_skew)
         .ok_or_else(|| Error::XmlParse("now + clock_skew overflows SystemTime".to_string()))?;
-    for sc in &bearers {
+    for sc in &candidates {
         // Recipient must match the expected destination.
         match sc.recipient.as_deref() {
             Some(r) if r == expected_destination => {}
@@ -634,6 +670,44 @@ fn find_valid_bearer_subject_confirmation<'a>(
             (None, Some(_)) => {
                 last_err = Some(Error::UnsolicitedNotAllowed);
                 continue;
+            }
+        }
+        // Holder-of-Key: the SubjectConfirmationData constraints above are
+        // necessary but NOT sufficient. The presenter must actually hold the
+        // key named in `<ds:KeyInfo>` (SAML V2.0 HoK SSO Profile §2.5). We
+        // match the caller-supplied presenter cert's public key against the
+        // confirmation's KeyInfo certs; a HoK confirmation is satisfied ONLY
+        // when that match succeeds. (`candidates` already excludes HoK when no
+        // presenter cert is configured, so the `expect`-free unwrap here is
+        // total.)
+        if sc.method == SUBJECT_CONFIRMATION_HOLDER_OF_KEY {
+            match holder_of_key_cert {
+                Some(presenter) => {
+                    if sc.key_info_certs.is_empty() {
+                        last_err = Some(Error::HolderOfKeyConfirmation {
+                            reason: "Holder-of-Key SubjectConfirmationData has no usable <ds:KeyInfo> key material",
+                        });
+                        continue;
+                    }
+                    if !sc
+                        .key_info_certs
+                        .iter()
+                        .any(|kc| presenter.same_public_key_as(kc))
+                    {
+                        last_err = Some(Error::HolderOfKeyConfirmation {
+                            reason: "presenter certificate key does not match the Holder-of-Key <ds:KeyInfo>",
+                        });
+                        continue;
+                    }
+                }
+                None => {
+                    // Unreachable given the candidate filter, but fail closed
+                    // rather than accept an unconfirmed HoK confirmation.
+                    last_err = Some(Error::HolderOfKeyConfirmation {
+                        reason: "Holder-of-Key confirmation requires a presenter certificate",
+                    });
+                    continue;
+                }
             }
         }
         return Ok(sc);
@@ -858,6 +932,185 @@ mod tests {
             .finish()
     }
 
+    /// Build a signed Response carrying an assertion whose
+    /// `<saml:SubjectConfirmation>` is Holder-of-Key and embeds `embed_cert` in
+    /// its `<ds:KeyInfo>/<ds:X509Data>/<ds:X509Certificate>`. The KeyInfo
+    /// declares `xmlns:ds` on itself (the SubjectConfirmationData has no
+    /// in-scope `ds` binding), mirroring the issue-side emitter.
+    fn build_signed_hok_response(embed_cert: &X509Certificate) -> Vec<u8> {
+        let name_id = Element::build(saml_qname("NameID"))
+            .with_attribute(
+                QName::new(None, "Format"),
+                "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_owned(),
+            )
+            .with_text("alice@example.com")
+            .finish();
+
+        let ds = |local: &str| QName::new(Some(DS_NS.to_owned()), local);
+        let x509_cert = ds("X509Certificate");
+        let key_info = Element::build(ds("KeyInfo"))
+            .with_namespace(Some("ds".to_owned()), DS_NS)
+            .with_child(Node::Element(
+                Element::build(ds("X509Data"))
+                    .with_child(Node::Element(
+                        Element::build(x509_cert)
+                            .with_text(embed_cert.to_base64_x509())
+                            .finish(),
+                    ))
+                    .finish(),
+            ))
+            .finish();
+
+        let scd = Element::build(saml_qname("SubjectConfirmationData"))
+            .with_attribute(
+                QName::new(None, "Recipient"),
+                "https://sp.example.com/acs".to_owned(),
+            )
+            .with_attribute(
+                QName::new(None, "NotOnOrAfter"),
+                "2026-05-26T12:05:00Z".to_owned(),
+            )
+            .with_attribute(QName::new(None, "InResponseTo"), "_req1".to_owned())
+            .with_child(Node::Element(key_info))
+            .finish();
+        let sc = Element::build(saml_qname("SubjectConfirmation"))
+            .with_attribute(
+                QName::new(None, "Method"),
+                SUBJECT_CONFIRMATION_HOLDER_OF_KEY.to_owned(),
+            )
+            .with_child(Node::Element(scd))
+            .finish();
+        let subject = Element::build(saml_qname("Subject"))
+            .with_child(Node::Element(name_id))
+            .with_child(Node::Element(sc))
+            .finish();
+
+        let audience = Element::build(saml_qname("Audience"))
+            .with_text("https://sp.example.com")
+            .finish();
+        let restriction = Element::build(saml_qname("AudienceRestriction"))
+            .with_child(Node::Element(audience))
+            .finish();
+        let conditions = Element::build(saml_qname("Conditions"))
+            .with_attribute(QName::new(None, "NotBefore"), "2026-05-26T11:59:00Z")
+            .with_attribute(QName::new(None, "NotOnOrAfter"), "2026-05-26T12:10:00Z")
+            .with_child(Node::Element(restriction))
+            .finish();
+        let class_ref = Element::build(saml_qname("AuthnContextClassRef"))
+            .with_text("urn:oasis:names:tc:SAML:2.0:ac:classes:Password")
+            .finish();
+        let actx = Element::build(saml_qname("AuthnContext"))
+            .with_child(Node::Element(class_ref))
+            .finish();
+        let astmt = Element::build(saml_qname("AuthnStatement"))
+            .with_attribute(QName::new(None, "AuthnInstant"), "2026-05-26T12:00:00Z")
+            .with_attribute(QName::new(None, "SessionIndex"), "sess-1")
+            .with_child(Node::Element(actx))
+            .finish();
+        let issuer = Element::build(saml_qname("Issuer"))
+            .with_text("https://idp.example.com")
+            .finish();
+        let assertion = Element::build(saml_qname("Assertion"))
+            .with_namespace(Some("saml".to_owned()), SAML_NS)
+            .with_attribute(QName::new(None, "ID"), "_a1")
+            .with_attribute(QName::new(None, "Version"), "2.0")
+            .with_attribute(QName::new(None, "IssueInstant"), "2026-05-26T12:00:00Z")
+            .with_child(Node::Element(issuer))
+            .with_child(Node::Element(subject))
+            .with_child(Node::Element(conditions))
+            .with_child(Node::Element(astmt))
+            .finish();
+
+        let kp = rsa_signing_key();
+        let d = Document::new(assertion).unwrap();
+        let signed = sign_element(
+            d.root().clone(),
+            &d,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .unwrap();
+        let response = build_response_with_assertion(
+            "_r",
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://idp.example.com",
+            signed,
+            STATUS_SUCCESS,
+        );
+        emit_document(&Document::new(response).unwrap())
+            .unwrap()
+            .into_bytes()
+    }
+
+    #[test]
+    fn holder_of_key_accepts_matching_presenter_cert() {
+        // The KeyInfo embeds the RSA cert and the presenter holds the same
+        // key — HoK confirmation succeeds (all SubjectConfirmationData
+        // constraints also pass).
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let xml = build_signed_hok_response(&cert);
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        let mut input = default_input(&doc, parsed, &idp, &policy);
+        input.holder_of_key_cert = Some(&cert);
+        let identity = validate_response(input).expect("HoK confirms with matching key");
+        assert_eq!(identity.name_id.value, "alice@example.com");
+    }
+
+    #[test]
+    fn holder_of_key_rejects_non_matching_presenter_cert() {
+        // KeyInfo embeds the RSA cert; the presenter offers a different key
+        // (EC P-256). The HoK key match must fail — being well-formed and
+        // time-valid is NOT enough.
+        let embedded = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let presenter =
+            X509Certificate::from_pem(crate::crypto::cert::test_vectors::EC_P256_CERT_PEM).unwrap();
+        let xml = build_signed_hok_response(&embedded);
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        let mut input = default_input(&doc, parsed, &idp, &policy);
+        input.holder_of_key_cert = Some(&presenter);
+        let err = validate_response(input).unwrap_err();
+        match err {
+            Error::HolderOfKeyConfirmation { reason } => {
+                assert!(reason.contains("does not match"), "got: {reason}");
+            }
+            other => panic!("expected HolderOfKeyConfirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn holder_of_key_only_assertion_without_presenter_cert_is_rejected() {
+        // Even with a well-formed HoK assertion (KeyInfo present), consuming it
+        // with no presenter cert configured must reject — never silently
+        // accept a confirmation the SP cannot actually confirm.
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let xml = build_signed_hok_response(&cert);
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        // default_input leaves holder_of_key_cert = None.
+        let err = validate_response(default_input(&doc, parsed, &idp, &policy)).unwrap_err();
+        match err {
+            Error::HolderOfKeyConfirmation { reason } => {
+                assert!(reason.contains("no presenter certificate"), "got: {reason}");
+            }
+            other => panic!("expected HolderOfKeyConfirmation, got {other:?}"),
+        }
+    }
+
     /// Inputs for [`build_and_sign_response`] test fixture.
     struct BuildAndSignResponseFixture<'a> {
         kp: &'a KeyPair,
@@ -966,6 +1219,7 @@ mod tests {
             now: fixed_now(),
             clock_skew: Duration::from_secs(30),
             requested_authn_context: None,
+            holder_of_key_cert: None,
         }
     }
 
@@ -1288,8 +1542,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_no_bearer_subject_confirmation() {
-        // Build an assertion whose SC method is NOT bearer.
+    fn rejects_holder_of_key_when_no_presenter_cert_configured() {
+        // An assertion offering ONLY Holder-of-Key, consumed without a
+        // presenter cert configured (`default_input` sets `holder_of_key_cert:
+        // None`), cannot be confirmed. Before HoK support this surfaced as the
+        // generic "no bearer SubjectConfirmation" rejection; now the validator
+        // recognizes the HoK method and rejects with the precise
+        // `HolderOfKeyConfirmation` error — still a rejection (HoK without a
+        // presenter cert is never silently accepted), just a sharper one.
         let name_id = Element::build(saml_qname("NameID"))
             .with_attribute(
                 QName::new(None, "Format"),
@@ -1383,10 +1643,10 @@ mod tests {
         let policy = strong_policy();
         let err = validate_response(default_input(&doc, parsed, &idp, &policy)).unwrap_err();
         match err {
-            Error::SignatureVerification { reason } => {
-                assert!(reason.contains("bearer"), "got: {reason}");
+            Error::HolderOfKeyConfirmation { reason } => {
+                assert!(reason.contains("no presenter certificate"), "got: {reason}");
             }
-            other => panic!("expected SignatureVerification, got {other:?}"),
+            other => panic!("expected HolderOfKeyConfirmation, got {other:?}"),
         }
     }
 

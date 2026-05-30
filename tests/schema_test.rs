@@ -90,6 +90,7 @@ fn well_formed_response_clears_schema_gate() {
             clock_skew: Duration::from_mins(1),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect_err("unsigned Response cannot succeed");
     if let Error::SchemaViolation { element, reason } = &err {
@@ -158,6 +159,7 @@ fn condition_extension_via_wildcard_clears_schema_gate() {
             clock_skew: Duration::from_mins(1),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect_err("unsigned Response cannot succeed");
     if let Error::SchemaViolation { element, reason } = &err {
@@ -207,6 +209,7 @@ fn response_missing_status_surfaces_schema_violation() {
             clock_skew: Duration::from_mins(1),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect_err("missing Status must be rejected");
     match err {
@@ -260,6 +263,7 @@ fn response_with_unknown_top_level_element_rejected() {
             clock_skew: Duration::from_mins(1),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect_err("unknown top-level element must be rejected");
     match err {
@@ -306,6 +310,7 @@ fn response_missing_version_surfaces_schema_violation() {
             clock_skew: Duration::from_mins(1),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect_err("missing @Version must be rejected");
     match err {
@@ -358,6 +363,7 @@ fn assertion_subject_before_issuer_rejected() {
             clock_skew: Duration::from_mins(1),
             replay_cache: None,
             replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
         })
         .expect_err("out-of-order children must be rejected");
     match err {
