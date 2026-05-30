@@ -289,6 +289,7 @@ async fn artifact_flow_end_to_end() {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                backchannel: None,
             },
         )
         .await
@@ -336,6 +337,7 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                backchannel: None,
             },
         )
         .await

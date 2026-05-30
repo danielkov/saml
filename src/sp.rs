@@ -24,6 +24,7 @@ use crate::descriptor::IdpDescriptor;
 use crate::dsig::algorithms::{
     C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
 };
+use crate::dsig::reference::DS_NS;
 use crate::dsig::sign::{SignOptions, sign_detached_query, sign_element};
 #[cfg(feature = "slo")]
 use crate::dsig::verify::{verify_detached_signature, verify_signature};
@@ -429,6 +430,42 @@ pub struct ConsumeArtifactResponse<'a> {
     /// after artifact resolution. See [`ConsumeResponse::replay_mode`] for
     /// semantics.
     pub replay_mode: ReplayMode,
+    /// Optional SOAP back-channel hardening for the artifact-resolution
+    /// exchange itself. When `None` (the default), the outbound
+    /// `<samlp:ArtifactResolve>` is sent unsigned and the inbound
+    /// `<samlp:ArtifactResponse>` *envelope* signature is not checked — the
+    /// recovered `<samlp:Response>`/assertion is still independently verified
+    /// downstream by [`ServiceProvider::consume_response`], which remains the
+    /// safety anchor. Supply [`ArtifactBackchannel`] to additionally sign the
+    /// outbound resolve and/or verify the inbound envelope signature against
+    /// the IdP certificates. See [`ArtifactBackchannel`].
+    pub backchannel: Option<ArtifactBackchannel<'a>>,
+}
+
+/// Opt-in SOAP back-channel hardening for [`ConsumeArtifactResponse`].
+///
+/// The artifact back channel is mutually authenticated in practice. This
+/// struct lets the high-level SP artifact path route through the first-class
+/// [`BackchannelClient`](crate::binding::artifact::BackchannelClient) instead
+/// of the bare unsigned/unverified resolution helper:
+///
+/// - `sign` enveloped-signs the outbound `<samlp:ArtifactResolve>`,
+///   authenticating the SP to the IdP.
+/// - `verify` checks the inbound `<samlp:ArtifactResponse>` *envelope*
+///   signature against the IdP certificates.
+///
+/// Both are additive and independent — either, both, or neither may be set.
+/// Leaving the field `None` on [`ConsumeArtifactResponse`] preserves the
+/// pre-existing default behavior exactly.
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[derive(Default)]
+pub struct ArtifactBackchannel<'a> {
+    /// When set, enveloped-sign the outbound `ArtifactResolve` with this key
+    /// and algorithms.
+    pub sign: Option<crate::binding::artifact::SignConfig<'a>>,
+    /// When set, verify the inbound `ArtifactResponse` envelope signature
+    /// against these certificates / algorithms.
+    pub verify: Option<crate::binding::artifact::VerifyConfig<'a>>,
 }
 
 impl ServiceProvider {
@@ -532,13 +569,24 @@ impl ServiceProvider {
                 binding: Binding::HttpArtifact,
             })?;
 
-        let inner_xml = crate::binding::artifact::resolve_artifact(
-            http,
-            ars.url.as_str(),
-            &self.config.entity_id,
-            input.artifact,
-        )
-        .await?;
+        // Route through the first-class BackchannelClient so callers can opt
+        // into signing the outbound resolve and/or verifying the inbound
+        // envelope signature. With no `backchannel` config this is byte-for-
+        // byte the old `resolve_artifact` behavior (unsigned, unverified) —
+        // the recovered inner Response is still independently verified below.
+        let mut client = crate::binding::artifact::BackchannelClient::new(http);
+        if let Some(bc) = input.backchannel {
+            if let Some(sign) = bc.sign {
+                client = client.sign_with(sign);
+            }
+            if let Some(verify) = bc.verify {
+                client = client.verify_with(verify);
+            }
+        }
+        let inner_xml = client
+            .resolve_artifact(ars.url.as_str(), &self.config.entity_id, input.artifact)
+            .await?
+            .payload_xml;
 
         self.consume_response(ConsumeResponse {
             idp: input.idp,
@@ -939,40 +987,23 @@ impl ServiceProvider {
         // Wrap in a SOAP envelope.
         let logout_request_str = std::str::from_utf8(&logout_request_xml)
             .map_err(|_err| Error::XmlEmit("logout request XML is not UTF-8".to_string()))?;
-        let soap_envelope = format!(
-            "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
-<soap:Body>{logout_request_str}</soap:Body>\
-</soap:Envelope>"
-        );
+        let soap_envelope = crate::binding::soap::wrap(logout_request_str)?;
 
         // Dispatch via the caller's HttpClient.
         let request = HttpRequest {
             method: http::Method::POST,
             url: slo_endpoint.url.clone(),
-            headers: vec![
-                ("Content-Type".to_owned(), "text/xml".to_owned()),
-                ("SOAPAction".to_owned(), String::new()),
-            ],
+            headers: crate::binding::soap::request_headers(),
             body: soap_envelope.into_bytes(),
         };
         let response = http.send(request).await.map_err(Error::Http)?;
 
-        // Parse the SOAP envelope; find the inner LogoutResponse element.
-        let envelope_doc = Document::parse(&response.body)?;
-        let inner = envelope_doc
-            .find_first(
-                Some("urn:oasis:names:tc:SAML:2.0:protocol"),
-                "LogoutResponse",
-            )
-            .ok_or(Error::XmlParse(
-                "SOAP envelope contained no <samlp:LogoutResponse>".to_string(),
-            ))?;
-
-        // Re-emit the inner element as a standalone document so we can
-        // hand it to the regular validate-and-verify path (which needs an
-        // ElementId arena rooted on the LogoutResponse).
-        let inner_xml = crate::xml::emit::emit_element(inner)?;
-        let inner_doc = Document::parse(inner_xml.as_bytes())?;
+        // Unwrap the SOAP envelope (a <soap:Fault> surfaces as
+        // Error::SoapFault) and re-parse the inner element as a standalone
+        // document so we can hand it to the regular validate-and-verify path
+        // (which needs an ElementId arena rooted on the LogoutResponse).
+        let inner_xml = crate::binding::soap::unwrap(&response.body)?.payload_xml()?;
+        let inner_doc = Document::parse(&inner_xml)?;
         let (parsed, _) = parse_logout_response(&inner_doc)?;
 
         // Issuer match.
@@ -992,7 +1023,7 @@ impl ServiceProvider {
         if self.config.logout_want_signed.responses {
             let sig = inner_doc
                 .root()
-                .child_element(Some("http://www.w3.org/2000/09/xmldsig#"), "Signature")
+                .child_element(Some(DS_NS), "Signature")
                 .ok_or(Error::SignatureMissing)?;
             let verified = verify_signature(
                 &inner_doc,
@@ -1005,10 +1036,7 @@ impl ServiceProvider {
                     reason: "signature does not cover LogoutResponse root",
                 });
             }
-        } else if let Some(sig) = inner_doc
-            .root()
-            .child_element(Some("http://www.w3.org/2000/09/xmldsig#"), "Signature")
-        {
+        } else if let Some(sig) = inner_doc.root().child_element(Some(DS_NS), "Signature") {
             // Signature present but not required: still verify if present.
             let _ = verify_signature(
                 &inner_doc,
@@ -1222,19 +1250,10 @@ fn decode_logout_wire(
         }
         Binding::Soap => {
             // Unwrap `<soap:Envelope>/<soap:Body>/<samlp:LogoutRequest|Response>`
-            // and re-emit the inner element as standalone XML.
-            let envelope = Document::parse(body)?;
-            let inner_local = if is_request {
-                "LogoutRequest"
-            } else {
-                "LogoutResponse"
-            };
-            let inner = envelope
-                .find_first(Some("urn:oasis:names:tc:SAML:2.0:protocol"), inner_local)
-                .ok_or_else(|| {
-                    Error::XmlParse(format!("SOAP envelope contained no <samlp:{inner_local}>"))
-                })?;
-            let xml = crate::xml::emit::emit_element(inner)?.into_bytes();
+            // and re-emit the inner element as standalone XML. A <soap:Fault>
+            // body surfaces as Error::SoapFault.
+            let _ = is_request;
+            let xml = crate::binding::soap::unwrap(body)?.payload_xml()?;
             Ok(DecodedSlo {
                 xml,
                 relay_state: None,
@@ -1286,9 +1305,7 @@ fn verify_inbound_signature(
             }
         }
         Binding::HttpPost | Binding::Soap => {
-            let sig_elem = document
-                .root()
-                .child_element(Some("http://www.w3.org/2000/09/xmldsig#"), "Signature");
+            let sig_elem = document.root().child_element(Some(DS_NS), "Signature");
             match sig_elem {
                 Some(sig) => {
                     let verified =
@@ -2778,5 +2795,272 @@ mod tests {
             .child_element(Some("urn:oasis:names:tc:SAML:2.0:metadata"), "Organization")
             .expect("Organization");
         let _ = org;
+    }
+
+    // ---------- artifact back-channel envelope verification ----------
+    //
+    // These cover Item 1: the high-level SP artifact path can opt into
+    // verifying the inbound `<samlp:ArtifactResponse>` *envelope* signature
+    // (routed through `BackchannelClient`), independently of the inner
+    // `<samlp:Response>` validation that always runs downstream.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    mod artifact_backchannel {
+        use super::*;
+        use crate::binding::artifact::VerifyConfig;
+        use crate::binding::soap;
+        use crate::dsig::algorithms::C14nAlgorithm;
+        use crate::http::{HttpRequest, HttpResponse};
+        use std::future::Future;
+        use std::time::Duration;
+
+        const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+        const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+        const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
+        const ARS_URL: &str = "https://idp.example.com/ars";
+
+        /// Mock `HttpClient` returning a fixed SOAP envelope body.
+        struct MockClient {
+            response: Vec<u8>,
+        }
+
+        impl HttpClient for MockClient {
+            fn send(
+                &self,
+                _request: HttpRequest,
+            ) -> impl Future<
+                Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send {
+                let body = self.response.clone();
+                async move {
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![("Content-Type".to_owned(), "text/xml".to_owned())],
+                        body,
+                    })
+                }
+            }
+        }
+
+        /// IdP descriptor advertising an `ArtifactResolutionService` so the SP
+        /// artifact path resolves an ARS endpoint.
+        fn artifact_idp() -> IdpDescriptor {
+            let mut idp = fixture_idp();
+            idp.artifact_resolution_endpoints = vec![Endpoint::post(ARS_URL, 0, true)];
+            idp
+        }
+
+        fn artifact_sp() -> ServiceProvider {
+            let mut cfg = fixture_sp_config(None, false, false);
+            cfg.acs = vec![SsoResponseEndpoint::artifact(
+                "https://sp.example.com/acs",
+                0,
+                true,
+            )];
+            ServiceProvider::new(cfg).expect("sp builds")
+        }
+
+        /// Build an `<samlp:ArtifactResponse>` SOAP envelope whose
+        /// ArtifactResponse element is enveloped-signed with the fixture key.
+        /// When `tamper` is set, an attribute is mutated after signing so the
+        /// envelope signature no longer verifies.
+        fn signed_envelope(tamper: bool) -> Vec<u8> {
+            let kp = rsa_signing_key();
+            let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
+            let inner_doc = Document::parse(inner.as_bytes()).expect("inner parse");
+            let inner_elem = inner_doc.root().clone();
+
+            let issuer = Element::build(QName::new(Some(SAML_NS.to_owned()), "Issuer"))
+                .with_text("https://idp.example.com".to_owned())
+                .finish();
+            let status_code = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "StatusCode"))
+                .with_attribute(QName::new(None, "Value"), STATUS_SUCCESS.to_owned())
+                .finish();
+            let status = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "Status"))
+                .with_child(Node::Element(status_code))
+                .finish();
+            let ar = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResponse"))
+                .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
+                .with_namespace(Some("saml".to_owned()), SAML_NS)
+                .with_attribute(QName::new(None, "ID"), "_art-resp".to_owned())
+                .with_attribute(QName::new(None, "Version"), "2.0")
+                .with_attribute(QName::new(None, "IssueInstant"), "2026-01-01T00:00:00Z")
+                .with_child(Node::Element(issuer))
+                .with_child(Node::Element(status))
+                .with_child(Node::Element(inner_elem))
+                .finish();
+
+            let stash = Document::new(ar).expect("stash doc");
+            let signed = sign_element(
+                stash.root().clone(),
+                &stash,
+                SignOptions {
+                    signing_key: &kp,
+                    sig_alg: SignatureAlgorithm::RsaSha256,
+                    digest_alg: DigestAlgorithm::Sha256,
+                    c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    inclusive_namespaces: &[],
+                    include_x509_cert: true,
+                },
+            )
+            .expect("sign");
+            let envelope = soap::wrap_element(signed).expect("wrap");
+            if tamper {
+                envelope.replace("_art-resp", "_art-TAMP").into_bytes()
+            } else {
+                envelope.into_bytes()
+            }
+        }
+
+        fn consume_input<'a>(
+            idp: &'a IdpDescriptor,
+            backchannel: Option<ArtifactBackchannel<'a>>,
+        ) -> ConsumeArtifactResponse<'a> {
+            ConsumeArtifactResponse {
+                idp,
+                peer_crypto_policy: None,
+                artifact: "AAQAA-sample",
+                relay_state: None,
+                tracker: None,
+                expected_destination: "https://sp.example.com/acs",
+                now: SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_hours(490_896))
+                    .expect("fixed now fits"),
+                clock_skew: Duration::from_mins(2),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                backchannel,
+            }
+        }
+
+        /// A validly-signed envelope passes envelope verification routed
+        /// through the SP API; the error (if any) then comes from the *inner*
+        /// Response validation, never from the envelope signature stage.
+        #[tokio::test]
+        async fn sp_verifies_signed_envelope_end_to_end() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let certs = idp.signing_certs.clone();
+            let client = MockClient {
+                response: signed_envelope(false),
+            };
+
+            let bc = ArtifactBackchannel {
+                sign: None,
+                verify: Some(VerifyConfig {
+                    certs: &certs,
+                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    require_signed: true,
+                }),
+            };
+
+            // The envelope signature is valid, so resolution proceeds past the
+            // envelope-verify stage. The minimal inner Response is not a
+            // fully-valid login, so consume_response rejects it downstream —
+            // but crucially NOT with an envelope SignatureVerification/Missing
+            // error, which would mean the envelope check itself failed.
+            let err = sp
+                .consume_response_artifact(&client, consume_input(&idp, Some(bc)))
+                .await
+                .expect_err("inner Response is minimal -> downstream rejects");
+            assert!(
+                !matches!(
+                    err,
+                    Error::SignatureMissing | Error::SignatureVerification { .. }
+                ),
+                "envelope signature must have verified; got {err:?}"
+            );
+        }
+
+        /// A tampered envelope signature is rejected by the SP artifact path
+        /// before any inner-Response processing.
+        #[tokio::test]
+        async fn sp_rejects_tampered_envelope_signature() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let certs = idp.signing_certs.clone();
+            let client = MockClient {
+                response: signed_envelope(true),
+            };
+
+            let bc = ArtifactBackchannel {
+                sign: None,
+                verify: Some(VerifyConfig {
+                    certs: &certs,
+                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    require_signed: true,
+                }),
+            };
+
+            let err = sp
+                .consume_response_artifact(&client, consume_input(&idp, Some(bc)))
+                .await
+                .expect_err("tampered envelope signature must be rejected");
+            assert!(
+                matches!(err, Error::SignatureVerification { .. }),
+                "got {err:?}"
+            );
+        }
+
+        /// `require_signed: true` rejects an unsigned envelope at the SP path.
+        #[tokio::test]
+        async fn sp_require_signed_rejects_unsigned_envelope() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let certs = idp.signing_certs.clone();
+            // Build an unsigned ArtifactResponse envelope via the binding helper.
+            let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
+            let unsigned = crate::binding::artifact::build_artifact_response(
+                "https://idp.example.com",
+                "_req1",
+                inner,
+            )
+            .expect("build unsigned envelope")
+            .into_bytes();
+            let client = MockClient { response: unsigned };
+
+            let bc = ArtifactBackchannel {
+                sign: None,
+                verify: Some(VerifyConfig {
+                    certs: &certs,
+                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    require_signed: true,
+                }),
+            };
+
+            let err = sp
+                .consume_response_artifact(&client, consume_input(&idp, Some(bc)))
+                .await
+                .expect_err("require_signed must reject an unsigned envelope");
+            assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
+        }
+
+        /// Default (no backchannel config) leaves behavior unchanged: an
+        /// unsigned envelope is accepted at the envelope layer and processing
+        /// continues to inner-Response validation.
+        #[tokio::test]
+        async fn sp_default_is_unchanged_no_envelope_check() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
+            let unsigned = crate::binding::artifact::build_artifact_response(
+                "https://idp.example.com",
+                "_req1",
+                inner,
+            )
+            .expect("build unsigned envelope")
+            .into_bytes();
+            let client = MockClient { response: unsigned };
+
+            let err = sp
+                .consume_response_artifact(&client, consume_input(&idp, None))
+                .await
+                .expect_err("minimal inner Response -> downstream rejects");
+            // No envelope signature check ran: the failure is a downstream
+            // SAML-level rejection, not an envelope SignatureMissing.
+            assert!(
+                !matches!(err, Error::SignatureMissing),
+                "default path must not require an envelope signature; got {err:?}"
+            );
+        }
     }
 }

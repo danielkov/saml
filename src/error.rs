@@ -75,6 +75,17 @@ pub enum Error {
         code: String,
         message: Option<String>,
     },
+    /// The peer answered a SOAP request with a `<soap:Fault>` (SOAP 1.1 §4.4)
+    /// instead of the expected payload. `faultcode` is the QName-shaped fault
+    /// code (e.g. `soap:Client`, `soap:Server`); `faultstring` is the
+    /// human-readable description, when present. Surfaced by the SOAP
+    /// back-channel envelope parser so callers can distinguish a transport-
+    /// level SOAP refusal from a SAML-level non-Success status.
+    #[error("SOAP Fault: {faultcode}{}", .faultstring.as_deref().map(|s| format!(" — {s}")).unwrap_or_default())]
+    SoapFault {
+        faultcode: String,
+        faultstring: Option<String>,
+    },
     #[error("Unsolicited Response received but allow_unsolicited is false")]
     UnsolicitedNotAllowed,
     #[error("Requested AuthnContextClassRef not satisfied")]

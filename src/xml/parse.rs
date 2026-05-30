@@ -346,7 +346,7 @@ impl Document {
 
     /// First element in document order with the given expanded name, anywhere
     /// in the subtree (including the root).
-    #[cfg(any(test, feature = "slo"))]
+    #[cfg(test)]
     pub(crate) fn find_first<'a>(
         &'a self,
         namespace: Option<&str>,
@@ -356,7 +356,7 @@ impl Document {
     }
 }
 
-#[cfg(any(test, feature = "slo"))]
+#[cfg(test)]
 fn find_first_in<'a>(
     element: &'a Element,
     namespace: Option<&str>,

@@ -86,12 +86,8 @@ pub use crate::authn::request_validate::{AcsSelection, ParsedAuthnRequest};
 // pub(crate) and we'd otherwise have to plumb a re-export).
 // =============================================================================
 
-#[cfg(any(feature = "slo", test))]
+#[cfg(test)]
 const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
-#[cfg(feature = "slo")]
-const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
-#[cfg(feature = "slo")]
-const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 
 // =============================================================================
 // Configuration
@@ -1085,15 +1081,12 @@ impl IdentityProvider {
         let xml = serialize_element(element)?;
         let xml_str = std::str::from_utf8(&xml)
             .map_err(|_err| Error::XmlEmit("non-UTF-8 outbound XML".to_string()))?;
-        let envelope = wrap_soap_envelope(xml_str);
+        let envelope = wrap_soap_envelope(xml_str)?;
 
         let request = HttpRequest {
             method: http::Method::POST,
             url: destination_endpoint.url.clone(),
-            headers: vec![
-                ("Content-Type".to_owned(), "text/xml".to_owned()),
-                ("SOAPAction".to_owned(), "\"\"".to_owned()),
-            ],
+            headers: crate::binding::soap::request_headers(),
             body: envelope.into_bytes(),
         };
         let HttpResponse { body, .. } = http.send(request).await.map_err(Error::Http)?;
@@ -1237,35 +1230,16 @@ fn verify_logout_signature(
 
 /// Wrap a SAML protocol message XML body in a SOAP 1.1 envelope.
 #[cfg(feature = "slo")]
-fn wrap_soap_envelope(saml_xml: &str) -> String {
-    format!(
-        r#"<soap:Envelope xmlns:soap="{SOAP_NS}"><soap:Body>{saml_xml}</soap:Body></soap:Envelope>"#
-    )
+fn wrap_soap_envelope(saml_xml: &str) -> Result<String, Error> {
+    crate::binding::soap::wrap(saml_xml)
 }
 
 /// Unwrap a SOAP 1.1 envelope and return the inner SAML protocol message
-/// element re-serialized to XML bytes.
+/// element re-serialized to XML bytes. A `<soap:Fault>` body surfaces as
+/// [`Error::SoapFault`].
 #[cfg(feature = "slo")]
 fn unwrap_soap_envelope(envelope_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    let doc = Document::parse(envelope_bytes)?;
-    let envelope = doc.root();
-    if envelope.qname().namespace() != Some(SOAP_NS) || envelope.qname().local() != "Envelope" {
-        return Err(Error::XmlParse(
-            "SOAP envelope root is not soap:Envelope".to_string(),
-        ));
-    }
-    let body = envelope
-        .child_element(Some(SOAP_NS), "Body")
-        .ok_or_else(|| Error::XmlParse("SOAP envelope missing soap:Body".to_string()))?;
-    let payload = body
-        .child_elements()
-        .find(|e| {
-            let ns = e.qname().namespace();
-            ns == Some(SAMLP_NS) || ns == Some(SAML_NS)
-        })
-        .ok_or_else(|| Error::XmlParse("SOAP body contains no SAML payload element".to_string()))?;
-    let serialized = crate::xml::emit::emit_element(payload)?;
-    Ok(serialized.into_bytes())
+    crate::binding::soap::unwrap(envelope_bytes)?.payload_xml()
 }
 
 /// Encode an outbound LogoutResponse over the requested binding. POST returns
@@ -1294,7 +1268,7 @@ fn encode_logout_dispatch_response(
         Binding::Soap => {
             let xml_str = std::str::from_utf8(xml)
                 .map_err(|_err| Error::XmlEmit("non-UTF-8 outbound XML".to_string()))?;
-            let envelope = wrap_soap_envelope(xml_str);
+            let envelope = wrap_soap_envelope(xml_str)?;
             Ok(Dispatch::Post(crate::binding::PostForm {
                 action: dest,
                 saml_request: None,
@@ -2698,7 +2672,7 @@ mod tests {
     #[test]
     fn soap_envelope_round_trip_extracts_payload() {
         let saml = r#"<samlp:LogoutResponse xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_x" Version="2.0" IssueInstant="2026-05-26T12:34:56Z" InResponseTo="_y"><saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">idp</saml:Issuer><samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status></samlp:LogoutResponse>"#;
-        let envelope = wrap_soap_envelope(saml);
+        let envelope = wrap_soap_envelope(saml).unwrap();
         let unwrapped = unwrap_soap_envelope(envelope.as_bytes()).unwrap();
         // The unwrapped payload must re-parse as a LogoutResponse.
         let doc = Document::parse(&unwrapped).unwrap();

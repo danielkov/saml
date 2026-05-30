@@ -5,6 +5,8 @@
 pub mod artifact;
 pub mod post;
 pub mod redirect;
+#[cfg(any(feature = "artifact-binding", feature = "slo"))]
+pub mod soap;
 
 use crate::error::Error;
 

@@ -287,6 +287,7 @@ async fn artifact_round_trip_through_example_handlers() {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                backchannel: None,
             },
         )
         .await
@@ -315,6 +316,7 @@ async fn artifact_round_trip_through_example_handlers() {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                backchannel: None,
             },
         )
         .await
@@ -349,6 +351,7 @@ async fn unknown_artifact_is_rejected() {
                 clock_skew: Duration::from_mins(2),
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
+                backchannel: None,
             },
         )
         .await;

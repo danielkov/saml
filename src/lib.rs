@@ -377,7 +377,7 @@ pub use crate::response::Identity;
 pub use crate::response::issue::SamlStatusCode;
 
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
-pub use crate::sp::ConsumeArtifactResponse;
+pub use crate::sp::{ArtifactBackchannel, ConsumeArtifactResponse};
 pub use crate::sp::{
     ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
     StartLogin, StartLoginResult,
