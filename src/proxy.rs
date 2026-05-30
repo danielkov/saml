@@ -112,7 +112,7 @@ pub struct ProxyContext {
 // AES-256-GCM codec (RFC-005 §2.1)
 // =============================================================================
 
-/// Stateless AEAD codec: bincode-serialized `ProxyContext` sealed with
+/// Stateless AEAD codec: postcard-serialized `ProxyContext` sealed with
 /// AES-256-GCM, base64url-encoded for `RelayState`.
 pub struct Aes256GcmCodec {
     key: [u8; 32],
@@ -139,7 +139,7 @@ impl Aes256GcmCodec {
 impl ProxyContextCodec for Aes256GcmCodec {
     fn encode(&self, context: &ProxyContext) -> Result<String, Error> {
         let plaintext =
-            bincode::serialize(context).map_err(|_err| Error::InvalidConfiguration {
+            postcard::to_allocvec(context).map_err(|_err| Error::InvalidConfiguration {
                 reason: "proxy context serialize",
             })?;
 
@@ -202,7 +202,7 @@ impl ProxyContextCodec for Aes256GcmCodec {
             })?;
 
         let context: ProxyContext =
-            bincode::deserialize(&plaintext).map_err(|_err| Error::InvalidConfiguration {
+            postcard::from_bytes(&plaintext).map_err(|_err| Error::InvalidConfiguration {
                 reason: "proxy context deserialize",
             })?;
 
