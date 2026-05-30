@@ -27,7 +27,18 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa`. Accepted
+    # with documented rationale (see SECURITY.md): no fixed release exists (the
+    # mitigation is partial and unreleased in the dragging rsa 0.10 line,
+    # RustCrypto/RSA#390), and pure-Rust RSA has no maintained alternative that
+    # would not pull in a C/asm backend — defeating this crate's no-C-build-chain
+    # premise. The practically-exploitable PKCS#1 v1.5 padding-oracle vector is
+    # gated behind `weak-algos` and refused by default (only RSA-OAEP key
+    # transport is accepted); the residual is generic non-constant-time modexp
+    # timing, and SP-side signature verification (no private key) is unaffected.
+    "RUSTSEC-2023-0071",
+]
 
 # ---------------------------------------------------------------------------
 # Licenses: allow permissive only. No GPL/AGPL/LGPL/SSPL.

@@ -49,4 +49,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
       - name: cargo audit
-        run: cargo audit --deny warnings
+        # RUSTSEC-2023-0071 (rsa "Marvin Attack") is accepted with documented
+        # rationale — see SECURITY.md and the matching entry in deny.toml. No
+        # fixed release exists; the exploitable v1.5 vector is off by default.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071

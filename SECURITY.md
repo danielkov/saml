@@ -86,6 +86,36 @@ The following are **out of scope** — protect against them at a higher layer:
 - **Identity provider correctness.** If the IdP issues an assertion for the
   wrong subject, no SP-side check can detect it.
 
+## Known Advisories
+
+The dependency audit (`cargo audit` / `cargo deny`) carries one accepted,
+documented advisory:
+
+- **RUSTSEC-2023-0071 — `rsa` "Marvin Attack" timing sidechannel.** The
+  pure-Rust `rsa` crate's RSA private-key operations are not fully
+  constant-time. No fixed release exists: the mitigation is partial and
+  unreleased in the in-progress `rsa` 0.10 line (tracked at RustCrypto/RSA#390),
+  and even that is described upstream as a "stop the bleeding" fix that does not
+  completely close the channel. Pure-Rust RSA has no maintained alternative that
+  avoids a C/asm backend, which would defeat this crate's no-C-build-chain
+  premise.
+
+  **Exposure here is limited by default.** The practically-exploitable PKCS#1
+  v1.5 decryption padding-oracle vector is gated behind the `weak-algos` feature
+  and refused by default — only RSA-OAEP key transport is accepted, so the
+  classic Bleichenbacher/Marvin oracle is not reachable in a default build.
+  SP-side signature *verification* uses no private key and is unaffected. The
+  residual is generic non-constant-time modular-exponentiation timing on the
+  RSA-OAEP `xmlenc` decryption and RSA signing paths — the same ecosystem-wide
+  limitation noted under "Side-channel timing leaks" above, hard to exploit over
+  a network.
+
+  Operators who enable `weak-algos` (re-enabling RSA-1.5 key transport) take on
+  the full Marvin exposure and should weigh that against their threat model.
+
+  The advisory is recorded in `deny.toml` and the `cargo audit` CI step; it will
+  be dropped once `rsa` ships a constant-time stable release.
+
 ## Disclosure Timeline
 
 Standard timeline is **90 days** from receipt of the report to public
