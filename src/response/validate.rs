@@ -190,7 +190,13 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     };
 
     // --- Step 11: re-parse the verified assertion ----------------------------
-    #[cfg_attr(not(feature = "xmlenc"), allow(unused_mut))]
+    #[cfg_attr(
+        not(feature = "xmlenc"),
+        expect(
+            unused_mut,
+            reason = "assertion is only reassigned on the xmlenc EncryptedID decrypt path below"
+        )
+    )]
     let mut assertion = parse_assertion(&assertion_element)?;
     // If the subject was carried as <saml:EncryptedID>, decrypt it now that the
     // assertion is verified (the parser left a placeholder NameID).
@@ -596,7 +602,7 @@ fn find_valid_subject_confirmation<'a>(
     // — see the dedicated error below). This keeps bearer back-compat exact:
     // with `holder_of_key_cert == None` the candidate set is identical to the
     // pre-HoK bearer-only set.
-    let candidates: Vec<&SubjectConfirmation> = assertion
+    let mut candidates: Vec<&SubjectConfirmation> = assertion
         .subject_confirmations
         .iter()
         .filter(|sc| {
@@ -604,6 +610,11 @@ fn find_valid_subject_confirmation<'a>(
                 || (holder_of_key_cert.is_some() && sc.method == SUBJECT_CONFIRMATION_HOLDER_OF_KEY)
         })
         .collect();
+    // Try bearer confirmations before Holder-of-Key ones (stable, so document
+    // order is preserved within each group). A satisfied bearer confirmation
+    // therefore always wins over a failing HoK one, and a HoK key-match error is
+    // surfaced only when no bearer confirmation could satisfy its constraints.
+    candidates.sort_by_key(|sc| sc.method != SUBJECT_CONFIRMATION_BEARER);
 
     if candidates.is_empty() {
         // An assertion that offers ONLY Holder-of-Key but no presenter cert was

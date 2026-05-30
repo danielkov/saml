@@ -369,6 +369,12 @@ fn parse_subject_confirmation(elem: &Element) -> Result<SubjectConfirmation, Err
         .to_owned();
 
     let data = elem.child_element(Some(SAML_NS), "SubjectConfirmationData");
+    // Only decode the `<ds:KeyInfo>` certs for a Holder-of-Key confirmation —
+    // they are used solely by the HoK key-match. Skipping the X.509 DER parse on
+    // bearer confirmations avoids per-request work an attacker could otherwise
+    // amplify by attaching large `<ds:X509Certificate>` blobs to a bearer
+    // assertion on the SP's login hot path.
+    let is_holder_of_key = method == SUBJECT_CONFIRMATION_HOLDER_OF_KEY;
     let (recipient, not_on_or_after, not_before, in_response_to, key_info_certs) = match data {
         Some(d) => (
             d.attribute(None, "Recipient").map(str::to_owned),
@@ -379,7 +385,11 @@ fn parse_subject_confirmation(elem: &Element) -> Result<SubjectConfirmation, Err
                 .map(parse_xs_datetime)
                 .transpose()?,
             d.attribute(None, "InResponseTo").map(str::to_owned),
-            extract_subject_confirmation_certs(d),
+            if is_holder_of_key {
+                extract_subject_confirmation_certs(d)
+            } else {
+                Vec::new()
+            },
         ),
         None => (None, None, None, None, Vec::new()),
     };
