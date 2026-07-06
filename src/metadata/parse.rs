@@ -43,6 +43,15 @@ pub struct EntitiesDescriptor {
 }
 
 /// One entry in a federation aggregate.
+#[cfg_attr(
+    feature = "idp-disco",
+    expect(
+        clippy::large_enum_variant,
+        reason = "the idp-disco endpoint list pushes SpDescriptor over the lint's size \
+                  ratio; Dual (both roles on one entity) is a rare shape and boxing it \
+                  would churn the public parse API for a cold path"
+    )
+)]
 pub enum MetadataEntry {
     Idp(IdpDescriptor),
     Sp(SpDescriptor),
@@ -847,7 +856,7 @@ pub(crate) fn parse_optional_bool(element: &Element, attr: &str) -> Result<Optio
     parse_optional_bool_value(element.attribute(None, attr))
 }
 
-fn parse_optional_bool_value(value: Option<&str>) -> Result<Option<bool>, Error> {
+pub(crate) fn parse_optional_bool_value(value: Option<&str>) -> Result<Option<bool>, Error> {
     match value {
         None => Ok(None),
         // xs:boolean lexical space.

@@ -2790,6 +2790,8 @@ mod tests {
                 language: "en".into(),
             }),
             contacts: vec![],
+            #[cfg(feature = "idp-disco")]
+            discovery_response_endpoints: vec![],
         };
         let xml = sp
             .metadata_xml_with_extras(false, &extras)

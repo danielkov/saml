@@ -36,6 +36,12 @@ pub struct SpDescriptor {
     pub authn_requests_signed: bool,
     pub valid_until: Option<SystemTime>,
     pub cache_duration: Option<Duration>,
+    /// `<idpdisc:DiscoveryResponse>` endpoints from the role descriptor's
+    /// `<md:Extensions>` — the URLs a discovery service may redirect the
+    /// user agent back to for this SP. See
+    /// [`validate_discovery_return_url`](crate::disco::validate_discovery_return_url).
+    #[cfg(feature = "idp-disco")]
+    pub discovery_response_endpoints: Vec<crate::disco::DiscoveryResponseEndpoint>,
 }
 
 impl SpDescriptor {
@@ -113,6 +119,9 @@ impl SpDescriptor {
 
         let supported_name_id_formats = parse_name_id_formats(sp);
 
+        #[cfg(feature = "idp-disco")]
+        let discovery_response_endpoints = crate::disco::parse_discovery_response_extensions(sp)?;
+
         Ok(Self {
             entity_id,
             assertion_consumer_services,
@@ -124,6 +133,8 @@ impl SpDescriptor {
             authn_requests_signed,
             valid_until,
             cache_duration,
+            #[cfg(feature = "idp-disco")]
+            discovery_response_endpoints,
         })
     }
 
@@ -168,6 +179,17 @@ impl SpDescriptor {
     /// decryption.
     pub fn encryption_cert(&self) -> Option<&X509Certificate> {
         self.encryption_certs.first()
+    }
+
+    /// Default `<idpdisc:DiscoveryResponse>` endpoint: the entry flagged
+    /// `isDefault="true"`, falling back to the first entry if none is so
+    /// flagged. Mirrors [`Self::default_acs`].
+    #[cfg(feature = "idp-disco")]
+    pub fn default_discovery_response(&self) -> Option<&crate::disco::DiscoveryResponseEndpoint> {
+        self.discovery_response_endpoints
+            .iter()
+            .find(|e| e.is_default)
+            .or_else(|| self.discovery_response_endpoints.first())
     }
 }
 
@@ -369,6 +391,50 @@ mod tests {
         let sp = SpDescriptor::from_metadata_xml(xml.as_bytes()).unwrap();
         let default = sp.default_acs().unwrap();
         assert_eq!(default.url, "https://sp.example.com/acs/a");
+    }
+
+    #[cfg(feature = "idp-disco")]
+    #[test]
+    fn parses_discovery_response_extensions() {
+        use crate::disco::{DiscoveryResponseEndpoint, IDPDISC_NS};
+
+        let xml = format!(
+            r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                                    xmlns:idpdisc="{IDPDISC_NS}"
+                                    entityID="https://sp.example.com/saml">
+              <md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+                <md:Extensions>
+                  <idpdisc:DiscoveryResponse Binding="{IDPDISC_NS}"
+                      Location="https://sp.example.com/disco" index="0" isDefault="true"/>
+                  <idpdisc:DiscoveryResponse Binding="{IDPDISC_NS}"
+                      Location="https://sp.example.com/disco/alt" index="1"/>
+                </md:Extensions>
+                <md:AssertionConsumerService index="0"
+                    Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+                    Location="https://sp.example.com/acs"/>
+              </md:SPSSODescriptor>
+            </md:EntityDescriptor>"#
+        );
+        let sp = SpDescriptor::from_metadata_xml(xml.as_bytes()).expect("parse ok");
+        assert_eq!(
+            sp.discovery_response_endpoints,
+            vec![
+                DiscoveryResponseEndpoint::new("https://sp.example.com/disco", 0, true),
+                DiscoveryResponseEndpoint::new("https://sp.example.com/disco/alt", 1, false),
+            ]
+        );
+        assert_eq!(
+            sp.default_discovery_response().unwrap().url,
+            "https://sp.example.com/disco"
+        );
+    }
+
+    #[cfg(feature = "idp-disco")]
+    #[test]
+    fn no_extensions_means_no_discovery_endpoints() {
+        let sp = SpDescriptor::from_metadata_xml(sp_metadata_xml().as_bytes()).unwrap();
+        assert!(sp.discovery_response_endpoints.is_empty());
+        assert!(sp.default_discovery_response().is_none());
     }
 
     #[test]

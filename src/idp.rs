@@ -1505,6 +1505,8 @@ mod tests {
             authn_requests_signed,
             valid_until: None,
             cache_duration: None,
+            #[cfg(feature = "idp-disco")]
+            discovery_response_endpoints: vec![],
         }
     }
 

@@ -418,6 +418,8 @@ mod tests {
                     company: Some("Example IdP Inc".into()),
                 },
             ],
+            #[cfg(feature = "idp-disco")]
+            discovery_response_endpoints: vec![],
         };
         let mut inputs = baseline_inputs(&cert, &sso, &[], &[], &formats, &algos);
         inputs.extras = Some(&extras);

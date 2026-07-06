@@ -111,6 +111,18 @@ pub(super) fn build_sp_entity_descriptor(
             bool_str(inputs.want_assertions_signed),
         );
 
+    // <md:Extensions> with <idpdisc:DiscoveryResponse> endpoints. Per the
+    // metadata schema, Extensions is the first child of the role descriptor,
+    // ahead of any KeyDescriptor.
+    #[cfg(feature = "idp-disco")]
+    if let Some(extras) = inputs.extras
+        && !extras.discovery_response_endpoints.is_empty()
+    {
+        sp_descriptor = sp_descriptor.with_child(Node::Element(build_disco_extensions(
+            &extras.discovery_response_endpoints,
+        )));
+    }
+
     // KeyDescriptors (signing first, then encryption — order matches the
     // worked example in the spec and is the only ordering parsers in the
     // wild reliably tolerate).
@@ -238,6 +250,30 @@ fn build_key_info_x509(cert: &X509Certificate) -> Element {
     Element::build(ds_qname("KeyInfo"))
         .with_child(Node::Element(x509_data))
         .finish()
+}
+
+/// `<md:Extensions>` wrapping one `<idpdisc:DiscoveryResponse>` per entry.
+/// The `Binding` attribute is fixed to the discovery-protocol namespace URI
+/// by the profile; `index` is required on md:IndexedEndpointType, so it is
+/// emitted unconditionally.
+#[cfg(feature = "idp-disco")]
+fn build_disco_extensions(endpoints: &[crate::disco::DiscoveryResponseEndpoint]) -> Element {
+    use crate::disco::IDPDISC_NS;
+
+    let mut extensions = Element::build(md_qname("Extensions"));
+    for endpoint in endpoints {
+        let mut builder =
+            Element::build(QName::new(Some(IDPDISC_NS.to_owned()), "DiscoveryResponse"))
+                .with_namespace(Some("idpdisc".to_owned()), IDPDISC_NS)
+                .with_attribute(QName::new(None, "Binding"), IDPDISC_NS)
+                .with_attribute(QName::new(None, "Location"), endpoint.url.clone())
+                .with_attribute(QName::new(None, "index"), endpoint.index.to_string());
+        if endpoint.is_default {
+            builder = builder.with_attribute(QName::new(None, "isDefault"), "true");
+        }
+        extensions = extensions.with_child(Node::Element(builder.finish()));
+    }
+    extensions.finish()
 }
 
 fn build_acs_endpoint(endpoint: &SsoResponseEndpoint) -> Element {
@@ -618,6 +654,8 @@ mod tests {
                 telephone_numbers: vec!["+15551234567".into()],
                 company: Some("Example Corp".into()),
             }],
+            #[cfg(feature = "idp-disco")]
+            discovery_response_endpoints: vec![],
         };
         let mut inputs = baseline_inputs(&cert, &acs, &[], &formats, &algos);
         inputs.extras = Some(&extras);
@@ -679,6 +717,93 @@ mod tests {
                 .map(Element::text_content),
             Some("+15551234567".to_owned())
         );
+    }
+
+    #[cfg(feature = "idp-disco")]
+    #[test]
+    fn discovery_response_endpoints_emit_as_first_extensions_child() {
+        use crate::disco::{DiscoveryResponseEndpoint, IDPDISC_NS};
+
+        let cert = rsa_cert();
+        let acs = [SsoResponseEndpoint::post(
+            "https://sp.example.com/acs",
+            0,
+            true,
+        )];
+        let formats = [NameIdFormat::EmailAddress];
+        let algos: [DataEncryptionAlgorithm; 0] = [];
+        let extras = MetadataExtras {
+            organization: None,
+            contacts: vec![],
+            discovery_response_endpoints: vec![
+                DiscoveryResponseEndpoint::new("https://sp.example.com/disco", 0, true),
+                DiscoveryResponseEndpoint::new("https://sp.example.com/disco/alt", 1, false),
+            ],
+        };
+        let mut inputs = baseline_inputs(&cert, &acs, &[], &formats, &algos);
+        inputs.extras = Some(&extras);
+
+        let xml = emit_sp_metadata(&inputs, None).unwrap();
+        let doc = Document::parse(xml.as_bytes()).unwrap();
+        let sp_desc = doc
+            .root()
+            .child_element(Some(MD_NS), "SPSSODescriptor")
+            .unwrap();
+
+        // Extensions must be the first child of the role descriptor.
+        let first_child = sp_desc.child_elements().next().expect("has children");
+        assert_eq!(first_child.qname().namespace(), Some(MD_NS));
+        assert_eq!(first_child.qname().local(), "Extensions");
+
+        let entries: Vec<_> = first_child
+            .all_child_elements(Some(IDPDISC_NS), "DiscoveryResponse")
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].attribute(None, "Binding"), Some(IDPDISC_NS));
+        assert_eq!(
+            entries[0].attribute(None, "Location"),
+            Some("https://sp.example.com/disco")
+        );
+        assert_eq!(entries[0].attribute(None, "index"), Some("0"));
+        assert_eq!(entries[0].attribute(None, "isDefault"), Some("true"));
+        assert_eq!(entries[1].attribute(None, "index"), Some("1"));
+        assert_eq!(entries[1].attribute(None, "isDefault"), None);
+
+        // Round-trips through the descriptor parse path.
+        let descriptor =
+            crate::descriptor::SpDescriptor::from_metadata_xml(xml.as_bytes()).expect("reparse");
+        assert_eq!(
+            descriptor.discovery_response_endpoints,
+            extras.discovery_response_endpoints
+        );
+    }
+
+    #[cfg(feature = "idp-disco")]
+    #[test]
+    fn no_extensions_element_when_no_discovery_endpoints() {
+        let cert = rsa_cert();
+        let acs = [SsoResponseEndpoint::post(
+            "https://sp.example.com/acs",
+            0,
+            true,
+        )];
+        let formats = [NameIdFormat::EmailAddress];
+        let algos: [DataEncryptionAlgorithm; 0] = [];
+        let extras = MetadataExtras {
+            organization: None,
+            contacts: vec![],
+            discovery_response_endpoints: vec![],
+        };
+        let mut inputs = baseline_inputs(&cert, &acs, &[], &formats, &algos);
+        inputs.extras = Some(&extras);
+
+        let xml = emit_sp_metadata(&inputs, None).unwrap();
+        let doc = Document::parse(xml.as_bytes()).unwrap();
+        let sp_desc = doc
+            .root()
+            .child_element(Some(MD_NS), "SPSSODescriptor")
+            .unwrap();
+        assert!(sp_desc.child_element(Some(MD_NS), "Extensions").is_none());
     }
 
     #[test]

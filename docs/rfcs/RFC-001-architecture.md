@@ -112,6 +112,11 @@ saml/
       response_build.rs
       response_parse.rs
 
+    disco/                  # RFC-008 (idp-disco feature)
+      mod.rs                # <idpdisc:DiscoveryResponse> metadata + constants
+      cdc.rs                # Common Domain Cookie codec
+      service.rs            # discovery service protocol codecs
+
     xml/                    # RFC-002
       mod.rs
       parse.rs              # quick-xml-based DOM-ish parser
@@ -167,6 +172,7 @@ saml/
       RFC-005-proxy-composition.md
       RFC-006-metadata.md
       RFC-007-single-logout.md
+      RFC-008-idp-discovery.md
 ```
 
 ---
@@ -389,12 +395,13 @@ Captured at v0.1.0 from real production deployments (sanitized):
 
 Explicit non-goals so the scope statement stays honest:
 
-- ECP / PAOS profile (Enhanced Client or Proxy). Browser flows only.
-- Holder-of-Key subject confirmation. Bearer-only.
+(ECP/PAOS, Holder-of-Key subject confirmation, and IdP Discovery were on this
+list originally and have since been implemented behind the `ecp`, default, and
+`idp-disco` features respectively — see RFC-008 for discovery.)
+
 - SAML 1.x compatibility. SAML 2.0 only.
 - Attribute Query profile.
 - Name Identifier Management profile.
-- Identity Discovery Service Protocol (IdP-disco). The caller picks the IdP.
 - Metadata signing-key rotation policy. The library exposes primitives (`cert.not_after()`, `signing_certs()`); operational policy is the caller's.
 - Long-lived session registry for SLO chain propagation. The library exposes inbound/outbound LogoutRequest/LogoutResponse primitives; the chain loop lives in the caller.
 - Asynchronous front-channel SLO chain orchestration (sequential redirects to N downstream SPs).

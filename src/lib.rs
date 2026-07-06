@@ -296,6 +296,8 @@
 //! - `slo` (default) — Single Logout.
 //! - `metadata-emit` (default) — `metadata_xml` / `metadata_xml_with_extras`.
 //! - `artifact-binding` — HTTP-Artifact binding (requires `weak-algos`).
+//! - `idp-disco` — IdP Discovery: Common Domain Cookie + discovery service
+//!   protocol (off by default).
 //! - `ecp` — Enhanced Client or Proxy profile + PAOS binding (off by default).
 //! - `weak-algos` — SHA-1 / RSA-PKCS#1-v1.5 / DSA-SHA1 (off by default).
 //!
@@ -316,6 +318,8 @@ pub mod nameid;
 pub mod binding;
 pub mod crypto;
 pub mod descriptor;
+#[cfg(feature = "idp-disco")]
+pub mod disco;
 pub mod dsig;
 pub mod metadata;
 pub mod xml;
@@ -362,6 +366,14 @@ pub use crate::crypto::keypair::OaepDigest;
 pub use crate::crypto::verifier::{DefaultVerifier, KeyInfo, SignatureVerifier, VerifyMatch};
 
 pub use crate::descriptor::{IdpDescriptor, SpDescriptor};
+
+#[cfg(feature = "idp-disco")]
+pub use crate::disco::{
+    COMMON_DOMAIN_COOKIE_NAME, CommonDomainCookie, DEFAULT_RETURN_ID_PARAM,
+    DISCOVERY_POLICY_SINGLE, DiscoveryRequest, DiscoveryResponseEndpoint, IDPDISC_NS,
+    ParsedDiscoveryRequest, build_discovery_request_url, build_discovery_response_url,
+    parse_discovery_request_query, parse_discovery_response_query, validate_discovery_return_url,
+};
 
 pub use crate::dsig::algorithms::{
     C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,

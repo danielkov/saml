@@ -71,6 +71,11 @@ xmlenc = []
 slo = []
 metadata-emit = []
 artifact-binding = []
+# Identity Provider Discovery: the Common Domain Cookie profile (SAML 2.0
+# Profiles §4.3) and the Identity Provider Discovery Service Protocol and
+# Profile (OASIS sstc-saml-idp-discovery-cs-01). Pure string / URL codecs plus
+# <idpdisc:DiscoveryResponse> metadata parse + emit; no extra dependencies.
+idp-disco = []
 # Enhanced Client or Proxy profile (SAML 2.0 Profiles §4.2) + the Reverse-SOAP
 # (PAOS) binding (SAML 2.0 Bindings §3.3). The non-browser SSO flow used by
 # desktop apps and federated CLI tooling. Layers a SOAP envelope + PAOS header

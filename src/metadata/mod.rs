@@ -14,12 +14,19 @@ pub mod parse;
 /// methods (Wave 6) and by the standalone `emit_*_metadata` functions in
 /// `metadata::emit_sp` / `metadata::emit_idp`.
 ///
-/// Both fields are optional / may be empty — passing the default value is
+/// All fields are optional / may be empty — passing the default value is
 /// equivalent to emitting no extras at all.
 #[derive(Debug, Clone, Default)]
 pub struct MetadataExtras {
     pub organization: Option<MetadataOrganization>,
     pub contacts: Vec<MetadataContact>,
+    /// `<idpdisc:DiscoveryResponse>` endpoints, emitted inside
+    /// `<md:Extensions>` as the first child of the `<md:SPSSODescriptor>`
+    /// (Identity Provider Discovery Service Protocol §2.4). SP metadata
+    /// only — the IdP role has no discovery-response concept, so the IdP
+    /// emit path ignores this field.
+    #[cfg(feature = "idp-disco")]
+    pub discovery_response_endpoints: Vec<crate::disco::DiscoveryResponseEndpoint>,
 }
 
 /// `<md:Organization>` payload. Per the SAML 2.0 metadata schema each of the

@@ -41,6 +41,7 @@ See [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-001-architecture.md) §1
 | `metadata-emit` | yes | `metadata_xml` / `metadata_xml_with_extras` for SP and IdP, plus federation `EntitiesDescriptor` aggregate emit. |
 | `xsd-validate` | yes | Structural XSD-style schema validation of inbound messages before any crypto runs. Opt out for permissive interop with borderline-conformant IdPs. |
 | `artifact-binding` | no | HTTP-Artifact binding (SOAP `ArtifactResolve`) + `BackchannelClient`. Requires `weak-algos` for the SHA-1 SourceID. |
+| `idp-disco` | no | IdP Discovery: Common Domain Cookie codec + discovery service protocol (request/response, return-URL validation) + `<idpdisc:DiscoveryResponse>` metadata. No extra dependencies. |
 | `ecp` | no | ECP / PAOS profile (Enhanced Client or Proxy) for non-browser clients. Reuses the `binding::soap` envelope; no extra dependencies. |
 | `weak-algos` | no | SHA-1 digest, RSA-PKCS1-v1.5 key transport, DSA-SHA1. Off by default; opt in only for legacy peer interop. |
 
@@ -156,6 +157,7 @@ Implemented:
 - XML-DSig — Exclusive and Inclusive C14N (with and without comments), enveloped-signature transform; multi-Reference signatures rejected by default; transform whitelist enforced.
 - Metadata parse and emit (`metadata-emit` feature) for single `EntityDescriptor`s and federation `EntitiesDescriptor` aggregates — signed-aggregate verification, an `entityID` index, and bounded streaming for large (InCommon / eduGAIN-scale) aggregates.
 - Identity proxy composition with stateless `ProxyContext`, opaque-handle Redirect codec, NameID transforms, and attribute release policies.
+- IdP Discovery (`idp-disco` feature) — Common Domain Cookie profile (`_saml_idp` codec) and the Identity Provider Discovery Service Protocol (SP and discovery-service sides, with metadata-backed return-URL validation).
 - Pluggable signature verification via the `SignatureVerifier` trait (for HSM- or KMS-backed keys).
 
 Out of scope for v0.1 (see [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-001-architecture.md) §12):
@@ -163,7 +165,6 @@ Out of scope for v0.1 (see [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-0
 - SAML 1.x compatibility.
 - Attribute Query profile.
 - Name Identifier Management profile.
-- Identity Discovery Service Protocol (IdP-disco).
 - Metadata signing-key rotation policy (the library exposes the primitives; policy is the caller's).
 - Asynchronous front-channel SLO chain orchestration across N downstream SPs.
 - `RetrievalMethod`, `AgreementMethod` (DH / ECDH) inside `KeyInfo`.
@@ -230,6 +231,7 @@ The harnesses reach into `pub mod __fuzz` in `src/lib.rs`, which is gated on `#[
 - [`docs/rfcs/RFC-005-proxy-composition.md`](docs/rfcs/RFC-005-proxy-composition.md) — Proxy composition and `ProxyContext`.
 - [`docs/rfcs/RFC-006-metadata.md`](docs/rfcs/RFC-006-metadata.md) — Metadata parse and emit.
 - [`docs/rfcs/RFC-007-single-logout.md`](docs/rfcs/RFC-007-single-logout.md) — Single Logout.
+- [`docs/rfcs/RFC-008-idp-discovery.md`](docs/rfcs/RFC-008-idp-discovery.md) — IdP Discovery (Common Domain Cookie + discovery service protocol).
 
 ## Minimum Supported Rust Version
 

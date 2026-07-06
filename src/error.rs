@@ -140,6 +140,36 @@ pub enum Error {
     #[error("ECP message carries a duplicate PAOS/ECP header: {header}")]
     EcpDuplicatePaosHeader { header: &'static str },
 
+    // --- IdP Discovery (`idp-disco` feature) ---
+    /// An inbound discovery-service request query string violated the
+    /// protocol: missing/empty `entityID`, a duplicated parameter, an
+    /// unsupported `policy`, a non-boolean `isPassive`, or a `returnIDParam`
+    /// that is not a plain URL-parameter token. Surfaced by
+    /// [`parse_discovery_request_query`](crate::disco::parse_discovery_request_query)
+    /// and the discovery request/response builders.
+    #[error("IdP discovery request malformed: {reason}")]
+    DiscoveryRequestMalformed { reason: &'static str },
+    /// The discovery service's return redirect was malformed — currently
+    /// only a duplicated chosen-IdP parameter, which is rejected outright so
+    /// an attacker-appended second value can never win a first-match parse.
+    /// Surfaced by
+    /// [`parse_discovery_response_query`](crate::disco::parse_discovery_response_query).
+    #[error("IdP discovery response malformed: {reason}")]
+    DiscoveryResponseMalformed { reason: &'static str },
+    /// **The** discovery-service trust check: the `return` URL in a
+    /// discovery request does not match any `<idpdisc:DiscoveryResponse>`
+    /// endpoint registered in the requesting SP's metadata. Redirecting
+    /// there anyway would be an open redirect that hands the user agent (and
+    /// the chosen IdP hint) to an attacker. Surfaced by
+    /// [`validate_discovery_return_url`](crate::disco::validate_discovery_return_url).
+    #[error("IdP discovery return URL not registered in SP metadata: {return_url}")]
+    DiscoveryReturnUrlNotRegistered { return_url: String },
+    /// The `_saml_idp` Common Domain Cookie value did not decode
+    /// (percent-encoding, base64, or UTF-8 layer). Surfaced by
+    /// [`CommonDomainCookie::parse`](crate::disco::CommonDomainCookie::parse).
+    #[error("Common Domain Cookie malformed: {reason}")]
+    CommonDomainCookieMalformed { reason: &'static str },
+
     // --- Trust / metadata ---
     #[error("Unknown peer entity: {entity_id}")]
     UnknownEntity { entity_id: String },
