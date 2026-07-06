@@ -33,23 +33,18 @@ Version conventions: pre-1.0, breaking API changes bump the minor version;
 an MSRV bump is treated as a minor-version change and called out in the
 release notes (see README).
 
-## One-time setup (bootstrap)
+## Bootstrap status
 
-Trusted Publishing can only be configured for a crate that already exists on
-crates.io, so the **first-ever publish is manual**:
+Both one-time prerequisites are **done**:
 
-1. `cargo publish --all-features` locally with a crates.io API token
-   (`cargo login`). This ships `v0.0.1-alpha.1` and claims the crate name.
-2. On crates.io: *saml → Settings → Trusted Publishing → Add* with
-   repository owner `danielkov`, repository `saml`, workflow `release.yml`,
-   environment `crates-io`.
-3. On GitHub: *Settings → Environments → New environment* named `crates-io`;
-   add a **required reviewer** (the maintainer) and, optionally, restrict
-   deployment branches/tags to `v*`.
-4. Push the matching `v0.0.1-alpha.1` tag so the release point is recorded.
-   The verify job runs and passes; **reject** the paused `crates-io`
-   deployment for this one run — the version is already on crates.io, so
-   there is nothing to publish and approving it would just fail.
+- `saml v0.0.1-alpha.0` was published to crates.io manually on 2026-05-28,
+  claiming the crate name (Trusted Publishing can only be configured for an
+  existing crate).
+- Trusted Publishing (repo `danielkov/saml`, workflow `release.yml`,
+  environment `crates-io`) and the `crates-io` GitHub environment (required
+  reviewer, deployments restricted to `v*` tags) were configured on
+  2026-07-06.
 
-After bootstrap, every release is: bump version → merge → push tag →
-approve.
+`v0.0.1-alpha.0` predates the tag-driven flow and has no git tag; the next
+release (`v0.0.1-alpha.1`, version already in `Cargo.toml`) is the first to
+go through it end to end.

@@ -7,7 +7,7 @@ to happen to get bits onto crates.io.
 
 > **Status (2026-05-29).** Done: 1 (already implemented), 2, 3, 4, 5, 6, 7, 8,
 > 9, 10, 11. Repo CI is green. Toolchain pinned via `mise.toml` (rust 1.95.0 +
-> cargo-fuzz). Remaining: 12, 13 (publish + tag — held for explicit go-ahead).
+> cargo-fuzz). All items done; releases now run via docs/releasing.md flow.
 
 ## Code gaps
 
@@ -82,12 +82,11 @@ to happen to get bits onto crates.io.
     third-party `tests/corpus/` fixtures: 324 → 87 files, 714 → 356 KiB
     compressed.
 
-12. **`cargo publish -p saml`** ⬜ TODO — held for explicit go-ahead
-    (irreversible). One-time manual bootstrap: Trusted Publishing can only be
-    configured for a crate that already exists on crates.io. Subsequent
-    releases are automated — see `docs/releasing.md` (tag push → verify →
-    environment approval → OIDC publish).
-
-13. **Push `v0.0.1-alpha.1` tag** ⬜ TODO — after 12, plus the one-time
-    Trusted Publishing + `crates-io` environment setup in
+12. **`cargo publish -p saml`** ✅ DONE — `v0.0.1-alpha.0` published
+    2026-05-28. Subsequent releases are automated: tag push → verify →
+    `crates-io` environment approval → Trusted Publishing (OIDC). See
     `docs/releasing.md`.
+
+13. **Push version tag** ✅ SUPERSEDED — `v0.0.1-alpha.0` shipped untagged;
+    from `v0.0.1-alpha.1` on, the tag push *is* the release trigger
+    (`docs/releasing.md`).
