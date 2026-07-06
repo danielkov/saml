@@ -113,3 +113,45 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --all-features
+
+  # ----- GitHub release + notes -----
+  # After a successful publish, render release notes for the span since the
+  # previous tag (git-cliff over the conventional-commit history, config in
+  # cliff.toml) and create the GitHub release. `-alpha`/`-beta`/`-rc` tags
+  # are marked as prereleases.
+  github-release:
+    name: Create GitHub release
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full history and all tags to find the
+          # previous release boundary.
+          fetch-depth: 0
+
+      - name: Generate release notes (git-cliff)
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in
+            *-alpha*|*-beta*|*-rc*) prerelease="--prerelease" ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag \
+            $prerelease

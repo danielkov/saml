@@ -1,0 +1,47 @@
+# git-cliff configuration — release-notes generation.
+#
+# Consumed by the `github-release` job in `.github/workflows/release.yml`,
+# which renders the notes for the span since the previous tag and attaches
+# them to the GitHub release. Preview locally with:
+#
+#   git cliff --latest            # notes for the most recent tag
+#   git cliff <rev>..<rev>        # arbitrary range
+
+[changelog]
+header = ""
+# Group commits by conventional-commit type. The `<!-- N -->` prefixes exist
+# only to force group ordering; `striptags` removes them at render time.
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | upper_first }} ({{ commit.id | truncate(length=7, end="") }})
+{%- endfor %}
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+# Keep non-conventional commits (grouped under "Other") rather than hiding
+# them — silence would misrepresent what shipped.
+filter_unconventional = false
+protect_breaking_commits = true
+tag_pattern = "v[0-9].*"
+sort_commits = "oldest"
+commit_parsers = [
+  # Merge commits restate work already listed by their constituent commits.
+  { message = "^Merge ", skip = true },
+  { message = "^feat", group = "<!-- 00 -->Features" },
+  { message = "^fix", group = "<!-- 01 -->Bug fixes" },
+  { message = "^security", group = "<!-- 02 -->Security" },
+  { message = "^perf", group = "<!-- 03 -->Performance" },
+  { message = "^refactor", group = "<!-- 04 -->Refactoring" },
+  { message = "^docs", group = "<!-- 05 -->Documentation" },
+  { message = "^test", group = "<!-- 06 -->Testing" },
+  { message = "^deps", group = "<!-- 07 -->Dependencies" },
+  { message = "^(ci|build)", group = "<!-- 08 -->CI & build" },
+  { message = "^chore", group = "<!-- 09 -->Chores" },
+  { message = ".*", group = "<!-- 10 -->Other" },
+]

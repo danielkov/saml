@@ -13,6 +13,11 @@ runs `.github/workflows/release.yml`:
    short-lived crates.io token (Trusted Publishing) and runs
    `cargo publish --all-features`. No long-lived registry token is stored in
    the repo.
+4. **GitHub release** — after a successful publish, release notes are
+   rendered with git-cliff (`cliff.toml`; grouped by conventional-commit
+   type, span since the previous tag) and a GitHub release is created for
+   the tag. `-alpha`/`-beta`/`-rc` versions are marked prerelease. Preview
+   notes locally with `git cliff --latest`.
 
 `workflow_dispatch` runs the verify/dry-run half only — use it to rehearse a
 release for any tag name without publishing.
