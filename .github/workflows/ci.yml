@@ -146,12 +146,17 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Coverage: instrument the workspace with cargo-llvm-cov, emit lcov, and push
-  # to Codecov. Mirrors the test job's keycloak-example exclusion. Tokenless
-  # upload (public repo); never fail CI on an upload hiccup.
+  # to Codecov. Mirrors the test job's keycloak-example exclusion. Uploads
+  # authenticate via GitHub OIDC (requires the Codecov GitHub App on the repo;
+  # plain tokenless upload is rejected for pushes to main). Never fail CI on
+  # an upload hiccup.
   # ---------------------------------------------------------------------------
   coverage:
     name: coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (stable + llvm-tools)
@@ -168,9 +173,10 @@ jobs:
       - name: cargo llvm-cov
         run: cargo llvm-cov --workspace --exclude saml-keycloak-example --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: lcov.info
+          use_oidc: true
           fail_ci_if_error: false
 
   # ---------------------------------------------------------------------------
