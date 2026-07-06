@@ -449,9 +449,10 @@ pub(crate) fn normalize_line_endings(xml: &[u8]) -> Cow<'_, [u8]> {
 }
 
 /// Decode a raw attribute-value byte slice as UTF-8 and apply XML 1.0
-/// entity unescaping (`&amp;` → `&`, `&#xD;` → `\r`, etc.), matching exactly
-/// what `quick_xml::events::attributes::Attribute::unescape_value` does on an
-/// element's own attributes in [`open_element`].
+/// entity unescaping (`&amp;` → `&`, `&#xD;` → `\r`, etc.). Used by
+/// [`open_element`] for an element's own attributes; deliberately does *not*
+/// apply attribute-value whitespace normalization so escaped whitespace
+/// survives verbatim for c14n.
 ///
 /// Shared so the seeded-ancestor namespace path ([`TreeBuilder::with_seed_scope`])
 /// resolves a prefix bound to an escaped URI (e.g. `xmlns:foo="urn:a&amp;b"`)
@@ -583,6 +584,13 @@ pub(crate) struct TreeBuilder {
     id_index: HashMap<String, ElementId>,
     completed_root: Option<Element>,
     total_nodes: usize,
+    /// Accumulates the current run of character data. quick-xml ≥ 0.37 splits
+    /// a text run at every entity/character reference (`A&amp;B` becomes
+    /// `Text("A")`, `GeneralRef("amp")`, `Text("B")`), so fragments are
+    /// buffered here and flushed as one `Node::Text` when the run ends —
+    /// preserving the one-node-per-run tree shape c14n and the accessors
+    /// were built against.
+    pending_text: String,
 }
 
 impl TreeBuilder {
@@ -597,6 +605,7 @@ impl TreeBuilder {
             id_index: HashMap::new(),
             completed_root: None,
             total_nodes: 0,
+            pending_text: String::new(),
         }
     }
 
@@ -640,6 +649,37 @@ impl TreeBuilder {
     /// [`Event::Eof`] (it has no element-tree meaning); stop the read loop on it
     /// instead.
     pub(crate) fn feed(&mut self, event: &Event<'_>) -> Result<(), Error> {
+        match event {
+            Event::Text(text) => {
+                let decoded = text
+                    .decode()
+                    .map_err(|e| Error::XmlParse(format!("text decode: {e}")))?;
+                self.append_text(&decoded)
+            }
+            Event::GeneralRef(general_ref) => {
+                // Re-wrap the reference and resolve it through the same
+                // unescaper the pre-0.37 inline path used: numeric character
+                // references and the five predefined entities resolve; any
+                // other entity (DTD-defined, XXE bait) is a parse error.
+                let decoded = general_ref
+                    .decode()
+                    .map_err(|e| Error::XmlParse(format!("entity reference decode: {e}")))?;
+                let raw = format!("&{decoded};");
+                let resolved = quick_xml::escape::unescape(&raw)
+                    .map_err(|e| Error::XmlParse(format!("entity reference: {e}")))?;
+                self.append_text(&resolved)
+            }
+            _ => {
+                self.flush_text()?;
+                self.feed_structural(event)
+            }
+        }
+    }
+
+    /// Handle every non-character-data event. Split from [`feed`](Self::feed)
+    /// so the text-run buffering above is the only place that decides when a
+    /// run of character data ends.
+    fn feed_structural(&mut self, event: &Event<'_>) -> Result<(), Error> {
         match event {
             Event::Eof => Ok(()),
             Event::Decl(_) => {
@@ -696,18 +736,13 @@ impl TreeBuilder {
                 }
                 close_element(frame.element, &mut self.stack, &mut self.completed_root)
             }
-            Event::Text(text) => {
-                let value = text
-                    .unescape()
-                    .map_err(|e| Error::XmlParse(format!("text decode: {e}")))?
-                    .into_owned();
-                if value.len() > self.limits.max_text_length {
-                    return Err(Error::XmlParse("max text length exceeded".to_string()));
-                }
-                if value.is_empty() {
-                    return Ok(());
-                }
-                self.push_text(value)
+            Event::Text(_) | Event::GeneralRef(_) => {
+                // Consumed by `feed` before it delegates here; kept as an
+                // error rather than a panic so a future routing mistake
+                // surfaces as a parse failure, not a crash.
+                Err(Error::XmlParse(
+                    "internal: character data reached structural handler".to_string(),
+                ))
             }
             Event::CData(cdata) => {
                 let value = std::str::from_utf8(cdata.as_ref())
@@ -779,6 +814,32 @@ impl TreeBuilder {
         Ok(())
     }
 
+    /// Append one fragment of the current character-data run, enforcing
+    /// `max_text_length` on the accumulated run (the whole run was a single
+    /// event pre-0.37, so the limit applies to the run, not the fragment).
+    fn append_text(&mut self, fragment: &str) -> Result<(), Error> {
+        if self
+            .pending_text
+            .len()
+            .checked_add(fragment.len())
+            .is_none_or(|total| total > self.limits.max_text_length)
+        {
+            return Err(Error::XmlParse("max text length exceeded".to_string()));
+        }
+        self.pending_text.push_str(fragment);
+        Ok(())
+    }
+
+    /// End the current character-data run: emit the buffered fragments as a
+    /// single `Node::Text` (if any) on the innermost open element.
+    fn flush_text(&mut self) -> Result<(), Error> {
+        if self.pending_text.is_empty() {
+            return Ok(());
+        }
+        let value = std::mem::take(&mut self.pending_text);
+        self.push_text(value)
+    }
+
     fn push_text(&mut self, value: String) -> Result<(), Error> {
         if self.stack.is_empty() {
             // Whitespace / text outside the root is silently dropped by
@@ -837,10 +898,7 @@ fn open_element(
         }
 
         let key_bytes = attr.key.into_inner().to_vec();
-        let value = attr
-            .unescape_value()
-            .map_err(|e| Error::XmlParse(format!("attribute value decode: {e}")))?
-            .into_owned();
+        let value = unescape_value(&attr.value)?;
 
         match QxQName(&key_bytes).as_namespace_binding() {
             Some(PrefixDeclaration::Default) => {
