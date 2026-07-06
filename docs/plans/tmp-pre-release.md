@@ -83,6 +83,11 @@ to happen to get bits onto crates.io.
     compressed.
 
 12. **`cargo publish -p saml`** ⬜ TODO — held for explicit go-ahead
-    (irreversible).
+    (irreversible). One-time manual bootstrap: Trusted Publishing can only be
+    configured for a crate that already exists on crates.io. Subsequent
+    releases are automated — see `docs/releasing.md` (tag push → verify →
+    environment approval → OIDC publish).
 
-13. **Push `v0.0.1-alpha.1` tag** ⬜ TODO — after 12.
+13. **Push `v0.0.1-alpha.1` tag** ⬜ TODO — after 12, plus the one-time
+    Trusted Publishing + `crates-io` environment setup in
+    `docs/releasing.md`.

@@ -1,5 +1,13 @@
 name: Release
 
+# Tag push (v*.*.*) → verify + dry-run → human approval on the `crates-io`
+# environment → publish via crates.io Trusted Publishing (OIDC, no stored
+# token). `workflow_dispatch` runs the verify + dry-run half only, for
+# rehearsing a release without publishing.
+#
+# See docs/releasing.md for the release runbook and the one-time setup
+# (GitHub environment + crates.io Trusted Publishing config).
+
 on:
   push:
     tags:
@@ -11,6 +19,8 @@ on:
         required: true
         type: string
 
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,6 +28,8 @@ jobs:
   verify-and-dry-run:
     name: Verify tag + cargo publish --dry-run
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -65,12 +77,39 @@ jobs:
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --all-features
 
-      # ----- Manual gate -----
-      # The real publish step is intentionally left commented out. To cut a
-      # release, run `cargo publish` locally (or uncomment after reviewing the
-      # dry-run output) so a human approves each upload to crates.io.
-      #
-      # - name: cargo publish
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      #   run: cargo publish --all-features
+  # ----- Human gate -----
+  # This job is bound to the `crates-io` GitHub environment, which is
+  # configured with a required reviewer: the workflow pauses here until a
+  # maintainer approves the deployment in the GitHub UI. Only real tag
+  # pushes reach this job — workflow_dispatch runs stay dry-run-only.
+  #
+  # Auth is crates.io Trusted Publishing: the job exchanges its GitHub OIDC
+  # identity (`id-token: write`) for a 30-minute publish token scoped to this
+  # crate. No long-lived CARGO_REGISTRY_TOKEN exists anywhere in the repo.
+  publish:
+    name: Publish to crates.io
+    needs: verify-and-dry-run
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Authenticate with crates.io (OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --all-features
