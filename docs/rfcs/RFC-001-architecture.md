@@ -203,7 +203,7 @@ url = "2"
 reqwest = { version = "0.12", features = ["json"], optional = true }
 
 [features]
-default = ["reqwest-client", "rsa-sha", "ecdsa-sha", "xmlenc", "slo", "metadata-emit"]
+default = ["rsa-sha", "ecdsa-sha", "xmlenc", "slo", "metadata-emit", "xsd-validate"]
 reqwest-client = ["dep:reqwest"]
 rsa-sha = []
 ecdsa-sha = []
@@ -219,7 +219,10 @@ proptest = "1"
 hex = "0.4"
 ```
 
-Cross-compilation matrix tested in CI: `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`. The `wasm32-unknown-unknown` target is supported with `default-features = false` (the SAML protocol mechanics are Rust-only; targets where `reqwest-client` cannot be built require the caller to plug a different `HttpClient` implementation, or to configure `reqwest` itself for `rustls-tls` and a webassembly-compatible transport).
+CI runs the full root-crate feature matrix on Linux under stable, beta, and the
+declared MSRV, plus default-feature workspace smoke tests on macOS and Windows.
+Feature-specific jobs target `-p saml` so examples and fuzz workspace members
+cannot silently re-enable default features through Cargo feature unification.
 
 ---
 
@@ -347,28 +350,31 @@ This matches `arctic-oauth`'s posture (the only `SystemTime::now()` call in that
 
 Three tiers:
 
-1. **Unit tests inside each module** (`#[cfg(test)] mod tests`) — XML parse round-trip, c14n known-answer vectors, RFC 7517 / RFC 7518 known test vectors for crypto, AuthnRequest builder output structure, error-path coverage.
+1. **Unit tests inside each module** (`#[cfg(test)] mod tests`) — XML parse round-trips, focused C14N known answers and regressions, signature/encryption round-trips, AuthnRequest builder output structure, and error-path coverage. The C14N suite includes four external Merlin/xmlsec Exclusive-C14N known answers with pinned provenance.
 2. **Cross-role flow tests** (`tests/sp_flow_test.rs`, `tests/idp_flow_test.rs`, `tests/proxy_flow_test.rs`) — SP and IdP from the same process exchange real XML, validating end-to-end behavior under controlled conditions.
-3. **Interop corpus tests** (`tests/interop_*_test.rs`) — captured real-world responses from Okta, Azure AD, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, Shibboleth. Each fixture is a deidentified XML file under `tests/common/fixtures/`. These guard against the long tail of vendor quirks (cert chain order, namespace prefix variation, BOM, fractional-second formats, comment positioning, whitespace handling).
+3. **Interop and security corpus tests** (`tests/corpus_runner.rs`, `tests/strong_security_corpus.rs`) — MIT-licensed fixtures imported from ruby-saml and python3-saml, including real AD FS RSA-SHA256/384/512 signatures, plus strong-algorithm in-process attack mutations with exact failure assertions.
 
-Property tests on XML parser robustness via `proptest`. A fuzz target on canonicalization + signature verification once the cargo-fuzz integration lands.
+One focused C14N `proptest` generates flat elements with bounded attribute maps
+and text, then checks source-order independence and idempotence under Inclusive
+and Exclusive C14N. Three `cargo-fuzz` targets exercise XML parsing, C14N, and
+the end-to-end base64 Response consume path. The corpus runner records borrowed
+fixture licenses; the external C14N fixtures additionally pin their exact
+xmlsec source commit and transformation.
 
 ---
 
 ## 10. Interop corpus
 
-Captured at v0.1.0 from real production deployments (sanitized):
+The checked-in interop inputs are borrowed test fixtures, not claimed production
+captures. Their source licenses are retained under `tests/corpus/`; the suite's
+currently exercised provider/library shapes are:
 
-| Vendor | Notes |
+| Source / shape | Notes |
 | --- | --- |
-| Okta | Most common enterprise IdP. Tests cert-chain ordering and `ds:` prefix variation. |
-| Microsoft Entra ID (Azure AD) | Heaviest namespace usage; signs both Response and Assertion. |
-| Auth0 | Common SaaS IdP. Standard exc-c14n. |
-| Google Workspace | Quirk: comment-position handling. |
-| OneLogin | Quirk: whitespace before signature. |
-| Keycloak | Open-source IdP; tests EncryptedAssertion + AES-GCM. |
-| ADFS (Windows Server) | Tests RSA-SHA1 fallback under `weak-algos`. |
-| Shibboleth IdP | Tests federated metadata aggregates. |
+| AD FS | Always-on RSA-SHA256/384/512 positives, a namespace variant, and RSA-SHA1 compatibility under `weak-algos`. |
+| ruby-saml / python3-saml | Positive and negative Response shapes covering signatures, encryption, schema errors, audience/time checks, and XSW mutations. |
+| OpenSAML / SimpleSAMLphp-shaped fixtures | Additional namespace, serialization, and signed-response interoperability cases from the imported corpora. |
+| In-process Rust SP ↔ IdP | Fresh RSA-SHA256/SHA-256 baseline with exact digest-tamper, unresolved-reference, and duplicate-ID failures. |
 
 ---
 

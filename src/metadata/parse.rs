@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use crate::crypto::cert::X509Certificate;
 use crate::descriptor::idp::IdpDescriptor;
 use crate::descriptor::sp::SpDescriptor;
-use crate::dsig::algorithms::SignatureAlgorithm;
+use crate::dsig::algorithms::PeerCryptoPolicy;
 use crate::dsig::verify::verify_signature;
 use crate::error::Error;
 use crate::nameid::NameIdFormat;
@@ -630,11 +630,12 @@ fn verify_metadata_signature_on_document(
         .root()
         .child_element(Some(DS_NS), "Signature")
         .ok_or(Error::SignatureMissing)?;
+    let policy = PeerCryptoPolicy::strong_defaults();
     let verified = verify_signature(
         doc,
         signature_elem,
         std::slice::from_ref(trusted_signing_cert),
-        SignatureAlgorithm::DEFAULTS,
+        &policy,
     )?;
     if verified.signed_element != doc.root().id() {
         return Err(Error::SignatureVerification {

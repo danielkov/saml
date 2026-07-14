@@ -38,14 +38,19 @@ jobs:
       matrix:
         include:
           - name: all-features
+            scope: -p saml
             flags: --all-features
           - name: default-features
+            scope: --workspace
             flags: ""
           - name: no-default-features
+            scope: -p saml
             flags: --no-default-features
           - name: artifact+weak (default)
+            scope: -p saml
             flags: --features "artifact-binding weak-algos"
           - name: artifact+weak (no-default)
+            scope: -p saml
             flags: --features "artifact-binding weak-algos" --no-default-features
     steps:
       - uses: actions/checkout@v4
@@ -56,8 +61,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: clippy-${{ matrix.name }}
-      - name: cargo clippy ${{ matrix.flags }}
-        run: cargo clippy --workspace --all-targets ${{ matrix.flags }} -- -D warnings
+      - name: cargo clippy ${{ matrix.scope }} ${{ matrix.flags }}
+        # Feature-specific rows target the package so workspace members cannot
+        # re-enable its defaults through Cargo feature unification. The default
+        # row still checks every workspace member.
+        run: cargo clippy ${{ matrix.scope }} --all-targets ${{ matrix.flags }} -- -D warnings
+
+  # The default protocol graph must not compile or link native crypto/XML.
+  # Optional HTTP clients may choose their own TLS provider when explicitly
+  # enabled, but ordinary SAML users get RustCrypto + quick-xml only.
+  pure-rust-default-graph:
+    name: pure Rust default graph
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Reject native crypto and XML dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree -p saml --edges normal,build --prefix none)"
+          if grep -E '^(ring|aws-lc-rs|aws-lc-sys|openssl|openssl-sys|libxml|libxml2-sys|xmlsec|xmlsec-sys|cc) v' <<<"$tree"; then
+            echo "native dependency found in the default saml graph" >&2
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # Tests: matrix on Rust toolchain X feature combo, Ubuntu only
@@ -71,14 +98,19 @@ jobs:
         rust: [stable, beta, "1.91.0"]
         features:
           - name: default
+            scope: --workspace
             flags: ""
           - name: all-features
+            scope: -p saml
             flags: --all-features
           - name: no-default-features
+            scope: -p saml
             flags: --no-default-features
           - name: artifact+weak (default)
+            scope: -p saml
             flags: --features "artifact-binding weak-algos"
           - name: artifact+weak (no-default)
+            scope: -p saml
             flags: --features "artifact-binding weak-algos" --no-default-features
     steps:
       - uses: actions/checkout@v4
@@ -89,10 +121,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-${{ matrix.rust }}-${{ matrix.features.name }}
-      - name: cargo test ${{ matrix.features.flags }}
-        # Exclude the keycloak example from default test runs — it requires
-        # SAML_RUN_KEYCLOAK_E2E=1 and a live Keycloak instance.
-        run: cargo test --workspace --exclude saml-keycloak-example ${{ matrix.features.flags }}
+      - name: cargo test ${{ matrix.features.scope }} ${{ matrix.features.flags }}
+        # As with Clippy, isolate feature-specific package rows from workspace
+        # feature unification. The default row exercises the whole workspace.
+        run: cargo test ${{ matrix.features.scope }} ${{ matrix.features.flags }}
 
   # ---------------------------------------------------------------------------
   # xmlsec1 interop: prove a foreign reference verifier (the XML Security

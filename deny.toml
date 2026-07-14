@@ -38,6 +38,13 @@ ignore = [
     # transport is accepted); the residual is generic non-constant-time modexp
     # timing, and SP-side signature verification (no private key) is unaffected.
     "RUSTSEC-2023-0071",
+    # `spin` 0.9.8 is yanked, but remains locked through
+    # rsa 0.9 -> num-bigint-dig -> lazy_static. rsa 0.10 removes this chain,
+    # but is still prerelease, does not resolve RUSTSEC-2023-0071, and requires
+    # a coordinated crypto-stack migration. Keep this exact-version exception
+    # until a suitable stable rsa release is available; cargo-deny will flag it
+    # as unused as soon as the dependency graph no longer contains this crate.
+    { crate = "spin@0.9.8", reason = "transitive through rsa 0.9; rsa 0.10 is prerelease and does not resolve RUSTSEC-2023-0071" },
 ]
 
 # ---------------------------------------------------------------------------

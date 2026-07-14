@@ -635,7 +635,9 @@ mod tests {
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
     use crate::crypto::keypair::KeyPair;
-    use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
+    use crate::dsig::algorithms::{
+        C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
+    };
     use crate::dsig::sign::{SignOptions, sign_element};
     use crate::xml::emit::emit_element;
     use std::time::{Duration, UNIX_EPOCH};
@@ -847,11 +849,12 @@ mod tests {
             .root()
             .child_element(Some(crate::dsig::reference::DS_NS), "Signature")
             .expect("signature present");
+        let policy = PeerCryptoPolicy::strong_defaults();
         let verified = crate::dsig::verify::verify_signature(
             &inner_doc,
             sig,
             std::slice::from_ref(&cert),
-            &[SignatureAlgorithm::RsaSha256],
+            &policy,
         )
         .expect("verify recovered response signature");
         assert_eq!(verified.signed_element, inner_doc.root().id());

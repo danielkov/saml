@@ -120,6 +120,8 @@ pub(crate) struct ParsedReference {
 pub(crate) fn parse_reference(
     document: &Document,
     reference: &Element,
+    allowed_digest_algorithms: &[DigestAlgorithm],
+    allowed_c14n_algorithms: &[C14nAlgorithm],
 ) -> Result<ParsedReference, Error> {
     // ---- @URI -> target ElementId ------------------------------------------
     let uri_attr = reference.attribute(None, "URI").unwrap_or("");
@@ -175,6 +177,15 @@ pub(crate) fn parse_reference(
             transform: "c14n transform must be the final transform".to_owned(),
         });
     }
+    let reference_c14n_algorithm = transforms
+        .iter()
+        .find_map(|transform| transform.as_c14n_algorithm())
+        .unwrap_or(C14nAlgorithm::ExclusiveCanonical);
+    if !allowed_c14n_algorithms.contains(&reference_c14n_algorithm) {
+        return Err(Error::DisallowedAlgorithm {
+            alg: reference_c14n_algorithm.uri().to_owned(),
+        });
+    }
 
     // ---- <ds:DigestMethod> -------------------------------------------------
     let digest_method = reference.child_element(Some(DS_NS), "DigestMethod").ok_or(
@@ -189,6 +200,11 @@ pub(crate) fn parse_reference(
                 reason: "DigestMethod missing Algorithm",
             })?;
     let digest_algorithm = DigestAlgorithm::from_uri(digest_alg_uri)?;
+    if !allowed_digest_algorithms.contains(&digest_algorithm) {
+        return Err(Error::DisallowedAlgorithm {
+            alg: digest_alg_uri.to_owned(),
+        });
+    }
 
     // ---- <ds:DigestValue> --------------------------------------------------
     let digest_value_elem = reference.child_element(Some(DS_NS), "DigestValue").ok_or(
@@ -561,7 +577,13 @@ mod tests {
             .root()
             .child_element(Some(DS_NS), "Reference")
             .expect("ds:Reference");
-        let parsed = parse_reference(&doc, reference).expect("parse_reference");
+        let parsed = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .expect("parse_reference");
         assert_eq!(parsed.target, doc.element_by_id_attr("X").unwrap());
         assert_eq!(parsed.digest_algorithm, DigestAlgorithm::Sha256);
         assert_eq!(
@@ -579,7 +601,13 @@ mod tests {
         let xml = synth_reference("", "AAAA");
         let doc = parse(&xml);
         let reference = doc.root().child_element(Some(DS_NS), "Reference").unwrap();
-        let parsed = parse_reference(&doc, reference).unwrap();
+        let parsed = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .unwrap();
         assert_eq!(parsed.target, doc.root().id());
     }
 
@@ -596,7 +624,13 @@ mod tests {
         </Root>"##;
         let doc = parse(xml);
         let reference = doc.root().child_element(Some(DS_NS), "Reference").unwrap();
-        let err = parse_reference(&doc, reference).unwrap_err();
+        let err = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::DisallowedTransform { .. }));
     }
 
@@ -616,7 +650,13 @@ mod tests {
         </Root>"##;
         let doc = parse(xml);
         let reference = doc.root().child_element(Some(DS_NS), "Reference").unwrap();
-        let err = parse_reference(&doc, reference).unwrap_err();
+        let err = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::DisallowedTransform { .. }));
     }
 
@@ -636,10 +676,51 @@ mod tests {
         </Root>"##;
         let doc = parse(xml);
         let reference = doc.root().child_element(Some(DS_NS), "Reference").unwrap();
-        let parsed = parse_reference(&doc, reference).unwrap();
+        let parsed = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .unwrap();
         assert_eq!(
             parsed.inclusive_namespace_prefixes,
             vec!["ds".to_owned(), "saml".to_owned(), "#default".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reference_c14n_requires_explicit_policy_opt_in() {
+        let xml = synth_reference("#X", "AAAA").replace(
+            C14nAlgorithm::ExclusiveCanonical.uri(),
+            C14nAlgorithm::InclusiveCanonical.uri(),
+        );
+        let doc = parse(&xml);
+        let reference = doc.root().child_element(Some(DS_NS), "Reference").unwrap();
+
+        let err = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .expect_err("strong policy rejects an inclusive reference transform");
+        assert!(matches!(
+            err,
+            Error::DisallowedAlgorithm { ref alg }
+                if alg == C14nAlgorithm::InclusiveCanonical.uri()
+        ));
+
+        let allowed = [
+            C14nAlgorithm::ExclusiveCanonical,
+            C14nAlgorithm::InclusiveCanonical,
+        ];
+        let parsed = parse_reference(&doc, reference, DigestAlgorithm::DEFAULTS, &allowed)
+            .expect("explicit inclusive-C14N opt-in");
+        assert!(
+            parsed
+                .transforms
+                .contains(&AllowedTransform::InclusiveCanonical)
         );
     }
 
@@ -755,7 +836,13 @@ mod tests {
         </Root>"##;
         let doc = parse(xml);
         let reference = doc.root().child_element(Some(DS_NS), "Reference").unwrap();
-        let err = parse_reference(&doc, reference).unwrap_err();
+        let err = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::SignatureVerification { .. }));
     }
 
@@ -764,7 +851,13 @@ mod tests {
         let xml = synth_reference("#X", "not!base64!");
         let doc = parse(&xml);
         let reference = doc.root().child_element(Some(DS_NS), "Reference").unwrap();
-        let err = parse_reference(&doc, reference).unwrap_err();
+        let err = parse_reference(
+            &doc,
+            reference,
+            DigestAlgorithm::DEFAULTS,
+            C14nAlgorithm::DEFAULTS,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::Base64Decode));
     }
 }

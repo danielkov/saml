@@ -39,10 +39,44 @@ use crate::error::Error;
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OaepDigest {
+    /// SHA-1. The policy value is representable with `xmlenc` so inbound
+    /// messages can be rejected deterministically; performing SHA-1 OAEP
+    /// crypto additionally requires `weak-algos` and an explicit peer-policy
+    /// opt-in.
     Sha1,
     Sha256,
     Sha384,
     Sha512,
+}
+
+#[cfg(feature = "xmlenc")]
+impl OaepDigest {
+    /// Strong inbound defaults for RSA-OAEP digest selection.
+    pub const DEFAULTS: &'static [Self] = &[Self::Sha256, Self::Sha384, Self::Sha512];
+
+    /// XML-Enc `<ds:DigestMethod Algorithm="…">` URI.
+    pub const fn uri(self) -> &'static str {
+        match self {
+            Self::Sha1 => "http://www.w3.org/2000/09/xmldsig#sha1",
+            Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
+            Self::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#sha384",
+            Self::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
+        }
+    }
+
+    /// Parse an XML-Enc OAEP digest-method URI.
+    pub fn from_uri(uri: &str) -> Result<Self, Error> {
+        match uri {
+            "http://www.w3.org/2000/09/xmldsig#sha1" => Ok(Self::Sha1),
+            "http://www.w3.org/2001/04/xmlenc#sha256" => Ok(Self::Sha256),
+            "http://www.w3.org/2001/04/xmldsig-more#sha384"
+            | "http://www.w3.org/2001/04/xmlenc#sha384" => Ok(Self::Sha384),
+            "http://www.w3.org/2001/04/xmlenc#sha512" => Ok(Self::Sha512),
+            _ => Err(Error::DisallowedAlgorithm {
+                alg: uri.to_owned(),
+            }),
+        }
+    }
 }
 
 /// A keypair bound to one of the supported asymmetric algorithm families.

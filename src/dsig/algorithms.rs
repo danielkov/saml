@@ -103,6 +103,12 @@ pub enum DigestAlgorithm {
 }
 
 impl DigestAlgorithm {
+    /// The default set accepted for inbound XML-DSig reference digests.
+    ///
+    /// Used by [`PeerCryptoPolicy::strong_defaults`]. Weak algorithms remain
+    /// excluded even when their Cargo feature is enabled.
+    pub const DEFAULTS: &'static [Self] = &[Self::Sha256, Self::Sha384, Self::Sha512];
+
     /// XML Signature digest algorithm URI.
     pub const fn uri(self) -> &'static str {
         match self {
@@ -173,6 +179,13 @@ pub enum C14nAlgorithm {
 }
 
 impl C14nAlgorithm {
+    /// The default set accepted for inbound XML-DSig canonicalization.
+    ///
+    /// Exclusive canonicalization without comments is the SAML profile's
+    /// interoperable, non-ambiguous baseline. Other variants require an
+    /// explicit per-peer compatibility opt-in.
+    pub const DEFAULTS: &'static [Self] = &[Self::ExclusiveCanonical];
+
     /// Canonicalization algorithm URI.
     pub const fn uri(self) -> &'static str {
         match self {
@@ -232,12 +245,28 @@ impl C14nAlgorithm {
 pub struct PeerCryptoPolicy {
     /// Inbound XML-DSig and HTTP-Redirect detached signature algorithms.
     pub allowed_signature_algorithms: Vec<SignatureAlgorithm>,
+    /// Inbound XML-DSig `<ds:Reference>` digest algorithms.
+    ///
+    /// This is independent of `allowed_signature_algorithms`: an otherwise
+    /// strong RSA-SHA256 signature can still carry a weak SHA-1 reference
+    /// digest, so both allow-lists must accept the presented algorithms.
+    pub allowed_digest_algorithms: Vec<DigestAlgorithm>,
+    /// Inbound `<ds:CanonicalizationMethod>` and reference-transform
+    /// canonicalization algorithms.
+    pub allowed_c14n_algorithms: Vec<C14nAlgorithm>,
     /// Inbound XML-Enc data-encryption algorithms.
     #[cfg(feature = "xmlenc")]
     pub allowed_data_encryption_algorithms: Vec<crate::xmlenc::algorithms::DataEncryptionAlgorithm>,
     /// Inbound XML-Enc key-transport algorithms.
     #[cfg(feature = "xmlenc")]
     pub allowed_key_transport_algorithms: Vec<crate::xmlenc::algorithms::KeyTransportAlgorithm>,
+    /// Inbound RSA-OAEP digest algorithms, independent of key-transport URI.
+    ///
+    /// A modern `rsa-oaep` transport can explicitly request SHA-1, while the
+    /// legacy `rsa-oaep-mgf1p` URI implies it. Both forms require this
+    /// allow-list to contain [`crate::OaepDigest::Sha1`].
+    #[cfg(feature = "xmlenc")]
+    pub allowed_oaep_digest_algorithms: Vec<crate::crypto::keypair::OaepDigest>,
 }
 
 impl PeerCryptoPolicy {
@@ -245,12 +274,19 @@ impl PeerCryptoPolicy {
     ///
     /// - Signature algorithms: [`SignatureAlgorithm::DEFAULTS`]
     ///   (RSA-SHA{256,384,512} + ECDSA-SHA{256,384,512}; no SHA-1, no DSA).
+    /// - Reference digest algorithms: [`DigestAlgorithm::DEFAULTS`]
+    ///   (SHA-{256,384,512}; no SHA-1).
+    /// - Canonicalization algorithms: [`C14nAlgorithm::DEFAULTS`]
+    ///   (exclusive canonicalization without comments only).
     /// - Data encryption: AES-128-GCM and AES-256-GCM (CBC is compatibility opt-in).
     /// - Key transport: RSA-OAEP only (MGF1-SHA1 and RSA-PKCS1-v1.5 are
     ///   compatibility / `weak-algos` opt-ins respectively).
+    /// - OAEP digests: SHA-{256,384,512}; SHA-1 is a compatibility opt-in.
     pub fn strong_defaults() -> Self {
         Self {
             allowed_signature_algorithms: SignatureAlgorithm::DEFAULTS.to_vec(),
+            allowed_digest_algorithms: DigestAlgorithm::DEFAULTS.to_vec(),
+            allowed_c14n_algorithms: C14nAlgorithm::DEFAULTS.to_vec(),
             #[cfg(feature = "xmlenc")]
             allowed_data_encryption_algorithms: vec![
                 crate::xmlenc::algorithms::DataEncryptionAlgorithm::Aes128Gcm,
@@ -260,6 +296,8 @@ impl PeerCryptoPolicy {
             allowed_key_transport_algorithms: vec![
                 crate::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
             ],
+            #[cfg(feature = "xmlenc")]
+            allowed_oaep_digest_algorithms: crate::crypto::keypair::OaepDigest::DEFAULTS.to_vec(),
         }
     }
 }
@@ -421,9 +459,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn strong_defaults_excludes_weak_digest_algorithms() {
+        let policy = PeerCryptoPolicy::strong_defaults();
+        let digests = &policy.allowed_digest_algorithms;
+
+        assert_eq!(digests.as_slice(), DigestAlgorithm::DEFAULTS);
+
+        #[cfg(feature = "weak-algos")]
+        assert!(!digests.contains(&DigestAlgorithm::Sha1));
+    }
+
+    #[test]
+    fn strong_defaults_use_exclusive_c14n_without_comments() {
+        let policy = PeerCryptoPolicy::strong_defaults();
+
+        assert_eq!(
+            policy.allowed_c14n_algorithms.as_slice(),
+            C14nAlgorithm::DEFAULTS
+        );
+        assert!(
+            !policy
+                .allowed_c14n_algorithms
+                .contains(&C14nAlgorithm::ExclusiveCanonicalWithComments)
+        );
+        assert!(
+            !policy
+                .allowed_c14n_algorithms
+                .contains(&C14nAlgorithm::InclusiveCanonical)
+        );
+        assert!(
+            !policy
+                .allowed_c14n_algorithms
+                .contains(&C14nAlgorithm::InclusiveCanonicalWithComments)
+        );
+    }
+
     #[cfg(feature = "xmlenc")]
     #[test]
     fn strong_defaults_xmlenc_choices() {
+        use crate::crypto::keypair::OaepDigest;
         use crate::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
 
         let policy = PeerCryptoPolicy::strong_defaults();
@@ -463,6 +538,13 @@ mod tests {
             !policy
                 .allowed_key_transport_algorithms
                 .contains(&KeyTransportAlgorithm::RsaPkcs1V15)
+        );
+
+        assert_eq!(policy.allowed_oaep_digest_algorithms, OaepDigest::DEFAULTS);
+        assert!(
+            !policy
+                .allowed_oaep_digest_algorithms
+                .contains(&OaepDigest::Sha1)
         );
     }
 }

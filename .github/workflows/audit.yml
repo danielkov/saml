@@ -52,4 +52,13 @@ jobs:
         # RUSTSEC-2023-0071 (rsa "Marvin Attack") is accepted with documented
         # rationale — see SECURITY.md and the matching entry in deny.toml. No
         # fixed release exists; the exploitable v1.5 vector is off by default.
-        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
+        # cargo-audit cannot ignore one exact yanked package. Yank enforcement
+        # therefore lives in cargo-deny, whose only version-pinned exception is
+        # spin 0.9.8. Vulnerabilities still fail here by default; preserve the
+        # other strict warning classes explicitly and skip only the duplicate
+        # yank scan.
+        run: >-
+          cargo audit --no-yanked
+          --deny unmaintained
+          --deny unsound
+          --ignore RUSTSEC-2023-0071

@@ -289,7 +289,8 @@
 //!
 //! # Feature flags
 //!
-//! - `reqwest-client` (default) — optional [`ReqwestClient`] adapter.
+//! - `reqwest-client` — optional [`ReqwestClient`] adapter. This is excluded
+//!   from defaults so the protocol crate's default graph stays pure Rust.
 //! - `rsa-sha` (default) — RSA-SHA256/384/512 signature algorithms.
 //! - `ecdsa-sha` (default) — ECDSA-SHA256/384/512 signature algorithms.
 //! - `xmlenc` (default) — XML Encryption (EncryptedAssertion).

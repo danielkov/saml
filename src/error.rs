@@ -19,6 +19,8 @@ pub enum Error {
     XmlEmit(String),
     #[error("Base64 decode failed")]
     Base64Decode,
+    #[error("decoded SAML message exceeds the {limit}-byte limit")]
+    MessageTooLarge { limit: usize },
     #[error("DEFLATE decode failed")]
     Inflate,
     /// Structural-XSD-style schema mismatch on an inbound message. Surfaced
@@ -41,7 +43,7 @@ pub enum Error {
     SignatureVerification { reason: &'static str },
     #[error("XML signature missing where required")]
     SignatureMissing,
-    #[error("Disallowed signature algorithm: {alg}")]
+    #[error("Disallowed cryptographic algorithm: {alg}")]
     DisallowedAlgorithm { alg: String },
     #[error("Disallowed transform: {transform}")]
     DisallowedTransform { transform: String },

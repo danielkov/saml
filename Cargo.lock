@@ -502,6 +502,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "email_address"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1784,6 +1790,7 @@ dependencies = [
  "ctr",
  "digest",
  "ecdsa",
+ "email_address",
  "flate2",
  "hex",
  "hmac",
