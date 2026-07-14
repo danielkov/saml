@@ -37,7 +37,9 @@ use crate::binding::ArtifactRedirect;
 use crate::binding::soap;
 use crate::crypto::cert::X509Certificate;
 use crate::crypto::keypair::KeyPair;
-use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
+use crate::dsig::algorithms::{
+    C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
+};
 use crate::error::Error;
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::time::format_xs_datetime;
@@ -289,9 +291,9 @@ pub struct SignConfig<'a> {
 pub struct VerifyConfig<'a> {
     /// Candidate IdP certificates the response signature must verify against.
     pub certs: &'a [X509Certificate],
-    /// Signature algorithms accepted on the response (anything else is
-    /// rejected as [`Error::DisallowedAlgorithm`]).
-    pub allowed_algorithms: &'a [SignatureAlgorithm],
+    /// Per-peer policy for the signature, reference digest, and
+    /// canonicalization algorithms accepted on the response.
+    pub policy: &'a PeerCryptoPolicy,
     /// When true, an `ArtifactResponse` with no `<ds:Signature>` is rejected
     /// with [`Error::SignatureMissing`]. When false, an unsigned response is
     /// accepted (and [`ResolvedResponse::signature_verified`] is `false`), but
@@ -445,12 +447,8 @@ impl<'a, H: HttpClient> BackchannelClient<'a, H> {
         let sig = root.child_element(Some(crate::dsig::reference::DS_NS), "Signature");
         match sig {
             Some(sig) => {
-                let verified = crate::dsig::verify::verify_signature(
-                    document,
-                    sig,
-                    cfg.certs,
-                    cfg.allowed_algorithms,
-                )?;
+                let verified =
+                    crate::dsig::verify::verify_signature(document, sig, cfg.certs, cfg.policy)?;
                 if verified.signed_element != root.id() {
                     return Err(Error::SignatureVerification {
                         reason: "ArtifactResponse signature does not cover the message root",
@@ -1122,11 +1120,12 @@ mod tests {
         let envelope = signed_artifact_response_envelope(payload, false);
         let client = MockClient::new(envelope);
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
 
         let resolved = BackchannelClient::new(&client)
             .verify_with(VerifyConfig {
                 certs: std::slice::from_ref(&cert),
-                allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                policy: &policy,
                 require_signed: true,
             })
             .resolve_artifact(
@@ -1149,11 +1148,12 @@ mod tests {
         let envelope = signed_artifact_response_envelope(payload, true);
         let client = MockClient::new(envelope);
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
 
         let err = BackchannelClient::new(&client)
             .verify_with(VerifyConfig {
                 certs: std::slice::from_ref(&cert),
-                allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                policy: &policy,
                 require_signed: true,
             })
             .resolve_artifact(
@@ -1175,11 +1175,12 @@ mod tests {
         let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
         let client = MockClient::new(success_envelope_xml(payload));
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let policy = PeerCryptoPolicy::strong_defaults();
 
         let err = BackchannelClient::new(&client)
             .verify_with(VerifyConfig {
                 certs: std::slice::from_ref(&cert),
-                allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                policy: &policy,
                 require_signed: true,
             })
             .resolve_artifact(

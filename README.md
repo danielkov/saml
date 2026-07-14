@@ -11,7 +11,7 @@ Stateless, async-native SAML 2.0 toolkit with no libxml2 / xmlsec C build chain.
 
 ## Status
 
-Pre-release: **v0.0.1-alpha**. The protocol surface described below is implemented and exercised against an interop corpus drawn from Okta, Microsoft Entra ID, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, and Shibboleth fixtures. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
+Pre-release: **v0.0.1-alpha**. The protocol surface described below is implemented and exercised against MIT-licensed ruby-saml/python3-saml fixtures, real AD FS RSA-SHA256/384/512 signatures, a pinned Merlin/xmlsec C14N vector, and in-process SP ↔ IdP flows. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
 
 ## Why this vs. samael
 
@@ -33,7 +33,7 @@ See [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-001-architecture.md) §1
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `reqwest-client` | yes | Optional `ReqwestClient` adapter for the `HttpClient` trait. |
+| `reqwest-client` | no | Optional `ReqwestClient` adapter for the `HttpClient` trait. Opting in also opts into reqwest's TLS-provider dependency graph. |
 | `rsa-sha` | yes | RSA-SHA256 / 384 / 512 signature algorithms. |
 | `ecdsa-sha` | yes | ECDSA-SHA256 / 384 / 512 signature algorithms (P-256, P-384). |
 | `xmlenc` | yes | XML Encryption (`EncryptedAssertion`, `EncryptedID`, AES-CBC / AES-GCM, RSA-OAEP). |
@@ -53,10 +53,11 @@ The protocol layer compiles for any target `rustc` supports, including `wasm32-u
 cargo add saml
 ```
 
-Minimal build, opt out of the bundled `reqwest` HTTP client:
+The default build is already protocol-only and pure Rust; it does not bundle
+an HTTP client. For a reduced RSA-only SP surface:
 
 ```sh
-cargo add saml --no-default-features --features rsa-sha,ecdsa-sha,xmlenc,slo,metadata-emit,xsd-validate
+cargo add saml --no-default-features --features rsa-sha,metadata-emit,xsd-validate
 ```
 
 ## Quick example — Service Provider
@@ -153,7 +154,7 @@ Implemented:
 - HTTP-Artifact binding (`artifact-binding` feature) — `ArtifactResolve` / `ArtifactResponse` over SOAP, with a first-class `BackchannelClient` (signs the resolve, verifies the response) built on a shared, binding-agnostic `binding::soap` envelope module.
 - ECP / PAOS profile (`ecp` feature) — Enhanced Client or Proxy for non-browser clients: SP, client, and IdP primitives over the Reverse-SOAP (PAOS) binding, including the spec §4.2.4.2 `AssertionConsumerServiceURL` anti-redirect check.
 - Holder-of-Key subject confirmation — SP-side match of the caller-supplied presenter TLS certificate against the assertion's `<ds:KeyInfo>` (`SubjectPublicKeyInfo`, constant-time) plus IdP-side issuance; opt-in, with bearer remaining the default.
-- XML-Encryption (`xmlenc` feature) — `EncryptedAssertion`, `EncryptedID`, AES-128/256-CBC, AES-128/256-GCM, RSA-OAEP-MGF1-SHA1/256/384/512 key transport.
+- XML-Encryption (`xmlenc` feature) — `EncryptedAssertion`, `EncryptedID`, AES-128/256-CBC, AES-128/256-GCM, and RSA-OAEP with SHA-1/256/384/512 digests.
 - XML-DSig — Exclusive and Inclusive C14N (with and without comments), enveloped-signature transform; multi-Reference signatures rejected by default; transform whitelist enforced.
 - Metadata parse and emit (`metadata-emit` feature) for single `EntityDescriptor`s and federation `EntitiesDescriptor` aggregates — signed-aggregate verification, an `entityID` index, and bounded streaming for large (InCommon / eduGAIN-scale) aggregates.
 - Identity proxy composition with stateless `ProxyContext`, opaque-handle Redirect codec, NameID transforms, and attribute release policies.
@@ -172,12 +173,12 @@ Out of scope for v0.1 (see [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-0
 ## Security posture
 
 - **XSW resistance is structural.** Duplicate `ID` attributes are rejected at parse time; the `Reference URI` resolves to a unique `ElementId`; validated payload extraction is bound to the `VerifiedSignature` handle, not to a name lookup. There is no API path that returns a "validated" payload distinct from the signed payload. See [`docs/rfcs/RFC-002-xml-crypto-core.md`](docs/rfcs/RFC-002-xml-crypto-core.md) §3.
-- **Weak algorithms are feature-gated.** SHA-1, RSA-PKCS1-v1.5 key transport, and DSA-SHA1 are unavailable unless `weak-algos` is enabled — the dependency is visible in `cargo tree`. Even when compiled in, the per-peer `PeerCryptoPolicy` allow-list still gates acceptance at validation time.
+- **Weak algorithms are feature-gated and policy-gated.** SHA-1 crypto, RSA-PKCS1-v1.5 key transport, and DSA-SHA1 are unavailable unless `weak-algos` is enabled — the dependency is visible in `cargo tree`. Even when compiled in, `PeerCryptoPolicy` independently gates signature methods, XML-DSig reference digests, key transport, and RSA-OAEP digests; enabling a legacy peer cannot weaken strong peers through Cargo feature unification.
 - **Hard-fail defaults** for signature validity, audience restriction, ACS URL allow-listing, NameID scoping, destination matching, and the XML-DSig transform whitelist (XSLT, XPath, and base64 transforms are rejected).
 - **Caller-owned clock.** Every method that compares against `xs:dateTime` values takes `now: SystemTime` and `clock_skew: Duration` explicitly. Multi-instance deployments avoid drift surprises; tests pass deterministic timestamps.
 - **Replay protection is pluggable.** `ConsumeResponse::replay_cache` accepts an `Option<&dyn ReplayCache>`. The default `InMemoryReplayCache` covers single-process deployments; multi-instance setups implement the trait against Redis or a SQL store. When `None`, no replay check runs and the caller is expected to dedupe `Identity::assertion_id` against their own store. See [Replay protection](#replay-protection) below.
 - **DTD, internal entities, and processing instructions are rejected** at parse time, eliminating the XXE / billion-laughs class.
-- **Detached query-string signatures** (HTTP-Redirect binding) go through a distinct verification entry point with the same `allowed_algorithms` discipline as XML-DSig.
+- **Detached query-string signatures** (HTTP-Redirect binding) go through a distinct verification entry point with the same signature-algorithm policy discipline as XML-DSig.
 - **`unsafe_code` is forbidden** at the crate root.
 
 See [`docs/rfcs/RFC-002-xml-crypto-core.md`](docs/rfcs/RFC-002-xml-crypto-core.md) for the full crypto-layer threat model and [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-001-architecture.md) §2 for the operational principles.

@@ -51,6 +51,26 @@ pub(crate) fn random_xml_id() -> Result<String, Error> {
     Ok(out)
 }
 
+/// Generate an opaque 256-bit RelayState value encoded as unpadded Base64url.
+///
+/// The 43-character result is safe to place in Redirect- and POST-binding
+/// parameters and remains below SAML's 80-byte RelayState interoperability
+/// limit. Applications should still retain it server-side and consume it
+/// atomically when the matching response succeeds.
+pub fn random_relay_state() -> Result<String, Error> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use rsa::rand_core::{OsRng, RngCore as _};
+
+    let mut bytes = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_err| Error::InvalidConfiguration {
+            reason: "RNG failure generating RelayState",
+        })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
 // ── enums ─────────────────────────────────────────────────────────────
 
 /// The four SAML 2.0 protocol bindings used by this crate.
@@ -455,6 +475,30 @@ pub fn decode_wire(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_states_are_random_unique_and_binding_safe() {
+        use std::collections::HashSet;
+
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let relay_state = random_relay_state().expect("OS randomness");
+            assert_eq!(relay_state.len(), 43);
+            assert!(relay_state.len() <= 80);
+            assert!(!relay_state.contains('='));
+            assert_eq!(
+                URL_SAFE_NO_PAD
+                    .decode(&relay_state)
+                    .expect("Base64url RelayState")
+                    .len(),
+                32
+            );
+            assert!(seen.insert(relay_state));
+        }
+    }
 
     #[test]
     fn binding_uri_roundtrip() {

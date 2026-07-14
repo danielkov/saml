@@ -14,17 +14,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use url::Url;
 
-/// Hard upper bound on POST-binding base64-decoded payload size. Same 10 MiB
-/// cap as the Redirect binding's inflation guard.
-const MAX_DECODED_BYTES: usize = 10 * 1024 * 1024;
-
-/// Precomputed upper bound on the base64-encoded input length such that the
-/// decoded output cannot exceed `MAX_DECODED_BYTES`. Each base64 char encodes
-/// 6 bits → 3 output bytes per 4 input chars, plus a small slack for padding.
-const MAX_BASE64_INPUT_LEN: usize = MAX_DECODED_BYTES
-    .saturating_mul(4)
-    .saturating_div(3)
-    .saturating_add(4);
+/// Default upper bound on POST-binding base64-decoded payload size. Same
+/// 10 MiB cap as the Redirect binding's inflation guard.
+pub const DEFAULT_MAX_DECODED_BYTES: usize = 10 * 1024 * 1024;
 
 /// Encode an outbound XML payload for the HTTP-POST binding (request side).
 /// `xml` must already contain any enveloped XML-DSig signature.
@@ -82,19 +74,59 @@ pub fn decode(
     saml_request_or_response_b64: &str,
     relay_state: Option<&str>,
 ) -> Result<DecodedPost, Error> {
+    decode_with_limit(
+        saml_request_or_response_b64,
+        relay_state,
+        DEFAULT_MAX_DECODED_BYTES,
+    )
+}
+
+/// Decode an inbound POST-bound payload with a caller-selected decoded-size
+/// limit. ASCII whitespace in Base64 is accepted for interoperability with
+/// line-wrapping IdPs, but bounded before allocating the cleaned input.
+pub fn decode_with_limit(
+    saml_request_or_response_b64: &str,
+    relay_state: Option<&str>,
+    max_decoded_bytes: usize,
+) -> Result<DecodedPost, Error> {
+    let max_base64_input_len = max_decoded_bytes
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .and_then(|value| value.checked_add(4))
+        .ok_or(Error::MessageTooLarge {
+            limit: max_decoded_bytes,
+        })?;
+
     // Reject oversized payloads before decoding to avoid allocating a large
-    // buffer. Any input longer than `MAX_BASE64_INPUT_LEN` cannot possibly
-    // decode to ≤ MAX_DECODED_BYTES; fail fast.
-    if saml_request_or_response_b64.len() > MAX_BASE64_INPUT_LEN {
-        return Err(Error::Base64Decode);
+    // buffer. A second bound permits ordinary line wrapping without allowing
+    // unbounded whitespace amplification.
+    let max_raw_input_len = max_base64_input_len.saturating_mul(2);
+    if saml_request_or_response_b64.len() > max_raw_input_len {
+        return Err(Error::MessageTooLarge {
+            limit: max_decoded_bytes,
+        });
+    }
+    let meaningful_len = saml_request_or_response_b64
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count();
+    if meaningful_len > max_base64_input_len {
+        return Err(Error::MessageTooLarge {
+            limit: max_decoded_bytes,
+        });
     }
 
-    let xml = BASE64
-        .decode(saml_request_or_response_b64.as_bytes())
-        .map_err(|_err| Error::Base64Decode)?;
+    let cleaned = saml_request_or_response_b64
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let xml = BASE64.decode(cleaned).map_err(|_err| Error::Base64Decode)?;
 
-    if xml.len() > MAX_DECODED_BYTES {
-        return Err(Error::Base64Decode);
+    if xml.len() > max_decoded_bytes {
+        return Err(Error::MessageTooLarge {
+            limit: max_decoded_bytes,
+        });
     }
 
     Ok(DecodedPost {
@@ -185,16 +217,38 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized_input_before_decoding() {
-        // Any input longer than the precomputed max base64 length must be
-        // rejected without allocating a >10MiB output buffer.
-        // We don't need to actually fill ~14MiB — the length check is the
-        // gate; build a string just past the threshold.
-        let oversized = "A".repeat(MAX_BASE64_INPUT_LEN + 1);
-        let err = decode(&oversized, None).unwrap_err();
+        let oversized = BASE64.encode([b'X'; 17]);
+        let err = decode_with_limit(&oversized, None, 16).unwrap_err();
         match err {
-            Error::Base64Decode => {}
-            other => panic!("expected Base64Decode, got {other:?}"),
+            Error::MessageTooLarge { limit: 16 } => {}
+            other => panic!("expected MessageTooLarge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_rejects_whitespace_amplification() {
+        // The meaningful Base64 content is empty, but the raw form value is
+        // still bounded so line-wrapping tolerance cannot become a cheap CPU
+        // or allocation amplification primitive.
+        let oversized_whitespace = " ".repeat(57);
+        let err = decode_with_limit(&oversized_whitespace, None, 16).unwrap_err();
+        assert!(matches!(err, Error::MessageTooLarge { limit: 16 }));
+    }
+
+    #[test]
+    fn decode_accepts_line_wrapped_base64() {
+        let payload = b"<samlp:Response ID=\"_wrapped\"/>";
+        let encoded = BASE64.encode(payload);
+        let wrapped = encoded
+            .as_bytes()
+            .chunks(8)
+            .map(|chunk| std::str::from_utf8(chunk).expect("Base64 is ASCII"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+
+        let decoded = decode_with_limit(&wrapped, Some("relay"), 1024).unwrap();
+        assert_eq!(decoded.xml, payload);
+        assert_eq!(decoded.relay_state.as_deref(), Some("relay"));
     }
 
     #[test]

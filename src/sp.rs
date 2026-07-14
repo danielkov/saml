@@ -499,11 +499,23 @@ impl ServiceProvider {
                 reason: "expected_destination is not a registered ACS URL",
             });
         }
-        // Step 3b: for solicited flow, tracker.acs_endpoint.url MUST match.
-        if let Some(tracker) = input.tracker
-            && tracker.acs_endpoint.url != input.expected_destination
-        {
-            return Err(Error::DestinationMismatch);
+        // Step 3b: a solicited response must stay bound to the IdP and ACS
+        // (URL plus binding) captured when the AuthnRequest was issued.
+        if let Some(tracker) = input.tracker {
+            if tracker.idp_entity_id != input.idp.entity_id {
+                return Err(Error::IssuerMismatch {
+                    expected: tracker.idp_entity_id.clone(),
+                    got: Some(input.idp.entity_id.clone()),
+                });
+            }
+            if tracker.acs_endpoint.url != input.expected_destination {
+                return Err(Error::DestinationMismatch);
+            }
+            if tracker.acs_endpoint.binding != input.binding {
+                return Err(Error::IllegalResponseBinding {
+                    requested: input.binding.as_binding(),
+                });
+            }
         }
 
         // Parse XML and locate `<samlp:Response>`. The caller passed raw XML
@@ -559,7 +571,19 @@ impl ServiceProvider {
         if let Some(cache) = input.replay_cache
             && replay_check_needed(input.replay_mode, identity.is_one_time_use)
         {
-            let fresh = cache.check_and_insert(&identity.assertion_id, identity.not_on_or_after)?;
+            // Validation accepts the assertion until NotOnOrAfter + clock
+            // skew, so the replay tombstone must live through that same
+            // window. Expiring it at raw NotOnOrAfter would reopen a replay
+            // interval while the assertion is still accepted.
+            let replay_expires_at = identity
+                .not_on_or_after
+                .checked_add(input.clock_skew)
+                .ok_or_else(|| {
+                    Error::XmlParse(
+                        "Conditions NotOnOrAfter + clock_skew overflows SystemTime".to_owned(),
+                    )
+                })?;
+            let fresh = cache.check_and_insert(&identity.assertion_id, replay_expires_at)?;
             if !fresh {
                 return Err(Error::AssertionReplay);
             }
@@ -784,7 +808,7 @@ impl ServiceProvider {
             &decoded,
             binding,
             &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
+            policy,
             self.config.logout_want_signed.responses,
         )?;
 
@@ -861,7 +885,7 @@ impl ServiceProvider {
             &decoded,
             binding,
             &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
+            policy,
             self.config.logout_want_signed.requests,
         )?;
 
@@ -1043,12 +1067,7 @@ impl ServiceProvider {
                 .root()
                 .child_element(Some(DS_NS), "Signature")
                 .ok_or(Error::SignatureMissing)?;
-            let verified = verify_signature(
-                &inner_doc,
-                sig,
-                &idp.signing_certs,
-                &policy.allowed_signature_algorithms,
-            )?;
+            let verified = verify_signature(&inner_doc, sig, &idp.signing_certs, policy)?;
             if verified.signed_element != inner_doc.root().id() {
                 return Err(Error::SignatureVerification {
                     reason: "signature does not cover LogoutResponse root",
@@ -1056,12 +1075,7 @@ impl ServiceProvider {
             }
         } else if let Some(sig) = inner_doc.root().child_element(Some(DS_NS), "Signature") {
             // Signature present but not required: still verify if present.
-            let _ = verify_signature(
-                &inner_doc,
-                sig,
-                &idp.signing_certs,
-                &policy.allowed_signature_algorithms,
-            )?;
+            let _ = verify_signature(&inner_doc, sig, &idp.signing_certs, policy)?;
         }
 
         Ok(parsed.to_outcome())
@@ -1267,7 +1281,7 @@ fn verify_inbound_signature(
     decoded: &DecodedSlo,
     binding: Binding,
     signing_certs: &[crate::crypto::cert::X509Certificate],
-    allowed_algorithms: &[SignatureAlgorithm],
+    policy: &PeerCryptoPolicy,
     require_signature: bool,
 ) -> Result<(), Error> {
     match binding {
@@ -1284,7 +1298,7 @@ fn verify_inbound_signature(
                         sig,
                         sig_alg,
                         signing_certs,
-                        allowed_algorithms,
+                        &policy.allowed_signature_algorithms,
                     )?;
                     Ok(())
                 }
@@ -1301,8 +1315,7 @@ fn verify_inbound_signature(
             let sig_elem = document.root().child_element(Some(DS_NS), "Signature");
             match sig_elem {
                 Some(sig) => {
-                    let verified =
-                        verify_signature(document, sig, signing_certs, allowed_algorithms)?;
+                    let verified = verify_signature(document, sig, signing_certs, policy)?;
                     if verified.signed_element != document.root().id() {
                         return Err(Error::SignatureVerification {
                             reason: "signature does not cover message root",
@@ -2149,7 +2162,148 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
+    #[test]
+    fn consume_response_rejects_tracker_for_different_idp() {
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let mut idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        idp.entity_id = "https://different-idp.example.com".to_owned();
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: b"not parsed because tracker correlation fails first",
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::IssuerMismatch { expected, got }
+                if expected == "https://idp.example.com"
+                    && got.as_deref() == Some("https://different-idp.example.com")
+        ));
+    }
+
+    #[test]
+    fn consume_response_rejects_binding_different_from_tracker_acs() {
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: b"not parsed because tracker correlation fails first",
+                binding: SsoResponseBinding::HttpArtifact,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::IllegalResponseBinding {
+                requested: Binding::HttpArtifact
+            }
+        ));
+    }
+
     // ---------- replay cache ----------
+
+    #[test]
+    fn replay_cache_expiry_includes_accepted_clock_skew() {
+        #[derive(Default)]
+        struct RecordingReplayCache(std::sync::Mutex<Option<SystemTime>>);
+
+        impl ReplayCache for RecordingReplayCache {
+            fn check_and_insert(
+                &self,
+                _assertion_id: &str,
+                expires_at: SystemTime,
+            ) -> Result<bool, Error> {
+                *self.0.lock().map_err(|_poisoned| Error::ReplayCache {
+                    reason: "recording cache lock poisoned",
+                })? = Some(expires_at);
+                Ok(true)
+            }
+        }
+
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        let xml = build_signed_response_xml(
+            &kp,
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+        let cache = RecordingReplayCache::default();
+        let clock_skew = Duration::from_secs(90);
+
+        let identity = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew,
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect("valid response");
+
+        assert_eq!(
+            *cache.0.lock().expect("recorded expiry lock"),
+            identity.not_on_or_after.checked_add(clock_skew)
+        );
+    }
 
     /// End-to-end: a successful `consume_response` followed by a second
     /// call with the exact same Response (same `assertion_id`) MUST be
@@ -2816,7 +2970,7 @@ mod tests {
         use crate::binding::artifact::VerifyConfig;
         use crate::binding::soap;
         use crate::dsig::algorithms::C14nAlgorithm;
-        use crate::http::{HttpRequest, HttpResponse};
+        use crate::http::{HttpClient, HttpRequest, HttpResponse};
         use std::future::Future;
         use std::time::Duration;
 
@@ -2948,6 +3102,7 @@ mod tests {
             let sp = artifact_sp();
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
+            let policy = PeerCryptoPolicy::strong_defaults();
             let client = MockClient {
                 response: signed_envelope(false),
             };
@@ -2956,7 +3111,7 @@ mod tests {
                 sign: None,
                 verify: Some(VerifyConfig {
                     certs: &certs,
-                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    policy: &policy,
                     require_signed: true,
                 }),
             };
@@ -2986,6 +3141,7 @@ mod tests {
             let sp = artifact_sp();
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
+            let policy = PeerCryptoPolicy::strong_defaults();
             let client = MockClient {
                 response: signed_envelope(true),
             };
@@ -2994,7 +3150,7 @@ mod tests {
                 sign: None,
                 verify: Some(VerifyConfig {
                     certs: &certs,
-                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    policy: &policy,
                     require_signed: true,
                 }),
             };
@@ -3015,6 +3171,7 @@ mod tests {
             let sp = artifact_sp();
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
+            let policy = PeerCryptoPolicy::strong_defaults();
             // Build an unsigned ArtifactResponse envelope via the binding helper.
             let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
             let unsigned = crate::binding::artifact::build_artifact_response(
@@ -3030,7 +3187,7 @@ mod tests {
                 sign: None,
                 verify: Some(VerifyConfig {
                     certs: &certs,
-                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    policy: &policy,
                     require_signed: true,
                 }),
             };

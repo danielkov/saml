@@ -105,11 +105,23 @@ pub(crate) fn canonicalize(
 ### 2.2 Hardening
 
 - Canonicalization is a deterministic function from the parsed XML node set to a byte sequence, applied to the same `Element` tree used everywhere else in validation. The parser preserves enough fidelity (namespace context, attribute values after XML 1.0 normalization, character data, document order) for the canonicalized output to match what a conformant signer produced. There is no second parse, no byte-range slicing of the source, and no string re-emit pass — the same parsed tree feeds digest comparison and payload extraction.
-- The `<ec:InclusiveNamespaces PrefixList="...">` extension is parsed and honored. Failing to honor it is a known XSW vector.
+- The `<ec:InclusiveNamespaces PrefixList="...">` extension nested under an
+  Exclusive-C14N `Reference` transform is parsed and honored. A PrefixList on
+  `SignedInfo/CanonicalizationMethod` is not currently supported; peers that
+  require that form will fail signature verification rather than being
+  interpreted with different semantics.
 
 ### 2.3 Test vectors
 
-Known-answer test vectors from the W3C XML-C14N test suite are bundled in `tests/common/c14n_vectors/`. Each test case is a `(input.xml, expected_output.bytes, algorithm, inclusive_prefixes)` tuple.
+`tests/common/c14n_vectors/` contains a reduced, provenance-pinned form of the
+Merlin Hughes Exclusive C14N interoperability vector distributed by xmlsec.
+Four independently produced known answers cover Exclusive C14N with and without
+comments, each with and without the `bar #default` inclusive prefix list. The
+fixture README records the exact upstream commit and reduction, and the upstream
+license is shipped alongside it. Module tests add focused namespace, escaping,
+ordering, and SAML-shape regressions; a `proptest` checks idempotence and source
+attribute-order independence for generated flat elements under Inclusive and
+Exclusive C14N.
 
 ---
 
@@ -122,13 +134,9 @@ pub(crate) fn verify_signature(
     document: &Document,
     signature_element: &Element,
     candidate_certs: &[X509Certificate],
-    /// Per-call allow-list of acceptable signature algorithms. Sourced from
-    /// the peer's `PeerCryptoPolicy`. Algorithms that are compiled in
-    /// (under `weak-algos`) but not in this list MUST be rejected.
-    /// This is the policy enforcement point: feature gating controls whether
-    /// an algorithm is compiled at all; this allow-list controls whether it
-    /// is acceptable for THIS verification call.
-    allowed_algorithms: &[SignatureAlgorithm],
+    /// Per-call signature, reference-digest, and canonicalization allow-lists.
+    /// Compilation under `weak-algos` never implies acceptance for this peer.
+    policy: &PeerCryptoPolicy,
 ) -> Result<VerifiedSignature, Error>;
 
 pub(crate) struct VerifiedSignature {
@@ -145,12 +153,13 @@ pub(crate) struct VerifiedSignature {
 ### 3.1 Steps (RFC 3275, refined by SAML profile constraints)
 
 1. Locate the `<ds:SignedInfo>` child of `<ds:Signature>`. Parse:
-   - `CanonicalizationMethod/@Algorithm` — must be in the `C14nAlgorithm` enum, else `Error::DisallowedAlgorithm`.
-   - `SignatureMethod/@Algorithm` — must parse to a `SignatureAlgorithm` variant **AND** appear in the caller-supplied `allowed_algorithms` slice. Both checks must pass; the enum check alone is insufficient because `weak-algos` may have compiled additional variants that are not policy-acceptable for this peer. Otherwise `Error::DisallowedAlgorithm`.
+   - `CanonicalizationMethod/@Algorithm` — must parse to a `C14nAlgorithm` variant **AND** appear in `policy.allowed_c14n_algorithms`, else `Error::DisallowedAlgorithm`.
+   - `SignatureMethod/@Algorithm` — must parse to a `SignatureAlgorithm` variant **AND** appear in `policy.allowed_signature_algorithms`. Both checks must pass; the enum check alone is insufficient because `weak-algos` may have compiled additional variants that are not policy-acceptable for this peer. Otherwise `Error::DisallowedAlgorithm`.
    - `Reference` — must be exactly one. Multiple `Reference`s are a known XSW vector; rejected by default.
    - `Reference/@URI` — must be either empty (the document root) or `#xyz` where `xyz` resolves to an element via `Document::id_index`.
    - `Reference/Transforms` — every transform's `@Algorithm` must be in `{enveloped-signature, exc-c14n, exc-c14n#WithComments, c14n, c14n#WithComments}`. Any other transform — XSLT, XPath, base64 — is rejected with `Error::DisallowedTransform`.
-   - `Reference/DigestMethod/@Algorithm` — must be in `DigestAlgorithm` enum.
+   - A Reference-level canonicalization transform must also appear in `policy.allowed_c14n_algorithms`.
+   - `Reference/DigestMethod/@Algorithm` — must parse to a `DigestAlgorithm` variant **AND** appear in `policy.allowed_digest_algorithms`.
    - `Reference/DigestValue` — base64-decoded digest bytes.
 
 2. **Resolve the reference.** If `URI` is empty → root element. If `URI` is `#xyz` → look up in `id_index`. The index is unique by construction (duplicate IDs are rejected at parse time, §1.1), so there is no ambiguity. If lookup fails → `Error::ReferenceResolution`. Record the resolved `ElementId`.
@@ -186,7 +195,7 @@ let verified = verify_signature(
     &document,
     signature_elem,
     &idp.signing_certs,
-    &peer_policy.allowed_signature_algorithms,
+    peer_policy,
 )?;
 // The Assertion the caller gets is fetched by ElementId — not by name lookup.
 let assertion_elem = document.element(verified.signed_element);
@@ -199,7 +208,7 @@ Multiple-Reference signatures: rejected by default. A `permissive_multi_referenc
 
 The HTTP-Redirect binding (SAML 2.0 §3.4.4.1) does NOT use XML-DSig. Instead, the signature is a detached query-string signature over the canonical query string: a base64-encoded raw signature in the `Signature` parameter, with the algorithm URI in `SigAlg`. The signed bytes are the URL-encoded query parameters in a spec-mandated order (`SAMLRequest=...&RelayState=...&SigAlg=...` for requests, or `SAMLResponse=...&RelayState=...&SigAlg=...` for responses), **not** the decoded XML.
 
-Detached signature verification is a separate entry point — the XML-DSig path (`verify_signature`) does not apply. The same allow-list discipline applies:
+Detached signature verification is a separate entry point — the XML-DSig path (`verify_signature`) does not apply. Redirect signatures have no XML `Reference` digest or canonicalization method, so this entry point receives only the signature-algorithm slice from the effective peer policy:
 
 ```rust
 pub(crate) fn verify_detached_signature(
@@ -212,17 +221,17 @@ pub(crate) fn verify_detached_signature(
     /// Algorithm URI from the `SigAlg` query parameter, parsed to enum.
     sig_alg: SignatureAlgorithm,
     candidate_certs: &[X509Certificate],
-    /// Same allow-list contract as `verify_signature`. Role layer MUST thread
-    /// `peer_policy.allowed_signature_algorithms` through. Without this,
-    /// weak-algos would leak through the Redirect path even when the peer's
-    /// policy excludes them.
+    /// Signature-algorithm component of the peer policy. Role layers MUST
+    /// thread `peer_policy.allowed_signature_algorithms` through. Without
+    /// this, weak-algos would leak through the Redirect path even when the
+    /// peer's policy excludes them.
     allowed_algorithms: &[SignatureAlgorithm],
 ) -> Result<VerifyMatch, Error>;
 ```
 
 Rule (parallels §3.1 step 1): `sig_alg` MUST parse to a `SignatureAlgorithm` variant **AND** appear in `allowed_algorithms`; otherwise `Error::DisallowedAlgorithm`.
 
-Role layers calling Redirect-side validation (`consume_authn_request` for AuthnRequest, both consume methods for SLO when binding is HTTP-Redirect) MUST pass `peer_policy.allowed_signature_algorithms` into this function, exactly as they do for XML-DSig verification.
+Role layers calling Redirect-side validation (`consume_authn_request` for AuthnRequest, both consume methods for SLO when binding is HTTP-Redirect) MUST pass `peer_policy.allowed_signature_algorithms` into this function. Embedded XML-DSig validation instead receives the complete `PeerCryptoPolicy`, because it must independently enforce the signature, Reference-digest, and canonicalization allow-lists.
 
 ---
 
@@ -252,7 +261,7 @@ pub trait SignatureVerifier: Send + Sync {
 pub struct DefaultVerifier; // pure-Rust rsa + ecdsa, enabled by default features
 ```
 
-The default impl is selected when `ServiceProviderConfig` / `IdentityProviderConfig` don't override the verifier. Role layers MUST pass the effective peer policy's `allowed_signature_algorithms` through unchanged on every `verify_signature` / `SignatureVerifier::verify` call. The effective policy is selected per consumed message: caller-supplied peer override when present, otherwise the role's default policy. This keeps a legacy peer that needs RSA-SHA1 from widening acceptance for every other peer handled by the same role instance.
+The default impl is selected when `ServiceProviderConfig` / `IdentityProviderConfig` don't override the verifier. Role layers MUST pass the complete effective peer policy to every embedded XML-DSig `verify_signature` call. After enforcing that policy's Reference-digest and canonicalization fields, the XML-DSig layer passes `allowed_signature_algorithms` to `SignatureVerifier::verify`; detached Redirect verification passes the same signature slice directly. The effective policy is selected per consumed message: caller-supplied peer override when present, otherwise the role's default policy. This keeps a legacy peer that needs weak algorithms from widening acceptance for every other peer handled by the same role instance.
 
 ---
 
@@ -297,8 +306,8 @@ pub enum DataEncryptionAlgorithm {
 
 #[non_exhaustive]
 pub enum KeyTransportAlgorithm {
-    RsaOaep,           // http://www.w3.org/2009/xmlenc11#rsa-oaep with SHA-256 + MGF1-SHA1 by default
-    RsaOaepMgf1Sha1,   // legacy IdPs
+    RsaOaep,           // http://www.w3.org/2009/xmlenc11#rsa-oaep; DigestMethod, default SHA-256
+    RsaOaepMgf1Sha1,   // legacy URI; implies SHA-1 digest + MGF1-SHA1
     #[cfg(feature = "weak-algos")] RsaPkcs1V15,
 }
 ```
@@ -312,22 +321,30 @@ Inbound algorithm acceptance is represented by an explicit peer-scoped policy:
 pub struct PeerCryptoPolicy {
     /// Inbound XML-DSig and HTTP-Redirect detached signatures.
     pub allowed_signature_algorithms: Vec<SignatureAlgorithm>,
+    /// Inbound XML-DSig Reference digests.
+    pub allowed_digest_algorithms: Vec<DigestAlgorithm>,
+    /// Inbound SignedInfo and Reference-transform canonicalization.
+    pub allowed_c14n_algorithms: Vec<C14nAlgorithm>,
     /// Inbound XML-Enc data-encryption algorithms.
     pub allowed_data_encryption_algorithms: Vec<DataEncryptionAlgorithm>,
     /// Inbound XML-Enc key-transport algorithms.
     pub allowed_key_transport_algorithms: Vec<KeyTransportAlgorithm>,
+    /// Inbound RSA-OAEP digests, independently of the key-transport URI.
+    pub allowed_oaep_digest_algorithms: Vec<OaepDigest>,
 }
 
 impl PeerCryptoPolicy {
-    /// Strong defaults: signature algorithms from `SignatureAlgorithm::DEFAULTS`,
-    /// AES-GCM data encryption, and RSA-OAEP key transport. CBC and
-    /// RSA-OAEP-MGF1-SHA1 are compatibility opt-ins; RSA-PKCS1-v1.5 requires
-    /// `weak-algos` and an explicit peer policy.
+    /// Strong defaults: signature and SHA-2 digest algorithms from their
+    /// respective `DEFAULTS`, Exclusive C14N without comments, AES-GCM data
+    /// encryption, RSA-OAEP key transport, and SHA-256/384/512 OAEP digests.
+    /// Other C14N variants, CBC, RSA-OAEP-MGF1-SHA1, and the SHA-1 OAEP digest
+    /// are compatibility opt-ins; RSA-PKCS1-v1.5 requires `weak-algos` and an
+    /// explicit peer policy.
     pub fn strong_defaults() -> Self;
 }
 ```
 
-The `weak-algos` feature flag controls **compilation** of `RsaSha1` / `DsaSha1` / `Sha1` / `RsaPkcs1V15` variants. It does **not** control whether they will be accepted at verification/decryption time. Acceptance is gated by the effective `PeerCryptoPolicy` selected for that specific peer. A process that has `weak-algos` compiled but excludes `RsaSha1` from every effective peer policy will reject RSA-SHA1 signatures everywhere. A process that includes `RsaSha1` in one legacy peer's policy will accept RSA-SHA1 only for messages consumed with that policy.
+The `weak-algos` feature flag controls **compilation** of SHA-1 crypto and RSA-PKCS1-v1.5 support. It does **not** control whether they will be accepted at verification/decryption time. Acceptance is gated by every relevant field of the effective `PeerCryptoPolicy` selected for that specific peer. In particular, allowing `RsaOaep` or `RsaOaepMgf1Sha1` does not by itself allow a SHA-1 OAEP digest: `allowed_oaep_digest_algorithms` must also contain `OaepDigest::Sha1`.
 
 ---
 
@@ -366,12 +383,11 @@ Two layers per spec:
 pub(crate) fn decrypt_encrypted_assertion(
     encrypted_assertion: &Element,
     decryption_keys: &[&KeyPair],
-    allowed_data_algorithms: &[DataEncryptionAlgorithm],
-    allowed_key_transport_algorithms: &[KeyTransportAlgorithm],
+    policy: &PeerCryptoPolicy,
 ) -> Result<Element, Error>;  // returns the cleartext <saml:Assertion> element
 ```
 
-Before attempting decryption, the `<xenc:EncryptedData>` and `<xenc:EncryptedKey>` algorithm URIs MUST parse to known enum variants and appear in the supplied allow-lists. Each key in `decryption_keys` is tried in order — the first that successfully decrypts `<xenc:EncryptedKey>` wins. This supports decryption-key rotation without allowing weak XML-Enc algorithms merely because they were compiled.
+Before attempting decryption, the `<xenc:EncryptedData>` and `<xenc:EncryptedKey>` algorithm URIs MUST parse to known enum variants and appear in the supplied policy. RSA-OAEP additionally resolves its effective digest from `<ds:DigestMethod>` (modern `rsa-oaep`, default SHA-256) or the legacy `rsa-oaep-mgf1p` URI (implied SHA-1), and that digest MUST appear in `allowed_oaep_digest_algorithms`. Each key in `decryption_keys` is tried in order — the first that successfully decrypts `<xenc:EncryptedKey>` wins. This supports decryption-key rotation without allowing weak XML-Enc algorithms merely because they were compiled.
 
 ### 7.2 Encrypt entry point
 
@@ -400,8 +416,8 @@ When `weak-algos` is enabled and `RsaPkcs1V15` is in use, decryption errors are 
 | Transform-based escalation (XSLT/XPath) | Transforms whitelisted; XSLT/XPath rejected at verification time. |
 | External entity injection (XXE) | DTDs rejected at parse layer. |
 | Billion-laughs / quadratic blowup | DTDs rejected; node-count and depth limits. |
-| Comment-position confusion | Inclusive C14N with comments is implemented per spec; SAML default Exclusive C14N (no comments) drops comments deterministically. Test vectors include adversarial comment positioning. |
-| Namespace declaration smuggling | `InclusiveNamespaces/PrefixList` honored. |
+| Comment-position confusion | C14N-with-comments preserves in-subtree comments, while the strong default Exclusive C14N without comments drops them deterministically; the Merlin/xmlsec known answers cover both modes. |
+| Namespace declaration smuggling | Reference-transform `InclusiveNamespaces/PrefixList` is honored and covered by independent known answers. |
 | Bleichenbacher (RSA-PKCS1-v1.5) | Generic decrypt error; algorithm itself gated behind `weak-algos` and explicit peer key-transport policy. |
 | Algorithm confusion / downgrade | Each consume call uses an effective `PeerCryptoPolicy`; defaults reject RSA-SHA1, RSA-1.5, DSA, and non-default XML-Enc algorithms. |
 | Cert chain confusion | Inline `<ds:X509Certificate>` in KeyInfo only honored if fingerprint matches a caller-supplied trusted cert. |

@@ -1,6 +1,6 @@
 //! `<saml:Conditions>` parsed fields.
 //!
-//! `Conditions` is intentionally a flat parsed view. The semantic checks
+//! `Conditions` is a parsed view. The semantic checks
 //! (`NotBefore`, `NotOnOrAfter`, audience, `OneTimeUse`) are applied inside
 //! the response-validation pipeline (RFC-003 §4.1 steps 12–14), not on this
 //! struct.
@@ -16,11 +16,12 @@ pub struct Conditions {
     /// `Conditions/@NotOnOrAfter` — assertion is expired at this instant.
     /// Compared against `now - clock_skew`.
     pub not_on_or_after: Option<SystemTime>,
-    /// All `<saml:AudienceRestriction>/<saml:Audience>` values, flattened.
-    /// Multiple `AudienceRestriction` blocks each carrying their own
-    /// `Audience` are conjunctive per spec; the conjunction is enforced at
-    /// validation time, not here.
-    pub audiences: Vec<String>,
+    /// `<saml:AudienceRestriction>` groups in document order.
+    ///
+    /// Each inner vector contains that restriction's `<saml:Audience>`
+    /// values. Audiences within one group are alternatives (OR), while all
+    /// groups must be satisfied (AND) per SAML Core section 2.5.1.4.
+    pub audience_restrictions: Vec<Vec<String>>,
     /// `<saml:OneTimeUse>` was present. The caller is expected to enforce
     /// single-use semantics by deduping on `assertion_id`.
     pub one_time_use: bool,
@@ -39,7 +40,7 @@ mod tests {
         Conditions {
             not_before: UNIX_EPOCH.checked_add(Duration::from_secs(1)),
             not_on_or_after: UNIX_EPOCH.checked_add(Duration::from_hours(1)),
-            audiences: vec!["https://sp.example.com".into()],
+            audience_restrictions: vec![vec!["https://sp.example.com".into()]],
             one_time_use: false,
             proxy_restriction_count: None,
             proxy_restriction_audiences: vec![],
@@ -51,7 +52,10 @@ mod tests {
         let c = sample();
         assert!(c.not_before.is_some());
         assert!(c.not_on_or_after.is_some());
-        assert_eq!(c.audiences, vec!["https://sp.example.com".to_string()]);
+        assert_eq!(
+            c.audience_restrictions,
+            vec![vec!["https://sp.example.com".to_string()]]
+        );
         assert!(!c.one_time_use);
         assert!(c.proxy_restriction_count.is_none());
         assert!(c.proxy_restriction_audiences.is_empty());
@@ -63,7 +67,7 @@ mod tests {
         let c = Conditions {
             not_before: None,
             not_on_or_after: None,
-            audiences: vec![],
+            audience_restrictions: vec![],
             one_time_use: false,
             proxy_restriction_count: Some(3),
             proxy_restriction_audiences: vec!["https://downstream.example.com".into()],
@@ -76,16 +80,16 @@ mod tests {
     fn one_time_use_flag_independent_of_other_fields() {
         let mut c = sample();
         c.one_time_use = true;
-        c.audiences.clear();
+        c.audience_restrictions.clear();
         assert!(c.one_time_use);
-        assert!(c.audiences.is_empty());
+        assert!(c.audience_restrictions.is_empty());
     }
 
     #[test]
     fn clone_preserves_fields() {
         let c = sample();
         let d = c.clone();
-        assert_eq!(d.audiences, c.audiences);
+        assert_eq!(d.audience_restrictions, c.audience_restrictions);
         assert_eq!(d.not_before, c.not_before);
         assert_eq!(d.not_on_or_after, c.not_on_or_after);
     }

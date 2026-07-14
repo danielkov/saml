@@ -294,7 +294,8 @@ pub struct ConsumeResponse<'a> {
     /// `SAMLResponse` form value. For HTTP-Artifact: the resolved Response XML.
     pub saml_response: &'a [u8],
     /// Type-narrowed to POST / Artifact only; `Redirect` is not representable
-    /// here per SAML 2.0 Profiles §4.1.4.
+    /// here per SAML 2.0 Profiles §4.1.4. For solicited flows this must equal
+    /// `tracker.acs_endpoint.binding`.
     pub binding: SsoResponseBinding,
     pub relay_state: Option<&'a str>,
     /// Tracker from the matching `start_login`. `None` only if
@@ -337,9 +338,11 @@ Each step short-circuits on error to a specific `Error` variant:
 
 1. Parse XML; hardening per RFC-002 §1.
 2. Locate `<samlp:Response>` root. Reject if not present.
-3. **Destination binding**:
+3. **Tracker and destination binding**:
    - `expected_destination` MUST resolve to a registered ACS URL in `self.acs`. If not, `Error::InvalidConfiguration` (caller bug, not a wire-format issue).
+   - If `tracker.is_some()`: `tracker.idp_entity_id` MUST equal `idp.entity_id`. → `Error::IssuerMismatch`.
    - If `tracker.is_some()`: `tracker.acs_endpoint.url` MUST equal `expected_destination`. → `Error::DestinationMismatch`.
+   - If `tracker.is_some()`: `tracker.acs_endpoint.binding` MUST equal `binding`. → `Error::IllegalResponseBinding`.
    - If `Response/@Destination` is present: it MUST equal `expected_destination`. → `Error::DestinationMismatch`.
 4. Check `Response/Issuer` equals `idp.entity_id`. → `Error::IssuerMismatch`.
 5. Check `Status/StatusCode/@Value` equals `urn:oasis:names:tc:SAML:2.0:status:Success`. Otherwise `Error::StatusNotSuccess { code, message }` carrying the StatusCode/StatusMessage from the response.
@@ -348,10 +351,10 @@ Each step short-circuits on error to a specific `Error` variant:
    - If `tracker.is_none()`: `allow_unsolicited` MUST be true AND `Response/@InResponseTo` MUST be absent. If `InResponseTo` is present, the response is claiming to be solicited and the caller has no tracker for it — reject with `Error::UnsolicitedNotAllowed`. If `allow_unsolicited` is false, reject with `Error::UnsolicitedNotAllowed` regardless of `InResponseTo`.
 7. Locate `<saml:Assertion>` or `<saml:EncryptedAssertion>` children. Reject if not exactly one (multiple-assertion responses are out of scope for v0.1 and a known XSW vector).
 8. Select `policy = input.peer_crypto_policy.unwrap_or(&self.default_peer_crypto_policy)`.
-9. If `EncryptedAssertion`: decrypt per RFC-002 §7 using `decryption_key` and `policy.allowed_data_encryption_algorithms` / `policy.allowed_key_transport_algorithms`.
+9. If `EncryptedAssertion`: decrypt per RFC-002 §7 using `decryption_key` and the complete effective `PeerCryptoPolicy`, including its independent data-encryption, key-transport, and OAEP-digest allow-lists.
 10. **Signature verification**:
-   - If `want_response_signed`: verify Response signature against `idp.signing_certs`, threading `policy.allowed_signature_algorithms`. The signed element MUST be the Response root.
-   - If `want_assertions_signed`: verify Assertion signature with the same allow-list. The signed element MUST be the Assertion.
+   - If `want_response_signed`: verify the Response signature against `idp.signing_certs`, passing the complete effective `PeerCryptoPolicy` so signature, Reference-digest, and canonicalization allow-lists are all enforced. The signed element MUST be the Response root.
+   - If `want_assertions_signed`: verify the Assertion signature with the same complete policy. The signed element MUST be the Assertion.
    - If neither flag is set: require at least one of the two signatures to be present and valid.
    - In all cases, the validated payload is extracted from the signed element by `ElementId`, not by re-lookup. (RFC-002 §3.2.)
 11. Check `Assertion/Issuer` equals `idp.entity_id`.

@@ -27,6 +27,9 @@ exclude = [
     # integration tests in CI; no reason to ship megabytes of another
     # project's test data inside the published crate.
     "tests/corpus/",
+    # This runner depends on the excluded corpus above. Excluding it keeps
+    # `cargo test` usable from a crates.io source package.
+    "tests/corpus_runner.rs",
 ]
 
 [dependencies]
@@ -51,6 +54,7 @@ aes-gcm = "0.10"
 ctr = "0.9"
 hmac = "0.12"
 digest = "0.10"
+email_address = { version = "0.2", default-features = false }
 signature = "2"
 thiserror = "2"
 http = "1"
@@ -63,7 +67,7 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 
 [features]
-default = ["reqwest-client", "rsa-sha", "ecdsa-sha", "xmlenc", "slo", "metadata-emit", "xsd-validate"]
+default = ["rsa-sha", "ecdsa-sha", "xmlenc", "slo", "metadata-emit", "xsd-validate"]
 reqwest-client = ["dep:reqwest"]
 rsa-sha = []
 ecdsa-sha = []

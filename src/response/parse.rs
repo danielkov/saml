@@ -273,7 +273,7 @@ pub(crate) fn parse_assertion(assertion: &Element) -> Result<ParsedAssertion, Er
         None => Conditions {
             not_before: None,
             not_on_or_after: None,
-            audiences: vec![],
+            audience_restrictions: vec![],
             one_time_use: false,
             proxy_restriction_count: None,
             proxy_restriction_audiences: vec![],
@@ -348,12 +348,8 @@ pub(crate) fn decrypt_subject_encrypted_id(
             reason: "assertion Subject carries <saml:EncryptedID> but no decryption key is configured",
         });
     }
-    let decrypted = crate::xmlenc::decrypt::decrypt_encrypted_assertion(
-        encrypted_id,
-        decryption_keys,
-        &policy.allowed_data_encryption_algorithms,
-        &policy.allowed_key_transport_algorithms,
-    )?;
+    let decrypted =
+        crate::xmlenc::decrypt::decrypt_encrypted_assertion(encrypted_id, decryption_keys, policy)?;
     if decrypted.qname().namespace() != Some(SAML_NS) || decrypted.qname().local() != "NameID" {
         return Err(Error::XmlParse(
             "decrypted <saml:EncryptedID> did not contain a <saml:NameID>".to_string(),
@@ -435,11 +431,13 @@ fn parse_conditions(elem: &Element) -> Result<Conditions, Error> {
         .map(parse_xs_datetime)
         .transpose()?;
 
-    let mut audiences: Vec<String> = Vec::new();
+    let mut audience_restrictions: Vec<Vec<String>> = Vec::new();
     for restriction in elem.all_child_elements(Some(SAML_NS), "AudienceRestriction") {
+        let mut audiences = Vec::new();
         for aud in restriction.all_child_elements(Some(SAML_NS), "Audience") {
             audiences.push(aud.text_content().trim().to_owned());
         }
+        audience_restrictions.push(audiences);
     }
 
     let one_time_use = elem.child_element(Some(SAML_NS), "OneTimeUse").is_some();
@@ -467,7 +465,7 @@ fn parse_conditions(elem: &Element) -> Result<Conditions, Error> {
     Ok(Conditions {
         not_before,
         not_on_or_after,
-        audiences,
+        audience_restrictions,
         one_time_use,
         proxy_restriction_count,
         proxy_restriction_audiences,
@@ -626,8 +624,8 @@ mod tests {
         assert!(assertion.conditions.not_before.is_some());
         assert!(assertion.conditions.not_on_or_after.is_some());
         assert_eq!(
-            assertion.conditions.audiences,
-            vec!["https://sp.example.com".to_string()]
+            assertion.conditions.audience_restrictions,
+            vec![vec!["https://sp.example.com".to_string()]]
         );
 
         // AuthnStatement
@@ -656,6 +654,34 @@ mod tests {
         assert_eq!(groups.values.len(), 2);
         assert!(groups.values.contains(&"admins".to_string()));
         assert!(groups.values.contains(&"engineering".to_string()));
+    }
+
+    #[test]
+    fn conditions_preserve_audience_restriction_groups() {
+        let xml = format!(
+            r#"<saml:Conditions xmlns:saml="{SAML_NS}">
+                  <saml:AudienceRestriction>
+                    <saml:Audience>https://sp.example.com</saml:Audience>
+                    <saml:Audience>https://alias.example.com</saml:Audience>
+                  </saml:AudienceRestriction>
+                  <saml:AudienceRestriction>
+                    <saml:Audience>https://sp.example.com</saml:Audience>
+                  </saml:AudienceRestriction>
+                </saml:Conditions>"#
+        );
+        let doc = Document::parse(xml.as_bytes()).expect("parse conditions");
+        let conditions = parse_conditions(doc.root()).expect("parse grouped audiences");
+
+        assert_eq!(
+            conditions.audience_restrictions,
+            vec![
+                vec![
+                    "https://sp.example.com".to_owned(),
+                    "https://alias.example.com".to_owned(),
+                ],
+                vec!["https://sp.example.com".to_owned()],
+            ]
+        );
     }
 
     #[test]

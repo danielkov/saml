@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Independent AD FS RSA-SHA256/384/512 interoperability coverage and an
+  always-on strong-algorithm security corpus for digest tampering, invalid
+  references, and duplicate-ID signature wrapping.
+- Pinned Merlin/xmlsec Exclusive-C14N known answers and a bounded C14N
+  idempotence/source-order property test.
+- Bounded, whitespace-tolerant HTTP-POST decoding, cryptographically random
+  256-bit RelayState generation, and conventional identity-claim helpers.
+- CI enforcement that the default `saml` dependency graph contains no native
+  crypto or XML implementation.
+
+### Changed
+
+- `reqwest-client` is now explicit opt-in, keeping the default protocol graph
+  on `quick-xml` and RustCrypto only.
+- `PeerCryptoPolicy` now independently allow-lists signature, reference-digest,
+  canonicalization, and RSA-OAEP digest algorithms. Strong defaults permit
+  SHA-2 and exclusive canonicalization without comments, even if Cargo feature
+  unification enables `weak-algos` elsewhere. SHA-1 OAEP requires a separate
+  explicit opt-in for both modern `rsa-oaep` and legacy `rsa-oaep-mgf1p`.
+- Conventional email lookup now requires an email-format NameID or an exact
+  allow-listed claim name/URI and validates address syntax; arbitrary URI
+  suffixes and opaque NameIDs containing `@` no longer become account keys.
+- Published source packages omit the corpus runner together with its excluded
+  third-party fixtures, and feature-specific CI jobs isolate the root package
+  from workspace feature unification.
+- Source migration: `binding::artifact::VerifyConfig::allowed_algorithms` is
+  replaced by `policy`; `Conditions::audiences` is replaced by grouped
+  `audience_restrictions`; and `PeerCryptoPolicy` struct literals must add
+  `allowed_digest_algorithms`, `allowed_c14n_algorithms`, and (with `xmlenc`)
+  `allowed_oaep_digest_algorithms`, or start from
+  `PeerCryptoPolicy::strong_defaults()`.
+
+### Fixed
+
+- Preserve individual `AudienceRestriction` groups and require every group to
+  admit the SP, as required by SAML's conjunctive restriction semantics.
+- Bind solicited responses to the tracker IdP and ACS binding in addition to
+  request ID and ACS URL.
+- Retain replay-cache entries through the accepted clock-skew window.
+
 ## [0.0.1-alpha.1] - 2026-05-29
 
 ### Added

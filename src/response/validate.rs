@@ -235,16 +235,16 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         return Err(Error::Expired);
     }
 
-    // --- Step 14: AudienceRestriction MUST contain SP entity ID ---------------
-    // Per spec: empty audiences == AudienceMismatch (we treat it as strict).
-    if assertion.conditions.audiences.is_empty() {
-        return Err(Error::AudienceMismatch);
-    }
-    if !assertion
-        .conditions
-        .audiences
-        .iter()
-        .any(|a| a == sp_entity_id)
+    // --- Step 14: every AudienceRestriction MUST admit this SP ---------------
+    // Audiences within one restriction are alternatives (OR), but multiple
+    // restrictions are conjunctive (AND), per SAML Core section 2.5.1.4.
+    // Missing restrictions and empty restriction groups fail closed.
+    if assertion.conditions.audience_restrictions.is_empty()
+        || assertion
+            .conditions
+            .audience_restrictions
+            .iter()
+            .any(|restriction| !restriction.iter().any(|audience| audience == sp_entity_id))
     {
         return Err(Error::AudienceMismatch);
     }
@@ -394,12 +394,7 @@ fn verify_response_and_or_assertion(
     let assertion_signature = assertion_elem.child_element(Some(DS_NS), "Signature");
 
     let verify_response = |sig: &Element| -> Result<VerifiedSignature, Error> {
-        let verified = verify_signature(
-            document,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != response_root_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Response root",
@@ -408,12 +403,7 @@ fn verify_response_and_or_assertion(
         Ok(verified)
     };
     let verify_assertion = |sig: &Element| -> Result<VerifiedSignature, Error> {
-        let verified = verify_signature(
-            document,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != assertion_name_lookup_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Assertion",
@@ -503,12 +493,7 @@ fn handle_encrypted(
 
     let mut response_verified_fingerprint: Option<[u8; 32]> = None;
     if let Some(sig) = response_signature {
-        let verified = verify_signature(
-            document,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != response_root_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Response root",
@@ -525,12 +510,7 @@ fn handle_encrypted(
         .ok_or(Error::DecryptFailed {
             reason: "EncryptedAssertion element id not resolvable",
         })?;
-    let cleartext_assertion = decrypt_encrypted_assertion(
-        enc_elem,
-        decryption_keys,
-        &policy.allowed_data_encryption_algorithms,
-        &policy.allowed_key_transport_algorithms,
-    )?;
+    let cleartext_assertion = decrypt_encrypted_assertion(enc_elem, decryption_keys, policy)?;
 
     // ---- Re-wrap into a fresh Document so we can verify the inner signature
     // ---- via its own ElementId index. Mutating the parent document would
@@ -544,12 +524,7 @@ fn handle_encrypted(
     // the same verify-and-resolve dance; differ only on what to do when the
     // signature is absent.
     let verify_inner = |sig: &Element| -> Result<([u8; 32], Element), Error> {
-        let verified = verify_signature(
-            &decrypted_doc,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(&decrypted_doc, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != assertion_root.id() {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Assertion",
@@ -760,7 +735,7 @@ mod tests {
     use crate::response::parse::parse_response;
     use crate::response::{SAML_NS, SAMLP_NS, saml_qname, samlp_qname};
     use crate::xml::emit::emit_document;
-    use crate::xml::parse::{Document, Node, QName};
+    use crate::xml::parse::{Document, Element, Node, QName};
     use std::time::{Duration, UNIX_EPOCH};
 
     // ---------- Test fixtures ----------
@@ -1208,6 +1183,71 @@ mod tests {
         emit_document(&doc).unwrap().into_bytes()
     }
 
+    fn build_signed_response_with_second_audience_restriction(second_audience: &str) -> Vec<u8> {
+        let kp = rsa_signing_key();
+        let mut assertion = build_assertion(&BuildAssertionFixture {
+            id: "_a1",
+            issuer: "https://idp.example.com",
+            recipient: "https://sp.example.com/acs",
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+            sc_not_on_or_after: "2026-05-26T12:05:00Z",
+            authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            name_id_value: "alice@example.com",
+            name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        });
+
+        let conditions = assertion
+            .children
+            .iter_mut()
+            .find_map(|node| match node {
+                Node::Element(element)
+                    if element.qname().namespace() == Some(SAML_NS)
+                        && element.qname().local() == "Conditions" =>
+                {
+                    Some(element)
+                }
+                _ => None,
+            })
+            .expect("assertion conditions");
+        let second_restriction = Element::build(saml_qname("AudienceRestriction"))
+            .with_child(Node::Element(
+                Element::build(saml_qname("Audience"))
+                    .with_text(second_audience.to_owned())
+                    .finish(),
+            ))
+            .finish();
+        conditions.children.push(Node::Element(second_restriction));
+
+        let assertion_doc = Document::new(assertion).unwrap();
+        let signed_assertion = sign_element(
+            assertion_doc.root().clone(),
+            &assertion_doc,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .unwrap();
+        let response = build_response_with_assertion(
+            "_resp1",
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://idp.example.com",
+            signed_assertion,
+            STATUS_SUCCESS,
+        );
+        emit_document(&Document::new(response).unwrap())
+            .unwrap()
+            .into_bytes()
+    }
+
     fn default_input<'a>(
         document: &'a Document,
         parsed: ParsedResponse,
@@ -1419,6 +1459,33 @@ mod tests {
         let (parsed, _) = parse_response(&doc).unwrap();
         let idp = fixture_idp();
         let policy = strong_policy();
+        let err = validate_response(default_input(&doc, parsed, &idp, &policy)).unwrap_err();
+        assert!(matches!(err, Error::AudienceMismatch));
+    }
+
+    #[test]
+    fn accepts_when_every_audience_restriction_admits_sp() {
+        let xml = build_signed_response_with_second_audience_restriction("https://sp.example.com");
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+
+        validate_response(default_input(&doc, parsed, &idp, &policy))
+            .expect("both restrictions admit the SP");
+    }
+
+    #[test]
+    fn rejects_when_any_audience_restriction_excludes_sp() {
+        // The first restriction contains the SP, while the second does not.
+        // Flattening the groups would incorrectly accept this assertion.
+        let xml =
+            build_signed_response_with_second_audience_restriction("https://other.example.com");
+        let doc = Document::parse(&xml).unwrap();
+        let (parsed, _) = parse_response(&doc).unwrap();
+        let idp = fixture_idp();
+        let policy = strong_policy();
+
         let err = validate_response(default_input(&doc, parsed, &idp, &policy)).unwrap_err();
         assert!(matches!(err, Error::AudienceMismatch));
     }

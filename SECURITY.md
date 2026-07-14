@@ -48,10 +48,12 @@ SAML peer on the wire. The following classes are explicitly in scope:
 - **Replay** — `ConsumeResponse::replay_cache` exposes a `ReplayCache` trait
   with an in-memory default. Assertion `ID` deduplication is performed after
   signature verification so malformed payloads cannot pollute the store.
-- **Weak-crypto downgrade** — SHA-1, RSA-PKCS1-v1.5 key transport, and
+- **Weak-crypto downgrade** — SHA-1 crypto, RSA-PKCS1-v1.5 key transport, and
   DSA-SHA1 are gated behind the `weak-algos` Cargo feature, off by default.
-  The per-peer `PeerCryptoPolicy` allow-list still gates acceptance at
-  validation time even when `weak-algos` is compiled in.
+  Independent per-peer `PeerCryptoPolicy` allow-lists still gate signature,
+  XML-DSig reference digests, key transport, and RSA-OAEP digests even when
+  `weak-algos` is compiled in. Both modern `rsa-oaep` with an explicit SHA-1
+  `DigestMethod` and legacy `rsa-oaep-mgf1p` require a SHA-1 OAEP policy opt-in.
 - **Signature wrapping via transforms** — the XML-DSig `Transform` allow-list
   rejects XSLT, XPath, and base64 transforms. Multi-`Reference` signatures
   are rejected by default.
@@ -64,7 +66,7 @@ SAML peer on the wire. The following classes are explicitly in scope:
   `now: SystemTime` and `clock_skew: Duration`. No method silently reads the
   wall clock.
 - **HTTP-Redirect detached signatures** — verified via a distinct entry
-  point with the same `allowed_algorithms` discipline as XML-DSig.
+  point with the same signature-algorithm policy discipline as XML-DSig.
 
 The following are **out of scope** — protect against them at a higher layer:
 

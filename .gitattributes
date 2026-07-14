@@ -1,0 +1,2 @@
+# Canonical byte-stream fixtures intentionally preserve whitespace-only lines.
+tests/common/c14n_vectors/*without-comments.xml -whitespace

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Foo xmlns:bar="urn:bar" xmlns="urn:foo" xml:space="preserve">
+  <dsig:Signature xmlns:dsig="http://www.w3.org/2000/09/xmldsig#">
+    <dsig:Object Id="to-be-signed">
+      <bar:Baz>
+        <!--  comment -->
+      </bar:Baz>
+    </dsig:Object>
+  </dsig:Signature>
+</Foo>

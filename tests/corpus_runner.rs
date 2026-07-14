@@ -16,25 +16,29 @@
 //! for upstream attribution. Both source corpora are MIT-licensed.
 //!
 //! Some fixtures use weak algorithms (RSA-SHA1) or DEFLATE base64-wrapped
-//! payloads — see per-fixture flags below. The runner is feature-gated on
-//! `weak-algos` since several captured fixtures are SHA-1-signed.
-
-#![cfg(feature = "weak-algos")]
+//! payloads — see per-fixture flags below. Strong-algorithm fixtures run in
+//! every build; legacy SHA-1 compatibility fixtures are gated individually on
+//! `weak-algos`.
 
 #[path = "common/mod.rs"]
 mod common;
 
+use std::io::Read as _;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+#[cfg(all(feature = "xmlenc", feature = "weak-algos"))]
+use saml::OaepDigest;
 use saml::binding::SsoResponseBinding;
 use saml::binding::{Endpoint, SsoResponseEndpoint};
 use saml::crypto::cert::X509Certificate;
 #[cfg(feature = "xmlenc")]
 use saml::crypto::keypair::KeyPair;
 use saml::descriptor::IdpDescriptor;
+#[cfg(feature = "weak-algos")]
+use saml::dsig::algorithms::C14nAlgorithm;
 use saml::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
 use saml::error::Error;
 use saml::nameid::NameIdFormat;
@@ -52,24 +56,50 @@ use saml::time::parse_xs_datetime;
 enum Expected {
     /// `consume_response` must return Ok(Identity).
     Ok,
-    /// Any `Err(_)` is acceptable. XSW/XXE/audience mismatch/expired/etc.
+    /// `consume_response` must reject. Setup failures and algorithm-policy
+    /// short-circuits do not count as security-test passes.
     Reject,
+    /// The imported fixture cannot reach SAML validation because its embedded
+    /// test certificate is intentionally malformed. This is a documented
+    /// corpus limitation, not a security rejection.
+    UnsupportedFixture(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureEncoding {
+    Xml,
+    Base64Xml,
+    Base64Deflate,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CryptoProfile {
+    Strong,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AssertionSignature {
+    Optional,
+    Required,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Fixture {
     /// Path relative to `tests/corpus/`.
     path: &'static str,
-    /// If true, file contents are base64-encoded XML (re-decode before parse).
-    b64_wrap: bool,
+    /// Encoding applied to the vendored fixture file.
+    encoding: FixtureEncoding,
     expected: Expected,
     /// Permit RSA-SHA1 / SHA-1 digest. Required for old ADFS captures.
-    weak_algos: bool,
-    /// Permit the response to be IdP-initiated (no tracker / no InResponseTo).
-    /// Some captured fixtures lack the original AuthnRequest context.
-    allow_unsolicited: bool,
+    crypto_profile: CryptoProfile,
     /// Short label for the test fn name.
     label: &'static str,
+    /// Require the Assertion to carry a valid signature. Used by explicit
+    /// missing-signature negatives; most corpus captures are signed already.
+    assertion_signature: AssertionSignature,
+    /// Evaluation time in seconds after the captured IssueInstant.
+    now_offset_secs: u64,
     /// Optional explicit Audience (SP entity_id) when the Audience is inside
     /// an EncryptedAssertion and therefore not visible in the cleartext.
     sp_entity_id_override: Option<&'static str>,
@@ -91,11 +121,12 @@ impl Fixture {
     const fn pos(path: &'static str, label: &'static str) -> Self {
         Self {
             path,
-            b64_wrap: false,
+            encoding: FixtureEncoding::Xml,
             expected: Expected::Ok,
-            weak_algos: true,
-            allow_unsolicited: true,
+            crypto_profile: CryptoProfile::Legacy,
             label,
+            assertion_signature: AssertionSignature::Optional,
+            now_offset_secs: 1,
             sp_entity_id_override: None,
             idp_cert_pem_path: None,
             sp_decryption_key_pkcs1_pem_path: None,
@@ -106,11 +137,12 @@ impl Fixture {
     const fn neg(path: &'static str, label: &'static str) -> Self {
         Self {
             path,
-            b64_wrap: false,
+            encoding: FixtureEncoding::Xml,
             expected: Expected::Reject,
-            weak_algos: true,
-            allow_unsolicited: true,
+            crypto_profile: CryptoProfile::Legacy,
             label,
+            assertion_signature: AssertionSignature::Optional,
+            now_offset_secs: 1,
             sp_entity_id_override: None,
             idp_cert_pem_path: None,
             sp_decryption_key_pkcs1_pem_path: None,
@@ -119,12 +151,17 @@ impl Fixture {
     }
 
     const fn b64(mut self) -> Self {
-        self.b64_wrap = true;
+        self.encoding = FixtureEncoding::Base64Xml;
+        self
+    }
+
+    const fn deflated(mut self) -> Self {
+        self.encoding = FixtureEncoding::Base64Deflate;
         self
     }
 
     const fn strong(mut self) -> Self {
-        self.weak_algos = false;
+        self.crypto_profile = CryptoProfile::Strong;
         self
     }
 
@@ -134,9 +171,23 @@ impl Fixture {
         self
     }
 
-    #[cfg(feature = "xmlenc")]
     const fn with_idp_cert(mut self, path: &'static str) -> Self {
         self.idp_cert_pem_path = Some(path);
+        self
+    }
+
+    const fn require_assertion_signature(mut self) -> Self {
+        self.assertion_signature = AssertionSignature::Required;
+        self
+    }
+
+    const fn at_issue_offset(mut self, seconds: u64) -> Self {
+        self.now_offset_secs = seconds;
+        self
+    }
+
+    const fn unsupported(mut self, reason: &'static str) -> Self {
+        self.expected = Expected::UnsupportedFixture(reason);
         self
     }
 
@@ -146,6 +197,7 @@ impl Fixture {
         self
     }
 
+    #[cfg(feature = "xmlenc")]
     const fn with_acs(mut self, url: &'static str) -> Self {
         self.acs_url_override = Some(url);
         self
@@ -156,15 +208,16 @@ impl Fixture {
 // Corpus manifest
 // =============================================================================
 
-// Path to the python3-saml IdP signing certificate. Used by every
-// python3-saml encrypted-assertion fixture, since the embedded signature
-// inside the encrypted blob references this cert.
-#[cfg(feature = "xmlenc")]
+// Path to the python3-saml IdP signing certificate. Encrypted fixtures need it
+// because KeyInfo is hidden; unsigned negatives need a syntactically valid
+// descriptor even though no signature verification consumes the key.
 const PY3_IDP_CERT: &str = "python3-saml/certs/idp.crt";
 // Matching SP decryption key (PKCS#1 PEM, "RSA PRIVATE KEY") shipped with
 // python3-saml's test corpus.
 #[cfg(feature = "xmlenc")]
 const PY3_SP_KEY: &str = "python3-saml/certs/sp.key";
+// A syntactically valid ruby-saml test cert for unsigned fixture setup.
+const RUBY_TEST_CERT: &str = "ruby-saml/certificates/ruby-saml.crt";
 
 const FIXTURES: &[Fixture] = &[
     // ---- Positive: ADFS captures (real Microsoft IdP) ----
@@ -194,12 +247,18 @@ const FIXTURES: &[Fixture] = &[
         "ruby-saml/responses/response_assertion_wrapped.xml.base64",
         "xsw_assertion_wrapped",
     )
-    .b64(),
+    .b64()
+    // Upstream embeds certificate1, whose certificate-signature OID is the
+    // intentionally malformed `0.0`. x509-cert rejects it before SAML runs.
+    .unsupported("X509 DER: X509Parse"),
     Fixture::neg(
         "ruby-saml/responses/response_node_text_attack.xml.base64",
         "node_text_attack_1",
     )
-    .b64(),
+    .b64()
+    // This attack injects XML nodes into X509Certificate text, so there is no
+    // parseable trust anchor with which to exercise signature verification.
+    .unsupported("X509 first=Base64Decode"),
     Fixture::neg(
         "ruby-saml/responses/response_node_text_attack2.xml.base64",
         "node_text_attack_2",
@@ -218,50 +277,44 @@ const FIXTURES: &[Fixture] = &[
         "ruby-saml/responses/response_unsigned_xml_base64",
         "unsigned",
     )
-    .b64(),
+    .b64()
+    .deflated()
+    .with_idp_cert(RUBY_TEST_CERT)
+    .require_assertion_signature(),
     // ---- python3-saml: encrypted + expired + audience ----
     Fixture::neg(
         "python3-saml/responses/expired_response.xml.base64",
         "expired",
     )
-    .b64(),
+    .b64()
+    .with_idp_cert(PY3_IDP_CERT)
+    .at_issue_offset(3_600),
     Fixture::neg(
         "python3-saml/responses/no_audience.xml.base64",
         "no_audience",
     )
-    .b64(),
-    // Real provider fixture: signed by a real cert (embedded matches the
-    // signer), validates cleanly in python3-saml. Currently fails saml's
-    // verify with `SignatureVerification { reason: "digest mismatch" }`,
-    // which is almost certainly a C14N divergence on a double-signed
-    // (Response + Assertion) tree. Left as Expected::Ok so the bug stays
-    // visible until fixed. Recheck after the parallel xml/c14n
-    // source-prefix fix lands.
+    .b64()
+    .with_idp_cert(PY3_IDP_CERT),
+    // Real provider fixture signed at both the Response and Assertion levels.
+    // This covers source-prefix preservation and the enveloped-signature rule
+    // that removes only the enclosing signature while retaining a separately
+    // signed descendant.
     Fixture::pos(
         "python3-saml/responses/double_signed_response.xml.base64",
         "double_signed",
     )
     .b64(),
     // ---- Positive: python3-saml single-target signed responses ----
-    // Response root signed only (Assertion unsigned).
-    //
-    // Currently fails with `SignatureVerification { reason: "no candidate
-    // cert matched" }`. The wire cert in <ds:KeyInfo> matches
-    // python3-saml/certs/idp.crt exactly (verified by hand), and the
-    // signature is RSA-SHA1 which is allowed. The failure points at a
-    // c14n divergence in how saml canonicalizes the SignedInfo — likely
-    // the same source-prefix bug being fixed in src/xml/parse.rs +
-    // src/dsig/c14n.rs in parallel. Recheck after that lands.
+    // Response root signed only (Assertion unsigned). Exercises legacy
+    // RSA-SHA1 SignedInfo canonicalization under explicit compatibility
+    // policy without requiring an Assertion signature.
     Fixture::pos(
         "python3-saml/responses/signed_message_response.xml.base64",
         "signed_message_response",
     )
     .b64(),
-    // Assertion-only signed (Response root unsigned). Identical shape to
+    // Assertion-only signed (Response root unsigned). Identical trust shape to
     // ruby-saml's response_with_signed_assertion.xml.base64.
-    //
-    // Same failure mode as `signed_message_response` above — recheck
-    // after the c14n source-prefix fix.
     Fixture::pos(
         "python3-saml/responses/signed_assertion_response.xml.base64",
         "signed_assertion_response",
@@ -299,14 +352,8 @@ const FIXTURES: &[Fixture] = &[
     .with_acs("https://pitbulk.no-ip.org/newonelogin/demo1/index.php?acs"),
     // ---- Positive: ruby-saml structural variants ----
     // xmlns:ds declared on the Response root rather than inside
-    // <ds:Signature>. The c14n InclusiveNamespaces logic must still resolve
-    // the prefix correctly. This is the canonical test for the
-    // source-prefix bug being fixed in src/xml/parse.rs +
-    // src/dsig/c14n.rs in parallel.
-    //
-    // Currently fails with `SignatureVerification { reason: "digest
-    // mismatch" }` — exactly the symptom the source-prefix fix targets.
-    // Recheck after that lands.
+    // <ds:Signature>. Canonicalization must resolve the inherited prefix and
+    // reproduce the signer's bytes.
     Fixture::pos(
         "ruby-saml/responses/response_with_ds_namespace_at_the_root.xml.base64",
         "ds_namespace_at_root",
@@ -328,7 +375,9 @@ const FIXTURES: &[Fixture] = &[
         "python3-saml/responses/invalids/no_signature.xml.base64",
         "no_signature_explicit",
     )
-    .b64(),
+    .b64()
+    .with_idp_cert(PY3_IDP_CERT)
+    .require_assertion_signature(),
     // Multi-assertion response (python3-saml's `multiple_assertions.xml.base64`
     // — note: the upstream filename omits "signed", but the fixture does
     // contain multiple signed Assertions inside one Response). Per
@@ -339,7 +388,10 @@ const FIXTURES: &[Fixture] = &[
         "python3-saml/responses/invalids/multiple_assertions.xml.base64",
         "multiple_assertions",
     )
-    .b64(),
+    .b64()
+    // This fixture reuses ruby-saml's malformed-OID certificate1. The
+    // always-on strong duplicate-ID XSW case covers the defense independently.
+    .unsupported("X509 DER: X509Parse"),
     // Empty Destination attribute (Destination=""). RFC-003 §4.1 step 4 and
     // SAML Core §3.2.2.1 require Destination to match the SP's ACS URL when
     // present — an empty string cannot match a real URL.
@@ -436,17 +488,39 @@ const FIXTURES: &[Fixture] = &[
         "xsw_pattern_8_namespace_injection",
     )
     .b64(),
+    // ADFS assertion signed with RSA-SHA256/SHA-256 and the XML-DSig
+    // namespace supplied as the default namespace on Signature. Keep this
+    // always-on: it catches namespace/c14n regressions without weak-algos.
+    Fixture::pos(
+        "ruby-saml/responses/adfs_response_xmlns.xml",
+        "adfs_response_xmlns",
+    )
+    .strong(),
 ];
 
 // =============================================================================
 // Permissive crypto policy for corpus fixtures (includes weak algos).
 // =============================================================================
 
+#[cfg(feature = "weak-algos")]
 fn permissive_policy() -> PeerCryptoPolicy {
     let mut allowed = SignatureAlgorithm::DEFAULTS.to_vec();
     allowed.push(SignatureAlgorithm::RsaSha1);
+    let mut allowed_digests = DigestAlgorithm::DEFAULTS.to_vec();
+    allowed_digests.push(DigestAlgorithm::Sha1);
+    #[cfg(feature = "xmlenc")]
+    let mut allowed_oaep_digests = OaepDigest::DEFAULTS.to_vec();
+    #[cfg(feature = "xmlenc")]
+    allowed_oaep_digests.push(OaepDigest::Sha1);
     PeerCryptoPolicy {
         allowed_signature_algorithms: allowed,
+        allowed_digest_algorithms: allowed_digests,
+        allowed_c14n_algorithms: vec![
+            C14nAlgorithm::ExclusiveCanonical,
+            C14nAlgorithm::ExclusiveCanonicalWithComments,
+            C14nAlgorithm::InclusiveCanonical,
+            C14nAlgorithm::InclusiveCanonicalWithComments,
+        ],
         #[cfg(feature = "xmlenc")]
         allowed_data_encryption_algorithms: vec![
             saml::xmlenc::algorithms::DataEncryptionAlgorithm::Aes128Gcm,
@@ -460,6 +534,8 @@ fn permissive_policy() -> PeerCryptoPolicy {
             saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaepMgf1Sha1,
             saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaPkcs1V15,
         ],
+        #[cfg(feature = "xmlenc")]
+        allowed_oaep_digest_algorithms: allowed_oaep_digests,
     }
 }
 
@@ -562,11 +638,22 @@ fn first_element_text(s: &str, local: &str) -> Option<String> {
 
 /// Find the first occurrence of `name="value"` on any element.
 fn first_attribute(s: &str, name: &str) -> Option<String> {
-    let needle = format!(" {name}=\"");
-    let start = s.find(&needle)?.saturating_add(needle.len());
-    let rest = s.get(start..)?;
-    let end = rest.find('"')?;
-    Some(rest.get(..end)?.to_string())
+    // Both quote styles are legal XML. ADFS captures in ruby-saml use both,
+    // so limiting this test-runner helper to double quotes silently skipped
+    // otherwise-valid interop fixtures.
+    for quote in ['"', '\''] {
+        let needle = format!(" {name}={quote}");
+        let Some(start) = s
+            .find(&needle)
+            .map(|offset| offset.saturating_add(needle.len()))
+        else {
+            continue;
+        };
+        let rest = s.get(start..)?;
+        let end = rest.find(quote)?;
+        return Some(rest.get(..end)?.to_string());
+    }
+    None
 }
 
 // =============================================================================
@@ -586,15 +673,24 @@ fn corpus_path(rel: &str) -> String {
 fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
     let abs_path = corpus_path(fx.path);
     let raw = std::fs::read(&abs_path).map_err(|e| format!("read {abs_path}: {e}"))?;
-    let xml = if fx.b64_wrap {
-        let s = std::str::from_utf8(&raw).map_err(|e| format!("utf8 wrap: {e}"))?;
-        let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        BASE64
-            .decode(clean.as_bytes())
-            .map_err(|e| format!("b64 wrap decode: {e}"))?
-    } else {
-        raw
+    let mut xml = match fx.encoding {
+        FixtureEncoding::Xml => raw,
+        FixtureEncoding::Base64Xml | FixtureEncoding::Base64Deflate => {
+            let s = std::str::from_utf8(&raw).map_err(|e| format!("utf8 wrap: {e}"))?;
+            let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            BASE64
+                .decode(clean.as_bytes())
+                .map_err(|e| format!("b64 wrap decode: {e}"))?
+        }
     };
+    if fx.encoding == FixtureEncoding::Base64Deflate {
+        let mut decoder = flate2::read::DeflateDecoder::new(xml.as_slice());
+        let mut inflated = Vec::new();
+        decoder
+            .read_to_end(&mut inflated)
+            .map_err(|e| format!("raw DEFLATE decode: {e}"))?;
+        xml = inflated;
+    }
 
     let meta = extract(&xml).map_err(|e| format!("extract: {e}"))?;
 
@@ -627,10 +723,21 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         .or_else(|| meta.audience.clone())
         .unwrap_or_else(|| "https://sp.example.com/metadata".to_string());
 
-    let policy = if fx.weak_algos {
-        permissive_policy()
-    } else {
-        PeerCryptoPolicy::strong_defaults()
+    let policy = match fx.crypto_profile {
+        CryptoProfile::Strong => PeerCryptoPolicy::strong_defaults(),
+        CryptoProfile::Legacy => {
+            #[cfg(feature = "weak-algos")]
+            {
+                permissive_policy()
+            }
+            #[cfg(not(feature = "weak-algos"))]
+            {
+                return Err(format!(
+                    "fixture {} requires the weak-algos feature",
+                    fx.path
+                ));
+            }
+        }
     };
 
     let idp = IdpDescriptor {
@@ -674,9 +781,10 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         sign_authn_requests: false,
         want_signed: SpWantSigned {
             response: false,
-            assertions: false,
+            assertions: matches!(fx.assertion_signature, AssertionSignature::Required),
         },
-        allow_unsolicited: fx.allow_unsolicited,
+        // Captured fixtures generally lack their original AuthnRequest state.
+        allow_unsolicited: true,
         #[cfg(feature = "slo")]
         logout_signing: saml::SpLogoutSigning::default(),
         #[cfg(feature = "slo")]
@@ -691,8 +799,8 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
     // see a "just-issued" assertion regardless of when the test runs.
     let now = meta
         .issue_instant
-        .checked_add(Duration::from_secs(1))
-        .ok_or_else(|| "issue_instant + 1s overflowed SystemTime".to_string())?;
+        .checked_add(Duration::from_secs(fx.now_offset_secs))
+        .ok_or_else(|| "issue_instant + fixture offset overflowed SystemTime".to_string())?;
 
     let tracker_owned = meta
         .in_response_to
@@ -735,7 +843,27 @@ macro_rules! corpus_test {
             let result = run_fixture(fx);
             match (fx.expected, result) {
                 (Expected::Ok, Ok(_)) => {}
-                (Expected::Reject, Err(_)) => {}
+                (Expected::Reject, Err(e)) => {
+                    assert!(
+                        e.starts_with("consume_response: "),
+                        "[{}] rejection was only a runner/setup failure: {e}\n  fixture: {}",
+                        fx.label,
+                        fx.path,
+                    );
+                    assert!(
+                        !e.contains("DisallowedAlgorithm"),
+                        "[{}] rejection stopped at an algorithm-policy gate; \
+                         this does not exercise the attack defense: {e}\n  fixture: {}",
+                        fx.label,
+                        fx.path,
+                    );
+                }
+                (Expected::UnsupportedFixture(reason), Err(e)) if e.contains(reason) => {}
+                (Expected::UnsupportedFixture(reason), Err(e)) => panic!(
+                    "[{}] unsupported-fixture preflight changed; expected an error containing \
+                     {reason:?}, got: {e}\n  fixture: {}",
+                    fx.label, fx.path,
+                ),
                 (Expected::Ok, Err(e)) => panic!(
                     "[{}] expected Ok, got Err: {e}\n  fixture: {}",
                     fx.label, fx.path
@@ -746,6 +874,11 @@ macro_rules! corpus_test {
                      case\n  fixture: {}",
                     fx.label, fx.path
                 ),
+                (Expected::UnsupportedFixture(reason), Ok(_)) => panic!(
+                    "[{}] fixture previously marked unsupported ({reason}) is now runnable; \
+                     promote it to a real positive/negative corpus case\n  fixture: {}",
+                    fx.label, fx.path,
+                ),
             }
         }
     };
@@ -754,46 +887,119 @@ macro_rules! corpus_test {
 corpus_test!(c01_adfs_sha256, 0);
 corpus_test!(c02_adfs_sha384, 1);
 corpus_test!(c03_adfs_sha512, 2);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c04_adfs_sha1, 3);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c05_xsw_wrapped, 4);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c06_xsw_assertion_wrapped, 5);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c07_node_text_attack_1, 6);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c08_node_text_attack_2, 7);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c09_node_text_attack_3, 8);
-corpus_test!(c10_xxe, 9);
+#[test]
+fn c10_xxe() {
+    // The XXE fixture is deliberately not a SAML Response, so metadata cannot
+    // be extracted from it. Supply trusted peers out-of-band and send the raw
+    // document through consume_response; a runner preflight error would not
+    // demonstrate that the XML/SAML parser itself rejected the DOCTYPE.
+    let xml = std::fs::read(corpus_path("ruby-saml/responses/attackxee.xml"))
+        .expect("read ruby-saml XXE fixture");
+    let base_sp = common::make_sp(
+        "https://sp.example.com/xxe-corpus",
+        "https://sp.example.com/xxe-corpus/acs",
+        false,
+    )
+    .expect("build SP");
+    let mut sp_config = base_sp.config().clone();
+    sp_config.allow_unsolicited = true;
+    let sp = ServiceProvider::new(sp_config).expect("rebuild unsolicited SP");
+    let idp_role = common::make_idp(
+        "https://idp.example.com/xxe-corpus",
+        "https://idp.example.com/xxe-corpus/sso",
+    )
+    .expect("build IdP");
+    let idp = common::idp_descriptor(&idp_role).expect("build IdP descriptor");
+    let now = common::fixed_now().expect("fixed timestamp");
+
+    let result = sp.consume_response(ConsumeResponse {
+        idp: &idp,
+        peer_crypto_policy: None,
+        saml_response: &xml,
+        binding: SsoResponseBinding::HttpPost,
+        relay_state: None,
+        tracker: None,
+        expected_destination: "https://sp.example.com/xxe-corpus/acs",
+        now,
+        clock_skew: Duration::from_mins(2),
+        replay_cache: None,
+        replay_mode: ReplayMode::All,
+        holder_of_key_cert: None,
+    });
+
+    match result {
+        Err(Error::XmlParse(_) | Error::SchemaViolation { .. }) => {}
+        other => panic!("expected XML/schema rejection for XXE fixture, got {other:?}"),
+    }
+}
+#[cfg(feature = "weak-algos")]
 corpus_test!(c11_no_signature_ns, 10);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c12_unsigned, 11);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c13_expired, 12);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c14_no_audience, 13);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c15_double_signed, 14);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c16_signed_message_response, 15);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c17_signed_assertion_response, 16);
 // Two xmlenc-gated entries (py3 encrypted-assertion negatives — saml
 // correctly rejects spec-violating Recipient/Issuer shapes).
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "weak-algos", feature = "xmlenc"))]
 corpus_test!(c18_py3_encrypted_missing_recipient, 17);
-#[cfg(feature = "xmlenc")]
+#[cfg(all(feature = "weak-algos", feature = "xmlenc"))]
 corpus_test!(c19_py3_encrypted_issuer_mismatch, 18);
 // Index arithmetic shifts when xmlenc is off, so compute the base.
 const POST_ENC: usize = if cfg!(feature = "xmlenc") { 19 } else { 17 };
+#[cfg(feature = "weak-algos")]
 corpus_test!(c21_ds_namespace_at_root, POST_ENC);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c22_signed_assertion_2, POST_ENC + 1);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c24_no_signature_explicit, POST_ENC + 2);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c25_multiple_assertions, POST_ENC + 3);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c26_empty_destination, POST_ENC + 4);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c27_ruby_multiple_signed, POST_ENC + 5);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c28_ruby_invalid_signed_element, POST_ENC + 6);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c29_ruby_concealed_signed_assertion, POST_ENC + 7);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c30_ruby_doubled_signed_assertion, POST_ENC + 8);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c31_py3_sig_wrap_attack, POST_ENC + 9);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c32_py3_sig_wrap_attack2, POST_ENC + 10);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c33_py3_bad_reference, POST_ENC + 11);
+#[cfg(feature = "weak-algos")]
 corpus_test!(
     c34_xsw_pattern_5_assertion_in_signature_object,
     POST_ENC + 12
 );
+#[cfg(feature = "weak-algos")]
 corpus_test!(c35_xsw_pattern_6_substituted_subject, POST_ENC + 13);
+#[cfg(feature = "weak-algos")]
 corpus_test!(c36_xsw_pattern_8_namespace_injection, POST_ENC + 14);
+corpus_test!(c20_adfs_response_xmlns, POST_ENC + 15);
 
 // Diagnostic helper: prints the actual rejection reason for each synthetic
 // XSW pattern fixture. `#[ignore]`d so it doesn't run in the default test
@@ -802,6 +1008,7 @@ corpus_test!(c36_xsw_pattern_8_namespace_injection, POST_ENC + 14);
 //         --ignored --nocapture
 // to see which validator path catches each attack.
 #[test]
+#[cfg(feature = "weak-algos")]
 #[ignore = "diagnostic-only: prints rejection reasons for synthetic XSW patterns; invoke with --ignored --nocapture"]
 fn xsw_pattern_rejection_reasons() {
     for fx in FIXTURES {

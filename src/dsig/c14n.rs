@@ -687,6 +687,7 @@ fn push_attr_value_escaped(out: &mut Vec<u8>, value: &str) {
 mod tests {
     use super::*;
     use crate::xml::parse::Document;
+    use proptest::prelude::*;
 
     /// Parse XML, locate the element with the given local name (no namespace
     /// filter), and canonicalize it. The ancestor chain is computed by walking
@@ -966,6 +967,68 @@ mod tests {
         );
     }
 
+    // ---------- External known-answer vector -------------------------------
+
+    #[test]
+    fn merlin_exclusive_c14n_known_answers() {
+        // Reduced from the Merlin Hughes Exclusive C14N interoperability
+        // vector distributed by xmlsec. Unlike the synthetic examples above,
+        // these expected byte streams come from an independent implementation
+        // and match the four published digest values in exc-signature.xml.
+        // Provenance and license live alongside the fixture files.
+        let input = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/c14n_vectors/merlin-exclusive-subset.xml"
+        ));
+        fn expected(fixture: &str) -> &str {
+            fixture.strip_suffix('\n').unwrap_or(fixture)
+        }
+
+        assert_eq!(
+            canon_named(input, "Object", C14nAlgorithm::ExclusiveCanonical, &[]),
+            expected(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/common/c14n_vectors/exclusive-without-comments.xml"
+            )))
+        );
+        assert_eq!(
+            canon_named(
+                input,
+                "Object",
+                C14nAlgorithm::ExclusiveCanonical,
+                &["bar", "#default"],
+            ),
+            expected(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/common/c14n_vectors/exclusive-inclusive-prefixes-without-comments.xml"
+            )))
+        );
+        assert_eq!(
+            canon_named(
+                input,
+                "Object",
+                C14nAlgorithm::ExclusiveCanonicalWithComments,
+                &[],
+            ),
+            expected(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/common/c14n_vectors/exclusive-with-comments.xml"
+            )))
+        );
+        assert_eq!(
+            canon_named(
+                input,
+                "Object",
+                C14nAlgorithm::ExclusiveCanonicalWithComments,
+                &["bar", "#default"],
+            ),
+            expected(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/common/c14n_vectors/exclusive-inclusive-prefixes-with-comments.xml"
+            )))
+        );
+    }
+
     // ---------- PrefixList semantics ---------------------------------------
 
     #[test]
@@ -1065,6 +1128,49 @@ mod tests {
         assert_eq!(ca, cb);
         assert_eq!(cb, cc);
         assert_eq!(ca, r#"<e a="1" b="2" c="3"></e>"#);
+    }
+
+    proptest! {
+        #[test]
+        fn canonicalization_is_idempotent_and_source_order_independent(
+            attributes in proptest::collection::hash_map(
+                "a[0-9]{1,3}",
+                "[A-Za-z0-9 ]{0,20}",
+                0..12,
+            ),
+            text in "[A-Za-z0-9 ]{0,40}",
+        ) {
+            fn source(attributes: &[(String, String)], text: &str) -> String {
+                let mut xml = String::from("<e");
+                for (name, value) in attributes {
+                    xml.push(' ');
+                    xml.push_str(name);
+                    xml.push_str("=\"");
+                    xml.push_str(value);
+                    xml.push('"');
+                }
+                xml.push('>');
+                xml.push_str(text);
+                xml.push_str("</e>");
+                xml
+            }
+
+            let forward = attributes.into_iter().collect::<Vec<_>>();
+            let mut reversed = forward.clone();
+            reversed.reverse();
+
+            for algorithm in [
+                C14nAlgorithm::ExclusiveCanonical,
+                C14nAlgorithm::InclusiveCanonical,
+            ] {
+                let canonical = canon_root(&source(&forward, &text), algorithm, &[]);
+                let reordered = canon_root(&source(&reversed, &text), algorithm, &[]);
+                let canonical_again = canon_root(&canonical, algorithm, &[]);
+
+                prop_assert_eq!(&canonical, &reordered);
+                prop_assert_eq!(&canonical, &canonical_again);
+            }
+        }
     }
 
     // ---------- Keycloak-shape prefix-vs-default-ns regression --------------

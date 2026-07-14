@@ -297,7 +297,7 @@ impl IdentityProvider {
                     root,
                     root_id,
                     &input.sp.signing_certs,
-                    &policy.allowed_signature_algorithms,
+                    policy,
                 )?;
             }
             // Artifact inbound AuthnRequest isn't a real binding — the spec
@@ -458,14 +458,14 @@ fn verify_envelope_signature(
     root: &Element,
     root_id: crate::xml::parse::ElementId,
     candidate_certs: &[crate::crypto::cert::X509Certificate],
-    allowed_algorithms: &[SignatureAlgorithm],
+    policy: &PeerCryptoPolicy,
 ) -> Result<(), Error> {
     let sig_elem = root.child_element(Some(DS_NS), "Signature");
     match sig_elem {
         None if required => Err(Error::SignatureMissing),
         None => Ok(()),
         Some(sig) => {
-            let verified = verify_signature(doc, sig, candidate_certs, allowed_algorithms)?;
+            let verified = verify_signature(doc, sig, candidate_certs, policy)?;
             if verified.signed_element != root_id {
                 return Err(Error::SignatureVerification {
                     reason: "signature covers a different element than the message root (XSW)",
@@ -715,7 +715,7 @@ impl IdentityProvider {
             root_id,
             detached_signature.as_ref(),
             &sp.signing_certs,
-            &policy.allowed_signature_algorithms,
+            policy,
         )?;
 
         // EncryptedID (§5.1): now that the request is authenticated, decrypt the
@@ -916,7 +916,7 @@ impl IdentityProvider {
             root_id,
             detached_signature.as_ref(),
             &sp.signing_certs,
-            &policy.allowed_signature_algorithms,
+            policy,
         )?;
 
         // InResponseTo match (§5.2 step 6).
@@ -1210,27 +1210,20 @@ fn verify_logout_signature(
     root_id: crate::xml::parse::ElementId,
     detached: Option<&DetachedSignature<'_>>,
     candidate_certs: &[crate::crypto::cert::X509Certificate],
-    allowed_algorithms: &[SignatureAlgorithm],
+    policy: &PeerCryptoPolicy,
 ) -> Result<(), Error> {
     match binding {
         Binding::HttpRedirect => verify_redirect_request_signature(
             required,
             detached,
             candidate_certs,
-            allowed_algorithms,
+            &policy.allowed_signature_algorithms,
         ),
         Binding::HttpPost | Binding::Soap => {
             let root = doc.element(root_id).ok_or(Error::SignatureVerification {
                 reason: "could not locate root element for signature check",
             })?;
-            verify_envelope_signature(
-                required,
-                doc,
-                root,
-                root_id,
-                candidate_certs,
-                allowed_algorithms,
-            )
+            verify_envelope_signature(required, doc, root, root_id, candidate_certs, policy)
         }
         Binding::HttpArtifact => Err(Error::UnsupportedByPeer {
             binding: Binding::HttpArtifact,
