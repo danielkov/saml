@@ -499,11 +499,26 @@ impl ServiceProvider {
                 reason: "expected_destination is not a registered ACS URL",
             });
         }
-        // Step 3b: for solicited flow, tracker.acs_endpoint.url MUST match.
-        if let Some(tracker) = input.tracker
-            && tracker.acs_endpoint.url != input.expected_destination
-        {
-            return Err(Error::DestinationMismatch);
+        // Step 3b: a solicited response must stay bound to the IdP and the ACS
+        // endpoint (URL *and* binding) captured when the AuthnRequest was
+        // issued. Checking only the URL let a response arrive from a different
+        // registered IdP, or over a different binding than the one the request
+        // asked for, while still correlating by request ID.
+        if let Some(tracker) = input.tracker {
+            if tracker.idp_entity_id != input.idp.entity_id {
+                return Err(Error::IssuerMismatch {
+                    expected: tracker.idp_entity_id.clone(),
+                    got: Some(input.idp.entity_id.clone()),
+                });
+            }
+            if tracker.acs_endpoint.url != input.expected_destination {
+                return Err(Error::DestinationMismatch);
+            }
+            if tracker.acs_endpoint.binding != input.binding {
+                return Err(Error::IllegalResponseBinding {
+                    requested: input.binding.as_binding(),
+                });
+            }
         }
 
         // Parse XML and locate `<samlp:Response>`. The caller passed raw XML
@@ -2147,6 +2162,83 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn consume_response_rejects_tracker_for_different_idp() {
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let mut idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        idp.entity_id = "https://different-idp.example.com".to_owned();
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: b"not parsed because tracker correlation fails first",
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::IssuerMismatch { expected, got }
+                if expected == "https://idp.example.com"
+                    && got.as_deref() == Some("https://different-idp.example.com")
+        ));
+    }
+
+    #[test]
+    fn consume_response_rejects_binding_different_from_tracker_acs() {
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: b"not parsed because tracker correlation fails first",
+                binding: SsoResponseBinding::HttpArtifact,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::IllegalResponseBinding {
+                requested: Binding::HttpArtifact
+            }
+        ));
     }
 
     // ---------- replay cache ----------
