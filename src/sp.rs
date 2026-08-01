@@ -612,7 +612,20 @@ impl ServiceProvider {
         if let Some(cache) = input.replay_cache
             && replay_check_needed(input.replay_mode, identity.is_one_time_use)
         {
-            let fresh = cache.check_and_insert(&identity.assertion_id, identity.not_on_or_after)?;
+            // Validation accepts the assertion until NotOnOrAfter + clock
+            // skew, so the replay tombstone must live through that same
+            // window. Expiring it at the raw NotOnOrAfter would reopen a
+            // replay interval `clock_skew` wide during which the assertion is
+            // still accepted but the cache no longer remembers it.
+            let replay_expires_at = identity
+                .not_on_or_after
+                .checked_add(input.clock_skew)
+                .ok_or_else(|| {
+                    Error::XmlParse(
+                        "Conditions NotOnOrAfter + clock_skew overflows SystemTime".to_owned(),
+                    )
+                })?;
+            let fresh = cache.check_and_insert(&identity.assertion_id, replay_expires_at)?;
             if !fresh {
                 return Err(Error::AssertionReplay);
             }
@@ -2292,6 +2305,70 @@ mod tests {
     }
 
     // ---------- replay cache ----------
+
+    #[test]
+    fn replay_cache_expiry_includes_accepted_clock_skew() {
+        #[derive(Default)]
+        struct RecordingReplayCache(std::sync::Mutex<Option<SystemTime>>);
+
+        impl ReplayCache for RecordingReplayCache {
+            fn check_and_insert(
+                &self,
+                _assertion_id: &str,
+                expires_at: SystemTime,
+            ) -> Result<bool, Error> {
+                *self.0.lock().map_err(|_poisoned| Error::ReplayCache {
+                    reason: "recording cache lock poisoned",
+                })? = Some(expires_at);
+                Ok(true)
+            }
+        }
+
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        let xml = build_signed_response_xml(
+            &kp,
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+        let cache = RecordingReplayCache::default();
+        let clock_skew = Duration::from_secs(90);
+
+        let identity = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew,
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect("valid response");
+
+        assert_eq!(
+            *cache.0.lock().expect("recorded expiry lock"),
+            identity.not_on_or_after.checked_add(clock_skew)
+        );
+    }
 
     /// End-to-end: a successful `consume_response` followed by a second
     /// call with the exact same Response (same `assertion_id`) MUST be
