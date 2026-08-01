@@ -394,12 +394,7 @@ fn verify_response_and_or_assertion(
     let assertion_signature = assertion_elem.child_element(Some(DS_NS), "Signature");
 
     let verify_response = |sig: &Element| -> Result<VerifiedSignature, Error> {
-        let verified = verify_signature(
-            document,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != response_root_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Response root",
@@ -408,12 +403,7 @@ fn verify_response_and_or_assertion(
         Ok(verified)
     };
     let verify_assertion = |sig: &Element| -> Result<VerifiedSignature, Error> {
-        let verified = verify_signature(
-            document,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != assertion_name_lookup_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Assertion",
@@ -503,12 +493,7 @@ fn handle_encrypted(
 
     let mut response_verified_fingerprint: Option<[u8; 32]> = None;
     if let Some(sig) = response_signature {
-        let verified = verify_signature(
-            document,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != response_root_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Response root",
@@ -525,12 +510,7 @@ fn handle_encrypted(
         .ok_or(Error::DecryptFailed {
             reason: "EncryptedAssertion element id not resolvable",
         })?;
-    let cleartext_assertion = decrypt_encrypted_assertion(
-        enc_elem,
-        decryption_keys,
-        &policy.allowed_data_encryption_algorithms,
-        &policy.allowed_key_transport_algorithms,
-    )?;
+    let cleartext_assertion = decrypt_encrypted_assertion(enc_elem, decryption_keys, policy)?;
 
     // ---- Re-wrap into a fresh Document so we can verify the inner signature
     // ---- via its own ElementId index. Mutating the parent document would
@@ -544,12 +524,7 @@ fn handle_encrypted(
     // the same verify-and-resolve dance; differ only on what to do when the
     // signature is absent.
     let verify_inner = |sig: &Element| -> Result<([u8; 32], Element), Error> {
-        let verified = verify_signature(
-            &decrypted_doc,
-            sig,
-            &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
-        )?;
+        let verified = verify_signature(&decrypted_doc, sig, &idp.signing_certs, policy)?;
         if verified.signed_element != assertion_root.id() {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Assertion",

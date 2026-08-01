@@ -41,7 +41,7 @@ const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 const SHA1_DIGEST_URI: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
 const SHA256_DIGEST_URI: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
-const MGF1_SHA1_URI: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha1";
+const MGF1_SHA256_URI: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha256";
 
 const ENCRYPTED_DATA_TYPE_ELEMENT: &str = "http://www.w3.org/2001/04/xmlenc#Element";
 
@@ -220,21 +220,15 @@ where
 
 /// Wrap the session key under the recipient's RSA public key.
 ///
-/// `RsaOaep` is the modern XML-Enc 1.1 variant; per the project hint and
-/// real-world IdP compatibility (Okta, Azure-AD) we use SHA-256 for the OAEP
-/// hash and SHA-1 for the MGF1 hash — matching what
-/// `KeyPair::decrypt_rsa_oaep(OaepDigest::Sha256)` accepts when decrypting
-/// (note: `decrypt_rsa_oaep` uses `rsa::Oaep::new::<T>()`, which sets *both*
-/// digests to `T`; that means for our default RsaOaep round-trip we must
-/// also use SHA-256 for *both* OAEP and MGF1, so the
-/// EncryptedKey/EncryptionMethod records SHA-256 as the digest and the MGF
-/// declaration is omitted from the tree at encrypt time. A peer that fills
-/// in MGF1-SHA1 on the wire stays compatible because the decrypt path reads
-/// the `<ds:DigestMethod>` to pick the OAEP digest and then re-uses that
-/// digest for MGF1 internally).
+/// `RsaOaep` is the modern XML-Enc 1.1 variant: `rsa::Oaep::new::<Sha256>()`
+/// sets *both* the OAEP label hash and the MGF1 hash to SHA-256. The
+/// `<xenc:EncryptionMethod>` emitted by
+/// `build_key_transport_encryption_method` therefore declares SHA-256 as the
+/// `<ds:DigestMethod>` and `mgf1sha256` as the `<xenc11:MGF>`, so a recipient
+/// reading those parameters literally reconstructs the same padding.
 ///
-/// `RsaOaepMgf1Sha1`: SHA-1 for OAEP digest *and* MGF1 (consistent with
-/// `KeyPair::decrypt_rsa_oaep(OaepDigest::Sha1)`).
+/// `RsaOaepMgf1Sha1`: SHA-1 for the OAEP digest *and* MGF1, which is what the
+/// `#rsa-oaep-mgf1p` URI pins by definition.
 fn wrap_session_key(
     public: &RsaPublicKey,
     algorithm: KeyTransportAlgorithm,
@@ -363,22 +357,20 @@ fn build_encrypted_assertion_element(
 fn build_key_transport_encryption_method(algorithm: KeyTransportAlgorithm) -> Element {
     match algorithm {
         KeyTransportAlgorithm::RsaOaep => {
-            // Modern RSA-OAEP: SHA-256 OAEP digest. Our underlying
-            // implementation uses the same digest for OAEP and MGF1 (per
-            // `KeyPair::decrypt_rsa_oaep`), so we mirror that by NOT emitting
-            // an MGF declaration that disagrees. We *do* emit a
-            // `<xenc11:MGF>` element so peers that parse it see an explicit
-            // mgf1sha1 (the historical default for `#rsa-oaep`), but our
-            // round-trip path uses SHA-256 / SHA-256 internally — this means
-            // the emitted MGF declaration is a no-op for *our* decrypt path,
-            // which always pairs MGF1 with the OAEP digest read from
-            // `<ds:DigestMethod>`. Cross-implementation compatibility is
-            // tested at the integration layer, not here.
+            // Modern RSA-OAEP: SHA-256 OAEP digest with MGF1-SHA256.
+            // `wrap_session_key` below builds the padding with
+            // `rsa::Oaep::new::<Sha256>()`, which sets *both* the OAEP label
+            // hash and the MGF1 hash to SHA-256, so the declaration must say
+            // `mgf1sha256`. Declaring `mgf1sha1` (as this did previously)
+            // misdescribes the ciphertext: a recipient that reads
+            // `<xenc11:MGF>` literally — which XML Encryption 1.1 §5.5.2
+            // requires — derives the wrong mask and fails to unwrap the
+            // session key.
             let digest = Element::build(QName::new(Some(DS_NS.to_owned()), "DigestMethod"))
                 .with_attribute(QName::new(None, "Algorithm"), SHA256_DIGEST_URI.to_owned())
                 .finish();
             let mgf = Element::build(QName::new(Some(XENC11_NS.to_owned()), "MGF"))
-                .with_attribute(QName::new(None, "Algorithm"), MGF1_SHA1_URI.to_owned())
+                .with_attribute(QName::new(None, "Algorithm"), MGF1_SHA256_URI.to_owned())
                 .finish();
             Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptionMethod"))
                 .with_attribute(QName::new(None, "Algorithm"), algorithm.uri().to_owned())

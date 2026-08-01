@@ -35,7 +35,7 @@ use saml::crypto::cert::X509Certificate;
 #[cfg(feature = "xmlenc")]
 use saml::crypto::keypair::KeyPair;
 use saml::descriptor::IdpDescriptor;
-use saml::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
+use saml::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
 use saml::error::Error;
 use saml::nameid::NameIdFormat;
 use saml::replay::ReplayMode;
@@ -445,8 +445,20 @@ const FIXTURES: &[Fixture] = &[
 fn permissive_policy() -> PeerCryptoPolicy {
     let mut allowed = SignatureAlgorithm::DEFAULTS.to_vec();
     allowed.push(SignatureAlgorithm::RsaSha1);
+    let mut allowed_digests = DigestAlgorithm::DEFAULTS.to_vec();
+    allowed_digests.push(DigestAlgorithm::Sha1);
     PeerCryptoPolicy {
         allowed_signature_algorithms: allowed,
+        // Real-world corpus fixtures carry SHA-1 digests and inclusive C14N;
+        // the corpus asserts on parser/XSW behaviour, not on policy strength,
+        // so every implemented algorithm is accepted here.
+        allowed_digest_algorithms: allowed_digests,
+        allowed_c14n_algorithms: vec![
+            C14nAlgorithm::ExclusiveCanonical,
+            C14nAlgorithm::ExclusiveCanonicalWithComments,
+            C14nAlgorithm::InclusiveCanonical,
+            C14nAlgorithm::InclusiveCanonicalWithComments,
+        ],
         #[cfg(feature = "xmlenc")]
         allowed_data_encryption_algorithms: vec![
             saml::xmlenc::algorithms::DataEncryptionAlgorithm::Aes128Gcm,
@@ -459,6 +471,13 @@ fn permissive_policy() -> PeerCryptoPolicy {
             saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
             saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaepMgf1Sha1,
             saml::xmlenc::algorithms::KeyTransportAlgorithm::RsaPkcs1V15,
+        ],
+        #[cfg(feature = "xmlenc")]
+        allowed_oaep_digest_algorithms: vec![
+            saml::OaepDigest::Sha1,
+            saml::OaepDigest::Sha256,
+            saml::OaepDigest::Sha384,
+            saml::OaepDigest::Sha512,
         ],
     }
 }

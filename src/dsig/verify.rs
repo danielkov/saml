@@ -13,7 +13,7 @@ use subtle::ConstantTimeEq;
 
 use crate::crypto::cert::X509Certificate;
 use crate::crypto::verifier::{DefaultVerifier, KeyInfo, SignatureVerifier, VerifyMatch};
-use crate::dsig::algorithms::{C14nAlgorithm, SignatureAlgorithm};
+use crate::dsig::algorithms::{C14nAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
 use crate::dsig::c14n::canonicalize;
 use crate::dsig::reference::{
     DS_NS, ancestor_chain, compute_reference_digest, decode_base64_lenient, parse_reference,
@@ -40,13 +40,13 @@ pub(crate) fn verify_signature(
     document: &Document,
     signature_element: &Element,
     candidate_certs: &[X509Certificate],
-    allowed_algorithms: &[SignatureAlgorithm],
+    policy: &PeerCryptoPolicy,
 ) -> Result<VerifiedSignature, Error> {
     verify_signature_with(
         document,
         signature_element,
         candidate_certs,
-        allowed_algorithms,
+        policy,
         &DefaultVerifier,
     )
 }
@@ -56,7 +56,7 @@ pub(crate) fn verify_signature_with(
     document: &Document,
     signature_element: &Element,
     candidate_certs: &[X509Certificate],
-    allowed_algorithms: &[SignatureAlgorithm],
+    policy: &PeerCryptoPolicy,
     verifier: &dyn SignatureVerifier,
 ) -> Result<VerifiedSignature, Error> {
     // ---- 1. Locate <ds:SignedInfo> -----------------------------------------
@@ -67,12 +67,17 @@ pub(crate) fn verify_signature_with(
         })?;
 
     // ---- 2. CanonicalizationMethod / SignatureMethod -----------------------
-    let c14n_alg = parse_c14n_method(signed_info)?;
-    let sig_alg = parse_signature_method(signed_info, allowed_algorithms)?;
+    let c14n_alg = parse_c14n_method(signed_info, &policy.allowed_c14n_algorithms)?;
+    let sig_alg = parse_signature_method(signed_info, &policy.allowed_signature_algorithms)?;
 
     // ---- 3. Exactly one Reference ------------------------------------------
     let reference_elem = single_reference(signed_info)?;
-    let parsed = parse_reference(document, reference_elem)?;
+    let parsed = parse_reference(
+        document,
+        reference_elem,
+        &policy.allowed_digest_algorithms,
+        &policy.allowed_c14n_algorithms,
+    )?;
 
     // ---- 4. Compute and compare digest -------------------------------------
     // Pass the enclosing <ds:Signature>'s ElementId so the enveloped-signature
@@ -118,7 +123,7 @@ pub(crate) fn verify_signature_with(
         &signed_info_bytes,
         &signature_bytes,
         candidate_certs,
-        allowed_algorithms,
+        &policy.allowed_signature_algorithms,
         &key_info,
     )?;
 
@@ -183,7 +188,10 @@ pub(crate) fn verify_detached_signature_with(
 // SignedInfo parsing helpers
 // =============================================================================
 
-fn parse_c14n_method(signed_info: &Element) -> Result<C14nAlgorithm, Error> {
+fn parse_c14n_method(
+    signed_info: &Element,
+    allowed_algorithms: &[C14nAlgorithm],
+) -> Result<C14nAlgorithm, Error> {
     let elem = signed_info
         .child_element(Some(DS_NS), "CanonicalizationMethod")
         .ok_or(Error::SignatureVerification {
@@ -194,7 +202,13 @@ fn parse_c14n_method(signed_info: &Element) -> Result<C14nAlgorithm, Error> {
         .ok_or(Error::SignatureVerification {
             reason: "CanonicalizationMethod missing Algorithm",
         })?;
-    C14nAlgorithm::from_uri(uri)
+    let algorithm = C14nAlgorithm::from_uri(uri)?;
+    if !allowed_algorithms.contains(&algorithm) {
+        return Err(Error::DisallowedAlgorithm {
+            alg: uri.to_owned(),
+        });
+    }
+    Ok(algorithm)
 }
 
 fn parse_signature_method(
@@ -299,8 +313,12 @@ mod tests {
 
     use crate::crypto::cert::test_vectors::*;
     use crate::crypto::keypair::KeyPair;
-    use crate::dsig::algorithms::DigestAlgorithm;
+    use crate::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy};
     use crate::xml::parse::Document;
+
+    fn strong_policy() -> PeerCryptoPolicy {
+        PeerCryptoPolicy::strong_defaults()
+    }
 
     /// Construct a SAML-shaped XML payload, sign it (locally, with the test
     /// keypair), and return the serialized XML plus the verifying cert.
@@ -325,6 +343,7 @@ mod tests {
         target_id: &str,
         body_xml: &str,
         sig_alg: SignatureAlgorithm,
+        digest_alg: DigestAlgorithm,
         c14n_alg: C14nAlgorithm,
     ) -> (String, X509Certificate) {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
@@ -342,14 +361,15 @@ mod tests {
         let chain_1 = ancestor_chain(&stage_1_doc, stage_1_doc.root().id()).unwrap();
         let canonical_root =
             canonicalize(&stage_1_doc, stage_1_doc.root(), &chain_1, c14n_alg, &[]).unwrap();
-        let reference_digest = DigestAlgorithm::Sha256.digest(&canonical_root);
+        let reference_digest = digest_alg.digest(&canonical_root);
         let reference_digest_b64 = BASE64_STANDARD.encode(&reference_digest);
 
         // ---- Stage 2: build <ds:SignedInfo>, canonicalize, sign.
         let signed_info_inner = format!(
-            r##"<ds:CanonicalizationMethod Algorithm="{c14n}"/><ds:SignatureMethod Algorithm="{sig}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="{c14n}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>"##,
+            r##"<ds:CanonicalizationMethod Algorithm="{c14n}"/><ds:SignatureMethod Algorithm="{sig}"/><ds:Reference URI="#{id}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="{c14n}"/></ds:Transforms><ds:DigestMethod Algorithm="{digest_alg}"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>"##,
             c14n = c14n_alg.uri(),
             sig = sig_alg.uri(),
+            digest_alg = digest_alg.uri(),
             id = target_id,
             digest = reference_digest_b64,
         );
@@ -390,6 +410,7 @@ mod tests {
             "root-1",
             "<Inner>payload</Inner>",
             SignatureAlgorithm::RsaSha256,
+            DigestAlgorithm::Sha256,
             C14nAlgorithm::ExclusiveCanonical,
         );
         let doc = Document::parse(xml.as_bytes()).unwrap();
@@ -401,7 +422,7 @@ mod tests {
             &doc,
             sig_elem,
             std::slice::from_ref(&cert),
-            &[SignatureAlgorithm::RsaSha256],
+            &strong_policy(),
         )
         .expect("should verify");
 
@@ -413,12 +434,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "weak-algos")]
     #[test]
-    fn rejects_when_signature_algorithm_not_in_allow_list() {
+    fn rsa_sha256_with_sha1_digest_requires_explicit_digest_opt_in() {
         let (xml, cert) = sign_test_root(
             "root-1",
             "<Inner>payload</Inner>",
             SignatureAlgorithm::RsaSha256,
+            DigestAlgorithm::Sha1,
             C14nAlgorithm::ExclusiveCanonical,
         );
         let doc = Document::parse(xml.as_bytes()).unwrap();
@@ -427,11 +450,69 @@ mod tests {
         let err = verify_signature(
             &doc,
             sig_elem,
-            &[cert],
-            // Allow only RsaSha512 — does not include the signed algorithm.
-            &[SignatureAlgorithm::RsaSha512],
+            std::slice::from_ref(&cert),
+            &strong_policy(),
         )
-        .expect_err("should reject disallowed algorithm");
+        .expect_err("strong digest policy must reject SHA-1");
+        assert!(matches!(
+            err,
+            Error::DisallowedAlgorithm { ref alg }
+                if alg == "http://www.w3.org/2000/09/xmldsig#sha1"
+        ));
+
+        let mut permissive_policy = strong_policy();
+        permissive_policy
+            .allowed_digest_algorithms
+            .push(DigestAlgorithm::Sha1);
+        verify_signature(&doc, sig_elem, &[cert], &permissive_policy)
+            .expect("an explicit SHA-1 digest opt-in should accept the valid signature");
+    }
+
+    #[test]
+    fn inclusive_signed_info_c14n_requires_explicit_opt_in() {
+        let xml = format!(
+            r#"<ds:SignedInfo xmlns:ds="{DS_NS}">
+                  <ds:CanonicalizationMethod Algorithm="{}"/>
+                </ds:SignedInfo>"#,
+            C14nAlgorithm::InclusiveCanonical.uri()
+        );
+        let doc = Document::parse(xml.as_bytes()).unwrap();
+
+        let err = parse_c14n_method(doc.root(), C14nAlgorithm::DEFAULTS)
+            .expect_err("strong C14N policy must reject inclusive C14N");
+        assert!(matches!(
+            err,
+            Error::DisallowedAlgorithm { ref alg }
+                if alg == C14nAlgorithm::InclusiveCanonical.uri()
+        ));
+
+        let permissive_c14n = [
+            C14nAlgorithm::ExclusiveCanonical,
+            C14nAlgorithm::InclusiveCanonical,
+        ];
+        assert_eq!(
+            parse_c14n_method(doc.root(), &permissive_c14n).unwrap(),
+            C14nAlgorithm::InclusiveCanonical
+        );
+    }
+
+    #[test]
+    fn rejects_when_signature_algorithm_not_in_allow_list() {
+        let (xml, cert) = sign_test_root(
+            "root-1",
+            "<Inner>payload</Inner>",
+            SignatureAlgorithm::RsaSha256,
+            DigestAlgorithm::Sha256,
+            C14nAlgorithm::ExclusiveCanonical,
+        );
+        let doc = Document::parse(xml.as_bytes()).unwrap();
+        let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
+
+        let mut policy = strong_policy();
+        policy.allowed_signature_algorithms = vec![SignatureAlgorithm::RsaSha512];
+
+        let err = verify_signature(&doc, sig_elem, &[cert], &policy)
+            .expect_err("should reject disallowed algorithm");
         assert!(matches!(err, Error::DisallowedAlgorithm { .. }));
     }
 
@@ -443,13 +524,14 @@ mod tests {
             "root-1",
             "<Inner>payload</Inner>",
             SignatureAlgorithm::RsaSha256,
+            DigestAlgorithm::Sha256,
             C14nAlgorithm::ExclusiveCanonical,
         );
         let tampered = xml.replace("payload", "TAMPERED");
         let doc = Document::parse(tampered.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
 
-        let err = verify_signature(&doc, sig_elem, &[cert], &[SignatureAlgorithm::RsaSha256])
+        let err = verify_signature(&doc, sig_elem, &[cert], &strong_policy())
             .expect_err("should reject tampered digest");
         assert!(
             matches!(
@@ -488,7 +570,7 @@ mod tests {
         </Root>"##;
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
-        let err = verify_signature(&doc, sig_elem, &[], &[SignatureAlgorithm::RsaSha256])
+        let err = verify_signature(&doc, sig_elem, &[], &strong_policy())
             .expect_err("multi-reference must be rejected");
         assert!(
             matches!(
@@ -524,7 +606,7 @@ mod tests {
         </Root>"##;
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
-        let err = verify_signature(&doc, sig_elem, &[], &[SignatureAlgorithm::RsaSha256])
+        let err = verify_signature(&doc, sig_elem, &[], &strong_policy())
             .expect_err("XSLT transform must be rejected");
         assert!(matches!(err, Error::DisallowedTransform { .. }));
     }
@@ -534,7 +616,7 @@ mod tests {
         let xml = r#"<Root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Signature/></Root>"#;
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
-        let err = verify_signature(&doc, sig_elem, &[], &[SignatureAlgorithm::RsaSha256])
+        let err = verify_signature(&doc, sig_elem, &[], &strong_policy())
             .expect_err("missing SignedInfo must be rejected");
         assert!(matches!(
             err,
@@ -558,7 +640,7 @@ mod tests {
         </Root>"#;
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
-        let err = verify_signature(&doc, sig_elem, &[], &[SignatureAlgorithm::RsaSha256])
+        let err = verify_signature(&doc, sig_elem, &[], &strong_policy())
             .expect_err("unknown SignatureMethod must be rejected");
         assert!(matches!(err, Error::DisallowedAlgorithm { .. }));
     }
@@ -573,6 +655,7 @@ mod tests {
             "root-1",
             "<Inner>payload</Inner>",
             SignatureAlgorithm::RsaSha256,
+            DigestAlgorithm::Sha256,
             C14nAlgorithm::ExclusiveCanonical,
         );
         let doc = Document::parse(xml.as_bytes()).unwrap();
@@ -685,12 +768,13 @@ mod tests {
             "root-1",
             "<Inner>payload</Inner>",
             SignatureAlgorithm::RsaSha256,
+            DigestAlgorithm::Sha256,
             C14nAlgorithm::ExclusiveCanonical,
         );
         let doc = Document::parse(xml.as_bytes()).unwrap();
         let sig_elem = doc.find_first(Some(DS_NS), "Signature").unwrap();
-        let verified = verify_signature(&doc, sig_elem, &[cert], &[SignatureAlgorithm::RsaSha256])
-            .expect("should verify");
+        let verified =
+            verify_signature(&doc, sig_elem, &[cert], &strong_policy()).expect("should verify");
 
         let resolved = doc.element(verified.signed_element).expect("element by id");
         assert_eq!(resolved.qname().local(), "Root");

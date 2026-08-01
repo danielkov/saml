@@ -784,7 +784,7 @@ impl ServiceProvider {
             &decoded,
             binding,
             &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
+            policy,
             self.config.logout_want_signed.responses,
         )?;
 
@@ -861,7 +861,7 @@ impl ServiceProvider {
             &decoded,
             binding,
             &idp.signing_certs,
-            &policy.allowed_signature_algorithms,
+            policy,
             self.config.logout_want_signed.requests,
         )?;
 
@@ -1043,12 +1043,7 @@ impl ServiceProvider {
                 .root()
                 .child_element(Some(DS_NS), "Signature")
                 .ok_or(Error::SignatureMissing)?;
-            let verified = verify_signature(
-                &inner_doc,
-                sig,
-                &idp.signing_certs,
-                &policy.allowed_signature_algorithms,
-            )?;
+            let verified = verify_signature(&inner_doc, sig, &idp.signing_certs, policy)?;
             if verified.signed_element != inner_doc.root().id() {
                 return Err(Error::SignatureVerification {
                     reason: "signature does not cover LogoutResponse root",
@@ -1056,12 +1051,7 @@ impl ServiceProvider {
             }
         } else if let Some(sig) = inner_doc.root().child_element(Some(DS_NS), "Signature") {
             // Signature present but not required: still verify if present.
-            let _ = verify_signature(
-                &inner_doc,
-                sig,
-                &idp.signing_certs,
-                &policy.allowed_signature_algorithms,
-            )?;
+            let _ = verify_signature(&inner_doc, sig, &idp.signing_certs, policy)?;
         }
 
         Ok(parsed.to_outcome())
@@ -1267,7 +1257,7 @@ fn verify_inbound_signature(
     decoded: &DecodedSlo,
     binding: Binding,
     signing_certs: &[crate::crypto::cert::X509Certificate],
-    allowed_algorithms: &[SignatureAlgorithm],
+    policy: &PeerCryptoPolicy,
     require_signature: bool,
 ) -> Result<(), Error> {
     match binding {
@@ -1284,7 +1274,7 @@ fn verify_inbound_signature(
                         sig,
                         sig_alg,
                         signing_certs,
-                        allowed_algorithms,
+                        &policy.allowed_signature_algorithms,
                     )?;
                     Ok(())
                 }
@@ -1301,8 +1291,7 @@ fn verify_inbound_signature(
             let sig_elem = document.root().child_element(Some(DS_NS), "Signature");
             match sig_elem {
                 Some(sig) => {
-                    let verified =
-                        verify_signature(document, sig, signing_certs, allowed_algorithms)?;
+                    let verified = verify_signature(document, sig, signing_certs, policy)?;
                     if verified.signed_element != document.root().id() {
                         return Err(Error::SignatureVerification {
                             reason: "signature does not cover message root",
@@ -2816,7 +2805,7 @@ mod tests {
         use crate::binding::artifact::VerifyConfig;
         use crate::binding::soap;
         use crate::dsig::algorithms::C14nAlgorithm;
-        use crate::http::{HttpRequest, HttpResponse};
+        use crate::http::{HttpClient, HttpRequest, HttpResponse};
         use std::future::Future;
         use std::time::Duration;
 
@@ -2948,6 +2937,7 @@ mod tests {
             let sp = artifact_sp();
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
+            let policy = PeerCryptoPolicy::strong_defaults();
             let client = MockClient {
                 response: signed_envelope(false),
             };
@@ -2956,7 +2946,7 @@ mod tests {
                 sign: None,
                 verify: Some(VerifyConfig {
                     certs: &certs,
-                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    policy: &policy,
                     require_signed: true,
                 }),
             };
@@ -2986,6 +2976,7 @@ mod tests {
             let sp = artifact_sp();
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
+            let policy = PeerCryptoPolicy::strong_defaults();
             let client = MockClient {
                 response: signed_envelope(true),
             };
@@ -2994,7 +2985,7 @@ mod tests {
                 sign: None,
                 verify: Some(VerifyConfig {
                     certs: &certs,
-                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    policy: &policy,
                     require_signed: true,
                 }),
             };
@@ -3015,6 +3006,7 @@ mod tests {
             let sp = artifact_sp();
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
+            let policy = PeerCryptoPolicy::strong_defaults();
             // Build an unsigned ArtifactResponse envelope via the binding helper.
             let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
             let unsigned = crate::binding::artifact::build_artifact_response(
@@ -3030,7 +3022,7 @@ mod tests {
                 sign: None,
                 verify: Some(VerifyConfig {
                     certs: &certs,
-                    allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+                    policy: &policy,
                     require_signed: true,
                 }),
             };
