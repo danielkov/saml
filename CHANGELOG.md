@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.1-alpha.2] - 2026-08-08
+
+### Fixed
+
+- Preserve each SAML `AudienceRestriction` as a separate group. Validation now
+  applies OR within each group and AND across groups, as required by SAML Core
+  §2.5.1.4. This prevents an assertion from passing when the service provider
+  satisfies only one of multiple restrictions.
+
+### Changed
+
+- **Breaking:** replace `Conditions::audiences: Vec<String>` with
+  `Conditions::audience_restrictions: Vec<Vec<String>>`. The flat field could
+  not represent the grouping required for correct audience validation.
+
+[0.0.1-alpha.2]: https://github.com/danielkov/saml/releases/tag/v0.0.1-alpha.2
+
 ## [0.0.1-alpha.1] - 2026-05-29
 
 ### Added

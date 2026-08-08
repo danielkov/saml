@@ -50,6 +50,5 @@ Both one-time prerequisites are **done**:
   reviewer, deployments restricted to `v*` tags) were configured on
   2026-07-06.
 
-`v0.0.1-alpha.0` predates the tag-driven flow and has no git tag; the next
-release (`v0.0.1-alpha.1`, version already in `Cargo.toml`) is the first to
-go through it end to end.
+`v0.0.1-alpha.0` predates the tag-driven flow and has no git tag.
+`v0.0.1-alpha.1` completed the tag-driven flow on 2026-07-06.
