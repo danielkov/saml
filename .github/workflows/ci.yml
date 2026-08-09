@@ -201,6 +201,47 @@ jobs:
         run: cargo test --workspace --exclude saml-keycloak-example
 
   # ---------------------------------------------------------------------------
+  # The artifact binding must not drag in weak signature/digest algorithms.
+  #
+  # Package-scoped on purpose. The matrix jobs above all run `--workspace`,
+  # which resolves the union of every member's features — `fuzz` depends on
+  # `saml` with `default-features = true` — so a `--workspace` run cannot
+  # demonstrate this isolation no matter what flags are appended to it.
+  #
+  # Building and testing is also not sufficient on its own: both would still
+  # pass if `artifact-binding` quietly re-enabled `weak-algos`. The resolved
+  # feature graph is asserted explicitly.
+  # ---------------------------------------------------------------------------
+  artifact-isolation:
+    name: artifact-binding without weak-algos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: artifact-isolation
+      - name: resolved feature graph excludes saml/weak-algos
+        run: |
+          set -euo pipefail
+          feats=$(cargo tree -p saml --no-default-features \
+                    --features artifact-binding -f "{f}" --depth 0 | head -1)
+          echo "resolved saml features: ${feats}"
+          case ",${feats}," in
+            *,weak-algos,*)
+              echo "::error::artifact-binding re-enabled saml/weak-algos"
+              exit 1
+              ;;
+          esac
+      - name: cargo test -p saml (artifact-binding only)
+        run: cargo test -p saml --no-default-features --features artifact-binding
+      - name: cargo clippy -p saml (artifact-binding only)
+        run: |
+          cargo clippy -p saml --all-targets --no-default-features \
+            --features artifact-binding -- -D warnings
+
+  # ---------------------------------------------------------------------------
   # Documentation must build cleanly.
   # ---------------------------------------------------------------------------
   doc:

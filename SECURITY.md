@@ -48,10 +48,15 @@ SAML peer on the wire. The following classes are explicitly in scope:
 - **Replay** — `ConsumeResponse::replay_cache` exposes a `ReplayCache` trait
   with an in-memory default. Assertion `ID` deduplication is performed after
   signature verification so malformed payloads cannot pollute the store.
-- **Weak-crypto downgrade** — SHA-1, RSA-PKCS1-v1.5 key transport, and
-  DSA-SHA1 are gated behind the `weak-algos` Cargo feature, off by default.
+- **Weak-crypto downgrade** — SHA-1 signature and digest algorithms
+  (RSA-SHA1, DSA-SHA1, `DigestAlgorithm::Sha1`) and RSA-PKCS1-v1.5 key
+  transport are gated behind the `weak-algos` Cargo feature, off by default.
   The per-peer `PeerCryptoPolicy` allow-list still gates acceptance at
-  validation time even when `weak-algos` is compiled in.
+  validation time even when `weak-algos` is compiled in. The `sha1` crate
+  itself is not a proxy for this: `artifact-binding` enables it independently
+  for the artifact `SourceID` (SAML 2.0 Bindings §3.6.4), a routing tag where
+  a collision misroutes rather than forges. Audit the enabled Cargo features
+  rather than the dependency graph.
 - **Signature wrapping via transforms** — the XML-DSig `Transform` allow-list
   rejects XSLT, XPath, and base64 transforms. Multi-`Reference` signatures
   are rejected by default.
