@@ -19,7 +19,9 @@ pub struct Identity {
     pub session_not_on_or_after: Option<SystemTime>,
     pub authn_context_class_ref: Option<String>,
     pub attributes: Vec<Attribute>,
-    /// For replay defense — dedupe on this until `not_on_or_after`.
+    /// For replay defense, retain this ID until `not_on_or_after` plus the
+    /// clock skew used for response validation. If the time calculation
+    /// fails, reject the assertion.
     pub assertion_id: String,
     pub not_on_or_after: SystemTime,
     /// Cert that verified the assertion signature. For key-rotation logging.
@@ -30,7 +32,8 @@ pub struct Identity {
     /// assertion regardless of `not_on_or_after`. The library does not
     /// enforce this directive itself; the caller is responsible for plugging
     /// in a replay cache (dedupe by `assertion_id`) and rejecting repeats
-    /// until at least `not_on_or_after`. Note that single-use is *stricter*
+    /// until `not_on_or_after` plus the clock skew used for response
+    /// validation. Note that single-use is *stricter*
     /// than ordinary expiry-bounded replay defense: even within the validity
     /// window the assertion is good for exactly one consumption.
     pub is_one_time_use: bool,

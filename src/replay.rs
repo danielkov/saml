@@ -40,6 +40,11 @@ use crate::error::Error;
 /// - It returns `Ok(false)` when the same `assertion_id` was previously
 ///   inserted AND has not yet expired — this is a replay, and the SP will
 ///   surface it as [`Error::AssertionReplay`].
+/// - `expires_at` is the last instant the assertion can still pass
+///   validation — the assertion's `NotOnOrAfter` plus the `clock_skew` the
+///   SP validated it under, not the raw `NotOnOrAfter`. Implementations MUST
+///   retain the entry until then; dropping it earlier reopens a replay
+///   window during which the assertion still validates.
 /// - Backend failures (e.g. a network blip against a Redis-backed store)
 ///   should be returned as [`Error`] variants — typically
 ///   [`Error::ReplayCache`] — and the SP will propagate them unchanged.
@@ -79,7 +84,7 @@ pub trait ReplayCache: Send + Sync {
 /// Failing closed is the safer default: under load the SP refuses new
 /// logins rather than risk accepting a replay of an entry it forgot.
 /// Tune `capacity` to comfortably exceed `peak_logins_per_second *
-/// max_assertion_lifetime_seconds`.
+/// (max_assertion_lifetime_seconds + clock_skew_seconds)`.
 #[derive(Debug)]
 pub struct InMemoryReplayCache {
     capacity: usize,
