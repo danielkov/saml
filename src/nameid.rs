@@ -65,6 +65,16 @@ pub struct NameId {
     pub value: String,
     pub format: NameIdFormat,
     pub name_qualifier: Option<String>,
+    /// `SPNameQualifier` — the entity the identifier is scoped to.
+    ///
+    /// On the IdP issue path this is taken verbatim when set, and is **not**
+    /// checked against the SP being issued to. For [`NameIdFormat::Persistent`]
+    /// it is the privacy boundary that stops two SPs correlating the same
+    /// subject, so setting it to anything other than the recipient's entity ID
+    /// hands that SP an identifier minted for someone else. Leave it `None` to
+    /// get the safe default (the recipient's entity ID); set it only when
+    /// deliberately issuing an identifier scoped to an affiliation or to a
+    /// downstream SP in a proxy chain.
     pub sp_name_qualifier: Option<String>,
     pub sp_provided_id: Option<String>,
 }
