@@ -1393,14 +1393,8 @@ mod tests {
             .find_first(Some("http://www.w3.org/2000/09/xmldsig#"), "SignedInfo")
             .expect("SignedInfo present in envelope");
         let si_chain = ancestor_chain(&placeholder_doc, signed_info_elem.id()).unwrap();
-        let si_canonical = canonicalize(
-            &placeholder_doc,
-            signed_info_elem,
-            &si_chain,
-            c14n_alg,
-            &[],
-        )
-        .unwrap();
+        let si_canonical =
+            canonicalize(&placeholder_doc, signed_info_elem, &si_chain, c14n_alg, &[]).unwrap();
         let sig_bytes = kp.sign(sig_alg, &si_canonical).unwrap();
         let sig_b64 = BASE64_STANDARD.encode(&sig_bytes);
 

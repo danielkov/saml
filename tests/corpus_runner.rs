@@ -35,7 +35,9 @@ use saml::crypto::cert::X509Certificate;
 #[cfg(feature = "xmlenc")]
 use saml::crypto::keypair::KeyPair;
 use saml::descriptor::IdpDescriptor;
-use saml::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
+use saml::dsig::algorithms::{
+    C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
+};
 use saml::error::Error;
 use saml::nameid::NameIdFormat;
 use saml::replay::ReplayMode;

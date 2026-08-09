@@ -442,12 +442,14 @@ pub(crate) struct DeclaredOaepParams {
 impl DeclaredOaepParams {
     /// The message digest actually used, after applying the §5.5.2 default.
     pub(crate) fn effective_digest(self) -> crate::crypto::keypair::OaepDigest {
-        self.digest.unwrap_or(crate::crypto::keypair::OaepDigest::Sha1)
+        self.digest
+            .unwrap_or(crate::crypto::keypair::OaepDigest::Sha1)
     }
 
     /// The MGF1 hash actually used, after applying the §5.5.2 default.
     pub(crate) fn effective_mgf1(self) -> crate::crypto::keypair::OaepDigest {
-        self.mgf1.unwrap_or(crate::crypto::keypair::OaepDigest::Sha1)
+        self.mgf1
+            .unwrap_or(crate::crypto::keypair::OaepDigest::Sha1)
     }
 }
 
@@ -482,10 +484,8 @@ pub(crate) fn encrypt_assertion_with_declared_oaep_params(
 
     // Wrap with the effective parameters — the same `oaep_padding` mapping the
     // decrypt side uses, so a round-trip proves both directions agree.
-    let padding = crate::crypto::keypair::oaep_padding(
-        params.effective_digest(),
-        params.effective_mgf1(),
-    )?;
+    let padding =
+        crate::crypto::keypair::oaep_padding(params.effective_digest(), params.effective_mgf1())?;
     let mut rng = OsRng;
     let wrapped_key_bytes = padding
         .encrypt(&mut rng, &rsa_public, &session_key)

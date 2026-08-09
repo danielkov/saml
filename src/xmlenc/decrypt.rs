@@ -234,9 +234,11 @@ fn mgf1_digest_from_method(encryption_method: &Element) -> Result<Option<OaepDig
     let Some(mgf) = encryption_method.child_element(Some(XENC11_NS), "MGF") else {
         return Ok(None);
     };
-    let uri = mgf.attribute(None, "Algorithm").ok_or(Error::DecryptFailed {
-        reason: "missing MGF/@Algorithm",
-    })?;
+    let uri = mgf
+        .attribute(None, "Algorithm")
+        .ok_or(Error::DecryptFailed {
+            reason: "missing MGF/@Algorithm",
+        })?;
     OaepDigest::from_mgf1_uri(uri).map(Some)
 }
 
@@ -770,7 +772,11 @@ mod tests {
     fn strong_defaults_split_the_two_oaep_axes() {
         let policy = strong_policy();
 
-        assert!(!policy.allowed_oaep_digest_algorithms.contains(&OaepDigest::Sha1));
+        assert!(
+            !policy
+                .allowed_oaep_digest_algorithms
+                .contains(&OaepDigest::Sha1)
+        );
         assert!(
             policy
                 .allowed_oaep_mgf1_digest_algorithms
