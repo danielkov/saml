@@ -260,13 +260,30 @@ pub struct PeerCryptoPolicy {
     /// Inbound XML-Enc key-transport algorithms.
     #[cfg(feature = "xmlenc")]
     pub allowed_key_transport_algorithms: Vec<crate::xmlenc::algorithms::KeyTransportAlgorithm>,
-    /// Inbound RSA-OAEP digest algorithms, independent of key-transport URI.
+    /// Inbound RSA-OAEP *message-digest* algorithms — the OAEP label hash
+    /// named by `<ds:DigestMethod>`.
     ///
-    /// A modern `rsa-oaep` transport can explicitly request SHA-1, while the
-    /// legacy `rsa-oaep-mgf1p` URI implies it. Both forms require this
-    /// allow-list to contain [`crate::OaepDigest::Sha1`].
+    /// Independent of the key-transport URI: `<ds:DigestMethod>` selects this
+    /// hash under both `rsa-oaep` and the legacy `rsa-oaep-mgf1p` (which
+    /// fixes only the mask-generation function), defaulting to SHA-1 when the
+    /// element is absent. Also independent of
+    /// [`allowed_oaep_mgf1_digest_algorithms`], per RFC 8017 Appendix A.2.1,
+    /// which makes `hashAlgorithm` and `maskGenAlgorithm` separate
+    /// parameters.
+    ///
+    /// [`allowed_oaep_mgf1_digest_algorithms`]: Self::allowed_oaep_mgf1_digest_algorithms
     #[cfg(feature = "xmlenc")]
     pub allowed_oaep_digest_algorithms: Vec<crate::crypto::keypair::OaepDigest>,
+    /// Inbound RSA-OAEP *MGF1* digest algorithms — the hash inside the mask
+    /// generation function named by `<xenc11:MGF>`.
+    ///
+    /// Kept separate from [`allowed_oaep_digest_algorithms`] so a peer can be
+    /// allowed the extremely common SHA-256 + MGF1-SHA1 combination without
+    /// SHA-1 thereby becoming acceptable as the message digest.
+    ///
+    /// [`allowed_oaep_digest_algorithms`]: Self::allowed_oaep_digest_algorithms
+    #[cfg(feature = "xmlenc")]
+    pub allowed_oaep_mgf1_digest_algorithms: Vec<crate::crypto::keypair::OaepDigest>,
 }
 
 impl PeerCryptoPolicy {
@@ -281,7 +298,12 @@ impl PeerCryptoPolicy {
     /// - Data encryption: AES-128-GCM and AES-256-GCM (CBC is compatibility opt-in).
     /// - Key transport: RSA-OAEP only (MGF1-SHA1 and RSA-PKCS1-v1.5 are
     ///   compatibility / `weak-algos` opt-ins respectively).
-    /// - OAEP digests: SHA-{256,384,512}; SHA-1 is a compatibility opt-in.
+    /// - OAEP message digests: SHA-{256,384,512}; SHA-1 is a compatibility
+    ///   opt-in.
+    /// - OAEP MGF1 digests: SHA-1 plus SHA-{256,384,512}. MGF1-SHA1 is the
+    ///   RFC 8017 / XML Encryption 1.1 default and is a separate parameter
+    ///   from the message digest — see
+    ///   [`OaepDigest::MGF1_DEFAULTS`](crate::OaepDigest::MGF1_DEFAULTS).
     pub fn strong_defaults() -> Self {
         Self {
             allowed_signature_algorithms: SignatureAlgorithm::DEFAULTS.to_vec(),
@@ -298,6 +320,9 @@ impl PeerCryptoPolicy {
             ],
             #[cfg(feature = "xmlenc")]
             allowed_oaep_digest_algorithms: crate::crypto::keypair::OaepDigest::DEFAULTS.to_vec(),
+            #[cfg(feature = "xmlenc")]
+            allowed_oaep_mgf1_digest_algorithms: crate::crypto::keypair::OaepDigest::MGF1_DEFAULTS
+                .to_vec(),
         }
     }
 

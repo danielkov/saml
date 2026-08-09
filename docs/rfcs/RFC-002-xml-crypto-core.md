@@ -301,7 +301,7 @@ pub enum DataEncryptionAlgorithm {
 #[non_exhaustive]
 pub enum KeyTransportAlgorithm {
     RsaOaep,           // http://www.w3.org/2009/xmlenc11#rsa-oaep; OAEP digest from <ds:DigestMethod>, MGF from <xenc11:MGF>
-    RsaOaepMgf1Sha1,   // legacy IdPs; the URI pins SHA-1 OAEP + MGF1-SHA1
+    RsaOaepMgf1Sha1,   // legacy IdPs; the URI pins MGF1-SHA1 only — <ds:DigestMethod> still selects the message digest
     #[cfg(feature = "weak-algos")] RsaPkcs1V15,
 }
 ```
@@ -325,14 +325,20 @@ pub struct PeerCryptoPolicy {
     /// Inbound XML-Enc key-transport algorithms.
     pub allowed_key_transport_algorithms: Vec<KeyTransportAlgorithm>,
     /// Inbound RSA-OAEP digests, covering both the `<ds:DigestMethod>` label
-    /// hash and the `<xenc11:MGF>` mask-generation hash.
+    /// message digest (`<ds:DigestMethod>`).
     pub allowed_oaep_digest_algorithms: Vec<OaepDigest>,
+    /// Inbound RSA-OAEP MGF1 digests (`<xenc11:MGF>`). Separate from the
+    /// message digest per RFC 8017 A.2.1, so SHA-256 + MGF1-SHA1 can be
+    /// permitted without admitting SHA-1 as the message digest.
+    pub allowed_oaep_mgf1_digest_algorithms: Vec<OaepDigest>,
 }
 
 impl PeerCryptoPolicy {
     /// Strong defaults: signature algorithms from `SignatureAlgorithm::DEFAULTS`,
     /// SHA-2 Reference digests, exclusive C14N without comments, AES-GCM data
-    /// encryption, RSA-OAEP key transport, and SHA-2 OAEP/MGF digests. CBC,
+    /// encryption, RSA-OAEP key transport, SHA-2 OAEP message digests, and
+    /// SHA-1 + SHA-2 MGF1 digests (MGF1-SHA1 is the RFC 8017 default and
+    /// the §5.5.2 default for an omitted `<xenc11:MGF>`). CBC,
     /// inclusive/with-comments C14N, and RSA-OAEP-MGF1-SHA1 are compatibility
     /// opt-ins; RSA-PKCS1-v1.5 requires `weak-algos` and an explicit peer policy.
     pub fn strong_defaults() -> Self;
@@ -405,7 +411,18 @@ pub(crate) fn encrypt_assertion(
 
 Defaults: `Aes256Gcm` + `RsaOaep` with a SHA-256 OAEP digest and MGF1-SHA256. The defaults reflect modern recommendations; `Aes128Cbc` and `RsaOaepMgf1Sha1` are kept for compatibility, not promoted.
 
-Per XML Encryption 1.1 §5.5.2 the OAEP label hash and the MGF1 hash are independent parameters: `<ds:DigestMethod>` names the first, `<xenc11:MGF>` the second. Both are parsed and enforced against `allowed_oaep_digest_algorithms`, and a declared MGF is honored rather than being derived from `<ds:DigestMethod>` — otherwise a peer could declare MGF1-SHA1 under a SHA-256 digest and have the declaration silently ignored. Outbound `#rsa-oaep` declares `mgf1sha256`, matching the padding this crate actually builds; declaring `mgf1sha1` there would misdescribe the ciphertext and break any recipient that reads the parameter literally. When `<xenc11:MGF>` is absent the MGF1 hash defaults to the OAEP digest for `#rsa-oaep`, and to SHA-1 for `#rsa-oaep-mgf1p` (which the URI pins by definition).
+Per XML Encryption 1.1 §5.5.2 and RFC 8017 Appendix A.2.1, the OAEP message digest (`hashAlgorithm`) and the MGF1 hash (`maskGenAlgorithm`) are independent parameters: `<ds:DigestMethod>` names the first, `<xenc11:MGF>` the second. They are policed by separate allow-lists, so a peer can be permitted SHA-256 + MGF1-SHA1 — by far the most common real-world pairing — without SHA-1 thereby becoming acceptable as the message digest.
+
+Both standard defaults are resolved from the XML *before* policy is applied, so a declaration is never reinterpreted to fit the allow-list:
+
+| Element | Absent under `#rsa-oaep` | Absent under `#rsa-oaep-mgf1p` |
+| --- | --- | --- |
+| `<ds:DigestMethod>` | SHA-1 | SHA-1 |
+| `<xenc11:MGF>` | MGF1-SHA1 | MGF1-SHA1 (element is not permitted at all) |
+
+The legacy `#rsa-oaep-mgf1p` URI fixes only the mask generation function. `<ds:DigestMethod>` still selects the message digest under it, so a legacy-URI message explicitly naming SHA-256 is conformant and is decrypted as such; pinning that path to SHA-1 rejected valid senders. Because the URI already determines the MGF, an explicit `<xenc11:MGF>` child is rejected outright there — §3.2 requires an error for a child element the selected algorithm does not permit — rather than being accepted when it happens to agree.
+
+Outbound `#rsa-oaep` declares a SHA-256 `<ds:DigestMethod>` and `mgf1sha256`, matching the padding this crate actually builds; declaring `mgf1sha1` there would misdescribe the ciphertext and break any recipient that reads the parameter literally.
 
 ### 7.3 Bleichenbacher hardening
 

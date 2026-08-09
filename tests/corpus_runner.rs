@@ -479,6 +479,13 @@ fn permissive_policy() -> PeerCryptoPolicy {
             saml::OaepDigest::Sha384,
             saml::OaepDigest::Sha512,
         ],
+        #[cfg(feature = "xmlenc")]
+        allowed_oaep_mgf1_digest_algorithms: vec![
+            saml::OaepDigest::Sha1,
+            saml::OaepDigest::Sha256,
+            saml::OaepDigest::Sha384,
+            saml::OaepDigest::Sha512,
+        ],
     }
 }
 

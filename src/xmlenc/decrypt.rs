@@ -109,64 +109,66 @@ pub(crate) fn decrypt_encrypted_assertion(
         });
     }
 
-    // -- 4. Choose the OAEP digest from <ds:DigestMethod> when applicable. --
-    let oaep_digest = match key_transport_algorithm {
-        KeyTransportAlgorithm::RsaOaep => oaep_digest_from_method(key_em)?,
-        KeyTransportAlgorithm::RsaOaepMgf1Sha1 => OaepDigest::Sha1,
-        #[cfg(feature = "weak-algos")]
-        KeyTransportAlgorithm::RsaPkcs1V15 => OaepDigest::Sha256, // unused
-    };
-    if matches!(
-        key_transport_algorithm,
-        KeyTransportAlgorithm::RsaOaep | KeyTransportAlgorithm::RsaOaepMgf1Sha1
-    ) && !policy.allowed_oaep_digest_algorithms.contains(&oaep_digest)
-    {
-        return Err(Error::DisallowedAlgorithm {
-            alg: oaep_digest.uri().to_owned(),
-        });
-    }
-
-    // -- 4b. Resolve the MGF1 hash from <xenc11:MGF> (XML Encryption 1.1
-    // §5.5.2). The MGF is an independent OAEP parameter, so a declared weak
-    // MGF must be policed on its own: deriving it from <ds:DigestMethod>
-    // would let a peer request MGF1-SHA1 under a SHA-256 digest and have the
-    // declaration silently ignored.
+    // -- 4. Resolve the two OAEP hashes.
     //
-    // Defaults when the element is absent:
-    //   - `#rsa-oaep-mgf1p`: the URI itself pins MGF1-SHA1.
-    //   - `#rsa-oaep`: the OAEP digest. XML Encryption 1.1 nominates
-    //     MGF1-SHA1, but adopting that as the default here would reject
-    //     same-hash senders that omit the element, and it would pull SHA-1
-    //     into every OAEP exchange. Senders wanting MGF1-SHA1 with a stronger
-    //     digest must therefore say so explicitly, which this code honours.
-    let mgf1_digest = match key_transport_algorithm {
+    // XML Encryption 1.1 §5.5.2 and RFC 8017 Appendix A.2.1 make the message
+    // digest (`hashAlgorithm`) and the mask-generation hash
+    // (`maskGenAlgorithm`) independent parameters. Both standard defaults are
+    // resolved from the XML *first*; policy is applied to the resolved values
+    // afterwards, so a peer's declaration is never reinterpreted to fit the
+    // allow-list.
+    //
+    //   - `<ds:DigestMethod>` selects the message digest under *both*
+    //     transport URIs, defaulting to SHA-1 when absent. The legacy
+    //     `#rsa-oaep-mgf1p` URI fixes only the mask generation function, so
+    //     pinning its message digest to SHA-1 would reject conformant
+    //     senders that explicitly select SHA-256.
+    //   - `<xenc11:MGF>` selects the MGF1 hash under `#rsa-oaep`, defaulting
+    //     to MGF1-SHA1 when absent. Under `#rsa-oaep-mgf1p` the URI already
+    //     fixes MGF1-SHA1 and the element is not permitted at all (§3.2
+    //     requires an error for a child the selected algorithm disallows).
+    let oaep_digest = match key_transport_algorithm {
         KeyTransportAlgorithm::RsaOaep | KeyTransportAlgorithm::RsaOaepMgf1Sha1 => {
-            let declared = mgf1_digest_from_method(key_em)?;
-            let default = match key_transport_algorithm {
-                KeyTransportAlgorithm::RsaOaepMgf1Sha1 => OaepDigest::Sha1,
-                _ => oaep_digest,
-            };
-            let resolved = declared.unwrap_or(default);
-            if !policy.allowed_oaep_digest_algorithms.contains(&resolved) {
-                return Err(Error::DisallowedAlgorithm {
-                    alg: resolved.mgf1_uri().to_owned(),
-                });
-            }
-            // `#rsa-oaep-mgf1p` fixes MGF1-SHA1 by definition; an explicit
-            // element disagreeing with the URI is a contradictory message
-            // rather than a supported combination.
-            if key_transport_algorithm == KeyTransportAlgorithm::RsaOaepMgf1Sha1
-                && resolved != OaepDigest::Sha1
-            {
-                return Err(Error::DecryptFailed {
-                    reason: "rsa-oaep-mgf1p declares a non-SHA-1 MGF",
-                });
-            }
-            resolved
+            oaep_digest_from_method(key_em)?
         }
         #[cfg(feature = "weak-algos")]
         KeyTransportAlgorithm::RsaPkcs1V15 => OaepDigest::Sha256, // unused
     };
+    let mgf1_digest = match key_transport_algorithm {
+        KeyTransportAlgorithm::RsaOaep => {
+            mgf1_digest_from_method(key_em)?.unwrap_or(OaepDigest::Sha1)
+        }
+        KeyTransportAlgorithm::RsaOaepMgf1Sha1 => {
+            if key_em.child_element(Some(XENC11_NS), "MGF").is_some() {
+                return Err(Error::DecryptFailed {
+                    reason: "rsa-oaep-mgf1p must not declare MGF",
+                });
+            }
+            OaepDigest::Sha1
+        }
+        #[cfg(feature = "weak-algos")]
+        KeyTransportAlgorithm::RsaPkcs1V15 => OaepDigest::Sha256, // unused
+    };
+
+    // -- 4b. Apply the two independent policies to the resolved values. --
+    if matches!(
+        key_transport_algorithm,
+        KeyTransportAlgorithm::RsaOaep | KeyTransportAlgorithm::RsaOaepMgf1Sha1
+    ) {
+        if !policy.allowed_oaep_digest_algorithms.contains(&oaep_digest) {
+            return Err(Error::DisallowedAlgorithm {
+                alg: oaep_digest.uri().to_owned(),
+            });
+        }
+        if !policy
+            .allowed_oaep_mgf1_digest_algorithms
+            .contains(&mgf1_digest)
+        {
+            return Err(Error::DisallowedAlgorithm {
+                alg: mgf1_digest.mgf1_uri().to_owned(),
+            });
+        }
+    }
 
     // -- 5. Base64-decode the wrapped session key. --
     let wrapped_key_bytes = extract_cipher_value(encrypted_key)?;
@@ -202,14 +204,17 @@ pub(crate) fn decrypt_encrypted_assertion(
 // Internal helpers
 // =============================================================================
 
-/// Read the OAEP digest from `<EncryptionMethod>/<ds:DigestMethod>`. Per the
-/// project hint, when the algorithm URI is the modern `xmlenc11#rsa-oaep`
-/// and no `<ds:DigestMethod>` is present we default to SHA-256 (the modern
-/// profile default). Legacy `rsa-oaep-mgf1p` would default to SHA-1 — but
-/// that path doesn't call this function (it pins SHA-1 directly).
+/// Read the OAEP message digest from `<EncryptionMethod>/<ds:DigestMethod>`.
+///
+/// XML Encryption 1.1 §5.5.2 defaults the OAEP `hashAlgorithm` to SHA-1 when
+/// the element is absent, under both the modern `#rsa-oaep` URI and the
+/// legacy `#rsa-oaep-mgf1p`. That default is the standard's, not a policy
+/// choice: peer policy is applied to the resolved value by the caller, so a
+/// strong policy rejects the SHA-1 default rather than silently substituting
+/// a stronger hash the sender did not use.
 fn oaep_digest_from_method(encryption_method: &Element) -> Result<OaepDigest, Error> {
     let Some(digest_method) = encryption_method.child_element(Some(DS_NS), "DigestMethod") else {
-        return Ok(OaepDigest::Sha256);
+        return Ok(OaepDigest::Sha1);
     };
     let uri = digest_method
         .attribute(None, "Algorithm")
@@ -379,7 +384,7 @@ mod tests {
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
     use crate::xml::emit::emit_element;
     use crate::xml::parse::{Document, Node, QName};
-    use crate::xmlenc::encrypt::encrypt_assertion;
+    use crate::xmlenc::encrypt::{DeclaredOaepParams, encrypt_assertion};
 
     const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 
@@ -503,14 +508,50 @@ mod tests {
         assert_eq!(decrypted.qname().local(), "Assertion");
     }
 
-    // ---------- <xenc11:MGF> (XML Encryption 1.1 §5.5.2) -------------------
+    // ---------- RSA-OAEP parameters (XML Enc 1.1 §5.5.2, RFC 8017 A.2.1) ----
+    //
+    // `hashAlgorithm` (the OAEP message digest, from `<ds:DigestMethod>`) and
+    // `maskGenAlgorithm` (the MGF1 hash, from `<xenc11:MGF>`) are independent
+    // parameters, each with its own standard default. Every fixture below
+    // *encrypts* with the parameters it declares — rewriting the algorithm
+    // URIs of an existing ciphertext would assert on XML shape while leaving
+    // the actual key-wrapping parameters untested.
+
+    /// Encrypt with exactly the parameters `params` declares (after applying
+    /// the §5.5.2 defaults for any omitted element).
+    fn encrypt_declaring(
+        key_transport: KeyTransportAlgorithm,
+        params: DeclaredOaepParams,
+    ) -> Element {
+        crate::xmlenc::encrypt::encrypt_assertion_with_declared_oaep_params(
+            &sample_assertion(),
+            &rsa_cert(),
+            DataEncryptionAlgorithm::Aes256Gcm,
+            key_transport,
+            params,
+        )
+        .expect("encrypt with declared OAEP parameters")
+    }
+
+    /// A policy that permits `digest` as the message digest and `mgf1` as the
+    /// MGF1 hash, leaving every other axis at its strong default.
+    fn oaep_policy(digest: OaepDigest, mgf1: OaepDigest) -> PeerCryptoPolicy {
+        let mut policy = PeerCryptoPolicy::strong_defaults();
+        policy.allowed_key_transport_algorithms = vec![
+            KeyTransportAlgorithm::RsaOaep,
+            KeyTransportAlgorithm::RsaOaepMgf1Sha1,
+        ];
+        policy.allowed_oaep_digest_algorithms = vec![digest];
+        policy.allowed_oaep_mgf1_digest_algorithms = vec![mgf1];
+        policy
+    }
 
     #[test]
     fn outbound_rsa_oaep_declares_the_mgf_it_actually_used() {
         // `wrap_session_key` builds the padding with `Oaep::new::<Sha256>()`,
-        // which uses SHA-256 for the MGF1 hash too. Declaring `mgf1sha1` (as
-        // this used to) misdescribes the ciphertext, so a peer honouring the
-        // declaration derives the wrong mask and cannot unwrap the key.
+        // which uses SHA-256 for the MGF1 hash too. Declaring `mgf1sha1` would
+        // misdescribe the ciphertext, so a peer honouring the declaration
+        // derives the wrong mask and cannot unwrap the session key.
         let encrypted = encrypt_assertion(
             &sample_assertion(),
             &rsa_cert(),
@@ -530,70 +571,211 @@ mod tests {
         );
     }
 
+    /// SHA-256 message digest with an explicit MGF1-SHA1 — the combination
+    /// RFC 8017 A.2.1 makes possible and a single shared allow-list could not
+    /// express. Deriving MGF1 from `<ds:DigestMethod>` would build SHA-256 /
+    /// SHA-256 padding and fail to unwrap.
     #[cfg(feature = "weak-algos")]
     #[test]
-    fn declared_weak_mgf_is_rejected_by_strong_policy() {
-        // A SHA-256 DigestMethod paired with an explicit mgf1sha1: the OAEP
-        // digest alone passes strong policy, so a rejection here can only
-        // come from the MGF being policed independently.
-        let encrypted = encrypt_assertion(
-            &sample_assertion(),
-            &rsa_cert(),
-            DataEncryptionAlgorithm::Aes256Gcm,
+    fn rsa_oaep_sha256_digest_with_explicit_mgf1_sha1() {
+        let encrypted = encrypt_declaring(
             KeyTransportAlgorithm::RsaOaep,
-        )
-        .expect("encrypt");
-        let weak_mgf_xml = emit_element(&encrypted)
-            .expect("emit")
-            .replace(OaepDigest::Sha256.mgf1_uri(), OaepDigest::Sha1.mgf1_uri());
-        let document = Document::parse(weak_mgf_xml.as_bytes()).expect("parse");
+            DeclaredOaepParams {
+                digest: Some(OaepDigest::Sha256),
+                mgf1: Some(OaepDigest::Sha1),
+            },
+        );
         let key = rsa_keypair();
 
-        let err = decrypt_encrypted_assertion(document.root(), &[&key], &strong_policy())
-            .expect_err("strong policy must reject a declared MGF1-SHA1");
+        let decrypted = decrypt_encrypted_assertion(
+            &encrypted,
+            &[&key],
+            &oaep_policy(OaepDigest::Sha256, OaepDigest::Sha1),
+        )
+        .expect("declared SHA-256 + MGF1-SHA1 must decrypt");
+        assert_eq!(decrypted.qname().local(), "Assertion");
+    }
+
+    /// The same combination reached via the §5.5.2 default: an omitted
+    /// `<xenc11:MGF>` under `#rsa-oaep` means MGF1-SHA1, not "same hash as
+    /// the digest".
+    #[cfg(feature = "weak-algos")]
+    #[test]
+    fn rsa_oaep_omitted_mgf_defaults_to_mgf1_sha1() {
+        let encrypted = encrypt_declaring(
+            KeyTransportAlgorithm::RsaOaep,
+            DeclaredOaepParams {
+                digest: Some(OaepDigest::Sha256),
+                mgf1: None,
+            },
+        );
+        assert!(
+            emit_element(&encrypted)
+                .expect("emit")
+                .find("MGF")
+                .is_none(),
+            "fixture must omit the MGF element"
+        );
+        let key = rsa_keypair();
+
+        let decrypted = decrypt_encrypted_assertion(
+            &encrypted,
+            &[&key],
+            &oaep_policy(OaepDigest::Sha256, OaepDigest::Sha1),
+        )
+        .expect("omitted MGF must resolve to MGF1-SHA1");
+        assert_eq!(decrypted.qname().local(), "Assertion");
+    }
+
+    /// An omitted `<ds:DigestMethod>` means SHA-1, per §5.5.2 — not SHA-256.
+    #[cfg(feature = "weak-algos")]
+    #[test]
+    fn rsa_oaep_omitted_digest_method_defaults_to_sha1() {
+        let encrypted = encrypt_declaring(
+            KeyTransportAlgorithm::RsaOaep,
+            DeclaredOaepParams {
+                digest: None,
+                mgf1: Some(OaepDigest::Sha1),
+            },
+        );
+        let key = rsa_keypair();
+
+        let decrypted = decrypt_encrypted_assertion(
+            &encrypted,
+            &[&key],
+            &oaep_policy(OaepDigest::Sha1, OaepDigest::Sha1),
+        )
+        .expect("omitted DigestMethod must resolve to SHA-1");
+        assert_eq!(decrypted.qname().local(), "Assertion");
+    }
+
+    /// `#rsa-oaep-mgf1p` fixes only the mask generation function.
+    /// `<ds:DigestMethod>` still selects the message digest independently, so
+    /// a legacy-URI message explicitly naming SHA-256 is valid and must
+    /// decrypt — pinning the digest to SHA-1 rejected conformant senders.
+    #[cfg(feature = "weak-algos")]
+    #[test]
+    fn rsa_oaep_mgf1p_honours_an_explicit_sha256_digest() {
+        let encrypted = encrypt_declaring(
+            KeyTransportAlgorithm::RsaOaepMgf1Sha1,
+            DeclaredOaepParams {
+                digest: Some(OaepDigest::Sha256),
+                mgf1: None,
+            },
+        );
+        let key = rsa_keypair();
+
+        let decrypted = decrypt_encrypted_assertion(
+            &encrypted,
+            &[&key],
+            &oaep_policy(OaepDigest::Sha256, OaepDigest::Sha1),
+        )
+        .expect("mgf1p with an explicit SHA-256 digest must decrypt");
+        assert_eq!(decrypted.qname().local(), "Assertion");
+    }
+
+    /// §5.5.2 does not permit `<xenc11:MGF>` under `#rsa-oaep-mgf1p`, and
+    /// §3.2 requires an error for a child the selected algorithm disallows —
+    /// even when the declared value agrees with the URI.
+    #[test]
+    fn rsa_oaep_mgf1p_rejects_any_mgf_element() {
+        let key = rsa_keypair();
+        // Producing the MGF1-SHA1 ciphertext needs the `sha1` crate, so that
+        // value only participates under `weak-algos`. The rejection is about
+        // the element being present at all, so SHA-256 exercises it either
+        // way — including the case where the declaration agrees with the URI's
+        // implied MGF, which must still fail.
+        let declared_values: &[OaepDigest] = if cfg!(feature = "weak-algos") {
+            &[OaepDigest::Sha1, OaepDigest::Sha256]
+        } else {
+            &[OaepDigest::Sha256]
+        };
+        for &declared in declared_values {
+            let encrypted = encrypt_declaring(
+                KeyTransportAlgorithm::RsaOaepMgf1Sha1,
+                DeclaredOaepParams {
+                    digest: Some(OaepDigest::Sha256),
+                    mgf1: Some(declared),
+                },
+            );
+
+            let err = decrypt_encrypted_assertion(
+                &encrypted,
+                &[&key],
+                &oaep_policy(OaepDigest::Sha256, OaepDigest::Sha1),
+            )
+            .expect_err("mgf1p must not carry an MGF element");
+            assert!(
+                matches!(
+                    err,
+                    Error::DecryptFailed {
+                        reason: "rsa-oaep-mgf1p must not declare MGF"
+                    }
+                ),
+                "unexpected error for declared {declared:?}: {err:?}"
+            );
+        }
+    }
+
+    /// The two allow-lists are enforced separately: permitting MGF1-SHA1 does
+    /// not permit SHA-1 as the message digest.
+    #[cfg(feature = "weak-algos")]
+    #[test]
+    fn message_digest_and_mgf1_policies_are_independent() {
+        let key = rsa_keypair();
+
+        // SHA-1 digest rejected while MGF1-SHA1 is allowed.
+        let sha1_digest = encrypt_declaring(
+            KeyTransportAlgorithm::RsaOaep,
+            DeclaredOaepParams {
+                digest: Some(OaepDigest::Sha1),
+                mgf1: Some(OaepDigest::Sha1),
+            },
+        );
+        let err = decrypt_encrypted_assertion(
+            &sha1_digest,
+            &[&key],
+            &oaep_policy(OaepDigest::Sha256, OaepDigest::Sha1),
+        )
+        .expect_err("SHA-1 message digest is outside the digest allow-list");
+        assert!(matches!(
+            err,
+            Error::DisallowedAlgorithm { ref alg } if alg == OaepDigest::Sha1.uri()
+        ));
+
+        // MGF1-SHA1 rejected while SHA-1 is allowed as the message digest.
+        let sha1_mgf = encrypt_declaring(
+            KeyTransportAlgorithm::RsaOaep,
+            DeclaredOaepParams {
+                digest: Some(OaepDigest::Sha1),
+                mgf1: Some(OaepDigest::Sha1),
+            },
+        );
+        let err = decrypt_encrypted_assertion(
+            &sha1_mgf,
+            &[&key],
+            &oaep_policy(OaepDigest::Sha1, OaepDigest::Sha256),
+        )
+        .expect_err("MGF1-SHA1 is outside the MGF1 allow-list");
         assert!(matches!(
             err,
             Error::DisallowedAlgorithm { ref alg } if alg == OaepDigest::Sha1.mgf1_uri()
         ));
     }
 
-    #[cfg(feature = "weak-algos")]
+    /// Strong defaults reject a SHA-1 message digest but accept MGF1-SHA1,
+    /// which is the RFC 8017 / §5.5.2 default and would otherwise make every
+    /// conformant `#rsa-oaep` message that omits `<xenc11:MGF>` unusable.
     #[test]
-    fn declared_mgf_is_honoured_not_derived_from_digest_method() {
-        // Ciphertext produced with OAEP-SHA1 + MGF1-SHA1 but presented under
-        // the modern URI with a SHA-256 DigestMethod and an explicit
-        // mgf1sha1. Deriving MGF1 from DigestMethod would try SHA-256/SHA-256
-        // and fail; honouring the declaration decrypts.
-        let key = rsa_keypair();
-        let legacy = encrypt_assertion(
-            &sample_assertion(),
-            &rsa_cert(),
-            DataEncryptionAlgorithm::Aes128Gcm,
-            KeyTransportAlgorithm::RsaOaepMgf1Sha1,
-        )
-        .expect("encrypt");
-        let xml = emit_element(&legacy)
-            .expect("emit")
-            .replace(
-                KeyTransportAlgorithm::RsaOaepMgf1Sha1.uri(),
-                KeyTransportAlgorithm::RsaOaep.uri(),
-            )
-            // Keep the SHA-1 OAEP digest, but declare the MGF explicitly so
-            // the element (not the DigestMethod) is what selects MGF1-SHA1.
-            .replace(
-                "<ds:DigestMethod",
-                &format!(
-                    r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" Algorithm="{}"/><ds:DigestMethod"#,
-                    OaepDigest::Sha1.mgf1_uri()
-                ),
-            );
-        let document = Document::parse(xml.as_bytes()).expect("parse");
+    fn strong_defaults_split_the_two_oaep_axes() {
+        let policy = strong_policy();
 
-        let mut policy = strong_policy();
-        policy.allowed_oaep_digest_algorithms.push(OaepDigest::Sha1);
-        let decrypted = decrypt_encrypted_assertion(document.root(), &[&key], &policy)
-            .expect("declared MGF1-SHA1 is honoured");
-        assert_eq!(decrypted.qname().local(), "Assertion");
+        assert!(!policy.allowed_oaep_digest_algorithms.contains(&OaepDigest::Sha1));
+        assert!(
+            policy
+                .allowed_oaep_mgf1_digest_algorithms
+                .contains(&OaepDigest::Sha1)
+        );
     }
 
     #[test]
@@ -623,111 +805,6 @@ mod tests {
                 if alg == "http://www.w3.org/2009/xmlenc11#mgf1sha224"
         ));
     }
-
-    #[cfg(feature = "weak-algos")]
-    #[test]
-    fn legacy_mgf1p_uri_rejects_a_contradicting_mgf_declaration() {
-        // `#rsa-oaep-mgf1p` pins MGF1-SHA1 by definition; a message declaring
-        // something else is contradictory, not a supported combination.
-        let encrypted = encrypt_assertion(
-            &sample_assertion(),
-            &rsa_cert(),
-            DataEncryptionAlgorithm::Aes128Gcm,
-            KeyTransportAlgorithm::RsaOaepMgf1Sha1,
-        )
-        .expect("encrypt");
-        let xml = emit_element(&encrypted).expect("emit").replace(
-            "<ds:DigestMethod",
-            &format!(
-                r#"<xenc11:MGF xmlns:xenc11="http://www.w3.org/2009/xmlenc11#" Algorithm="{}"/><ds:DigestMethod"#,
-                OaepDigest::Sha256.mgf1_uri()
-            ),
-        );
-        let document = Document::parse(xml.as_bytes()).expect("parse");
-        let key = rsa_keypair();
-
-        let mut policy = strong_policy();
-        policy
-            .allowed_key_transport_algorithms
-            .push(KeyTransportAlgorithm::RsaOaepMgf1Sha1);
-        policy.allowed_oaep_digest_algorithms.push(OaepDigest::Sha1);
-
-        let err = decrypt_encrypted_assertion(document.root(), &[&key], &policy)
-            .expect_err("mgf1p with a non-SHA-1 MGF must be rejected");
-        assert!(matches!(
-            err,
-            Error::DecryptFailed {
-                reason: "rsa-oaep-mgf1p declares a non-SHA-1 MGF"
-            }
-        ));
-    }
-
-    #[cfg(feature = "weak-algos")]
-    #[test]
-    fn modern_rsa_oaep_sha1_digest_requires_explicit_policy() {
-        // Produce a valid SHA-1 OAEP ciphertext via the legacy emitter, then
-        // present it under the modern rsa-oaep URI with an explicit SHA-1
-        // DigestMethod. The strong key-transport policy allows rsa-oaep, so
-        // rejection must come specifically from the OAEP-digest policy.
-        let legacy = encrypt_assertion(
-            &sample_assertion(),
-            &rsa_cert(),
-            DataEncryptionAlgorithm::Aes128Gcm,
-            KeyTransportAlgorithm::RsaOaepMgf1Sha1,
-        )
-        .expect("encrypt SHA-1 OAEP");
-        let modern_xml = emit_element(&legacy)
-            .expect("emit encrypted assertion")
-            .replace(
-                KeyTransportAlgorithm::RsaOaepMgf1Sha1.uri(),
-                KeyTransportAlgorithm::RsaOaep.uri(),
-            );
-        let document = Document::parse(modern_xml.as_bytes()).expect("parse modern OAEP form");
-        let key = rsa_keypair();
-
-        let mut policy = PeerCryptoPolicy::strong_defaults();
-        let err = decrypt_encrypted_assertion(document.root(), &[&key], &policy)
-            .expect_err("strong policy must reject an explicit SHA-1 OAEP digest");
-        assert!(matches!(
-            err,
-            Error::DisallowedAlgorithm { ref alg } if alg == OaepDigest::Sha1.uri()
-        ));
-
-        policy.allowed_oaep_digest_algorithms.push(OaepDigest::Sha1);
-        let decrypted = decrypt_encrypted_assertion(document.root(), &[&key], &policy)
-            .expect("explicit SHA-1 OAEP digest opt-in");
-        assert_eq!(decrypted.qname().local(), "Assertion");
-    }
-
-    #[cfg(feature = "weak-algos")]
-    #[test]
-    fn legacy_rsa_oaep_mgf1p_requires_explicit_sha1_digest_policy() {
-        let encrypted = encrypt_assertion(
-            &sample_assertion(),
-            &rsa_cert(),
-            DataEncryptionAlgorithm::Aes128Gcm,
-            KeyTransportAlgorithm::RsaOaepMgf1Sha1,
-        )
-        .expect("encrypt legacy SHA-1 OAEP");
-        let key = rsa_keypair();
-        let mut policy = PeerCryptoPolicy::strong_defaults();
-        policy
-            .allowed_key_transport_algorithms
-            .push(KeyTransportAlgorithm::RsaOaepMgf1Sha1);
-
-        let err = decrypt_encrypted_assertion(&encrypted, &[&key], &policy)
-            .expect_err("legacy transport opt-in alone must not enable SHA-1 OAEP");
-        assert!(matches!(
-            err,
-            Error::DisallowedAlgorithm { ref alg } if alg == OaepDigest::Sha1.uri()
-        ));
-
-        policy.allowed_oaep_digest_algorithms.push(OaepDigest::Sha1);
-        let decrypted = decrypt_encrypted_assertion(&encrypted, &[&key], &policy)
-            .expect("legacy transport and SHA-1 digest explicitly allowed");
-        assert_eq!(decrypted.qname().local(), "Assertion");
-    }
-
     #[test]
     fn disallowed_data_algorithm_rejected() {
         let assertion = sample_assertion();

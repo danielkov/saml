@@ -51,8 +51,26 @@ pub enum OaepDigest {
 
 #[cfg(feature = "xmlenc")]
 impl OaepDigest {
-    /// Strong inbound defaults for RSA-OAEP digest selection.
+    /// Strong inbound defaults for the RSA-OAEP *message digest* (the OAEP
+    /// label hash from `<ds:DigestMethod>`).
     pub const DEFAULTS: &'static [Self] = &[Self::Sha256, Self::Sha384, Self::Sha512];
+
+    /// Strong inbound defaults for the RSA-OAEP *MGF1* hash.
+    ///
+    /// Unlike [`DEFAULTS`](Self::DEFAULTS) this includes SHA-1, for two
+    /// reasons. MGF1 uses its hash as a mask-generating PRF rather than to
+    /// bind a message, so SHA-1's broken collision resistance does not carry
+    /// the same weight there; RFC 8017 Appendix A.2.1 still names MGF1-SHA1
+    /// as the default `maskGenAlgorithm`. And XML Encryption 1.1 §5.5.2
+    /// defaults an omitted `<xenc11:MGF>` to MGF1-SHA1, so excluding it here
+    /// would reject every `rsa-oaep` message that does not name an MGF
+    /// explicitly — including spec-conformant senders.
+    ///
+    /// Performing MGF1-SHA1 still requires the `weak-algos` feature; without
+    /// it the attempt is refused at the crypto layer rather than silently
+    /// served with a different hash.
+    pub const MGF1_DEFAULTS: &'static [Self] =
+        &[Self::Sha1, Self::Sha256, Self::Sha384, Self::Sha512];
 
     /// XML-Enc `<ds:DigestMethod Algorithm="…">` URI.
     pub const fn uri(self) -> &'static str {
@@ -417,7 +435,10 @@ impl KeyPair {
                   cannot be constructed; the signature is stable across both builds"
     )
 )]
-fn oaep_padding(oaep_digest: OaepDigest, mgf1_digest: OaepDigest) -> Result<rsa::Oaep, Error> {
+pub(crate) fn oaep_padding(
+    oaep_digest: OaepDigest,
+    mgf1_digest: OaepDigest,
+) -> Result<rsa::Oaep, Error> {
     macro_rules! with_mgf_hash {
         ($oaep:ty) => {
             match mgf1_digest {
