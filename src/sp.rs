@@ -485,41 +485,79 @@ pub struct ArtifactBackchannel<'a> {
 }
 
 impl ServiceProvider {
-    /// Validate an inbound `<samlp:Response>` and extract the `Identity`.
-    /// See RFC-003 §4.1.
-    pub fn consume_response(&self, input: ConsumeResponse<'_>) -> Result<Identity, Error> {
+    /// Validate everything about an inbound response that can be checked
+    /// without the response itself: that `expected_destination` is one of this
+    /// SP's registered ACS URLs, and — for a solicited flow — that the
+    /// response correlates with the `LoginTracker` captured when the
+    /// `AuthnRequest` was issued.
+    ///
+    /// Checking only the ACS URL let a response arrive from a different
+    /// registered IdP, or over a different binding than the nominated
+    /// endpoint, while still correlating by request ID. `InResponseTo` does
+    /// not close the IdP gap on its own: the request ID is visible to
+    /// whichever IdP the request was sent to.
+    ///
+    /// This is deliberately pure and free of I/O so the artifact path can run
+    /// it *before* dereferencing the IdP's artifact-resolution endpoint —
+    /// otherwise a mis-correlated response would cost a backchannel HTTP
+    /// request, carrying the artifact, to an IdP the login was never issued
+    /// to. `consume_response` runs the same checks, so calling it directly is
+    /// equally safe.
+    ///
+    /// The tracker legs are a no-op for unsolicited flows (`tracker == None`).
+    fn validate_tracker_context(
+        &self,
+        tracker: Option<&LoginTracker>,
+        idp: &IdpDescriptor,
+        expected_destination: &str,
+        binding: SsoResponseBinding,
+    ) -> Result<(), Error> {
         // Step 3a: `expected_destination` MUST be a registered ACS URL.
         if !self
             .config
             .acs
             .iter()
-            .any(|e| e.url == input.expected_destination)
+            .any(|e| e.url == expected_destination)
         {
             return Err(Error::InvalidConfiguration {
                 reason: "expected_destination is not a registered ACS URL",
             });
         }
-        // Step 3b: a solicited response must stay bound to the IdP and the ACS
-        // endpoint (URL *and* binding) captured when the AuthnRequest was
-        // issued. Checking only the URL let a response arrive from a different
-        // registered IdP, or over a different binding than the one the request
-        // asked for, while still correlating by request ID.
-        if let Some(tracker) = input.tracker {
-            if tracker.idp_entity_id != input.idp.entity_id {
-                return Err(Error::IssuerMismatch {
-                    expected: tracker.idp_entity_id.clone(),
-                    got: Some(input.idp.entity_id.clone()),
-                });
-            }
-            if tracker.acs_endpoint.url != input.expected_destination {
-                return Err(Error::DestinationMismatch);
-            }
-            if tracker.acs_endpoint.binding != input.binding {
-                return Err(Error::IllegalResponseBinding {
-                    requested: input.binding.as_binding(),
-                });
-            }
+
+        // Step 3b: solicited responses stay bound to the tracked IdP and ACS.
+        let Some(tracker) = tracker else {
+            return Ok(());
+        };
+        if tracker.idp_entity_id != idp.entity_id {
+            return Err(Error::IssuerMismatch {
+                expected: tracker.idp_entity_id.clone(),
+                got: Some(idp.entity_id.clone()),
+            });
         }
+        if tracker.acs_endpoint.url != expected_destination {
+            return Err(Error::DestinationMismatch);
+        }
+        if tracker.acs_endpoint.binding != binding {
+            return Err(Error::ResponseBindingMismatch {
+                expected: tracker.acs_endpoint.binding.as_binding(),
+                received: binding.as_binding(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate an inbound `<samlp:Response>` and extract the `Identity`.
+    /// See RFC-003 §4.1.
+    pub fn consume_response(&self, input: ConsumeResponse<'_>) -> Result<Identity, Error> {
+        // Steps 3a/3b: registered ACS URL, plus tracker correlation for a
+        // solicited flow. Shared with the artifact path, which runs them
+        // before it dereferences the artifact.
+        self.validate_tracker_context(
+            input.tracker,
+            input.idp,
+            input.expected_destination,
+            input.binding,
+        )?;
 
         // Parse XML and locate `<samlp:Response>`. The caller passed raw XML
         // (already base64-decoded by the binding layer).
@@ -594,6 +632,17 @@ impl ServiceProvider {
         http: &H,
         input: ConsumeArtifactResponse<'_>,
     ) -> Result<Identity, Error> {
+        // Correlate against the tracker BEFORE resolving the artifact. The
+        // resolve step is an outbound HTTP request to the IdP's ARS, so
+        // checking afterwards would leak a backchannel call to an IdP the
+        // request was never issued to.
+        self.validate_tracker_context(
+            input.tracker,
+            input.idp,
+            input.expected_destination,
+            SsoResponseBinding::HttpArtifact,
+        )?;
+
         let ars = input
             .idp
             .artifact_resolution_endpoint()
@@ -2235,8 +2284,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            Error::IllegalResponseBinding {
-                requested: Binding::HttpArtifact
+            Error::ResponseBindingMismatch {
+                expected: Binding::HttpPost,
+                received: Binding::HttpArtifact,
             }
         ));
     }
@@ -3030,6 +3080,118 @@ mod tests {
                 holder_of_key_cert: None,
                 backchannel,
             }
+        }
+
+        /// Mock `HttpClient` that records how many requests it received and
+        /// fails loudly if one arrives. Used to prove that tracker
+        /// correlation short-circuits the artifact path before the
+        /// backchannel resolve.
+        #[derive(Default)]
+        struct CountingClient {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl CountingClient {
+            fn calls(&self) -> usize {
+                self.calls.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+
+        impl HttpClient for CountingClient {
+            fn send(
+                &self,
+                _request: HttpRequest,
+            ) -> impl Future<
+                Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    Err::<HttpResponse, Box<dyn std::error::Error + Send + Sync>>(
+                        "artifact resolve must not be reached".into(),
+                    )
+                }
+            }
+        }
+
+        fn artifact_tracker(sp: &ServiceProvider, idp_entity_id: &str) -> LoginTracker {
+            LoginTracker {
+                request_id: "_req1".to_owned(),
+                issued_at: fixed_now(),
+                idp_entity_id: idp_entity_id.to_owned(),
+                acs_endpoint: sp.config.acs[0].clone(),
+                requested_authn_context: None,
+                requested_name_id_format: None,
+            }
+        }
+
+        fn consume_artifact_with<'a>(
+            sp: &'a ServiceProvider,
+            client: &'a CountingClient,
+            idp: &'a IdpDescriptor,
+            tracker: &'a LoginTracker,
+        ) -> impl Future<Output = Result<Identity, Error>> + 'a {
+            sp.consume_response_artifact(
+                client,
+                ConsumeArtifactResponse {
+                    idp,
+                    peer_crypto_policy: None,
+                    artifact: "AAQAAK1234567890",
+                    relay_state: None,
+                    tracker: Some(tracker),
+                    expected_destination: "https://sp.example.com/acs",
+                    now: fixed_now(),
+                    clock_skew: Duration::from_secs(30),
+                    replay_cache: None,
+                    replay_mode: ReplayMode::All,
+                    holder_of_key_cert: None,
+                    backchannel: None,
+                },
+            )
+        }
+
+        /// A tracker naming a different IdP must be rejected *before* the
+        /// artifact is dereferenced. Resolving first would send a backchannel
+        /// request — carrying the artifact — to an IdP this login was never
+        /// issued to.
+        #[tokio::test]
+        async fn artifact_tracker_idp_mismatch_makes_no_http_call() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let tracker = artifact_tracker(&sp, "https://other-idp.example.com");
+            let client = CountingClient::default();
+
+            let err = consume_artifact_with(&sp, &client, &idp, &tracker)
+                .await
+                .expect_err("tracker names a different IdP");
+
+            assert!(matches!(
+                err,
+                Error::IssuerMismatch { ref expected, .. }
+                    if expected == "https://other-idp.example.com"
+            ));
+            assert_eq!(
+                client.calls(),
+                0,
+                "artifact must not be resolved against an uncorrelated IdP"
+            );
+        }
+
+        /// Same ordering guarantee for the ACS URL leg of the correlation.
+        #[tokio::test]
+        async fn artifact_tracker_acs_mismatch_makes_no_http_call() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let mut tracker = artifact_tracker(&sp, &idp.entity_id);
+            tracker.acs_endpoint.url = "https://sp.example.com/other-acs".to_owned();
+            let client = CountingClient::default();
+
+            let err = consume_artifact_with(&sp, &client, &idp, &tracker)
+                .await
+                .expect_err("tracker names a different ACS URL");
+
+            assert!(matches!(err, Error::DestinationMismatch));
+            assert_eq!(client.calls(), 0, "artifact must not be resolved");
         }
 
         /// A validly-signed envelope passes envelope verification routed
