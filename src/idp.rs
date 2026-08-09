@@ -598,6 +598,7 @@ impl IdentityProvider {
     /// Mint and binding-encode a success `<samlp:Response>` for an SP.
     /// See RFC-004 §3.1.
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
+        ensure_request_belongs_to_sp(input.in_response_to, input.sp)?;
         let acs_endpoint = &input.in_response_to.assertion_consumer_service;
         let relay_state = input.in_response_to.relay_state.as_deref();
 
@@ -652,6 +653,7 @@ impl IdentityProvider {
         &self,
         input: IssueErrorResponse<'_>,
     ) -> Result<SsoResponseDispatch, Error> {
+        ensure_request_belongs_to_sp(input.in_response_to, input.sp)?;
         let acs_endpoint = &input.in_response_to.assertion_consumer_service;
         let relay_state = input.in_response_to.relay_state.as_deref();
 
@@ -717,6 +719,56 @@ impl IdentityProvider {
             payload_xml,
         )
     }
+}
+
+/// Confirm a validated `AuthnRequest` actually came from the SP the caller is
+/// now issuing to.
+///
+/// [`ParsedAuthnRequest`] is only produced by `consume_authn_request`, which
+/// checks the request's `<saml:Issuer>` against *one* [`SpDescriptor`]. Nothing
+/// carries that binding forward, so the issue methods take `sp` and
+/// `in_response_to` as independent parameters and would otherwise let a caller
+/// pair a request from SP-A with SP-B's descriptor.
+///
+/// The result is an assertion audienced to SP-B and encrypted to SP-B's key,
+/// delivered to SP-A's `AssertionConsumerService` URL — the ACS is resolved
+/// from the request, everything else from `sp`. A conforming SP rejects it on
+/// `AudienceRestriction`, but that is the *peer's* check saving us; the IdP
+/// should not emit a cross-wired assertion in the first place, and an SP that
+/// flattens audience groups would accept it.
+fn ensure_request_belongs_to_sp(
+    request: &ParsedAuthnRequest,
+    sp: &SpDescriptor,
+) -> Result<(), Error> {
+    if request.issuer != sp.entity_id {
+        return Err(Error::IssuerMismatch {
+            expected: request.issuer.clone(),
+            got: Some(sp.entity_id.clone()),
+        });
+    }
+
+    // Re-resolve the ACS against this SP's metadata rather than trusting the
+    // one carried on the request.
+    //
+    // `ParsedAuthnRequest` has public, mutable fields, so `issuer` above is
+    // caller-controlled: a caller can validate against SP-A, overwrite
+    // `issuer` with SP-B, keep SP-A's ACS, and the comparison passes. The
+    // check that does not depend on any field being honest is this one — the
+    // endpoint the assertion is about to be POSTed to must belong to the SP
+    // whose audience and encryption key it was built with. `SsoResponseEndpoint`
+    // carries no interior state beyond URL, binding and index, so matching
+    // URL-and-binding against the descriptor is a complete membership test.
+    let acs = &request.assertion_consumer_service;
+    let registered = sp
+        .assertion_consumer_services
+        .iter()
+        .any(|e| e.url == acs.url && e.binding == acs.binding);
+    if !registered {
+        return Err(Error::UnregisteredAcs {
+            entity_id: sp.entity_id.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Pick the `NameID` Format for the outbound Assertion. The SP-requested
@@ -2036,6 +2088,108 @@ mod tests {
             .expect("validate");
         parsed.relay_state = Some("rs-token".into());
         parsed
+    }
+
+    #[test]
+    fn issue_response_rejects_request_from_a_different_sp() {
+        // The request was validated against `sp_descriptor()`; issuing it to a
+        // different SP would audience and encrypt the assertion to that SP
+        // while delivering it to the requesting SP's ACS URL.
+        let idp = idp_with(false, false);
+        let mut other_sp = sp_descriptor(false);
+        other_sp.entity_id = "https://other-sp.example.com".to_owned();
+        let parsed_req = parsed_authn_request_fixture();
+
+        let err = idp
+            .issue_response(IssueResponse {
+                sp: &other_sp,
+                in_response_to: &parsed_req,
+                name_id: NameId::email("alice@example.com"),
+                attributes: vec![],
+                authn_instant: fixed_now(),
+                session_index: "sess-1".into(),
+                session_not_on_or_after: None,
+                authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+                force_encrypt_assertion: Some(false),
+                now: fixed_now(),
+                assertion_lifetime: Duration::from_mins(10),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+                holder_of_key_cert: None,
+            })
+            .expect_err("request issuer does not match the supplied SP");
+
+        assert!(matches!(
+            err,
+            Error::IssuerMismatch { ref expected, ref got }
+                if expected == &parsed_req.issuer
+                    && got.as_deref() == Some("https://other-sp.example.com")
+        ));
+    }
+
+    /// The exact bypass the issuer comparison alone permits: validate against
+    /// SP-A, overwrite the public `issuer` field with SP-B, keep SP-A's ACS,
+    /// and issue to SP-B. `ParsedAuthnRequest` exposes both fields as `pub`,
+    /// so nothing stops a caller doing this. The ACS membership check is what
+    /// catches it, because it does not trust any field on the request.
+    #[test]
+    fn mutating_the_parsed_issuer_does_not_bypass_the_binding() {
+        let idp = idp_with(false, false);
+        let mut other_sp = sp_descriptor(false);
+        other_sp.entity_id = "https://other-sp.example.com".to_owned();
+        other_sp.assertion_consumer_services = vec![SsoResponseEndpoint::post(
+            "https://other-sp.example.com/acs",
+            0,
+            true,
+        )];
+
+        // Validated against the default SP, then relabelled as the other one.
+        let mut parsed_req = parsed_authn_request_fixture();
+        parsed_req.issuer = other_sp.entity_id.clone();
+
+        let err = idp
+            .issue_response(IssueResponse {
+                sp: &other_sp,
+                in_response_to: &parsed_req,
+                name_id: NameId::email("alice@example.com"),
+                attributes: vec![],
+                authn_instant: fixed_now(),
+                session_index: "sess-1".into(),
+                session_not_on_or_after: None,
+                authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+                force_encrypt_assertion: Some(false),
+                now: fixed_now(),
+                assertion_lifetime: Duration::from_mins(10),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+                holder_of_key_cert: None,
+            })
+            .expect_err("the ACS still belongs to the original SP");
+
+        // Not IssuerMismatch: the mutated issuer agrees with the descriptor.
+        // The ACS is what gives it away.
+        assert!(
+            matches!(err, Error::UnregisteredAcs { ref entity_id } if entity_id == &other_sp.entity_id),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn issue_error_response_rejects_request_from_a_different_sp() {
+        let idp = idp_with(false, false);
+        let mut other_sp = sp_descriptor(false);
+        other_sp.entity_id = "https://other-sp.example.com".to_owned();
+        let parsed_req = parsed_authn_request_fixture();
+
+        let err = idp
+            .issue_error_response(IssueErrorResponse {
+                sp: &other_sp,
+                in_response_to: &parsed_req,
+                status_code: SamlStatusCode::Responder,
+                second_level_status_code: None,
+                message: None,
+                now: fixed_now(),
+            })
+            .expect_err("error responses correlate the same way");
+        assert!(matches!(err, Error::IssuerMismatch { .. }));
     }
 
     #[test]
