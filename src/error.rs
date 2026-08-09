@@ -186,7 +186,10 @@ pub enum Error {
     /// issued. Both bindings are legal for SSO responses — they simply do not
     /// correlate, so this is distinct from [`Error::IllegalResponseBinding`].
     #[error("Response binding {received:?} does not match the tracked ACS binding {expected:?}")]
-    ResponseBindingMismatch { expected: Binding, received: Binding },
+    ResponseBindingMismatch {
+        expected: Binding,
+        received: Binding,
+    },
 
     // --- Configuration ---
     #[error("Invalid configuration: {reason}")]

@@ -3104,8 +3104,7 @@ mod tests {
             ) -> impl Future<
                 Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
             > + Send {
-                self.calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 async move {
                     Err::<HttpResponse, Box<dyn std::error::Error + Send + Sync>>(
                         "artifact resolve must not be reached".into(),
