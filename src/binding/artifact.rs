@@ -523,15 +523,70 @@ pub struct ArtifactResolveRequest {
     /// `InResponseTo`.
     pub request_id: String,
     /// `samlp:Issuer` text content — the SP entity ID requesting resolution.
+    ///
+    /// This is unauthenticated wire content on its own. It identifies who the
+    /// sender *claims* to be; only [`signature_verified`] (or transport-level
+    /// client authentication) establishes that the claim is true.
+    ///
+    /// [`signature_verified`]: ArtifactResolveRequest::signature_verified
     pub issuer: String,
     /// `samlp:Artifact` text content — the opaque token to look up.
     pub artifact: String,
+    /// Whether an enveloped `<ds:Signature>` covering the whole
+    /// `<samlp:ArtifactResolve>` was present and verified.
+    ///
+    /// `false` means the request carried no signature *and* the caller did not
+    /// require one — never that an invalid signature was tolerated, which is
+    /// always an error. Treat `false` as "this request is authenticated only
+    /// to the extent the transport authenticates it".
+    pub signature_verified: bool,
+}
+
+/// How to verify the enveloped signature on an inbound
+/// `<samlp:ArtifactResolve>`.
+///
+/// The resolve direction's mirror of [`VerifyConfig`]. SAML 2.0 Bindings
+/// §3.6.3 requires the requester be authenticated before an artifact is
+/// resolved — by signature, or by transport-level client authentication.
+/// An artifact travels in a URL query parameter, so it leaks into access
+/// logs, `Referer` headers and browser history; without authentication it is
+/// a bearer token that anyone who obtains it can redeem for the assertion.
+pub struct VerifyResolveConfig<'a> {
+    /// Candidate certificates for the SP the resolve claims to come from.
+    pub certs: &'a [X509Certificate],
+    /// Signature algorithms accepted on the resolve (anything else is
+    /// rejected as [`Error::DisallowedAlgorithm`]).
+    pub allowed_algorithms: &'a [SignatureAlgorithm],
+    /// When true, an `ArtifactResolve` with no `<ds:Signature>` is rejected
+    /// with [`Error::SignatureMissing`]. When false, an unsigned resolve is
+    /// accepted (and [`ArtifactResolveRequest::signature_verified`] is
+    /// `false`), but a present-but-invalid signature is *always* rejected.
+    ///
+    /// Set this false only when the artifact-resolution endpoint is behind
+    /// mutually-authenticated TLS, which is the other authentication mode
+    /// §3.6.3 permits.
+    pub require_signed: bool,
 }
 
 /// Parse a `<samlp:ArtifactResolve>` SOAP envelope received at the IdP's
 /// `ArtifactResolutionService`. Returns the request ID, requesting SP issuer,
 /// and the artifact value to look up.
 pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveRequest, Error> {
+    parse_artifact_resolve_with(soap_envelope, None)
+}
+
+/// Parse an inbound `<samlp:ArtifactResolve>`, verifying its enveloped
+/// signature against `verify`.
+///
+/// Passing `None` skips signature verification entirely and yields
+/// `signature_verified: false`; only do that when the endpoint authenticates
+/// the requester some other way (see [`VerifyResolveConfig`]). Verification
+/// runs before any field is read, so an unauthenticated tree never reaches
+/// the caller's artifact store.
+pub fn parse_artifact_resolve_with(
+    soap_envelope: &[u8],
+    verify: Option<&VerifyResolveConfig<'_>>,
+) -> Result<ArtifactResolveRequest, Error> {
     let body = soap::unwrap(soap_envelope)?;
     let resolve = body.payload();
     if resolve.qname().namespace() != Some(SAMLP_NS) || resolve.qname().local() != "ArtifactResolve"
@@ -540,6 +595,8 @@ pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveReq
             "ArtifactResolve: SOAP body payload is not samlp:ArtifactResolve".to_string(),
         ));
     }
+
+    let signature_verified = verify_artifact_resolve(&body, verify)?;
 
     let request_id = resolve
         .attribute(None, "ID")
@@ -560,7 +617,50 @@ pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveReq
         request_id,
         issuer,
         artifact,
+        signature_verified,
     })
+}
+
+/// Verify the enveloped signature on an inbound `ArtifactResolve`, honouring
+/// `verify`. Returns whether a signature was verified.
+///
+/// Mirrors `BackchannelClient::verify_artifact_response` on the SP side,
+/// including the XSW check: `soap::unwrap` re-roots the payload as its own
+/// `Document`, so requiring `signed_element == root` is exactly "the
+/// signature covers the whole `ArtifactResolve`" and rejects a signature
+/// moved onto a descendant.
+fn verify_artifact_resolve(
+    body: &soap::UnwrappedBody,
+    verify: Option<&VerifyResolveConfig<'_>>,
+) -> Result<bool, Error> {
+    let Some(cfg) = verify else {
+        return Ok(false);
+    };
+    let document = body.document_ref();
+    let root = document.root();
+    match root.child_element(Some(crate::dsig::reference::DS_NS), "Signature") {
+        Some(sig) => {
+            let verified = crate::dsig::verify::verify_signature(
+                document,
+                sig,
+                cfg.certs,
+                cfg.allowed_algorithms,
+            )?;
+            if verified.signed_element != root.id() {
+                return Err(Error::SignatureVerification {
+                    reason: "ArtifactResolve signature does not cover the message root",
+                });
+            }
+            Ok(true)
+        }
+        None => {
+            if cfg.require_signed {
+                Err(Error::SignatureMissing)
+            } else {
+                Ok(false)
+            }
+        }
+    }
 }
 
 /// Build a `<samlp:ArtifactResponse>` SOAP envelope wrapping the IdP's stashed
@@ -1012,7 +1112,7 @@ mod tests {
 
     // --- BackchannelClient: signing + verification --------------------------
 
-    use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
+    use crate::crypto::cert::test_vectors::{EC_P256_CERT_PEM, RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
 
     fn test_keypair() -> KeyPair {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("key");
@@ -1023,6 +1123,213 @@ mod tests {
     /// Build an `ArtifactResponse` SOAP envelope whose ArtifactResponse element
     /// is enveloped-signed with the test key. When `tamper` is true, a byte of
     /// the embedded payload is mutated *after* signing so verification fails.
+    /// Build a `<samlp:ArtifactResolve>` SOAP envelope, optionally
+    /// enveloped-signed by the test key.
+    fn artifact_resolve_envelope(issuer: &str, signed: bool) -> Vec<u8> {
+        let resolve = build_artifact_resolve_element(
+            issuer,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        if !signed {
+            return soap::wrap_element(resolve).expect("wrap").into_bytes();
+        }
+
+        let stash = Document::new(resolve).expect("stash doc");
+        let signed_elem =
+            crate::dsig::sign::sign_element(stash.root().clone(), &stash, test_sign_options())
+                .expect("sign resolve");
+        soap::wrap_element(signed_elem).expect("wrap").into_bytes()
+    }
+
+    fn test_sign_options() -> crate::dsig::sign::SignOptions<'static> {
+        // `test_keypair` returns by value; leak one for a 'static borrow so
+        // the options can be shared between fixtures.
+        static KP: std::sync::OnceLock<KeyPair> = std::sync::OnceLock::new();
+        crate::dsig::sign::SignOptions {
+            signing_key: KP.get_or_init(test_keypair),
+            sig_alg: SignatureAlgorithm::RsaSha256,
+            digest_alg: DigestAlgorithm::Sha256,
+            c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+            inclusive_namespaces: &[],
+            include_x509_cert: true,
+        }
+    }
+
+    /// An `ArtifactResolve` whose `<ds:Signature>` sits at the canonical
+    /// position — a direct child of the message root — but whose
+    /// `<ds:Reference>` resolves to a *descendant*.
+    ///
+    /// This is the signature-wrapping shape the coverage check exists for:
+    /// cryptographically valid, correctly placed, and yet it authenticates
+    /// only the nested element. Merely relocating a signature elsewhere in
+    /// the tree is a weaker attack that never gets this far — nothing looks
+    /// for signatures off the canonical position, so it reads as absent.
+    fn xsw_artifact_resolve_envelope() -> Vec<u8> {
+        let xml = format!(
+            r#"<samlp:ArtifactResolve xmlns:samlp="{SAMLP_NS}" ID="_outer" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer xmlns:saml="{SAML_NS}" ID="_inner">{RESOLVE_ISSUER}</saml:Issuer><samlp:Artifact>AAQAAK1234567890</samlp:Artifact></samlp:ArtifactResolve>"#
+        );
+        let doc = Document::parse(xml.as_bytes()).expect("parse xsw resolve");
+        let inner = doc
+            .root()
+            .child_element(Some(SAML_NS), "Issuer")
+            .expect("issuer child")
+            .clone();
+
+        // Sign the descendant *in the document's context*, so its Reference
+        // URI is `#_inner`.
+        let signed_inner =
+            crate::dsig::sign::sign_element(inner, &doc, test_sign_options()).expect("sign inner");
+        let sig = signed_inner
+            .children
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e)
+                    if e.qname().namespace() == Some(crate::dsig::reference::DS_NS)
+                        && e.qname().local() == "Signature" =>
+                {
+                    Some(e.clone())
+                }
+                _ => None,
+            })
+            .expect("signature produced");
+
+        // Hoist it to the root, leaving the original (unsigned) Issuer alone.
+        let mut root = doc.root().clone();
+        root.children.push(Node::Element(sig));
+        soap::wrap_element(root).expect("wrap").into_bytes()
+    }
+
+    // ---------- inbound ArtifactResolve authentication ----------------------
+    //
+    // SAML 2.0 Bindings §3.6.3 requires the requester be authenticated before
+    // an artifact is resolved. An artifact rides in a URL query parameter, so
+    // it reaches access logs, `Referer` headers and browser history; if the
+    // resolve endpoint accepts anyone, the artifact is a bearer token for the
+    // full assertion.
+
+    const RESOLVE_ISSUER: &str = "https://sp.example.com/saml";
+
+    fn resolve_certs() -> Vec<X509Certificate> {
+        vec![X509Certificate::from_pem(RSA_CERT_PEM).expect("cert")]
+    }
+
+    fn resolve_cfg(certs: &[X509Certificate], require_signed: bool) -> VerifyResolveConfig<'_> {
+        VerifyResolveConfig {
+            certs,
+            allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+            require_signed,
+        }
+    }
+
+    #[test]
+    fn signed_artifact_resolve_verifies() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+        let certs = resolve_certs();
+
+        let req = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, true)))
+            .expect("a correctly signed resolve must verify");
+
+        assert!(req.signature_verified);
+        assert_eq!(req.issuer, RESOLVE_ISSUER);
+        assert_eq!(req.artifact, "AAQAAK1234567890");
+    }
+
+    #[test]
+    fn unsigned_artifact_resolve_rejected_when_required() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
+        let certs = resolve_certs();
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, true)))
+            .expect_err("an unsigned resolve must not authenticate the requester");
+        assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
+    }
+
+    #[test]
+    fn unsigned_artifact_resolve_allowed_when_not_required() {
+        // The mutual-TLS deployment shape: the transport authenticates the
+        // requester, so no signature is demanded — but the caller can still
+        // see that nothing was verified at this layer.
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
+        let certs = resolve_certs();
+
+        let req = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, false)))
+            .expect("unsigned is acceptable when not required");
+        assert!(!req.signature_verified);
+    }
+
+    #[test]
+    fn tampered_artifact_resolve_signature_rejected_even_when_not_required() {
+        // `require_signed = false` relaxes *absence*, never validity: a
+        // present-but-broken signature is always an error.
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+        let tampered = String::from_utf8(envelope)
+            .expect("utf8")
+            .replace("AAQAAK1234567890", "AAQAAK0000000000")
+            .into_bytes();
+        let certs = resolve_certs();
+
+        for require_signed in [true, false] {
+            let err =
+                parse_artifact_resolve_with(&tampered, Some(&resolve_cfg(&certs, require_signed)))
+                    .expect_err("tampered payload must fail the digest check");
+            assert!(
+                matches!(err, Error::SignatureVerification { .. }),
+                "require_signed={require_signed}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_resolve_signed_by_an_untrusted_key_rejected() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+        let other = vec![X509Certificate::from_pem(EC_P256_CERT_PEM).expect("other cert")];
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&other, true)))
+            .expect_err("a signature from outside the SP's key set must be rejected");
+        assert!(
+            matches!(err, Error::SignatureVerification { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_resolve_signature_must_cover_the_message_root() {
+        // XSW: the signature still verifies, but covers a nested element
+        // rather than the ArtifactResolve. Without the coverage check an
+        // attacker could graft a captured signature onto a resolve carrying
+        // someone else's artifact.
+        let envelope = xsw_artifact_resolve_envelope();
+        let certs = resolve_certs();
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, true)))
+            .expect_err("a signature not covering the root must be rejected");
+        assert!(
+            matches!(
+                err,
+                Error::SignatureVerification {
+                    reason: "ArtifactResolve signature does not cover the message root"
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_artifact_resolve_without_config_reports_unverified() {
+        // The no-verification entry point must never claim verification it
+        // did not perform, even for a genuinely signed message.
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+
+        let req = parse_artifact_resolve(&envelope).expect("parses");
+        assert!(
+            !req.signature_verified,
+            "no config supplied -> nothing was verified"
+        );
+    }
+
     fn signed_artifact_response_envelope(payload_xml: &str, tamper: bool) -> Vec<u8> {
         let kp = test_keypair();
         let payload_doc = Document::parse(payload_xml.as_bytes()).expect("payload parse");

@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use saml::attribute::Attribute;
 use saml::authn_context::AuthnContextClassRef;
+use saml::binding::artifact::SignConfig;
 use saml::binding::{
     Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint,
 };
@@ -41,7 +42,10 @@ use saml::http::{HttpClient, HttpRequest, HttpResponse};
 use saml::idp::{ConsumeAuthnRequest, IdentityProvider, IdentityProviderConfig, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
 use saml::replay::ReplayMode;
-use saml::sp::{ConsumeArtifactResponse, ServiceProvider, ServiceProviderConfig, StartLogin};
+use saml::sp::{
+    ArtifactBackchannel, ConsumeArtifactResponse, ServiceProvider, ServiceProviderConfig,
+    StartLogin,
+};
 use saml::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
 
 const SP_ENTITY_ID: &str = "https://sp.example.com/artifact";
@@ -65,6 +69,8 @@ fn make_artifact_idp() -> common::TestResult<IdentityProvider> {
         signing_key,
         decryption_key: None,
         want_authn_requests_signed: false,
+        #[cfg(feature = "artifact-binding")]
+        want_artifact_resolve_signed: true,
         assertion_signing: saml::IdpAssertionSigning {
             sign_responses: false,
             sign_assertions: true,
@@ -91,7 +97,9 @@ fn make_artifact_sp() -> common::TestResult<ServiceProvider> {
         acs: vec![SsoResponseEndpoint::artifact(SP_ACS_URL, 0, true)],
         slo: vec![],
         name_id_formats: vec![NameIdFormat::EmailAddress, NameIdFormat::Persistent],
-        signing_key: None,
+        // An SP that signs its back-channel ArtifactResolve must publish the
+        // matching certificate, or the IdP has nothing to verify against.
+        signing_key: Some(common::rsa_keypair_with_cert()?),
         decryption_key: None,
         sign_authn_requests: false,
         want_signed: saml::SpWantSigned {
@@ -163,6 +171,7 @@ async fn artifact_flow_end_to_end() {
     let idp = make_artifact_idp().expect("idp builds");
     let idp_descriptor: IdpDescriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor: SpDescriptor = common::sp_descriptor(&sp).expect("sp descriptor");
+    let sp_signing_key = common::rsa_keypair_with_cert().expect("sp signing key");
     let now = common::fixed_now().expect("fixed_now");
 
     // 1. SP starts login requesting Artifact response binding.
@@ -291,7 +300,20 @@ async fn artifact_flow_end_to_end() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The IdP fixture requires a signed ArtifactResolve (SAML 2.0
+                // Bindings §3.6.3), so the SP authenticates itself on the
+                // back-channel. This exercises the full loop: the SP signs the
+                // resolve, the IdP verifies it against the SP's metadata certs
+                // before the artifact is looked up.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
