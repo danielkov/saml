@@ -181,6 +181,15 @@ pub enum Error {
     UnsupportedByPeer { binding: Binding },
     #[error("AuthnRequest/@ProtocolBinding is not legal for SSO Response: {requested:?}")]
     IllegalResponseBinding { requested: Binding },
+    /// A solicited Response arrived over a different binding than the ACS
+    /// endpoint recorded in the `LoginTracker` when the `AuthnRequest` was
+    /// issued. Both bindings are legal for SSO responses — they simply do not
+    /// correlate, so this is distinct from [`Error::IllegalResponseBinding`].
+    #[error("Response binding {received:?} does not match the tracked ACS binding {expected:?}")]
+    ResponseBindingMismatch {
+        expected: Binding,
+        received: Binding,
+    },
 
     // --- Configuration ---
     #[error("Invalid configuration: {reason}")]
