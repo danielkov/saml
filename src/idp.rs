@@ -145,6 +145,20 @@ pub struct IdentityProviderConfig {
     /// (rare in practice).
     pub decryption_key: Option<KeyPair>,
     pub want_authn_requests_signed: bool,
+    /// Require inbound `<samlp:ArtifactResolve>` to carry a verified
+    /// enveloped signature from the requesting SP.
+    ///
+    /// SAML 2.0 Bindings §3.6.3 requires the requester be authenticated
+    /// before an artifact is resolved. An artifact travels in a URL query
+    /// parameter, so it leaks into access logs, `Referer` headers and browser
+    /// history; unauthenticated resolution makes it a bearer token that
+    /// anyone who obtains it can redeem for the full assertion.
+    ///
+    /// Set false only when the artifact-resolution endpoint sits behind
+    /// mutually-authenticated TLS, the other mode §3.6.3 permits. A
+    /// present-but-invalid signature is rejected either way.
+    #[cfg(feature = "artifact-binding")]
+    pub want_artifact_resolve_signed: bool,
     /// Outbound assertion / Response signing flags.
     pub assertion_signing: IdpAssertionSigning,
     pub encrypt_assertions_when_possible: bool,
@@ -679,15 +693,35 @@ impl IdentityProvider {
     /// the artifact value in its store and constructs the response via
     /// [`IdentityProvider::build_artifact_response`].
     ///
-    /// Verifies the requesting SP's issuer matches the supplied
-    /// [`SpDescriptor`]; mismatches return [`Error::IssuerMismatch`].
+    /// Authenticates the requester against `sp.signing_certs` when
+    /// [`want_artifact_resolve_signed`] is set, using the effective peer
+    /// policy's signature allow-list, and requires the signature to cover the
+    /// whole `ArtifactResolve` (the XSW check). A present-but-invalid
+    /// signature is rejected regardless of that flag.
+    ///
+    /// The `<saml:Issuer>` comparison against `sp.entity_id` is a routing and
+    /// consistency check, not authentication: `Issuer` is attacker-controlled
+    /// wire content, so on its own it proves only that the sender named the
+    /// SP whose descriptor the caller passed. Authenticity comes from the
+    /// signature, or from client authentication at the transport.
+    ///
+    /// [`want_artifact_resolve_signed`]: IdentityProviderConfig::want_artifact_resolve_signed
     #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
     pub fn parse_artifact_resolve(
         &self,
         sp: &SpDescriptor,
         soap_envelope: &[u8],
     ) -> Result<crate::binding::artifact::ArtifactResolveRequest, Error> {
-        let req = crate::binding::artifact::parse_artifact_resolve(soap_envelope)?;
+        let verify = crate::binding::artifact::VerifyResolveConfig {
+            certs: &sp.signing_certs,
+            allowed_algorithms: &self
+                .config
+                .default_peer_crypto_policy
+                .allowed_signature_algorithms,
+            require_signed: self.config.want_artifact_resolve_signed,
+        };
+        let req =
+            crate::binding::artifact::parse_artifact_resolve_with(soap_envelope, Some(&verify))?;
         if req.issuer != sp.entity_id {
             return Err(Error::IssuerMismatch {
                 expected: sp.entity_id.clone(),
@@ -1543,6 +1577,8 @@ mod tests {
             signing_key: rsa_keypair_with_cert(),
             decryption_key: None,
             want_authn_requests_signed,
+            #[cfg(feature = "artifact-binding")]
+            want_artifact_resolve_signed: true,
             assertion_signing: IdpAssertionSigning {
                 sign_responses,
                 sign_assertions: true,
@@ -2036,6 +2072,84 @@ mod tests {
             .expect("validate");
         parsed.relay_state = Some("rs-token".into());
         parsed
+    }
+
+    // ---------- inbound ArtifactResolve authentication ----------------------
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn idp_with_artifact_resolve_signed(require: bool) -> IdentityProvider {
+        // `config` is private but reachable from this child module; flipping
+        // one flag post-construction keeps the fixture to the knob under test
+        // instead of restating every field.
+        let mut idp = idp_with(false, false);
+        idp.config.want_artifact_resolve_signed = require;
+        idp
+    }
+
+    /// `want_artifact_resolve_signed` must actually reach the verifier: an
+    /// unsigned resolve is refused before the caller ever sees the artifact,
+    /// so a leaked artifact cannot be redeemed by an unauthenticated party.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn unsigned_artifact_resolve_rejected_when_idp_requires_signing() {
+        let idp = idp_with_artifact_resolve_signed(true);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(&sp, envelope.as_bytes())
+            .expect_err("an unauthenticated resolve must not be honoured");
+        assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn unsigned_artifact_resolve_allowed_when_idp_does_not_require_signing() {
+        // The mutual-TLS shape: authentication happens at the transport, and
+        // the parsed request reports that nothing was verified here.
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let req = idp
+            .parse_artifact_resolve(&sp, envelope.as_bytes())
+            .expect("accepted without a signature");
+        assert!(!req.signature_verified);
+        assert_eq!(req.artifact, "AAQAAK1234567890");
+    }
+
+    /// The `<saml:Issuer>` cross-check still applies, and is reported as an
+    /// issuer mismatch rather than a signature failure.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_from_a_different_issuer_rejected() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            "https://other-sp.example.com/saml",
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(&sp, envelope.as_bytes())
+            .expect_err("issuer does not match the supplied descriptor");
+        assert!(matches!(
+            err,
+            Error::IssuerMismatch { ref got, .. }
+                if got.as_deref() == Some("https://other-sp.example.com/saml")
+        ));
     }
 
     #[test]

@@ -640,6 +640,8 @@ pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, s
         // The SP demo signs its outbound AuthnRequests; the IdP requires
         // signed inbound requests so we exercise the verify path.
         want_authn_requests_signed: true,
+        #[cfg(feature = "artifact-binding")]
+        want_artifact_resolve_signed: true,
         assertion_signing: IdpAssertionSigning {
             // Sign the Assertion, not the Response envelope, matching what
             // the SP's `SpWantSigned { response: false, assertions: true }`
