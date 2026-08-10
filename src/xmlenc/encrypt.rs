@@ -227,8 +227,9 @@ where
 /// `<ds:DigestMethod>` and `mgf1sha256` as the `<xenc11:MGF>`, so a recipient
 /// reading those parameters literally reconstructs the same padding.
 ///
-/// `RsaOaepMgf1Sha1`: SHA-1 for the OAEP digest *and* MGF1, which is what the
-/// `#rsa-oaep-mgf1p` URI pins by definition.
+/// `RsaOaepMgf1Sha1` outbound encryption uses SHA-1 for both hashes. The
+/// algorithm URI fixes only MGF1-SHA1; the explicit `<ds:DigestMethod>`
+/// emitted below selects SHA-1 as this emitter's message digest.
 fn wrap_session_key(
     public: &RsaPublicKey,
     algorithm: KeyTransportAlgorithm,

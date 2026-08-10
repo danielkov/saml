@@ -31,11 +31,21 @@ use crate::crypto::cert::{PublicKey, PublicKeyAlgorithm, X509Certificate};
 use crate::dsig::algorithms::SignatureAlgorithm;
 use crate::error::Error;
 
-/// OAEP digest options for `KeyPair::decrypt_rsa_oaep`. SHA-256 is the
-/// modern default; SHA-1 is included for legacy `xmlenc11#rsa-oaep` with
-/// MGF1-SHA1 (the digest itself is SHA-1 in the historical `xmlenc#rsa-1_5`
-/// counterpart, which we don't support — but for OAEP, the digest and MGF
-/// digests are conceptually separate; see RFC-002 §5).
+/// Hash selection for RSA-OAEP.
+///
+/// Names a hash only. It is used in two independent positions — the message
+/// digest from `<ds:DigestMethod>` and the MGF1 hash from `<xenc11:MGF>` —
+/// which RFC 8017 Appendix A.2.1 defines as separate parameters
+/// (`hashAlgorithm` and `maskGenAlgorithm`).
+///
+/// This type carries no notion of a default. XML Encryption 1.1 §5.5.2
+/// supplies those on the wire (SHA-1 for an absent `<ds:DigestMethod>`,
+/// MGF1-SHA1 for an absent `<xenc11:MGF>`) and `xmlenc::decrypt` resolves
+/// them before any policy is applied. Which values are *acceptable* is a
+/// separate question, answered per peer by
+/// [`PeerCryptoPolicy`](crate::PeerCryptoPolicy): [`DEFAULTS`](Self::DEFAULTS)
+/// for the message digest, [`MGF1_DEFAULTS`](Self::MGF1_DEFAULTS) for the
+/// MGF1 hash.
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OaepDigest {
