@@ -27,13 +27,16 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt as _;
 
-use saml::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
+use saml::binding::artifact::SignConfig;
+use saml::dsig::algorithms::{
+    C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
+};
 use saml::http::{HttpClient, HttpRequest, HttpResponse};
 use saml::{
-    Attribute, AuthnContextClassRef, Binding, ConsumeArtifactResponse, ConsumeAuthnRequest,
-    Dispatch, IdpDescriptor, IssueResponse, NameId, NameIdFormat, ReplayMode, ServiceProvider,
-    ServiceProviderConfig, SpDescriptor, SpWantSigned, SsoResponseBinding, SsoResponseDispatch,
-    SsoResponseEndpoint, StartLogin, X509Certificate,
+    ArtifactBackchannel, Attribute, AuthnContextClassRef, Binding, ConsumeArtifactResponse,
+    ConsumeAuthnRequest, Dispatch, IdpDescriptor, IssueResponse, NameId, NameIdFormat, ReplayMode,
+    ServiceProvider, ServiceProviderConfig, SpDescriptor, SpWantSigned, SsoResponseBinding,
+    SsoResponseDispatch, SsoResponseEndpoint, StartLogin, X509Certificate,
 };
 
 use saml_idp_example as idp;
@@ -157,6 +160,11 @@ impl HttpClient for RouterClient {
 #[tokio::test]
 async fn artifact_round_trip_through_example_handlers() {
     let sp = make_artifact_sp();
+    // Same keypair the SP was built with, for signing the back-channel
+    // ArtifactResolve below.
+    let sp_signing_key = saml::KeyPair::from_pkcs8_pem(idp::IDP_KEY_PEM)
+        .expect("sp keypair")
+        .with_certificate(X509Certificate::from_pem(idp::IDP_CERT_PEM).expect("sp cert"));
     let state = make_app_state(&sp);
     let idp_descriptor = idp_descriptor(&state);
     let sp_descriptor = state
@@ -290,7 +298,20 @@ async fn artifact_round_trip_through_example_handlers() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The example IdP requires a signed ArtifactResolve (SAML 2.0
+                // Bindings §3.6.3), so the SP authenticates itself on the
+                // back-channel. Exercises the full loop: SP signs, the
+                // handler verifies against the SP's registered certificate
+                // before the artifact is taken out of the stash.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
