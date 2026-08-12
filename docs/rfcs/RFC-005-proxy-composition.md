@@ -248,7 +248,9 @@ pub struct RelayToDownstream<'a> {
     /// Pluggable: how to mint a NameID for the downstream SP from the upstream subject.
     pub name_id_transform: &'a dyn NameIdTransform,
     /// If true, set downstream AuthnContextClassRef = upstream's actual.
-    /// If false, use the proxy's default policy (typically `PasswordProtectedTransport`).
+    /// If false — or upstream asserted none — emit `Unspecified`, which claims
+    /// nothing. Not `PasswordProtectedTransport`: that outranks plain
+    /// Password, so defaulting to it would assert more than upstream attested.
     pub passthrough_authn_context: bool,
     pub now: SystemTime,
     pub session_lifetime: Duration,

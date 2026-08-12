@@ -302,6 +302,13 @@ impl ProxyContext {
 // AES-256-GCM codec (RFC-005 §2.1)
 // =============================================================================
 
+/// How far ahead of local time a context's `issued_at` may be.
+///
+/// Clock disagreement between cooperating hosts is seconds; anything beyond
+/// this is a caller stamping a future date to evade `max_age`, since
+/// `BounceToUpstream::now` is caller-supplied.
+const MAX_CONTEXT_CLOCK_SKEW: Duration = Duration::from_mins(5);
+
 /// Stateless AEAD codec: postcard-serialized `ProxyContextPayload` sealed with
 /// AES-256-GCM, base64url-encoded for `RelayState`.
 pub struct Aes256GcmCodec {
@@ -397,15 +404,30 @@ impl ProxyContextCodec for Aes256GcmCodec {
                 reason: "proxy context deserialize",
             })?;
 
-        // Enforce max_age. We tolerate small backward clock skew (a context
-        // dated in the future is treated as `now`).
-        let age = SystemTime::now()
-            .duration_since(context.issued_at)
-            .unwrap_or(Duration::ZERO);
-        if age > self.max_age {
-            return Err(Error::InvalidConfiguration {
-                reason: "proxy context expired",
-            });
+        // Enforce max_age in both directions.
+        //
+        // Treating any future-dated context as age zero made `max_age` soft:
+        // `BounceToUpstream::now` is caller-supplied and sealed verbatim, so a
+        // context stamped a year ahead stayed valid for a year plus `max_age`.
+        // Real clock disagreement between hosts is seconds, not months, so a
+        // bounded skew tolerance keeps legitimate deployments working while
+        // making the limit actually hard.
+        let now = SystemTime::now();
+        match now.duration_since(context.issued_at) {
+            Ok(age) => {
+                if age > self.max_age {
+                    return Err(Error::InvalidConfiguration {
+                        reason: "proxy context expired",
+                    });
+                }
+            }
+            Err(ahead) => {
+                if ahead.duration() > MAX_CONTEXT_CLOCK_SKEW {
+                    return Err(Error::InvalidConfiguration {
+                        reason: "proxy context is dated too far in the future",
+                    });
+                }
+            }
         }
 
         Ok(context)
@@ -599,8 +621,11 @@ pub struct RelayToDownstream<'a> {
     pub attribute_release: &'a dyn AttributeReleasePolicy,
     /// Pluggable: how to mint a NameID for the downstream SP.
     pub name_id_transform: &'a dyn NameIdTransform,
-    /// If true, set downstream AuthnContextClassRef = upstream's actual.
-    /// If false, fall back to `PasswordProtectedTransport`.
+    /// If true, set the downstream AuthnContextClassRef to the upstream's
+    /// actual class. If false — or if upstream asserted none — the emitted
+    /// class is `Unspecified`, which claims nothing. It is deliberately not
+    /// `PasswordProtectedTransport`: that outranks plain Password, so
+    /// defaulting to it signed a *stronger* claim than upstream attested.
     pub passthrough_authn_context: bool,
     pub now: SystemTime,
     pub session_lifetime: Duration,
@@ -625,8 +650,8 @@ impl Proxy<'_> {
         //    with no requested context at all, so relay skipped the
         //    non-downgrade check entirely and a proxy that merely declined to
         //    forward the request upstream silently stopped enforcing it.
-        let force_authn = input.propagate_request_flags && downstream.force_authn;
-        let is_passive = input.propagate_request_flags && downstream.is_passive;
+        let force_authn = input.propagate_request_flags && downstream.validated_force_authn();
+        let is_passive = input.propagate_request_flags && downstream.validated_is_passive();
         let upstream_name_id_format = if input.propagate_name_id_policy {
             downstream.validated_name_id_format().cloned()
         } else {
@@ -665,7 +690,7 @@ impl Proxy<'_> {
             downstream_request_id: downstream.validated_request_id().to_owned(),
             downstream_sp_entity_id: downstream.validated_sp().to_owned(),
             downstream_acs: downstream.validated_acs().as_endpoint(),
-            downstream_relay_state: downstream.relay_state.clone(),
+            downstream_relay_state: downstream.validated_relay_state().map(str::to_owned),
             // Unconditionally what downstream asked for — see step 1 — and
             // from the private provenance, not the caller-mutable `pub` copies.
             requested_authn_context: downstream.validated_authn_context().cloned(),

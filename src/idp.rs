@@ -385,7 +385,7 @@ impl IdentityProvider {
             return Err(Error::StaleAuthnRequest { age, limit });
         }
 
-        parsed.relay_state = input.relay_state.map(str::to_owned);
+        parsed.seal_relay_state(input.relay_state.map(str::to_owned));
         Ok(parsed)
     }
 
@@ -452,7 +452,24 @@ impl IdentityProvider {
             crate::binding::WireDirection::Request,
         )?;
         let detached_signature = decoded.as_detached_signature();
-        let resolved_relay_state = input.relay_state.or(decoded.relay_state.as_deref());
+        // On Redirect the RelayState travels in the signed query string, so a
+        // separately-supplied value that disagrees would keep the signature
+        // valid while swapping the application correlation token. The decoded
+        // value is authoritative there; only POST carries RelayState in a
+        // separate form field the caller must pass in.
+        let resolved_relay_state = if input.binding == Binding::HttpRedirect {
+            if let Some(supplied) = input.relay_state
+                && Some(supplied) != decoded.relay_state.as_deref()
+            {
+                return Err(Error::InvalidConfiguration {
+                    reason: "Redirect RelayState is covered by the signature; \
+                             the supplied value disagrees with the decoded one",
+                });
+            }
+            decoded.relay_state.as_deref()
+        } else {
+            input.relay_state.or(decoded.relay_state.as_deref())
+        };
         self.consume_authn_request(ConsumeAuthnRequest {
             sp: input.sp,
             peer_crypto_policy: input.peer_crypto_policy,
@@ -607,7 +624,7 @@ impl IdentityProvider {
         // `SsoResponseEndpoint::index` is public too, and artifact issuance
         // names the endpoint by index.
         let acs_endpoint = input.in_response_to.validated_acs();
-        let relay_state = input.in_response_to.relay_state.as_deref();
+        let relay_state = input.in_response_to.validated_relay_state();
 
         // Resolve outbound `NameID` Format: honor the SP's requested format
         // when supported, otherwise fall back to the IdP's default. From the
@@ -616,7 +633,7 @@ impl IdentityProvider {
             input.in_response_to.validated_name_id_format(),
             &self.config.supported_name_id_formats,
             &self.config.default_name_id_format,
-        );
+        )?;
         let mut name_id = input.name_id;
         name_id.format = chosen_format;
 
@@ -666,7 +683,7 @@ impl IdentityProvider {
         // `SsoResponseEndpoint::index` is public too, and artifact issuance
         // names the endpoint by index.
         let acs_endpoint = input.in_response_to.validated_acs();
-        let relay_state = input.in_response_to.relay_state.as_deref();
+        let relay_state = input.in_response_to.validated_relay_state();
 
         let inputs = IssueErrorResponseInputs {
             idp_entity_id: &self.config.entity_id,
@@ -801,14 +818,24 @@ fn ensure_request_belongs_to_sp(
 /// format wins iff it appears in our `supported_name_id_formats`; otherwise
 /// we fall back to the IdP default. This matches the SAML 2.0 NameIDPolicy
 /// negotiation rules (Core §3.4.1.1).
+/// Resolve the outbound `NameID` Format.
+///
+/// Core §3.4.1.1: an explicit `<samlp:NameIDPolicy>/@Format` the IdP cannot
+/// produce is an error, not an invitation to substitute. Falling back handed
+/// the SP an identifier with different semantics under a request it believed
+/// was satisfied — a persistent pseudonym where it asked for a transient one,
+/// for instance. The default applies only when the SP requested nothing.
 fn pick_name_id_format(
     requested: Option<&NameIdFormat>,
     supported: &[NameIdFormat],
     default: &NameIdFormat,
-) -> NameIdFormat {
+) -> Result<NameIdFormat, Error> {
     match requested {
-        Some(fmt) if supported.contains(fmt) => fmt.clone(),
-        _ => default.clone(),
+        Some(fmt) if supported.contains(fmt) => Ok(fmt.clone()),
+        Some(fmt) => Err(Error::UnsupportedNameIdPolicy {
+            requested: fmt.as_uri().to_owned(),
+        }),
+        None => Ok(default.clone()),
     }
 }
 
@@ -2148,7 +2175,9 @@ mod tests {
         let sso_urls = vec!["https://idp.example.com/sso".to_string()];
         let mut parsed = validate_authn_request(raw, &sp, "https://idp.example.com/sso", &sso_urls)
             .expect("validate");
-        parsed.relay_state = Some("rs-token".into());
+        // Via the sealing path the role layer uses; assigning the pub field
+        // no longer counts, which is the point of the provenance.
+        parsed.seal_relay_state(Some("rs-token".into()));
         parsed
     }
 
@@ -2886,16 +2915,31 @@ mod tests {
         let supported = vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress];
         let default = NameIdFormat::Persistent;
         assert_eq!(
-            pick_name_id_format(Some(&NameIdFormat::EmailAddress), &supported, &default),
+            pick_name_id_format(Some(&NameIdFormat::EmailAddress), &supported, &default)
+                .expect("supported"),
             NameIdFormat::EmailAddress
         );
+        // No request at all: the default applies.
         assert_eq!(
-            pick_name_id_format(Some(&NameIdFormat::Transient), &supported, &default),
+            pick_name_id_format(None, &supported, &default).expect("no request"),
             NameIdFormat::Persistent
         );
-        assert_eq!(
-            pick_name_id_format(None, &supported, &default),
-            NameIdFormat::Persistent
+    }
+
+    /// Core §3.4.1.1: an explicit format the IdP cannot produce is an error,
+    /// not an invitation to substitute. Falling back to Persistent handed the
+    /// SP a durable pseudonym where it asked for a Transient one, under a
+    /// request it believed had been satisfied.
+    #[test]
+    fn pick_name_id_format_rejects_an_unsupported_explicit_request() {
+        let supported = vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress];
+        let default = NameIdFormat::Persistent;
+
+        let err = pick_name_id_format(Some(&NameIdFormat::Transient), &supported, &default)
+            .expect_err("Transient is not supported here");
+        assert!(
+            matches!(err, Error::UnsupportedNameIdPolicy { .. }),
+            "got {err:?}"
         );
     }
 

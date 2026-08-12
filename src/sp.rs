@@ -599,6 +599,24 @@ impl ServiceProvider {
             holder_of_key_cert: input.holder_of_key_cert,
         })?;
 
+        // The NameID Format must be the one we asked for.
+        //
+        // Core §3.4.1.1 requires the IdP to answer `InvalidNameIDPolicy`
+        // rather than substitute a format it cannot produce, but an SP cannot
+        // assume every peer does. A substituted format has different
+        // semantics — a persistent pseudonym where a transient one was
+        // requested is durably linkable across sessions — so accepting it
+        // silently defeats the reason the format was specified.
+        if let Some(requested) = input
+            .tracker
+            .and_then(|t| t.requested_name_id_format.as_ref())
+            && identity.name_id().format != *requested
+        {
+            return Err(Error::UnsupportedNameIdPolicy {
+                requested: requested.as_uri().to_owned(),
+            });
+        }
+
         // Replay-cache check, AFTER signature + all spec checks succeed.
         // We never offer an `assertion_id` to the cache until the
         // assertion is structurally valid and signed by a trusted cert
