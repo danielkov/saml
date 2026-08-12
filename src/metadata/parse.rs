@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use crate::crypto::cert::X509Certificate;
 use crate::descriptor::idp::IdpDescriptor;
 use crate::descriptor::sp::SpDescriptor;
-use crate::dsig::algorithms::SignatureAlgorithm;
+use crate::dsig::algorithms::PeerCryptoPolicy;
 use crate::dsig::verify::verify_signature;
 use crate::error::Error;
 use crate::nameid::NameIdFormat;
@@ -279,6 +279,25 @@ where
 pub fn stream_signed_entities<F>(
     metadata_xml: &[u8],
     trusted_signing_cert: &X509Certificate,
+    visit: F,
+) -> Result<(), Error>
+where
+    F: FnMut(MetadataEntry) -> StreamControl,
+{
+    stream_signed_entities_with_policy(
+        metadata_xml,
+        trusted_signing_cert,
+        &PeerCryptoPolicy::metadata_compat_defaults(),
+        visit,
+    )
+}
+
+/// [`stream_signed_entities`] with a caller-supplied crypto policy governing
+/// the wrapper signature's algorithms.
+pub fn stream_signed_entities_with_policy<F>(
+    metadata_xml: &[u8],
+    trusted_signing_cert: &X509Certificate,
+    policy: &PeerCryptoPolicy,
     mut visit: F,
 ) -> Result<(), Error>
 where
@@ -289,7 +308,7 @@ where
     // out, so the visitor cannot observe an entity from an unverified
     // aggregate.
     let doc = Document::parse_with_limits(metadata_xml, XmlLimits::aggregate())?;
-    verify_metadata_signature_on_document(&doc, trusted_signing_cert)?;
+    verify_metadata_signature_on_document(&doc, trusted_signing_cert, policy)?;
     visit_entities(doc.root(), &mut visit).map(|_control| ())
 }
 
@@ -618,13 +637,26 @@ pub struct VerifyMetadata<'a> {
 /// here. This is the structural XSW defense documented in RFC-002 §3.2 applied
 /// at the metadata layer.
 pub fn verify_metadata_signature(input: VerifyMetadata<'_>) -> Result<(), Error> {
+    verify_metadata_signature_with_policy(input, &PeerCryptoPolicy::metadata_compat_defaults())
+}
+
+/// [`verify_metadata_signature`] with a caller-supplied crypto policy.
+///
+/// Use this to tighten metadata verification — for example passing
+/// [`PeerCryptoPolicy::strong_defaults`] to require exclusive C14N — or to
+/// widen it for a peer whose signer needs an algorithm outside the defaults.
+pub fn verify_metadata_signature_with_policy(
+    input: VerifyMetadata<'_>,
+    policy: &PeerCryptoPolicy,
+) -> Result<(), Error> {
     let doc = Document::parse(input.metadata_xml)?;
-    verify_metadata_signature_on_document(&doc, input.trusted_signing_cert)
+    verify_metadata_signature_on_document(&doc, input.trusted_signing_cert, policy)
 }
 
 fn verify_metadata_signature_on_document(
     doc: &Document,
     trusted_signing_cert: &X509Certificate,
+    policy: &PeerCryptoPolicy,
 ) -> Result<(), Error> {
     let signature_elem = doc
         .root()
@@ -634,7 +666,7 @@ fn verify_metadata_signature_on_document(
         doc,
         signature_elem,
         std::slice::from_ref(trusted_signing_cert),
-        SignatureAlgorithm::DEFAULTS,
+        policy,
     )?;
     if verified.signed_element != doc.root().id() {
         return Err(Error::SignatureVerification {
@@ -652,11 +684,25 @@ pub fn parse_signed_entities_descriptor(
     metadata_xml: &[u8],
     trusted_signing_cert: &X509Certificate,
 ) -> Result<EntitiesDescriptor, Error> {
+    parse_signed_entities_descriptor_with_policy(
+        metadata_xml,
+        trusted_signing_cert,
+        &PeerCryptoPolicy::metadata_compat_defaults(),
+    )
+}
+
+/// [`parse_signed_entities_descriptor`] with a caller-supplied crypto policy governing the
+/// metadata signature's algorithms.
+pub fn parse_signed_entities_descriptor_with_policy(
+    metadata_xml: &[u8],
+    trusted_signing_cert: &X509Certificate,
+    policy: &PeerCryptoPolicy,
+) -> Result<EntitiesDescriptor, Error> {
     // Aggregate-sized node ceiling: a signed InCommon / eduGAIN aggregate
     // exceeds the default ~100k-node limit, and the signature covers the whole
     // wrapper so the document must be parsed as a unit before verification.
     let doc = Document::parse_with_limits(metadata_xml, XmlLimits::aggregate())?;
-    verify_metadata_signature_on_document(&doc, trusted_signing_cert)?;
+    verify_metadata_signature_on_document(&doc, trusted_signing_cert, policy)?;
     EntitiesDescriptor::from_root_element(doc.root())
 }
 
@@ -665,8 +711,22 @@ pub fn parse_signed_idp_descriptor(
     metadata_xml: &[u8],
     trusted_signing_cert: &X509Certificate,
 ) -> Result<IdpDescriptor, Error> {
+    parse_signed_idp_descriptor_with_policy(
+        metadata_xml,
+        trusted_signing_cert,
+        &PeerCryptoPolicy::metadata_compat_defaults(),
+    )
+}
+
+/// [`parse_signed_idp_descriptor`] with a caller-supplied crypto policy governing the
+/// metadata signature's algorithms.
+pub fn parse_signed_idp_descriptor_with_policy(
+    metadata_xml: &[u8],
+    trusted_signing_cert: &X509Certificate,
+    policy: &PeerCryptoPolicy,
+) -> Result<IdpDescriptor, Error> {
     let doc = Document::parse(metadata_xml)?;
-    verify_metadata_signature_on_document(&doc, trusted_signing_cert)?;
+    verify_metadata_signature_on_document(&doc, trusted_signing_cert, policy)?;
     let entity = find_entity_descriptor(doc.root(), |e| {
         e.child_element(Some(MD_NS), "IDPSSODescriptor").is_some()
     })
@@ -681,8 +741,22 @@ pub fn parse_signed_sp_descriptor(
     metadata_xml: &[u8],
     trusted_signing_cert: &X509Certificate,
 ) -> Result<SpDescriptor, Error> {
+    parse_signed_sp_descriptor_with_policy(
+        metadata_xml,
+        trusted_signing_cert,
+        &PeerCryptoPolicy::metadata_compat_defaults(),
+    )
+}
+
+/// [`parse_signed_sp_descriptor`] with a caller-supplied crypto policy governing the
+/// metadata signature's algorithms.
+pub fn parse_signed_sp_descriptor_with_policy(
+    metadata_xml: &[u8],
+    trusted_signing_cert: &X509Certificate,
+    policy: &PeerCryptoPolicy,
+) -> Result<SpDescriptor, Error> {
     let doc = Document::parse(metadata_xml)?;
-    verify_metadata_signature_on_document(&doc, trusted_signing_cert)?;
+    verify_metadata_signature_on_document(&doc, trusted_signing_cert, policy)?;
     let entity = find_entity_descriptor(doc.root(), |e| {
         e.child_element(Some(MD_NS), "SPSSODescriptor").is_some()
     })
@@ -1265,9 +1339,19 @@ mod tests {
 
     /// Sign a metadata document the same way `crate::dsig::verify` tests do.
     fn sign_metadata(target_id: &str, body_xml: &str) -> (String, X509Certificate) {
+        sign_metadata_with_c14n(target_id, body_xml, C14nAlgorithm::ExclusiveCanonical)
+    }
+
+    /// As [`sign_metadata`], with the canonicalization algorithm chosen by the
+    /// caller so tests can build the inclusive-C14N shape that federation
+    /// signing tooling commonly emits.
+    fn sign_metadata_with_c14n(
+        target_id: &str,
+        body_xml: &str,
+        c14n_alg: C14nAlgorithm,
+    ) -> (String, X509Certificate) {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = rsa_cert();
-        let c14n_alg = C14nAlgorithm::ExclusiveCanonical;
         let sig_alg = SignatureAlgorithm::RsaSha256;
 
         let stage_1_xml = format!(
@@ -1287,31 +1371,34 @@ mod tests {
             id = target_id,
             digest = digest_b64,
         );
-        let signed_info_xml = format!(
-            r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{signed_info_inner}</ds:SignedInfo>"#,
-        );
-        let signed_info_doc = Document::parse(signed_info_xml.as_bytes()).unwrap();
-        let si_chain = ancestor_chain(&signed_info_doc, signed_info_doc.root().id()).unwrap();
-        let si_canonical = canonicalize(
-            &signed_info_doc,
-            signed_info_doc.root(),
-            &si_chain,
-            c14n_alg,
-            &[],
-        )
-        .unwrap();
-        let sig_bytes = kp.sign(sig_alg, &si_canonical).unwrap();
-        let sig_b64 = BASE64_STANDARD.encode(&sig_bytes);
-
         let cert_b64 = cert.to_base64_x509();
         let body = body_xml;
         let si_inner = signed_info_inner.as_str();
-        let sig = sig_b64.as_str();
         let cert_text = cert_b64.as_str();
-        let final_xml = format!(
-            r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body}<ds:Signature><ds:SignedInfo>{si_inner}</ds:SignedInfo><ds:SignatureValue>{sig}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert_text}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature></md:EntitiesDescriptor>"#,
-        );
-        (final_xml, cert)
+        let envelope = |signature_value: &str| {
+            format!(
+                r#"<md:EntitiesDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="{target_id}">{body}<ds:Signature><ds:SignedInfo>{si_inner}</ds:SignedInfo><ds:SignatureValue>{signature_value}</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>{cert_text}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature></md:EntitiesDescriptor>"#,
+            )
+        };
+
+        // Canonicalize `<ds:SignedInfo>` *in place inside the envelope*, with
+        // its real ancestor chain, rather than as a standalone fragment.
+        // Inclusive C14N renders every namespace in scope, so the embedded
+        // element picks up `xmlns:md` from the root while a bare fragment does
+        // not — signing the fragment would produce bytes the verifier never
+        // reconstructs. Exclusive C14N happens to agree either way; doing it
+        // correctly keeps the helper honest for both algorithms.
+        let placeholder_doc = Document::parse(envelope("").as_bytes()).unwrap();
+        let signed_info_elem = placeholder_doc
+            .find_first(Some("http://www.w3.org/2000/09/xmldsig#"), "SignedInfo")
+            .expect("SignedInfo present in envelope");
+        let si_chain = ancestor_chain(&placeholder_doc, signed_info_elem.id()).unwrap();
+        let si_canonical =
+            canonicalize(&placeholder_doc, signed_info_elem, &si_chain, c14n_alg, &[]).unwrap();
+        let sig_bytes = kp.sign(sig_alg, &si_canonical).unwrap();
+        let sig_b64 = BASE64_STANDARD.encode(&sig_bytes);
+
+        (envelope(&sig_b64), cert)
     }
 
     #[test]
@@ -1323,6 +1410,59 @@ mod tests {
             trusted_signing_cert: &cert,
         })
         .expect("signature verifies");
+    }
+
+    #[test]
+    fn verify_metadata_signature_accepts_inclusive_c14n_by_default() {
+        // Federation signing tooling routinely emits inclusive C14N. The
+        // default metadata policy must keep accepting it: `strong_defaults`
+        // allows exclusive C14N only, so wiring that into the metadata path
+        // would reject aggregates that verified before per-peer C14N policy
+        // existed.
+        let body = idp_entity_xml("https://idp.example.com/saml");
+        let (xml, cert) =
+            sign_metadata_with_c14n("md-inclusive", &body, C14nAlgorithm::InclusiveCanonical);
+
+        verify_metadata_signature(VerifyMetadata {
+            metadata_xml: xml.as_bytes(),
+            trusted_signing_cert: &cert,
+        })
+        .expect("inclusive-C14N metadata still verifies under the default policy");
+
+        parse_signed_idp_descriptor(xml.as_bytes(), &cert)
+            .expect("verify-then-parse helpers share the compatible default");
+    }
+
+    #[test]
+    fn metadata_policy_opt_in_can_require_exclusive_c14n() {
+        let body = idp_entity_xml("https://idp.example.com/saml");
+        let (xml, cert) =
+            sign_metadata_with_c14n("md-inclusive", &body, C14nAlgorithm::InclusiveCanonical);
+
+        let err = verify_metadata_signature_with_policy(
+            VerifyMetadata {
+                metadata_xml: xml.as_bytes(),
+                trusted_signing_cert: &cert,
+            },
+            &PeerCryptoPolicy::strong_defaults(),
+        )
+        .expect_err("an explicit strong policy rejects inclusive C14N");
+        assert!(matches!(
+            err,
+            Error::DisallowedAlgorithm { ref alg }
+                if alg == C14nAlgorithm::InclusiveCanonical.uri()
+        ));
+
+        // The same document verifies when the caller passes a policy that
+        // admits it, so the tightening is opt-in rather than a hard rule.
+        verify_metadata_signature_with_policy(
+            VerifyMetadata {
+                metadata_xml: xml.as_bytes(),
+                trusted_signing_cert: &cert,
+            },
+            &PeerCryptoPolicy::metadata_compat_defaults(),
+        )
+        .expect("compat policy admits inclusive C14N");
     }
 
     #[test]

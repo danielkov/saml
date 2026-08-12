@@ -348,12 +348,8 @@ pub(crate) fn decrypt_subject_encrypted_id(
             reason: "assertion Subject carries <saml:EncryptedID> but no decryption key is configured",
         });
     }
-    let decrypted = crate::xmlenc::decrypt::decrypt_encrypted_assertion(
-        encrypted_id,
-        decryption_keys,
-        &policy.allowed_data_encryption_algorithms,
-        &policy.allowed_key_transport_algorithms,
-    )?;
+    let decrypted =
+        crate::xmlenc::decrypt::decrypt_encrypted_assertion(encrypted_id, decryption_keys, policy)?;
     if decrypted.qname().namespace() != Some(SAML_NS) || decrypted.qname().local() != "NameID" {
         return Err(Error::XmlParse(
             "decrypted <saml:EncryptedID> did not contain a <saml:NameID>".to_string(),

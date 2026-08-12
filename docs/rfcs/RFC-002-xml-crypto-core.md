@@ -122,13 +122,15 @@ pub(crate) fn verify_signature(
     document: &Document,
     signature_element: &Element,
     candidate_certs: &[X509Certificate],
-    /// Per-call allow-list of acceptable signature algorithms. Sourced from
-    /// the peer's `PeerCryptoPolicy`. Algorithms that are compiled in
-    /// (under `weak-algos`) but not in this list MUST be rejected.
-    /// This is the policy enforcement point: feature gating controls whether
-    /// an algorithm is compiled at all; this allow-list controls whether it
-    /// is acceptable for THIS verification call.
-    allowed_algorithms: &[SignatureAlgorithm],
+    /// Per-call signature, Reference-digest, and canonicalization allow-lists,
+    /// sourced from the peer's `PeerCryptoPolicy`. Algorithms that are compiled
+    /// in (under `weak-algos`) but absent from the relevant list MUST be
+    /// rejected. This is the policy enforcement point: feature gating controls
+    /// whether an algorithm is compiled at all; these allow-lists control
+    /// whether it is acceptable for THIS verification call. The three are
+    /// independent — a strong RSA-SHA256 signature can still carry a SHA-1
+    /// Reference digest, which decides what bytes the signature commits to.
+    policy: &PeerCryptoPolicy,
 ) -> Result<VerifiedSignature, Error>;
 
 pub(crate) struct VerifiedSignature {
@@ -145,12 +147,13 @@ pub(crate) struct VerifiedSignature {
 ### 3.1 Steps (RFC 3275, refined by SAML profile constraints)
 
 1. Locate the `<ds:SignedInfo>` child of `<ds:Signature>`. Parse:
-   - `CanonicalizationMethod/@Algorithm` — must be in the `C14nAlgorithm` enum, else `Error::DisallowedAlgorithm`.
-   - `SignatureMethod/@Algorithm` — must parse to a `SignatureAlgorithm` variant **AND** appear in the caller-supplied `allowed_algorithms` slice. Both checks must pass; the enum check alone is insufficient because `weak-algos` may have compiled additional variants that are not policy-acceptable for this peer. Otherwise `Error::DisallowedAlgorithm`.
+   - `CanonicalizationMethod/@Algorithm` — must parse to a `C14nAlgorithm` variant **AND** appear in `policy.allowed_c14n_algorithms`, else `Error::DisallowedAlgorithm`.
+   - `SignatureMethod/@Algorithm` — must parse to a `SignatureAlgorithm` variant **AND** appear in `policy.allowed_signature_algorithms`. Both checks must pass; the enum check alone is insufficient because `weak-algos` may have compiled additional variants that are not policy-acceptable for this peer. Otherwise `Error::DisallowedAlgorithm`.
    - `Reference` — must be exactly one. Multiple `Reference`s are a known XSW vector; rejected by default.
    - `Reference/@URI` — must be either empty (the document root) or `#xyz` where `xyz` resolves to an element via `Document::id_index`.
    - `Reference/Transforms` — every transform's `@Algorithm` must be in `{enveloped-signature, exc-c14n, exc-c14n#WithComments, c14n, c14n#WithComments}`. Any other transform — XSLT, XPath, base64 — is rejected with `Error::DisallowedTransform`.
-   - `Reference/DigestMethod/@Algorithm` — must be in `DigestAlgorithm` enum.
+   - A Reference-level canonicalization transform must also appear in `policy.allowed_c14n_algorithms`.
+   - `Reference/DigestMethod/@Algorithm` — must parse to a `DigestAlgorithm` variant **AND** appear in `policy.allowed_digest_algorithms`.
    - `Reference/DigestValue` — base64-decoded digest bytes.
 
 2. **Resolve the reference.** If `URI` is empty → root element. If `URI` is `#xyz` → look up in `id_index`. The index is unique by construction (duplicate IDs are rejected at parse time, §1.1), so there is no ambiguity. If lookup fails → `Error::ReferenceResolution`. Record the resolved `ElementId`.
@@ -186,7 +189,7 @@ let verified = verify_signature(
     &document,
     signature_elem,
     &idp.signing_certs,
-    &peer_policy.allowed_signature_algorithms,
+    peer_policy,
 )?;
 // The Assertion the caller gets is fetched by ElementId — not by name lookup.
 let assertion_elem = document.element(verified.signed_element);
@@ -297,8 +300,8 @@ pub enum DataEncryptionAlgorithm {
 
 #[non_exhaustive]
 pub enum KeyTransportAlgorithm {
-    RsaOaep,           // http://www.w3.org/2009/xmlenc11#rsa-oaep with SHA-256 + MGF1-SHA1 by default
-    RsaOaepMgf1Sha1,   // legacy IdPs
+    RsaOaep,           // http://www.w3.org/2009/xmlenc11#rsa-oaep; OAEP digest from <ds:DigestMethod>, MGF from <xenc11:MGF>
+    RsaOaepMgf1Sha1,   // legacy IdPs; the URI pins MGF1-SHA1 only — <ds:DigestMethod> still selects the message digest
     #[cfg(feature = "weak-algos")] RsaPkcs1V15,
 }
 ```
@@ -312,18 +315,40 @@ Inbound algorithm acceptance is represented by an explicit peer-scoped policy:
 pub struct PeerCryptoPolicy {
     /// Inbound XML-DSig and HTTP-Redirect detached signatures.
     pub allowed_signature_algorithms: Vec<SignatureAlgorithm>,
+    /// Inbound XML-DSig `<ds:Reference>` digest algorithms.
+    pub allowed_digest_algorithms: Vec<DigestAlgorithm>,
+    /// Inbound `<ds:CanonicalizationMethod>` and Reference-transform
+    /// canonicalization algorithms.
+    pub allowed_c14n_algorithms: Vec<C14nAlgorithm>,
     /// Inbound XML-Enc data-encryption algorithms.
     pub allowed_data_encryption_algorithms: Vec<DataEncryptionAlgorithm>,
     /// Inbound XML-Enc key-transport algorithms.
     pub allowed_key_transport_algorithms: Vec<KeyTransportAlgorithm>,
+    /// Inbound RSA-OAEP digests, covering both the `<ds:DigestMethod>` label
+    /// message digest (`<ds:DigestMethod>`).
+    pub allowed_oaep_digest_algorithms: Vec<OaepDigest>,
+    /// Inbound RSA-OAEP MGF1 digests (`<xenc11:MGF>`). Separate from the
+    /// message digest per RFC 8017 A.2.1, so SHA-256 + MGF1-SHA1 can be
+    /// permitted without admitting SHA-1 as the message digest.
+    pub allowed_oaep_mgf1_digest_algorithms: Vec<OaepDigest>,
 }
 
 impl PeerCryptoPolicy {
     /// Strong defaults: signature algorithms from `SignatureAlgorithm::DEFAULTS`,
-    /// AES-GCM data encryption, and RSA-OAEP key transport. CBC and
-    /// RSA-OAEP-MGF1-SHA1 are compatibility opt-ins; RSA-PKCS1-v1.5 requires
-    /// `weak-algos` and an explicit peer policy.
+    /// SHA-2 Reference digests, exclusive C14N without comments, AES-GCM data
+    /// encryption, RSA-OAEP key transport, SHA-2 OAEP message digests, and
+    /// SHA-1 + SHA-2 MGF1 digests (MGF1-SHA1 is the RFC 8017 default and
+    /// the §5.5.2 default for an omitted `<xenc11:MGF>`). CBC,
+    /// inclusive/with-comments C14N, and RSA-OAEP-MGF1-SHA1 are compatibility
+    /// opt-ins; RSA-PKCS1-v1.5 requires `weak-algos` and an explicit peer policy.
     pub fn strong_defaults() -> Self;
+
+    /// As `strong_defaults`, but accepting every implemented canonicalization
+    /// algorithm. This is the default for signed-metadata verification:
+    /// aggregates are signed offline by federation tooling the consumer does
+    /// not control, and inclusive C14N is common there. Signature and digest
+    /// strength are unchanged — C14N choice does not weaken the signature.
+    pub fn metadata_compat_defaults() -> Self;
 }
 ```
 
@@ -384,7 +409,20 @@ pub(crate) fn encrypt_assertion(
 ) -> Result<Element, Error>;
 ```
 
-Defaults: `Aes256Gcm` + `RsaOaep` with SHA-256 MGF1. The defaults reflect modern recommendations; `Aes128Cbc` and `RsaOaepMgf1Sha1` are kept for compatibility, not promoted.
+Defaults: `Aes256Gcm` + `RsaOaep` with a SHA-256 OAEP digest and MGF1-SHA256. The defaults reflect modern recommendations; `Aes128Cbc` and `RsaOaepMgf1Sha1` are kept for compatibility, not promoted.
+
+Per XML Encryption 1.1 §5.5.2 and RFC 8017 Appendix A.2.1, the OAEP message digest (`hashAlgorithm`) and the MGF1 hash (`maskGenAlgorithm`) are independent parameters: `<ds:DigestMethod>` names the first, `<xenc11:MGF>` the second. They are policed by separate allow-lists, so a peer can be permitted SHA-256 + MGF1-SHA1 — by far the most common real-world pairing — without SHA-1 thereby becoming acceptable as the message digest.
+
+Both standard defaults are resolved from the XML *before* policy is applied, so a declaration is never reinterpreted to fit the allow-list:
+
+| Element | Absent under `#rsa-oaep` | Absent under `#rsa-oaep-mgf1p` |
+| --- | --- | --- |
+| `<ds:DigestMethod>` | SHA-1 | SHA-1 |
+| `<xenc11:MGF>` | MGF1-SHA1 | MGF1-SHA1 (element is not permitted at all) |
+
+The legacy `#rsa-oaep-mgf1p` URI fixes only the mask generation function. `<ds:DigestMethod>` still selects the message digest under it, so a legacy-URI message explicitly naming SHA-256 is conformant and is decrypted as such; pinning that path to SHA-1 rejected valid senders. Because the URI already determines the MGF, an explicit `<xenc11:MGF>` child is rejected outright there — §3.2 requires an error for a child element the selected algorithm does not permit — rather than being accepted when it happens to agree.
+
+Outbound `#rsa-oaep` declares a SHA-256 `<ds:DigestMethod>` and `mgf1sha256`, matching the padding this crate actually builds; declaring `mgf1sha1` there would misdescribe the ciphertext and break any recipient that reads the parameter literally.
 
 ### 7.3 Bleichenbacher hardening
 

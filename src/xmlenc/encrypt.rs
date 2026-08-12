@@ -41,7 +41,7 @@ const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 const SHA1_DIGEST_URI: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
 const SHA256_DIGEST_URI: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
-const MGF1_SHA1_URI: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha1";
+const MGF1_SHA256_URI: &str = "http://www.w3.org/2009/xmlenc11#mgf1sha256";
 
 const ENCRYPTED_DATA_TYPE_ELEMENT: &str = "http://www.w3.org/2001/04/xmlenc#Element";
 
@@ -220,21 +220,16 @@ where
 
 /// Wrap the session key under the recipient's RSA public key.
 ///
-/// `RsaOaep` is the modern XML-Enc 1.1 variant; per the project hint and
-/// real-world IdP compatibility (Okta, Azure-AD) we use SHA-256 for the OAEP
-/// hash and SHA-1 for the MGF1 hash — matching what
-/// `KeyPair::decrypt_rsa_oaep(OaepDigest::Sha256)` accepts when decrypting
-/// (note: `decrypt_rsa_oaep` uses `rsa::Oaep::new::<T>()`, which sets *both*
-/// digests to `T`; that means for our default RsaOaep round-trip we must
-/// also use SHA-256 for *both* OAEP and MGF1, so the
-/// EncryptedKey/EncryptionMethod records SHA-256 as the digest and the MGF
-/// declaration is omitted from the tree at encrypt time. A peer that fills
-/// in MGF1-SHA1 on the wire stays compatible because the decrypt path reads
-/// the `<ds:DigestMethod>` to pick the OAEP digest and then re-uses that
-/// digest for MGF1 internally).
+/// `RsaOaep` is the modern XML-Enc 1.1 variant: `rsa::Oaep::new::<Sha256>()`
+/// sets *both* the OAEP label hash and the MGF1 hash to SHA-256. The
+/// `<xenc:EncryptionMethod>` emitted by
+/// `build_key_transport_encryption_method` therefore declares SHA-256 as the
+/// `<ds:DigestMethod>` and `mgf1sha256` as the `<xenc11:MGF>`, so a recipient
+/// reading those parameters literally reconstructs the same padding.
 ///
-/// `RsaOaepMgf1Sha1`: SHA-1 for OAEP digest *and* MGF1 (consistent with
-/// `KeyPair::decrypt_rsa_oaep(OaepDigest::Sha1)`).
+/// `RsaOaepMgf1Sha1` outbound encryption uses SHA-1 for both hashes. The
+/// algorithm URI fixes only MGF1-SHA1; the explicit `<ds:DigestMethod>`
+/// emitted below selects SHA-1 as this emitter's message digest.
 fn wrap_session_key(
     public: &RsaPublicKey,
     algorithm: KeyTransportAlgorithm,
@@ -294,6 +289,25 @@ fn build_encrypted_assertion_element(
     wrapped_key_b64: &str,
     data_cipher_b64: &str,
 ) -> Element {
+    build_encrypted_assertion_with_key_encryption_method(
+        data_algorithm,
+        build_key_transport_encryption_method(key_transport_algorithm),
+        wrapped_key_b64,
+        data_cipher_b64,
+    )
+}
+
+/// As [`build_encrypted_assertion_element`], but with the
+/// `<xenc:EncryptedKey>/<xenc:EncryptionMethod>` supplied by the caller.
+///
+/// Split out so test fixtures can declare OAEP parameter combinations the
+/// two production profiles do not emit, while sharing the rest of the tree.
+fn build_encrypted_assertion_with_key_encryption_method(
+    data_algorithm: DataEncryptionAlgorithm,
+    key_em: Element,
+    wrapped_key_b64: &str,
+    data_cipher_b64: &str,
+) -> Element {
     // ----- innermost: <xenc:CipherValue> for the wrapped session key -----
     let key_cipher_value = Element::build(QName::new(Some(XENC_NS.to_owned()), "CipherValue"))
         .with_text(wrapped_key_b64.to_owned())
@@ -302,8 +316,7 @@ fn build_encrypted_assertion_element(
         .with_child(Node::Element(key_cipher_value))
         .finish();
 
-    // ----- <xenc:EncryptionMethod> for the key-transport algorithm -----
-    let key_em = build_key_transport_encryption_method(key_transport_algorithm);
+    let declares_mgf = key_em.child_element(Some(XENC11_NS), "MGF").is_some();
 
     // ----- <xenc:EncryptedKey> -----
     let encrypted_key = Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptedKey"))
@@ -348,10 +361,10 @@ fn build_encrypted_assertion_element(
         .with_namespace(Some("saml".to_owned()), SAML_NS)
         .with_namespace(Some("xenc".to_owned()), XENC_NS)
         .with_namespace(Some("ds".to_owned()), DS_NS);
-    if matches!(key_transport_algorithm, KeyTransportAlgorithm::RsaOaep) {
-        // The xenc11 MGF declaration is only emitted for `#rsa-oaep`. We add
-        // the namespace declaration once on the outer wrapper so the
-        // `<xenc11:MGF>` element below resolves to a prefix.
+    if declares_mgf {
+        // Declare the xenc11 prefix once on the outer wrapper, and only when
+        // an `<xenc11:MGF>` is actually present, so the element resolves to a
+        // prefix without leaving an unused declaration on other profiles.
         wrapper = wrapper.with_namespace(Some("xenc11".to_owned()), XENC11_NS);
     }
     wrapper.with_child(Node::Element(encrypted_data)).finish()
@@ -363,22 +376,20 @@ fn build_encrypted_assertion_element(
 fn build_key_transport_encryption_method(algorithm: KeyTransportAlgorithm) -> Element {
     match algorithm {
         KeyTransportAlgorithm::RsaOaep => {
-            // Modern RSA-OAEP: SHA-256 OAEP digest. Our underlying
-            // implementation uses the same digest for OAEP and MGF1 (per
-            // `KeyPair::decrypt_rsa_oaep`), so we mirror that by NOT emitting
-            // an MGF declaration that disagrees. We *do* emit a
-            // `<xenc11:MGF>` element so peers that parse it see an explicit
-            // mgf1sha1 (the historical default for `#rsa-oaep`), but our
-            // round-trip path uses SHA-256 / SHA-256 internally — this means
-            // the emitted MGF declaration is a no-op for *our* decrypt path,
-            // which always pairs MGF1 with the OAEP digest read from
-            // `<ds:DigestMethod>`. Cross-implementation compatibility is
-            // tested at the integration layer, not here.
+            // Modern RSA-OAEP: SHA-256 OAEP digest with MGF1-SHA256.
+            // `wrap_session_key` below builds the padding with
+            // `rsa::Oaep::new::<Sha256>()`, which sets *both* the OAEP label
+            // hash and the MGF1 hash to SHA-256, so the declaration must say
+            // `mgf1sha256`. Declaring `mgf1sha1` (as this did previously)
+            // misdescribes the ciphertext: a recipient that reads
+            // `<xenc11:MGF>` literally — which XML Encryption 1.1 §5.5.2
+            // requires — derives the wrong mask and fails to unwrap the
+            // session key.
             let digest = Element::build(QName::new(Some(DS_NS.to_owned()), "DigestMethod"))
                 .with_attribute(QName::new(None, "Algorithm"), SHA256_DIGEST_URI.to_owned())
                 .finish();
             let mgf = Element::build(QName::new(Some(XENC11_NS.to_owned()), "MGF"))
-                .with_attribute(QName::new(None, "Algorithm"), MGF1_SHA1_URI.to_owned())
+                .with_attribute(QName::new(None, "Algorithm"), MGF1_SHA256_URI.to_owned())
                 .finish();
             Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptionMethod"))
                 .with_attribute(QName::new(None, "Algorithm"), algorithm.uri().to_owned())
@@ -405,6 +416,111 @@ fn build_key_transport_encryption_method(algorithm: KeyTransportAlgorithm) -> El
                 .finish()
         }
     }
+}
+
+// =============================================================================
+// Test-only: encrypt with explicitly declared OAEP parameters
+// =============================================================================
+
+/// The RSA-OAEP parameters a test fixture should *declare* in the emitted
+/// `<xenc:EncryptionMethod>`.
+///
+/// `None` means "omit the element", which is what exercises the XML
+/// Encryption 1.1 §5.5.2 defaults. The ciphertext is always produced with the
+/// effective parameters those declarations resolve to, so a fixture cannot
+/// claim a combination it did not actually encrypt with — the failure mode
+/// that XML string-rewriting fixtures hide.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeclaredOaepParams {
+    /// Emitted as `<ds:DigestMethod>`; `None` omits it (spec default SHA-1).
+    pub digest: Option<crate::crypto::keypair::OaepDigest>,
+    /// Emitted as `<xenc11:MGF>`; `None` omits it (spec default MGF1-SHA1).
+    pub mgf1: Option<crate::crypto::keypair::OaepDigest>,
+}
+
+#[cfg(test)]
+impl DeclaredOaepParams {
+    /// The message digest actually used, after applying the §5.5.2 default.
+    pub(crate) fn effective_digest(self) -> crate::crypto::keypair::OaepDigest {
+        self.digest
+            .unwrap_or(crate::crypto::keypair::OaepDigest::Sha1)
+    }
+
+    /// The MGF1 hash actually used, after applying the §5.5.2 default.
+    pub(crate) fn effective_mgf1(self) -> crate::crypto::keypair::OaepDigest {
+        self.mgf1
+            .unwrap_or(crate::crypto::keypair::OaepDigest::Sha1)
+    }
+}
+
+/// Encrypt an assertion under `key_transport_algorithm`, wrapping the session
+/// key with exactly the OAEP parameters `params` declares (after standard
+/// defaults) and emitting an `<xenc:EncryptionMethod>` that declares them.
+///
+/// This exists so interoperability fixtures can cover the independent
+/// `hashAlgorithm` / `maskGenAlgorithm` combinations of RFC 8017 A.2.1
+/// against real ciphertext.
+#[cfg(test)]
+pub(crate) fn encrypt_assertion_with_declared_oaep_params(
+    assertion: &Element,
+    recipient_encryption_cert: &X509Certificate,
+    data_algorithm: DataEncryptionAlgorithm,
+    key_transport_algorithm: KeyTransportAlgorithm,
+    params: DeclaredOaepParams,
+) -> Result<Element, Error> {
+    use rsa::traits::PaddingScheme as _;
+
+    let rsa_public = rsa_public_key_from_cert(recipient_encryption_cert)?;
+    let plaintext = emit_element(assertion)?.into_bytes();
+
+    let mut session_key = vec![0u8; data_algorithm.key_size()];
+    fill_random(&mut session_key)?;
+
+    let (mut cipher_value, ciphertext_bytes) =
+        encrypt_data(data_algorithm, &session_key, &plaintext)?;
+    cipher_value.reserve_exact(ciphertext_bytes.len());
+    cipher_value.extend_from_slice(&ciphertext_bytes);
+    let data_cipher_b64 = BASE64_STANDARD.encode(&cipher_value);
+
+    // Wrap with the effective parameters — the same `oaep_padding` mapping the
+    // decrypt side uses, so a round-trip proves both directions agree.
+    let padding =
+        crate::crypto::keypair::oaep_padding(params.effective_digest(), params.effective_mgf1())?;
+    let mut rng = OsRng;
+    let wrapped_key_bytes = padding
+        .encrypt(&mut rng, &rsa_public, &session_key)
+        .map_err(|_err| Error::DecryptFailed {
+            reason: "key transport",
+        })?;
+    let wrapped_key_b64 = BASE64_STANDARD.encode(&wrapped_key_bytes);
+
+    let mut em = Element::build(QName::new(Some(XENC_NS.to_owned()), "EncryptionMethod"))
+        .with_attribute(
+            QName::new(None, "Algorithm"),
+            key_transport_algorithm.uri().to_owned(),
+        );
+    if let Some(digest) = params.digest {
+        em = em.with_child(Node::Element(
+            Element::build(QName::new(Some(DS_NS.to_owned()), "DigestMethod"))
+                .with_attribute(QName::new(None, "Algorithm"), digest.uri().to_owned())
+                .finish(),
+        ));
+    }
+    if let Some(mgf1) = params.mgf1 {
+        em = em.with_child(Node::Element(
+            Element::build(QName::new(Some(XENC11_NS.to_owned()), "MGF"))
+                .with_attribute(QName::new(None, "Algorithm"), mgf1.mgf1_uri().to_owned())
+                .finish(),
+        ));
+    }
+
+    Ok(build_encrypted_assertion_with_key_encryption_method(
+        data_algorithm,
+        em.finish(),
+        &wrapped_key_b64,
+        &data_cipher_b64,
+    ))
 }
 
 // =============================================================================

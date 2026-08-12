@@ -61,10 +61,13 @@ impl DataEncryptionAlgorithm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum KeyTransportAlgorithm {
-    /// RSA-OAEP with SHA-256 + MGF1-SHA1 by default. URI:
+    /// RSA-OAEP with the digest selected by `<ds:DigestMethod>` (SHA-1 when
+    /// omitted) and the MGF1 hash selected by `<xenc11:MGF>` (MGF1-SHA1 when
+    /// omitted). URI:
     /// `http://www.w3.org/2009/xmlenc11#rsa-oaep`.
     RsaOaep,
-    /// Legacy RSA-OAEP with MGF1-SHA1. URI:
+    /// Legacy RSA-OAEP with the digest selected by `<ds:DigestMethod>` (SHA-1
+    /// when omitted) and MGF1-SHA1 fixed by the algorithm URI. URI:
     /// `http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p`.
     RsaOaepMgf1Sha1,
     /// RSA PKCS#1 v1.5. Disabled unless the `weak-algos` feature is enabled.

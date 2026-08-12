@@ -31,18 +31,108 @@ use crate::crypto::cert::{PublicKey, PublicKeyAlgorithm, X509Certificate};
 use crate::dsig::algorithms::SignatureAlgorithm;
 use crate::error::Error;
 
-/// OAEP digest options for `KeyPair::decrypt_rsa_oaep`. SHA-256 is the
-/// modern default; SHA-1 is included for legacy `xmlenc11#rsa-oaep` with
-/// MGF1-SHA1 (the digest itself is SHA-1 in the historical `xmlenc#rsa-1_5`
-/// counterpart, which we don't support — but for OAEP, the digest and MGF
-/// digests are conceptually separate; see RFC-002 §5).
+/// Hash selection for RSA-OAEP.
+///
+/// Names a hash only. It is used in two independent positions — the message
+/// digest from `<ds:DigestMethod>` and the MGF1 hash from `<xenc11:MGF>` —
+/// which RFC 8017 Appendix A.2.1 defines as separate parameters
+/// (`hashAlgorithm` and `maskGenAlgorithm`).
+///
+/// This type carries no notion of a default. XML Encryption 1.1 §5.5.2
+/// supplies those on the wire (SHA-1 for an absent `<ds:DigestMethod>`,
+/// MGF1-SHA1 for an absent `<xenc11:MGF>`) and `xmlenc::decrypt` resolves
+/// them before any policy is applied. Which values are *acceptable* is a
+/// separate question, answered per peer by
+/// [`PeerCryptoPolicy`](crate::PeerCryptoPolicy): [`DEFAULTS`](Self::DEFAULTS)
+/// for the message digest, [`MGF1_DEFAULTS`](Self::MGF1_DEFAULTS) for the
+/// MGF1 hash.
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OaepDigest {
+    /// SHA-1. The policy value is representable with `xmlenc` so inbound
+    /// messages can be rejected deterministically; performing SHA-1 OAEP
+    /// crypto additionally requires `weak-algos` and an explicit peer-policy
+    /// opt-in.
     Sha1,
     Sha256,
     Sha384,
     Sha512,
+}
+
+#[cfg(feature = "xmlenc")]
+impl OaepDigest {
+    /// Strong inbound defaults for the RSA-OAEP *message digest* (the OAEP
+    /// label hash from `<ds:DigestMethod>`).
+    pub const DEFAULTS: &'static [Self] = &[Self::Sha256, Self::Sha384, Self::Sha512];
+
+    /// Strong inbound defaults for the RSA-OAEP *MGF1* hash.
+    ///
+    /// Unlike [`DEFAULTS`](Self::DEFAULTS) this includes SHA-1, for two
+    /// reasons. MGF1 uses its hash as a mask-generating PRF rather than to
+    /// bind a message, so SHA-1's broken collision resistance does not carry
+    /// the same weight there; RFC 8017 Appendix A.2.1 still names MGF1-SHA1
+    /// as the default `maskGenAlgorithm`. And XML Encryption 1.1 §5.5.2
+    /// defaults an omitted `<xenc11:MGF>` to MGF1-SHA1, so excluding it here
+    /// would reject every `rsa-oaep` message that does not name an MGF
+    /// explicitly — including spec-conformant senders.
+    ///
+    /// Performing MGF1-SHA1 still requires the `weak-algos` feature; without
+    /// it the attempt is refused at the crypto layer rather than silently
+    /// served with a different hash.
+    pub const MGF1_DEFAULTS: &'static [Self] =
+        &[Self::Sha1, Self::Sha256, Self::Sha384, Self::Sha512];
+
+    /// XML-Enc `<ds:DigestMethod Algorithm="…">` URI.
+    pub const fn uri(self) -> &'static str {
+        match self {
+            Self::Sha1 => "http://www.w3.org/2000/09/xmldsig#sha1",
+            Self::Sha256 => "http://www.w3.org/2001/04/xmlenc#sha256",
+            Self::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#sha384",
+            Self::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
+        }
+    }
+
+    /// XML Encryption 1.1 `<xenc11:MGF Algorithm="…">` URI naming MGF1 with
+    /// this hash (XML Encryption 1.1 §5.5.2).
+    pub const fn mgf1_uri(self) -> &'static str {
+        match self {
+            Self::Sha1 => "http://www.w3.org/2009/xmlenc11#mgf1sha1",
+            Self::Sha256 => "http://www.w3.org/2009/xmlenc11#mgf1sha256",
+            Self::Sha384 => "http://www.w3.org/2009/xmlenc11#mgf1sha384",
+            Self::Sha512 => "http://www.w3.org/2009/xmlenc11#mgf1sha512",
+        }
+    }
+
+    /// Parse an XML Encryption 1.1 mask-generation-function URI (§5.5.2).
+    ///
+    /// `#mgf1sha224` is a valid spec URI but SHA-224 is not implemented here,
+    /// so it is rejected as [`Error::DisallowedAlgorithm`] like any other
+    /// unrecognized URI rather than being silently downgraded.
+    pub fn from_mgf1_uri(uri: &str) -> Result<Self, Error> {
+        match uri {
+            "http://www.w3.org/2009/xmlenc11#mgf1sha1" => Ok(Self::Sha1),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha256" => Ok(Self::Sha256),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha384" => Ok(Self::Sha384),
+            "http://www.w3.org/2009/xmlenc11#mgf1sha512" => Ok(Self::Sha512),
+            _ => Err(Error::DisallowedAlgorithm {
+                alg: uri.to_owned(),
+            }),
+        }
+    }
+
+    /// Parse an XML-Enc OAEP digest-method URI.
+    pub fn from_uri(uri: &str) -> Result<Self, Error> {
+        match uri {
+            "http://www.w3.org/2000/09/xmldsig#sha1" => Ok(Self::Sha1),
+            "http://www.w3.org/2001/04/xmlenc#sha256" => Ok(Self::Sha256),
+            "http://www.w3.org/2001/04/xmldsig-more#sha384"
+            | "http://www.w3.org/2001/04/xmlenc#sha384" => Ok(Self::Sha384),
+            "http://www.w3.org/2001/04/xmlenc#sha512" => Ok(Self::Sha512),
+            _ => Err(Error::DisallowedAlgorithm {
+                alg: uri.to_owned(),
+            }),
+        }
+    }
 }
 
 /// A keypair bound to one of the supported asymmetric algorithm families.
@@ -281,41 +371,29 @@ impl KeyPair {
 
     /// RSA-OAEP key transport unwrap, used by `<xenc:EncryptedKey>` with
     /// `KeyTransportAlgorithm::RsaOaep` or `RsaOaepMgf1Sha1`. The
-    /// `oaep_digest` selects the OAEP hash function and the MGF1 hash; for
-    /// `RsaOaepMgf1Sha1` callers should pass `OaepDigest::Sha1` even though
-    /// the OAEP digest itself is SHA-256 in the spec's modern profile —
-    /// see the XML-Enc 1.1 documentation. For v0.1 we pin the OAEP and MGF1
-    /// digests to the same function (which matches the common-case profile
-    /// every interop fixture we have uses); callers needing the MGF1-SHA1
-    /// asymmetric profile use a future API.
+    /// `oaep_digest` selects the OAEP label hash; `mgf1_digest` selects the
+    /// hash used inside MGF1. XML Encryption 1.1 §5.5.2 makes these two
+    /// independent parameters — `<ds:DigestMethod>` names the first and
+    /// `<xenc11:MGF>` the second — so they are accepted separately here
+    /// rather than being pinned to one function. Passing the same value for
+    /// both yields the common-case profile.
     #[cfg(feature = "xmlenc")]
     pub fn decrypt_rsa_oaep(
         &self,
         ciphertext: &[u8],
         oaep_digest: OaepDigest,
+        mgf1_digest: OaepDigest,
     ) -> Result<Vec<u8>, Error> {
         let KeyPairInner::Rsa(secret) = &self.inner else {
             return Err(Error::DecryptFailed {
                 reason: "key transport",
             });
         };
-        let padding = match oaep_digest {
-            OaepDigest::Sha1 => {
-                #[cfg(feature = "weak-algos")]
-                {
-                    rsa::Oaep::new::<sha1::Sha1>()
-                }
-                #[cfg(not(feature = "weak-algos"))]
-                {
-                    return Err(Error::DisallowedAlgorithm {
-                        alg: "RSA-OAEP-SHA1 requires the weak-algos feature".into(),
-                    });
-                }
-            }
-            OaepDigest::Sha256 => rsa::Oaep::new::<Sha256>(),
-            OaepDigest::Sha384 => rsa::Oaep::new::<Sha384>(),
-            OaepDigest::Sha512 => rsa::Oaep::new::<Sha512>(),
-        };
+        // SHA-1 OAEP/MGF1 needs the `sha1` crate, which is only compiled in
+        // under `weak-algos`; `oaep_padding` rejects it otherwise so an
+        // unsupported build fails deterministically rather than silently
+        // substituting a different hash.
+        let padding = oaep_padding(oaep_digest, mgf1_digest)?;
         secret
             .key
             .decrypt(padding, ciphertext)
@@ -351,6 +429,65 @@ impl KeyPair {
                 reason: "key transport",
             })
     }
+}
+
+/// Build an `rsa::Oaep` padding with independently-selected OAEP label and
+/// MGF1 hashes, per XML Encryption 1.1 §5.5.2.
+///
+/// SHA-1 in either position requires `weak-algos`; without it the request is
+/// refused rather than served with a different hash.
+#[cfg(feature = "xmlenc")]
+#[cfg_attr(
+    feature = "weak-algos",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the error arms are the not(weak-algos) build, where SHA-1 OAEP/MGF1 \
+                  cannot be constructed; the signature is stable across both builds"
+    )
+)]
+pub(crate) fn oaep_padding(
+    oaep_digest: OaepDigest,
+    mgf1_digest: OaepDigest,
+) -> Result<rsa::Oaep, Error> {
+    macro_rules! with_mgf_hash {
+        ($oaep:ty) => {
+            match mgf1_digest {
+                OaepDigest::Sha1 => {
+                    #[cfg(feature = "weak-algos")]
+                    {
+                        rsa::Oaep::new_with_mgf_hash::<$oaep, sha1::Sha1>()
+                    }
+                    #[cfg(not(feature = "weak-algos"))]
+                    {
+                        return Err(Error::DisallowedAlgorithm {
+                            alg: "RSA-OAEP MGF1-SHA1 requires the weak-algos feature".into(),
+                        });
+                    }
+                }
+                OaepDigest::Sha256 => rsa::Oaep::new_with_mgf_hash::<$oaep, Sha256>(),
+                OaepDigest::Sha384 => rsa::Oaep::new_with_mgf_hash::<$oaep, Sha384>(),
+                OaepDigest::Sha512 => rsa::Oaep::new_with_mgf_hash::<$oaep, Sha512>(),
+            }
+        };
+    }
+
+    Ok(match oaep_digest {
+        OaepDigest::Sha1 => {
+            #[cfg(feature = "weak-algos")]
+            {
+                with_mgf_hash!(sha1::Sha1)
+            }
+            #[cfg(not(feature = "weak-algos"))]
+            {
+                return Err(Error::DisallowedAlgorithm {
+                    alg: "RSA-OAEP-SHA1 requires the weak-algos feature".into(),
+                });
+            }
+        }
+        OaepDigest::Sha256 => with_mgf_hash!(Sha256),
+        OaepDigest::Sha384 => with_mgf_hash!(Sha384),
+        OaepDigest::Sha512 => with_mgf_hash!(Sha512),
+    })
 }
 
 fn sign_rsa<D>(key: &RsaPrivateKey, signed_bytes: &[u8]) -> Result<Vec<u8>, Error>
