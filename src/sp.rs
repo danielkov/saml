@@ -612,7 +612,10 @@ impl ServiceProvider {
         if let Some(cache) = input.replay_cache
             && replay_check_needed(input.replay_mode, identity.is_one_time_use)
         {
-            let fresh = cache.check_and_insert(&identity.assertion_id, identity.not_on_or_after)?;
+            // The tombstone must outlive every instant at which the assertion
+            // would still validate — see `replay_expires_at`.
+            let expires_at = replay_expires_at(identity.not_on_or_after, input.clock_skew)?;
+            let fresh = cache.check_and_insert(&identity.assertion_id, expires_at)?;
             if !fresh {
                 return Err(Error::AssertionReplay);
             }
@@ -684,6 +687,33 @@ impl ServiceProvider {
             holder_of_key_cert: input.holder_of_key_cert,
         })
     }
+}
+
+/// The instant a replay tombstone may be dropped: the last moment the
+/// assertion could still pass validation.
+///
+/// Validation accepts an assertion until `NotOnOrAfter + clock_skew`, so a
+/// tombstone expiring at the raw `NotOnOrAfter` would reopen a replay interval
+/// `clock_skew` wide during which the assertion still validates but the cache
+/// no longer remembers it.
+///
+/// Fails closed on overflow rather than saturating: a saturated expiry would
+/// silently pin the entry near the end of representable time, which for a
+/// bounded-capacity cache converts a bad input into `ReplayCacheFull` for
+/// unrelated logins. Extracted alongside [`replay_check_needed`] so the
+/// fail-closed branch is unit-testable independently of `consume_response` —
+/// see `replay_expires_at_fails_closed_on_overflow`, which reaches it
+/// directly. It is not reachable *through* `consume_response`: validation
+/// computes `now + clock_skew` and `now - clock_skew` first, and with
+/// `now` within minutes of `NotOnOrAfter` those guards fire on any skew large
+/// enough to overflow here.
+fn replay_expires_at(
+    not_on_or_after: SystemTime,
+    clock_skew: Duration,
+) -> Result<SystemTime, Error> {
+    not_on_or_after.checked_add(clock_skew).ok_or_else(|| {
+        Error::XmlParse("Conditions NotOnOrAfter + clock_skew overflows SystemTime".to_owned())
+    })
 }
 
 /// Whether the replay cache should be consulted for an assertion, given the
@@ -2293,6 +2323,97 @@ mod tests {
 
     // ---------- replay cache ----------
 
+    /// Shared [`ReplayCache`] double recording every `check_and_insert`.
+    ///
+    /// One double for both the "records the right expiry" and the "must not be
+    /// consulted" cases: a cache that only ever panics would leave its own body
+    /// uncovered, which is a poor way to assert that something never runs.
+    #[derive(Default)]
+    struct RecordingReplayCache {
+        calls: std::sync::Mutex<Vec<SystemTime>>,
+    }
+
+    impl RecordingReplayCache {
+        /// Expiries handed to the cache, in call order.
+        fn recorded(&self) -> Vec<SystemTime> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl ReplayCache for RecordingReplayCache {
+        fn check_and_insert(
+            &self,
+            _assertion_id: &str,
+            expires_at: SystemTime,
+        ) -> Result<bool, Error> {
+            // Recover through poisoning rather than mapping it to an error:
+            // this double has no failure mode worth modelling, and an error
+            // arm here would never execute, leaving a hole in its own
+            // coverage.
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(expires_at);
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn replay_cache_expiry_includes_accepted_clock_skew() {
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        let xml = build_signed_response_xml(
+            &kp,
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+        let cache = RecordingReplayCache::default();
+        let clock_skew = Duration::from_secs(90);
+
+        let identity = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew,
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect("valid response");
+
+        assert_eq!(
+            cache.recorded(),
+            vec![
+                identity
+                    .not_on_or_after
+                    .checked_add(clock_skew)
+                    .expect("fixture expiry is representable")
+            ]
+        );
+    }
+
     /// End-to-end: a successful `consume_response` followed by a second
     /// call with the exact same Response (same `assertion_id`) MUST be
     /// rejected with `Error::AssertionReplay`. The first call also
@@ -2599,6 +2720,104 @@ mod tests {
         .expect("second consume under Off mode also succeeds — cache never consulted");
 
         assert_eq!(cache.len(), 0, "cache stays untouched under Off mode");
+    }
+
+    #[test]
+    fn replay_expires_at_extends_through_the_skew_window() {
+        let noa = fixed_now() + Duration::from_mins(10);
+        let skew = Duration::from_secs(90);
+
+        assert_eq!(
+            replay_expires_at(noa, skew).expect("no overflow"),
+            noa + skew,
+            "the tombstone must outlive the last instant the assertion validates"
+        );
+        assert_eq!(
+            replay_expires_at(noa, Duration::ZERO).expect("no overflow"),
+            noa,
+            "zero skew degenerates to the raw NotOnOrAfter"
+        );
+    }
+
+    #[test]
+    fn replay_expires_at_fails_closed_on_overflow() {
+        // `Duration::MAX` overflows every platform's `SystemTime`, so this
+        // reaches the fail-closed branch without assuming a particular
+        // representable range (Unix stores i64 seconds; Windows a 64-bit
+        // 100ns FILETIME, a far narrower window).
+        let err = replay_expires_at(fixed_now(), Duration::MAX)
+            .expect_err("NotOnOrAfter + Duration::MAX cannot be represented");
+
+        // Fails closed rather than saturating: a saturated expiry would pin
+        // the entry near the end of representable time and starve a
+        // bounded-capacity cache.
+        assert!(matches!(
+            err,
+            Error::XmlParse(ref m) if m == "Conditions NotOnOrAfter + clock_skew overflows SystemTime"
+        ));
+    }
+
+    /// A `clock_skew` too large to add to a `SystemTime` must be refused
+    /// before anything is written to the replay cache.
+    ///
+    /// The error that surfaces is validation's own overflow guard, not
+    /// `replay_expires_at`: `consume_response` computes `now + clock_skew`
+    /// (Conditions `NotBefore`, and again for `SubjectConfirmationData`) and
+    /// `now - clock_skew` well before the replay block, and `now` sits within
+    /// minutes of `NotOnOrAfter`. Any skew large enough to overflow the
+    /// tombstone arithmetic therefore trips those first, on every platform.
+    /// `replay_expires_at_fails_closed_on_overflow` covers the replay branch
+    /// itself. What this test pins is the property that matters at the API
+    /// boundary: the call fails closed, and the cache is never consulted.
+    #[test]
+    fn overflowing_clock_skew_never_reaches_the_replay_cache() {
+        let cache = RecordingReplayCache::default();
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req1".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+        };
+        let xml = build_signed_response_xml(
+            &kp,
+            Some("_req1"),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::MAX,
+                replay_cache: Some(&cache),
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("an unrepresentable clock skew must fail closed");
+
+        assert!(
+            matches!(err, Error::XmlParse(_)),
+            "expected XmlParse, got {err:?}"
+        );
+        assert!(
+            cache.recorded().is_empty(),
+            "replay cache consulted despite a failed expiry computation"
+        );
     }
 
     #[test]

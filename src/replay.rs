@@ -40,6 +40,11 @@ use crate::error::Error;
 /// - It returns `Ok(false)` when the same `assertion_id` was previously
 ///   inserted AND has not yet expired — this is a replay, and the SP will
 ///   surface it as [`Error::AssertionReplay`].
+/// - `expires_at` is the last instant the assertion can still pass
+///   validation — the assertion's `NotOnOrAfter` plus the `clock_skew` the
+///   SP validated it under, not the raw `NotOnOrAfter`. Implementations MUST
+///   retain the entry until then; dropping it earlier reopens a replay
+///   window during which the assertion still validates.
 /// - Backend failures (e.g. a network blip against a Redis-backed store)
 ///   should be returned as [`Error`] variants — typically
 ///   [`Error::ReplayCache`] — and the SP will propagate them unchanged.
@@ -79,7 +84,7 @@ pub trait ReplayCache: Send + Sync {
 /// Failing closed is the safer default: under load the SP refuses new
 /// logins rather than risk accepting a replay of an entry it forgot.
 /// Tune `capacity` to comfortably exceed `peak_logins_per_second *
-/// max_assertion_lifetime_seconds`.
+/// (max_assertion_lifetime_seconds + clock_skew_seconds)`.
 #[derive(Debug)]
 pub struct InMemoryReplayCache {
     capacity: usize,
@@ -196,7 +201,7 @@ impl ReplayCache for InMemoryReplayCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     /// Capacity larger than the test workload so the only path that can
     /// fail is the actual logic under test.
@@ -261,6 +266,39 @@ mod tests {
             "an entry whose expires_at is in the past must be swept and re-insertable"
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn poisoned_lock_fails_closed_instead_of_panicking() {
+        // The only remaining uncovered branch in this module, and the one that
+        // matters most: if the mutex is poisoned the cache must surface an
+        // error, never panic and never quietly report an assertion as fresh.
+        // A panic here would take down the request handler; a false `true`
+        // would wave a replay through.
+        let cache = InMemoryReplayCache::default();
+
+        // Poison the lock by panicking while holding it. The default hook is
+        // muted so the deliberate panic does not look like a test failure.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_info| {}));
+        let outcome = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = cache.inner.lock().expect("uncontended first lock");
+                    panic!("deliberately poisoning the replay cache lock");
+                })
+                .join()
+        });
+        std::panic::set_hook(previous_hook);
+        assert!(outcome.is_err(), "the spawned thread must have panicked");
+
+        let err = cache
+            .check_and_insert("_a1", UNIX_EPOCH + Duration::from_secs(1))
+            .expect_err("a poisoned lock must surface as an error");
+        assert!(matches!(
+            err,
+            Error::ReplayCache { reason } if reason == "in-memory replay cache mutex poisoned"
+        ));
     }
 
     #[test]
