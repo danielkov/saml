@@ -21,7 +21,10 @@ pub struct IdentityProviderConfig {
     pub sso: Vec<Endpoint>,
     /// SLO endpoints.
     pub slo: Vec<Endpoint>,
-    /// ArtifactResolutionService endpoints.
+    /// ArtifactResolutionService endpoints. SOAP-bound (Bindings §3.6.3);
+    /// `IdentityProvider::new` rejects a set where any entry lacks the
+    /// REQUIRED `index` or two share one, since the index is what artifacts
+    /// carry to select an endpoint.
     pub artifact_resolution: Vec<Endpoint>,
 
     pub supported_name_id_formats: Vec<NameIdFormat>,
