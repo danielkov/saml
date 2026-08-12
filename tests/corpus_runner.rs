@@ -722,17 +722,16 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         .checked_add(Duration::from_secs(1))
         .ok_or_else(|| "issue_instant + 1s overflowed SystemTime".to_string())?;
 
-    let tracker_owned = meta
-        .in_response_to
-        .as_deref()
-        .map(|in_response_to| LoginTracker {
-            request_id: in_response_to.to_owned(),
-            issued_at: meta.issue_instant,
-            idp_entity_id: meta.issuer.clone(),
-            acs_endpoint: SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
-            requested_authn_context: None,
-            requested_name_id_format: None,
-        });
+    let tracker_owned = meta.in_response_to.as_deref().map(|in_response_to| {
+        LoginTracker::new(
+            in_response_to.to_owned(),
+            meta.issue_instant,
+            meta.issuer.clone(),
+            SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
+            None,
+            None,
+        )
+    });
 
     sp.consume_response(ConsumeResponse {
         idp: &idp,

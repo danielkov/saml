@@ -653,6 +653,28 @@ impl Proxy<'_> {
     pub fn bounce_to_upstream(&self, input: BounceToUpstream<'_>) -> Result<BounceResult, Error> {
         let downstream = input.downstream_request;
 
+        // A signed Redirect request cannot carry a RelayState this proxy only
+        // learns afterwards.
+        //
+        // `start_login` signs the canonical query — SAMLRequest, RelayState,
+        // SigAlg in that order (Bindings §3.4.4.1) — and the proxy's
+        // RelayState is the encoded context, which embeds the `LoginTracker`
+        // that `start_login` itself produces. So it cannot be supplied before
+        // signing, and appending it afterwards changes both the content and
+        // the ordering of what a receiver reconstructs: the signature is then
+        // unverifiable by any conforming peer.
+        //
+        // Emitting a request that cannot verify is worse than refusing to
+        // emit one. Pair Redirect upstream with an unsigned request, or use
+        // POST, where RelayState is a separate form field outside the
+        // signature.
+        if input.upstream_binding == Binding::HttpRedirect && self.sp.config().sign_authn_requests {
+            return Err(Error::InvalidConfiguration {
+                reason: "signed Redirect upstream cannot carry the proxy context RelayState; \
+                         use POST upstream or disable AuthnRequest signing",
+            });
+        }
+
         // 1. Build StartLogin honoring propagate flags.
         //
         //    These flags decide what the *upstream* IdP is asked for. They
@@ -1674,14 +1696,14 @@ mod tests {
             }),
             requested_name_id_format: Some(NameIdFormat::Persistent),
             upstream_signing_cert_fingerprints: vec![],
-            upstream_tracker: LoginTracker {
-                request_id: "_upstream-1".into(),
-                issued_at: tracker_issued_at,
-                idp_entity_id: "https://upstream-idp.example.com".into(),
-                acs_endpoint: SsoResponseEndpoint::post("https://proxy.example.com/acs", 0, true),
-                requested_authn_context: None,
-                requested_name_id_format: None,
-            },
+            upstream_tracker: LoginTracker::new(
+                "_upstream-1".into(),
+                tracker_issued_at,
+                "https://upstream-idp.example.com".into(),
+                SsoResponseEndpoint::post("https://proxy.example.com/acs", 0, true),
+                None,
+                None,
+            ),
             issued_at: SystemTime::now(),
         }
     }
