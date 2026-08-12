@@ -354,7 +354,12 @@ impl IdentityProvider {
         }
 
         // 5. Freshness. Runs after the signature check so an unauthenticated
-        //    sender cannot probe the accepted time window.
+        //    sender the effective policy refuses cannot probe the accepted
+        //    time window. That qualifier matters: when neither
+        //    `want_authn_requests_signed` nor the SP's metadata requires a
+        //    signature, unsigned requests are accepted and then judged on
+        //    freshness, so such a sender *can* probe it. The ordering is still
+        //    correct — it is simply not a probing defence on its own.
         //
         //    `AuthnRequest` carries no `NotOnOrAfter` (contrast
         //    `LogoutRequest`, whose peer-supplied expiry is enforced in
@@ -1899,7 +1904,9 @@ mod tests {
     #[test]
     fn freshness_is_checked_after_the_signature() {
         // A stale *and* unsigned request must surface the signature failure,
-        // so an unauthenticated sender cannot probe the accepted time window.
+        // so a sender the effective policy refuses cannot probe the accepted
+        // window. Where signing is optional, unsigned requests are accepted and
+        // then judged on freshness, so the ordering does not stop probing there.
         let idp = idp_with(true, false);
         let sp = sp_descriptor(false);
         let xml = build_unsigned_authn_request("_req-stale-unsigned", true);
