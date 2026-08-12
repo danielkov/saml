@@ -201,17 +201,22 @@ pub fn build_artifact_resolve(
     destination: &str,
     artifact: &str,
 ) -> Result<String, Error> {
-    let resolve_elem = build_artifact_resolve_element(issuer_entity_id, destination, artifact)?;
+    let (resolve_elem, _id) =
+        build_artifact_resolve_element(issuer_entity_id, destination, artifact)?;
     soap::wrap_element(resolve_elem)
 }
 
 /// Build the bare `<samlp:ArtifactResolve>` element (no SOAP envelope), so the
 /// back-channel client can optionally enveloped-sign it before wrapping.
+///
+/// Returns the element together with its generated `@ID`. The caller needs
+/// that ID to correlate the `ArtifactResponse/@InResponseTo` that comes back;
+/// discarding it would leave the exchange uncorrelated.
 pub(crate) fn build_artifact_resolve_element(
     issuer_entity_id: &str,
     destination: &str,
     artifact: &str,
-) -> Result<Element, Error> {
+) -> Result<(Element, String), Error> {
     let id = crate::binding::random_xml_id()?;
     let issue_instant = format_xs_datetime(SystemTime::now())?;
 
@@ -226,18 +231,17 @@ pub(crate) fn build_artifact_resolve_element(
         .finish();
 
     // <samlp:ArtifactResolve ...>
-    Ok(
-        Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResolve"))
-            .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
-            .with_namespace(Some("saml".to_owned()), SAML_NS)
-            .with_attribute(QName::new(None, "ID"), id)
-            .with_attribute(QName::new(None, "Version"), "2.0")
-            .with_attribute(QName::new(None, "IssueInstant"), issue_instant)
-            .with_attribute(QName::new(None, "Destination"), destination.to_owned())
-            .with_child(Node::Element(issuer_elem))
-            .with_child(Node::Element(artifact_elem))
-            .finish(),
-    )
+    let element = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResolve"))
+        .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
+        .with_namespace(Some("saml".to_owned()), SAML_NS)
+        .with_attribute(QName::new(None, "ID"), id.clone())
+        .with_attribute(QName::new(None, "Version"), "2.0")
+        .with_attribute(QName::new(None, "IssueInstant"), issue_instant)
+        .with_attribute(QName::new(None, "Destination"), destination.to_owned())
+        .with_child(Node::Element(issuer_elem))
+        .with_child(Node::Element(artifact_elem))
+        .finish();
+    Ok((element, id))
 }
 
 /// Parse a `<samlp:ArtifactResponse>` SOAP envelope and extract the inner
@@ -427,7 +431,8 @@ impl<'a, H: HttpClient> BackchannelClient<'a, H> {
         artifact: &str,
     ) -> Result<ResolvedResponse, Error> {
         // 1. Build + (optionally) sign the ArtifactResolve, then SOAP-wrap it.
-        let resolve_elem = build_artifact_resolve_element(issuer_entity_id, ars_url, artifact)?;
+        let (resolve_elem, request_id) =
+            build_artifact_resolve_element(issuer_entity_id, ars_url, artifact)?;
         let resolve_elem = match &self.sign {
             None => resolve_elem,
             Some(cfg) => {
@@ -467,6 +472,22 @@ impl<'a, H: HttpClient> BackchannelClient<'a, H> {
             return Err(Error::XmlParse(
                 "ArtifactResponse: SOAP body payload is not samlp:ArtifactResponse".to_string(),
             ));
+        }
+
+        // 3b. Correlate the response to the request we just sent.
+        //
+        //     `@InResponseTo` is how an ArtifactResponse identifies which
+        //     ArtifactResolve it answers (SAML 2.0 Core §3.2.2). Without this
+        //     check the client accepts any otherwise-valid ArtifactResponse,
+        //     so a substituted or replayed one — for a different artifact, or
+        //     an earlier resolve of this one — is indistinguishable from the
+        //     real answer. Checked before the signature: a correctly signed
+        //     response to somebody else's request is still the wrong response.
+        let in_response_to = artifact_response
+            .attribute(None, "InResponseTo")
+            .ok_or(Error::InResponseToMismatch)?;
+        if in_response_to != request_id {
+            return Err(Error::InResponseToMismatch);
         }
 
         // 4. Verify the ArtifactResponse signature *before* trusting its
@@ -1150,18 +1171,44 @@ mod tests {
 
     /// Mock `HttpClient` that returns a pre-built ArtifactResponse SOAP
     /// envelope and records the request it received for assertion.
+    /// Builds an ArtifactResponse from the request's `@ID`.
+    type ResponderFn = Box<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
     struct MockClient {
-        response: Vec<u8>,
+        /// Builds the response from the `@ID` of the ArtifactResolve received.
+        /// A canned blob cannot correlate: the client generates a fresh ID per
+        /// request, and a *signed* fixture must set `@InResponseTo` before it
+        /// is signed, exactly as a real ARS does.
+        respond: ResponderFn,
         last_request: std::sync::Mutex<Option<HttpRequest>>,
     }
 
     impl MockClient {
+        /// Canned response; the `_req1` placeholder is rewritten to the actual
+        /// request ID. For unsigned fixtures only — see [`Self::building`].
         fn new(response: Vec<u8>) -> Self {
+            Self::building(move |id| {
+                String::from_utf8_lossy(&response)
+                    .replace("_req1", id)
+                    .into_bytes()
+            })
+        }
+
+        /// Build the response from the request ID.
+        fn building(f: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
             Self {
-                response,
+                respond: Box::new(f),
                 last_request: std::sync::Mutex::new(None),
             }
         }
+    }
+
+    /// Extract the `@ID` of an outbound `<samlp:ArtifactResolve>`.
+    fn resolve_request_id(request: &[u8]) -> String {
+        let xml = String::from_utf8_lossy(request);
+        xml.split_once(" ID=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map_or_else(String::new, |(id, _)| id.to_owned())
     }
 
     impl HttpClient for MockClient {
@@ -1170,8 +1217,8 @@ mod tests {
             request: HttpRequest,
         ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
         {
+            let body = (self.respond)(&resolve_request_id(&request.body));
             *self.last_request.lock().unwrap() = Some(request);
-            let body = self.response.clone();
             async move {
                 Ok(HttpResponse {
                     status: 200,
@@ -1242,13 +1289,84 @@ mod tests {
         assert_eq!(issuer.text_content(), "https://sp.example.com");
     }
 
+    /// SAML 2.0 Core §3.2.2: `@InResponseTo` identifies the request being
+    /// answered. Without this check any otherwise-valid ArtifactResponse is
+    /// accepted, so a substituted or replayed one — for a different artifact,
+    /// or an earlier resolve of this one — cannot be told from the real
+    /// answer.
+    #[tokio::test]
+    async fn resolve_artifact_rejects_mismatched_in_response_to() {
+        // Correlates with nothing: a fixed ID that cannot equal the freshly
+        // generated one. Everything else about the envelope is well-formed.
+        let client = MockClient::building(|_id| {
+            format!(
+                r#"<soap:Envelope xmlns:soap="{SOAP_NS}">
+  <soap:Body>
+    <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+                            ID="_resp1" Version="2.0" InResponseTo="_some-other-request"
+                            IssueInstant="2026-01-01T00:00:00Z">
+      <saml:Issuer>https://idp.example.com</saml:Issuer>
+      <samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status>
+      <samlp:Response xmlns:samlp="{SAMLP_NS}" ID="_inner" Version="2.0"
+                      IssueInstant="2026-01-01T00:00:00Z"/>
+    </samlp:ArtifactResponse>
+  </soap:Body>
+</soap:Envelope>"#
+            )
+            .into_bytes()
+        });
+
+        let err = BackchannelClient::new(&client)
+            .resolve_artifact(
+                "https://idp.example.com/ars",
+                "https://sp.example.com/saml",
+                "AAQAAK1234567890",
+            )
+            .await
+            .expect_err("a response to a different request must be refused");
+        assert!(matches!(err, Error::InResponseToMismatch), "got {err:?}");
+    }
+
+    /// An absent `@InResponseTo` correlates with nothing either, so it is
+    /// refused rather than treated as "matches anything".
+    #[tokio::test]
+    async fn resolve_artifact_rejects_missing_in_response_to() {
+        let client = MockClient::building(|_id| {
+            format!(
+                r#"<soap:Envelope xmlns:soap="{SOAP_NS}">
+  <soap:Body>
+    <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+                            ID="_resp1" Version="2.0"
+                            IssueInstant="2026-01-01T00:00:00Z">
+      <saml:Issuer>https://idp.example.com</saml:Issuer>
+      <samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status>
+      <samlp:Response xmlns:samlp="{SAMLP_NS}" ID="_inner" Version="2.0"
+                      IssueInstant="2026-01-01T00:00:00Z"/>
+    </samlp:ArtifactResponse>
+  </soap:Body>
+</soap:Envelope>"#
+            )
+            .into_bytes()
+        });
+
+        let err = BackchannelClient::new(&client)
+            .resolve_artifact(
+                "https://idp.example.com/ars",
+                "https://sp.example.com/saml",
+                "AAQAAK1234567890",
+            )
+            .await
+            .expect_err("a response with no correlation must be refused");
+        assert!(matches!(err, Error::InResponseToMismatch), "got {err:?}");
+    }
+
     #[tokio::test]
     async fn resolve_artifact_propagates_status_error() {
         let envelope = format!(
             r#"<soap:Envelope xmlns:soap="{SOAP_NS}">
   <soap:Body>
     <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
-                            ID="_resp1" Version="2.0"
+                            ID="_resp1" Version="2.0" InResponseTo="_req1"
                             IssueInstant="2026-01-01T00:00:00Z">
       <saml:Issuer>https://idp.example.com</saml:Issuer>
       <samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Requester"/></samlp:Status>
@@ -1292,7 +1410,7 @@ mod tests {
     /// Build a `<samlp:ArtifactResolve>` SOAP envelope, optionally
     /// enveloped-signed by the test key.
     fn artifact_resolve_envelope(issuer: &str, signed: bool) -> Vec<u8> {
-        let resolve = build_artifact_resolve_element(
+        let (resolve, _id) = build_artifact_resolve_element(
             issuer,
             "https://idp.example.com/ars",
             "AAQAAK1234567890",
@@ -1314,7 +1432,7 @@ mod tests {
     /// `<ds:Reference>` digest so digest policy can be exercised independently
     /// of the signature method.
     fn artifact_resolve_envelope_with_digest(digest_alg: DigestAlgorithm) -> Vec<u8> {
-        let resolve = build_artifact_resolve_element(
+        let (resolve, _id) = build_artifact_resolve_element(
             RESOLVE_ISSUER,
             "https://idp.example.com/ars",
             "AAQAAK1234567890",
@@ -1579,7 +1697,11 @@ mod tests {
         );
     }
 
-    fn signed_artifact_response_envelope(payload_xml: &str, tamper: bool) -> Vec<u8> {
+    fn signed_artifact_response_envelope(
+        payload_xml: &str,
+        tamper: bool,
+        in_response_to: &str,
+    ) -> Vec<u8> {
         let kp = test_keypair();
         let payload_doc = Document::parse(payload_xml.as_bytes()).expect("payload parse");
         let payload_elem = payload_doc.root().clone();
@@ -1599,6 +1721,8 @@ mod tests {
             .with_attribute(QName::new(None, "ID"), "_resp-signed".to_owned())
             .with_attribute(QName::new(None, "Version"), "2.0")
             .with_attribute(QName::new(None, "IssueInstant"), "2026-01-01T00:00:00Z")
+            // Set before signing, so the signature covers the correlation.
+            .with_attribute(QName::new(None, "InResponseTo"), in_response_to.to_owned())
             .with_child(Node::Element(issuer))
             .with_child(Node::Element(status))
             .with_child(Node::Element(payload_elem))
@@ -1673,8 +1797,9 @@ mod tests {
     #[tokio::test]
     async fn backchannel_verifies_signed_artifact_response() {
         let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-signed" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
-        let envelope = signed_artifact_response_envelope(payload, false);
-        let client = MockClient::new(envelope);
+        let payload = payload.to_owned();
+        let client =
+            MockClient::building(move |id| signed_artifact_response_envelope(&payload, false, id));
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         let policy = PeerCryptoPolicy::strong_defaults();
 
@@ -1701,8 +1826,9 @@ mod tests {
     #[tokio::test]
     async fn backchannel_rejects_tampered_signature() {
         let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-signed" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
-        let envelope = signed_artifact_response_envelope(payload, true);
-        let client = MockClient::new(envelope);
+        let payload = payload.to_owned();
+        let client =
+            MockClient::building(move |id| signed_artifact_response_envelope(&payload, true, id));
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         let policy = PeerCryptoPolicy::strong_defaults();
 

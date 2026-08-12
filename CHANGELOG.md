@@ -17,12 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ServiceProvider::consume_response_artifact` now decodes the index and
   selects that exact endpoint, refusing an index the IdP does not advertise.
 
+- `BackchannelClient::resolve_artifact` now requires the
+  `ArtifactResponse/@InResponseTo` to match the `ArtifactResolve/@ID` it sent.
+  It previously accepted any otherwise-valid `ArtifactResponse`, so a
+  substituted or replayed one could not be distinguished from the real answer.
+- `<md:ArtifactResolutionService>` endpoints are now selected by exact `index`
+  **and** `Binding::Soap`. Selection previously accepted any binding and then
+  SOAP-posted to it, which contradicted the SOAP-only enforcement on the
+  receiving side.
+- **Breaking:** an `ArtifactResolutionService` with no `index`, or two sharing
+  one, is now rejected when parsing metadata and when constructing an
+  `IdentityProvider`. `index` is REQUIRED on an `IndexedEndpoint` and is what
+  the artifact carries; a missing one left the endpoint unaddressable and a
+  duplicate made routing depend on parse order.
+
 ### Added
 
 - `binding::artifact::parse_artifact` and `ParsedArtifact`, exposing the
   endpoint index and `SourceID` of a type `0x0004` artifact.
 - `IdpDescriptor::artifact_resolution_endpoint_by_index`.
-- `Error::InvalidArtifact` and `Error::UnknownArtifactEndpointIndex`.
+- `Error::InvalidArtifact`, `Error::UnknownArtifactEndpointIndex` and
+  `Error::AmbiguousArtifactEndpointIndex`.
 
 ### Security
 

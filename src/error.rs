@@ -212,6 +212,16 @@ pub enum Error {
     /// and artifacts travel in URL query parameters, so they leak readily.
     #[error("artifact was minted for {expected}, resolve came from {received}")]
     ArtifactRecipientMismatch { expected: String, received: String },
+    /// An `<md:ArtifactResolutionService>` lacked the REQUIRED `index`, or two
+    /// shared one.
+    ///
+    /// `ArtifactResolutionService` is an `IndexedEndpoint`: the index is what a
+    /// type `0x0004` artifact carries to say which endpoint to resolve against,
+    /// so it must identify exactly one. A missing index makes an endpoint
+    /// unaddressable; a duplicate makes routing ambiguous, silently resolved by
+    /// whichever entry happens to come first.
+    #[error("ArtifactResolutionService index is missing or duplicated: {reason}")]
+    AmbiguousArtifactEndpointIndex { reason: &'static str },
     /// An artifact was not a well-formed type `0x0004` value.
     #[error("malformed artifact: {reason}")]
     InvalidArtifact { reason: &'static str },

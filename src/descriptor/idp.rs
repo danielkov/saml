@@ -91,6 +91,7 @@ impl IdpDescriptor {
         for child in idp.all_child_elements(Some(MD_NS), "ArtifactResolutionService") {
             artifact_resolution_endpoints.push(parse_endpoint(child)?);
         }
+        validate_artifact_resolution_endpoints(&artifact_resolution_endpoints)?;
 
         let supported_name_id_formats = parse_name_id_formats(idp);
 
@@ -144,20 +145,139 @@ impl IdpDescriptor {
     /// several ARS endpoints (say, one per key rollover generation) routes to
     /// the wrong one otherwise.
     pub fn artifact_resolution_endpoint_by_index(&self, index: u16) -> Option<&Endpoint> {
-        // `index` is REQUIRED on a metadata IndexedEndpoint, but this crate's
-        // `Endpoint` models it as optional, so an unnumbered endpoint is
-        // treated as index 0 — matching what issuance writes for the same
-        // endpoint. Comparing against `Some(index)` instead would make every
-        // unnumbered ARS unresolvable.
+        // Both conditions matter. `index` is REQUIRED on a metadata
+        // IndexedEndpoint and must identify exactly one endpoint, so an
+        // unnumbered one is not addressable and is not a fallback for index 0.
+        // And an ArtifactResolutionService is a SOAP endpoint (Bindings
+        // §3.6.3) — resolution SOAP-POSTs to whatever this returns, and the
+        // IdP role parser enforces SOAP on the receiving side, so matching a
+        // POST or Redirect endpoint here would produce a request the peer's
+        // own parser rejects.
         self.artifact_resolution_endpoints
             .iter()
-            .find(|e| e.index.unwrap_or(0) == index)
+            .find(|e| e.index == Some(index) && e.binding == Binding::Soap)
     }
+}
+
+/// Reject `<md:ArtifactResolutionService>` sets that cannot route an artifact.
+///
+/// `index` is REQUIRED on an `IndexedEndpoint` and is what a type `0x0004`
+/// artifact carries. Accepting a missing one leaves the endpoint unaddressable;
+/// accepting duplicates makes routing depend on ordering. Both are refused at
+/// the boundary rather than producing a silently wrong resolve later.
+pub(crate) fn validate_artifact_resolution_endpoints(
+    endpoints: &[crate::binding::Endpoint],
+) -> Result<(), Error> {
+    let mut seen = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let Some(index) = endpoint.index else {
+            return Err(Error::AmbiguousArtifactEndpointIndex {
+                reason: "ArtifactResolutionService is missing the required index attribute",
+            });
+        };
+        if seen.contains(&index) {
+            return Err(Error::AmbiguousArtifactEndpointIndex {
+                reason: "two ArtifactResolutionService endpoints share an index",
+            });
+        }
+        seen.push(index);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal descriptor carrying only the ARS endpoints under test.
+    fn descriptor_with_ars(endpoints: Vec<Endpoint>) -> IdpDescriptor {
+        IdpDescriptor {
+            entity_id: "https://idp.example.com".to_owned(),
+            sso_endpoints: vec![],
+            slo_endpoints: vec![],
+            artifact_resolution_endpoints: endpoints,
+            signing_certs: vec![],
+            encryption_certs: vec![],
+            supported_name_id_formats: vec![],
+            want_authn_requests_signed: false,
+            valid_until: None,
+            cache_duration: None,
+        }
+    }
+
+    /// Bindings §3.6.3: an ArtifactResolutionService is a SOAP endpoint.
+    /// Resolution SOAP-POSTs to whatever this returns, and the IdP role parser
+    /// enforces SOAP on the receiving side, so returning a POST endpoint here
+    /// would produce a request the peer's own parser refuses.
+    #[test]
+    fn artifact_resolution_lookup_ignores_non_soap_endpoints() {
+        let idp = descriptor_with_ars(vec![
+            Endpoint::post("https://idp.example.com/ars-post", 0, true),
+            Endpoint::soap("https://idp.example.com/ars-soap", Some(1), false),
+        ]);
+
+        assert!(
+            idp.artifact_resolution_endpoint_by_index(0).is_none(),
+            "index 0 is a POST endpoint; it is not an ARS"
+        );
+        assert_eq!(
+            idp.artifact_resolution_endpoint_by_index(1)
+                .map(|e| e.url.as_str()),
+            Some("https://idp.example.com/ars-soap")
+        );
+    }
+
+    /// An unnumbered endpoint is not addressable by an artifact, and is not a
+    /// stand-in for index 0.
+    #[test]
+    fn artifact_resolution_lookup_does_not_treat_missing_index_as_zero() {
+        let idp = descriptor_with_ars(vec![Endpoint::soap(
+            "https://idp.example.com/ars",
+            None,
+            true,
+        )]);
+
+        assert!(idp.artifact_resolution_endpoint_by_index(0).is_none());
+    }
+
+    #[test]
+    fn missing_artifact_resolution_index_is_rejected() {
+        let err = validate_artifact_resolution_endpoints(&[Endpoint::soap(
+            "https://idp.example.com/ars",
+            None,
+            true,
+        )])
+        .expect_err("index is REQUIRED on an IndexedEndpoint");
+        assert!(
+            matches!(err, Error::AmbiguousArtifactEndpointIndex { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// Duplicates make routing depend on ordering: an artifact naming index 0
+    /// would resolve against whichever entry happened to be parsed first.
+    #[test]
+    fn duplicate_artifact_resolution_index_is_rejected() {
+        let err = validate_artifact_resolution_endpoints(&[
+            Endpoint::soap("https://idp.example.com/ars-a", Some(0), true),
+            Endpoint::soap("https://idp.example.com/ars-b", Some(0), false),
+        ])
+        .expect_err("two endpoints cannot share an index");
+        assert!(
+            matches!(err, Error::AmbiguousArtifactEndpointIndex { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_artifact_resolution_indices_are_accepted() {
+        validate_artifact_resolution_endpoints(&[
+            Endpoint::soap("https://idp.example.com/ars-a", Some(0), true),
+            Endpoint::soap("https://idp.example.com/ars-b", Some(1), false),
+        ])
+        .expect("distinct indices are unambiguous");
+    }
+
     use crate::binding::Binding;
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::RSA_CERT_PEM;
