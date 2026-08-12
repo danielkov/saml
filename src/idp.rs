@@ -670,14 +670,28 @@ impl IdentityProvider {
         };
         let req =
             crate::binding::artifact::parse_artifact_resolve_with(soap_envelope, Some(&verify))?;
-        // `@Destination` is optional on the wire; presence is binding. Without
-        // this, a signed resolve captured at one ARS endpoint replays at
-        // another sharing the same configuration — a tenant boundary in a
-        // multi-tenant deployment.
-        if let Some(dest) = req.destination.as_deref()
-            && dest != expected_destination
-        {
-            return Err(Error::DestinationMismatch);
+        // `@Destination` binds the message to the endpoint that received it.
+        // Without it, a captured resolve replays at any ARS sharing keys or
+        // configuration — a tenant boundary in a multi-tenant deployment.
+        //
+        // SAML Core §3.2.1 makes the attribute REQUIRED on a signed protocol
+        // message, so for a signature-authenticated resolve absence is itself
+        // a failure: tolerating it would hand back exactly the replay the
+        // signature was supposed to prevent. An unsigned resolve is a
+        // different case — it is authenticated by the transport, if at all,
+        // and the spec does not require the attribute there — so absence
+        // stays tolerated and presence stays binding.
+        match req.destination.as_deref() {
+            Some(dest) if dest != expected_destination => {
+                return Err(Error::DestinationMismatch);
+            }
+            None if req.signature_verified => {
+                return Err(Error::SchemaViolation {
+                    element: "{urn:oasis:names:tc:SAML:2.0:protocol}ArtifactResolve".to_owned(),
+                    reason: "signed ArtifactResolve must carry @Destination (SAML Core §3.2.1)",
+                });
+            }
+            _ => {}
         }
         if req.issuer != sp.entity_id {
             return Err(Error::IssuerMismatch {
@@ -2065,6 +2079,82 @@ mod tests {
             matches!(err, Error::InvalidConfiguration { .. }),
             "got {err:?}"
         );
+    }
+
+    /// SAML Core §3.2.1 makes `@Destination` REQUIRED on a signed protocol
+    /// message. Tolerating its absence on a *signed* resolve would hand back
+    /// the cross-endpoint replay the signature was meant to prevent.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn signed_artifact_resolve_without_destination_rejected() {
+        let idp = idp_with_artifact_resolve_signed(true);
+        let sp = sp_descriptor(false);
+        let envelope = signed_resolve_without_destination(&sp.entity_id);
+
+        let err = idp
+            .parse_artifact_resolve(&sp, None, "https://idp.example.com/ars", &envelope)
+            .expect_err("a signed resolve must carry Destination");
+        assert!(
+            matches!(err, Error::SchemaViolation { reason, .. }
+                if reason.contains("@Destination")),
+            "got {err:?}"
+        );
+    }
+
+    /// The unsigned case is different: the spec does not require the attribute
+    /// there, and such a resolve is authenticated by the transport if at all.
+    /// Absence stays tolerated so mutual-TLS deployments are not broken.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn unsigned_artifact_resolve_without_destination_still_accepted() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = unsigned_resolve_without_destination(&sp.entity_id);
+
+        let req = idp
+            .parse_artifact_resolve(&sp, None, "https://idp.example.com/ars", &envelope)
+            .expect("unsigned resolves may omit Destination");
+        assert!(!req.signature_verified);
+        assert!(req.destination.is_none());
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn resolve_element_without_destination(issuer: &str) -> crate::xml::parse::Element {
+        let xml = format!(
+            r#"<samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_ar1" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>{issuer}</saml:Issuer><samlp:Artifact>AAQAAK1234567890</samlp:Artifact></samlp:ArtifactResolve>"#
+        );
+        Document::parse(xml.as_bytes())
+            .expect("parse resolve without Destination")
+            .root()
+            .clone()
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn unsigned_resolve_without_destination(issuer: &str) -> Vec<u8> {
+        crate::binding::soap::wrap_element(resolve_element_without_destination(issuer))
+            .expect("wrap")
+            .into_bytes()
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn signed_resolve_without_destination(issuer: &str) -> Vec<u8> {
+        let doc = Document::new(resolve_element_without_destination(issuer)).expect("doc");
+        let signed = crate::dsig::sign::sign_element(
+            doc.root().clone(),
+            &doc,
+            crate::dsig::sign::SignOptions {
+                signing_key: &rsa_keypair_with_cert(),
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign");
+        crate::binding::soap::wrap_element(signed)
+            .expect("wrap")
+            .into_bytes()
     }
 
     /// The `<saml:Issuer>` cross-check still applies, and is reported as an
