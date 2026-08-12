@@ -37,6 +37,61 @@ pub struct Identity {
     /// than ordinary expiry-bounded replay defense: even within the validity
     /// window the assertion is good for exactly one consumption.
     pub is_one_time_use: bool,
+    /// Witness that this value came out of the SP response validator.
+    ///
+    /// Private, so `Identity` cannot be constructed outside this crate. It is
+    /// the evidence that a signed, audience-checked, time-window-checked
+    /// assertion was actually seen — and downstream consumers, notably
+    /// [`Proxy::relay_to_downstream`](crate::Proxy::relay_to_downstream),
+    /// mint signed assertions from it. Were it forgeable, a caller could
+    /// hand the proxy an arbitrary subject and get a signed assertion for
+    /// them without any upstream authentication having occurred.
+    #[expect(
+        dead_code,
+        reason = "never read: its purpose is to deny struct-literal construction \
+                  outside this crate, so an Identity can only come from response \
+                  validation. Reading it would prove nothing a type already does."
+    )]
+    validated: ValidatedUpstream,
+}
+
+/// Zero-sized proof that an [`Identity`] came from response validation.
+#[derive(Debug, Clone)]
+struct ValidatedUpstream;
+
+impl Identity {
+    /// Construct an `Identity`. Crate-internal: only the response validator
+    /// may vouch for one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the field list one-for-one; grouping them into a                   builder would add a second way to assemble an Identity,                   which is what the private witness exists to prevent"
+    )]
+    pub(crate) fn new(
+        name_id: NameId,
+        session_index: Option<String>,
+        authn_instant: SystemTime,
+        session_not_on_or_after: Option<SystemTime>,
+        authn_context_class_ref: Option<String>,
+        attributes: Vec<Attribute>,
+        assertion_id: String,
+        not_on_or_after: SystemTime,
+        verifying_cert_fingerprint: [u8; 32],
+        is_one_time_use: bool,
+    ) -> Self {
+        Self {
+            name_id,
+            session_index,
+            authn_instant,
+            session_not_on_or_after,
+            authn_context_class_ref,
+            attributes,
+            assertion_id,
+            not_on_or_after,
+            verifying_cert_fingerprint,
+            is_one_time_use,
+            validated: ValidatedUpstream,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +116,7 @@ mod tests {
             not_on_or_after: now + Duration::from_mins(5),
             verifying_cert_fingerprint: [0u8; 32],
             is_one_time_use: false,
+            validated: ValidatedUpstream,
         };
         assert_eq!(id.assertion_id, "_a1");
         assert_eq!(id.attributes.len(), 1);
@@ -81,6 +137,7 @@ mod tests {
             not_on_or_after: SystemTime::UNIX_EPOCH,
             verifying_cert_fingerprint: [1u8; 32],
             is_one_time_use: true,
+            validated: ValidatedUpstream,
         };
         let cloned = id.clone();
         assert_eq!(cloned.assertion_id, id.assertion_id);
