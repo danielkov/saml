@@ -45,6 +45,30 @@ pub struct Proxy<'a> {
     sp: &'a ServiceProvider,
     idp: &'a IdentityProvider,
     context_codec: Box<dyn ProxyContextCodec>,
+    /// Distinguishes this proxy from any other in the process.
+    ///
+    /// An [`UpstreamFlow`] records the instance that produced it, and
+    /// [`relay_to_downstream`](Self::relay_to_downstream) refuses one from
+    /// elsewhere. Without this the wrapper is opaque but transferable: a
+    /// caller can stand up a second `Proxy` over the same roles with a codec
+    /// of their choosing — a custom one that authenticates nothing — obtain a
+    /// flow there, and hand it to the production proxy, which would then act
+    /// on another instance's trust decision.
+    instance: ProxyInstance,
+}
+
+/// Opaque per-`Proxy` identity. Random rather than a counter so it cannot be
+/// predicted or reconstructed, and `PartialEq` only — there is nothing to
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProxyInstance(u128);
+
+impl ProxyInstance {
+    fn new() -> Self {
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        Self(u128::from_be_bytes(bytes))
+    }
 }
 
 impl<'a> Proxy<'a> {
@@ -58,6 +82,7 @@ impl<'a> Proxy<'a> {
             sp,
             idp,
             context_codec,
+            instance: ProxyInstance::new(),
         }
     }
 
@@ -543,6 +568,8 @@ pub struct ConsumeUpstreamResponse<'a> {
 pub struct UpstreamFlow {
     context: ProxyContext,
     identity: Identity,
+    /// The proxy that produced this flow. See [`Proxy::instance`].
+    instance: ProxyInstance,
 }
 
 impl UpstreamFlow {
@@ -601,12 +628,12 @@ impl Proxy<'_> {
         let force_authn = input.propagate_request_flags && downstream.force_authn;
         let is_passive = input.propagate_request_flags && downstream.is_passive;
         let upstream_name_id_format = if input.propagate_name_id_policy {
-            downstream.requested_name_id_format.clone()
+            downstream.validated_name_id_format().cloned()
         } else {
             None
         };
         let upstream_authn_context = if input.propagate_authn_context {
-            downstream.requested_authn_context.clone()
+            downstream.validated_authn_context().cloned()
         } else {
             None
         };
@@ -639,9 +666,10 @@ impl Proxy<'_> {
             downstream_sp_entity_id: downstream.validated_sp().to_owned(),
             downstream_acs: downstream.validated_acs().as_endpoint(),
             downstream_relay_state: downstream.relay_state.clone(),
-            // Unconditionally what downstream asked for — see step 1.
-            requested_authn_context: downstream.requested_authn_context.clone(),
-            requested_name_id_format: downstream.requested_name_id_format.clone(),
+            // Unconditionally what downstream asked for — see step 1 — and
+            // from the private provenance, not the caller-mutable `pub` copies.
+            requested_authn_context: downstream.validated_authn_context().cloned(),
+            requested_name_id_format: downstream.validated_name_id_format().cloned(),
             upstream_tracker: result.tracker,
             issued_at: input.now,
         };
@@ -699,7 +727,11 @@ impl Proxy<'_> {
             replay_mode: input.replay_mode,
             holder_of_key_cert: input.holder_of_key_cert,
         })?;
-        Ok(UpstreamFlow { context, identity })
+        Ok(UpstreamFlow {
+            context,
+            identity,
+            instance: self.instance,
+        })
     }
 
     /// Authenticate a relay token and return the context it carries.
@@ -782,7 +814,19 @@ impl Proxy<'_> {
         &self,
         input: RelayToDownstream<'_>,
     ) -> Result<SsoResponseDispatch, Error> {
-        // 0. The context must belong to the SP being relayed to.
+        // 0. The flow must have come from *this* proxy.
+        //
+        //    `UpstreamFlow` is opaque, but opacity only stops a caller from
+        //    fabricating one — not from obtaining a genuine one elsewhere. A
+        //    second `Proxy` over the same roles, with a codec that
+        //    authenticates nothing, produces structurally identical flows.
+        //    Checked first: nothing else here means anything if the trust
+        //    decision was made by an instance the caller controls.
+        if input.flow.instance != self.instance {
+            return Err(Error::ForeignProxyFlow);
+        }
+
+        // 0a. The context must belong to the SP being relayed to.
         //
         //    Without this an authentic SP-A context can be paired with SP-B —
         //    they may legitimately share an ACS URL and binding — and
@@ -832,13 +876,22 @@ impl Proxy<'_> {
         //    satisfied a downstream `Exact(MultiFactorAuth)` request, and the
         //    signed assertion then advertised PasswordProtectedTransport. The
         //    check has to bind to the emitted value.
+        //    Where there is nothing to pass through — upstream asserted no
+        //    class, or the caller disabled passthrough — the emitted value is
+        //    `Unspecified`. It previously defaulted to
+        //    PasswordProtectedTransport, which is *stronger* than plain
+        //    Password: an upstream Password result was signed downstream as
+        //    PPT, inventing evidence rather than merely losing it.
+        //    `Unspecified` claims nothing, and because it ranks lowest it
+        //    satisfies no stronger request — so a downstream SP that required
+        //    something specific is refused below rather than misled.
         let downstream_class_ref = if input.passthrough_authn_context {
             input.flow.identity().authn_context_class_ref().map_or(
-                AuthnContextClassRef::PasswordProtectedTransport,
+                AuthnContextClassRef::Unspecified,
                 AuthnContextClassRef::from_uri,
             )
         } else {
-            AuthnContextClassRef::PasswordProtectedTransport
+            AuthnContextClassRef::Unspecified
         };
 
         //    The set-aggregating semantics — in particular, `Better` requires
@@ -1518,10 +1571,11 @@ mod tests {
     /// context's own tracker. These tests exercise relay's logic downstream of
     /// that, so they assemble the pair directly — which is possible here only
     /// because this module is inside the crate.
-    fn flow(context: ProxyContextPayload, identity: Identity) -> UpstreamFlow {
+    fn flow(proxy: &Proxy<'_>, context: ProxyContextPayload, identity: Identity) -> UpstreamFlow {
         UpstreamFlow {
             context: ProxyContext::attested(context),
             identity,
+            instance: proxy.instance,
         }
     }
 
@@ -1734,6 +1788,132 @@ mod tests {
         .expect("the fixture ACS is registered on the fixture SP")
     }
 
+    /// The `pub` policy fields are caller-mutable after validation, so the
+    /// context must be sealed from the private provenance instead. Clearing
+    /// `requested_authn_context` here previously erased an `Exact` requirement
+    /// on its way into the authoritative context.
+    #[test]
+    fn context_seals_validated_policies_not_the_mutable_copies() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([12u8; 32])));
+        let upstream = upstream_idp_descriptor();
+
+        let mut downstream = synthetic_downstream_request();
+        // Post-validation tampering: weaken the policy the SP actually sent.
+        downstream.requested_authn_context = None;
+        downstream.requested_name_id_format = None;
+
+        let bounce = proxy
+            .bounce_to_upstream(BounceToUpstream {
+                upstream_idp: &upstream,
+                downstream_request: &downstream,
+                propagate_request_flags: true,
+                propagate_authn_context: true,
+                propagate_name_id_policy: true,
+                upstream_binding: Binding::HttpRedirect,
+                now: SystemTime::now(),
+            })
+            .expect("bounce ok");
+
+        let context = proxy
+            .decode_context(&bounce.upstream_relay_state)
+            .expect("decode context");
+        let payload = context.payload();
+
+        assert!(
+            payload.requested_authn_context.is_some(),
+            "the validated requirement must survive tampering with the pub field"
+        );
+        assert_eq!(
+            payload.requested_name_id_format,
+            Some(NameIdFormat::Persistent),
+            "the validated NameIDPolicy must survive tampering with the pub field"
+        );
+    }
+
+    /// A flow is opaque, but opacity only prevents fabrication — not
+    /// obtaining a genuine one from a proxy the caller controls. A second
+    /// `Proxy` over the same roles with a codec that authenticates nothing
+    /// produces structurally identical flows, so the production proxy must
+    /// refuse them.
+    #[test]
+    fn relay_refuses_a_flow_from_another_proxy_instance() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let production = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([1u8; 32])));
+        let attacker = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([2u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+
+        // A flow produced by the *other* proxy, otherwise entirely well-formed.
+        let foreign = flow(&attacker, sample_context(), identity);
+
+        let err = production
+            .relay_to_downstream(RelayToDownstream {
+                flow: &foreign,
+                downstream_sp: &downstream_sp,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("a flow from another Proxy must be refused");
+        assert!(matches!(err, Error::ForeignProxyFlow), "got {err:?}");
+    }
+
+    /// Without an upstream claim, or with passthrough disabled, there is
+    /// nothing to assert. Emitting PasswordProtectedTransport invented a
+    /// *stronger* claim than upstream made — an upstream Password result was
+    /// signed downstream as PPT.
+    #[test]
+    fn relay_does_not_invent_a_stronger_class_than_upstream_attested() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([11u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+
+        // Downstream asked for nothing, so issuance is not blocked and we can
+        // observe the class actually emitted.
+        let mut context = sample_context();
+        context.requested_authn_context = None;
+
+        // Upstream attested plain Password — weaker than PPT.
+        let identity = make_upstream_identity(AuthnContextClassRef::Password.as_uri());
+
+        let dispatch = proxy
+            .relay_to_downstream(RelayToDownstream {
+                flow: &flow(&proxy, context, identity),
+                downstream_sp: &downstream_sp,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                passthrough_authn_context: false,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect("relay ok");
+
+        let SsoResponseDispatch::Post(form) = dispatch else {
+            panic!("expected Post");
+        };
+        let decoded = crate::binding::post::decode(&form.saml_response, None).expect("decode");
+        let xml = String::from_utf8(decoded.xml).expect("utf8");
+
+        assert!(
+            xml.contains(AuthnContextClassRef::Unspecified.as_uri()),
+            "no passthrough must emit Unspecified, got: {xml}"
+        );
+        assert!(
+            !xml.contains(AuthnContextClassRef::PasswordProtectedTransport.as_uri()),
+            "must not invent a stronger class than upstream attested: {xml}"
+        );
+    }
+
     /// The propagate flags govern what the *upstream* IdP is asked for. The
     /// context is the authoritative record of what the downstream SP required,
     /// and relay enforces non-downgrade against it — so folding the flags into
@@ -1807,7 +1987,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -1823,7 +2003,7 @@ mod tests {
         // Control: with passthrough on, the emitted class *is* MFA and it passes.
         proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context, identity.clone()),
+                flow: &flow(&proxy, context, identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2028,7 +2208,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2076,7 +2256,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2135,7 +2315,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2177,7 +2357,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2217,7 +2397,7 @@ mod tests {
 
         let dispatch = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAllowList {
                     names: vec!["urn:oid:0.9.2342.19200300.100.1.3".into()],
@@ -2267,7 +2447,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2478,7 +2658,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2509,7 +2689,7 @@ mod tests {
 
         proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2622,7 +2802,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp_descriptor(),
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2662,7 +2842,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &twin,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2694,7 +2874,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(context.clone(), identity.clone()),
+                flow: &flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,

@@ -51,6 +51,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context under a chosen handle, then present that handle to `decode_context`.
   Its documented contract now also states that implementations must honour
   `ttl` and make `take` atomic and one-shot.
+- An `UpstreamFlow` is bound to the `Proxy` that produced it;
+  `relay_to_downstream` refuses one from another instance with
+  `Error::ForeignProxyFlow`. The wrapper being opaque only stopped a caller
+  fabricating one — a second `Proxy` over the same roles, with a codec that
+  authenticates nothing, produced structurally identical flows the production
+  proxy would have honoured.
+- `ParsedAuthnRequest` records the validated `RequestedAuthnContext` and
+  NameIDPolicy in its private provenance, exposed via
+  `validated_authn_context()` and `validated_name_id_format()`. The `pub`
+  copies are caller-mutable after validation, so clearing an `Exact(MFA)`
+  requirement previously let the weakened policy be sealed as authoritative.
+  Proxy sealing and issuance now read only the provenance.
+- `IdentityProvider::issue_response` refuses to sign an AuthnContext class that
+  does not satisfy the validated request. An `Exact(MultiFactorAuth)` request
+  could previously receive a signed Password assertion — the SP is expected to
+  re-check, but an SP that does not has no other defence.
+- `Proxy::relay_to_downstream` emits `Unspecified` where there is nothing to
+  pass through, instead of synthesizing `PasswordProtectedTransport` — which is
+  *stronger* than plain Password, so an upstream Password result was signed
+  downstream as PPT, inventing evidence rather than losing it.
 - **Breaking:** `Proxy::relay_to_downstream` takes a single `UpstreamFlow`
   instead of a separate `ProxyContext` and `Identity`, obtained from the new
   `Proxy::consume_upstream_response`. Both values were individually attested

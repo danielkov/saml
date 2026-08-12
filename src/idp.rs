@@ -521,6 +521,10 @@ impl IdentityProvider {
     /// See RFC-004 §3.1.
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
         ensure_request_belongs_to_sp(input.in_response_to, input.sp)?;
+        ensure_authn_context_satisfies_request(
+            input.in_response_to,
+            &input.authn_context_class_ref,
+        )?;
         // Canonical endpoint from the SP's metadata, not the `pub` field:
         // `SsoResponseEndpoint::index` is public too, and artifact issuance
         // names the endpoint by index.
@@ -528,9 +532,10 @@ impl IdentityProvider {
         let relay_state = input.in_response_to.relay_state.as_deref();
 
         // Resolve outbound `NameID` Format: honor the SP's requested format
-        // when supported, otherwise fall back to the IdP's default.
+        // when supported, otherwise fall back to the IdP's default. From the
+        // validated provenance, not the caller-mutable `pub` copy.
         let chosen_format = pick_name_id_format(
-            input.in_response_to.requested_name_id_format.as_ref(),
+            input.in_response_to.validated_name_id_format(),
             &self.config.supported_name_id_formats,
             &self.config.default_name_id_format,
         );
@@ -664,6 +669,35 @@ impl IdentityProvider {
 /// `AudienceRestriction`, but that is the *peer's* check saving us; the IdP
 /// should not emit a cross-wired assertion in the first place, and an SP that
 /// flattens audience groups would accept it.
+/// Refuse to sign an assertion whose `<saml:AuthnContextClassRef>` does not
+/// satisfy what the SP's validated request asked for.
+///
+/// The proxy enforces this on its own relay path, but every IdP built on this
+/// crate reaches issuance directly, and nothing here checked it: an
+/// `Exact(MultiFactorAuth)` request could be answered with a signed Password
+/// assertion. The SP is expected to re-check on receipt, but an IdP should not
+/// mint the downgrade in the first place — and an SP that omits the check has
+/// no other line of defence.
+///
+/// Uses the validated provenance rather than the `pub` field, and collapses
+/// `NotSatisfied` and `NotComparable` alike, matching the SP-side validator
+/// and the proxy.
+fn ensure_authn_context_satisfies_request(
+    request: &ParsedAuthnRequest,
+    emitted: &AuthnContextClassRef,
+) -> Result<(), Error> {
+    let Some(requested) = request.validated_authn_context() else {
+        return Ok(());
+    };
+    match crate::authn_context::StandardComparator.evaluate(requested, emitted.as_uri()) {
+        crate::authn_context::ComparatorOutcome::Satisfied => Ok(()),
+        crate::authn_context::ComparatorOutcome::NotSatisfied
+        | crate::authn_context::ComparatorOutcome::NotComparable => {
+            Err(Error::AuthnContextDowngrade)
+        }
+    }
+}
+
 fn ensure_request_belongs_to_sp(
     request: &ParsedAuthnRequest,
     sp: &SpDescriptor,
@@ -1453,7 +1487,9 @@ mod tests {
     use super::*;
     use crate::attribute::Attribute;
     use crate::authn::request_build::{AcsRequest, BuildAuthnRequest, build_authn_request_element};
-    use crate::authn_context::AuthnContextClassRef;
+    use crate::authn_context::{
+        AuthnContextClassRef, AuthnContextComparison, RequestedAuthnContext,
+    };
     use crate::binding::{Binding, Endpoint, SsoResponseDispatch, SsoResponseEndpoint};
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
@@ -1551,6 +1587,27 @@ mod tests {
         UNIX_EPOCH
             .checked_add(Duration::from_hours(494_388))
             .expect("static UNIX_EPOCH + bounded Duration cannot overflow")
+    }
+
+    fn build_unsigned_authn_request_with_authn_context(
+        id: &str,
+        rac: &RequestedAuthnContext,
+    ) -> Vec<u8> {
+        let build = BuildAuthnRequest {
+            id,
+            issue_instant: fixed_now(),
+            issuer_entity_id: "https://sp.example.com/saml",
+            destination: "https://idp.example.com/sso",
+            force_authn: false,
+            is_passive: false,
+            acs_selection: AcsRequest::Index(0),
+            protocol_binding: None,
+            requested_name_id_format: Some(NameIdFormat::Persistent),
+            requested_authn_context: Some(rac),
+        };
+        let element = build_authn_request_element(&build).unwrap();
+        let doc = Document::new(element).unwrap();
+        emit_document(&doc).unwrap().into_bytes()
     }
 
     fn build_unsigned_authn_request(id: &str, with_destination: bool) -> Vec<u8> {
@@ -1776,6 +1833,19 @@ mod tests {
     // issue_response / issue_error_response
     // -------------------------------------------------------------------------
 
+    /// A *validated* request carrying `rac`, so the requirement lives in the
+    /// private provenance where issuance reads it.
+    fn parsed_authn_request_with_authn_context(rac: RequestedAuthnContext) -> ParsedAuthnRequest {
+        use crate::authn::request_parse::parse_authn_request;
+        let xml = build_unsigned_authn_request_with_authn_context("_req-rac", &rac);
+        let doc = Document::parse(&xml).unwrap();
+        let (raw, _root) = parse_authn_request(&doc).unwrap();
+        let sp = sp_descriptor(false);
+        let sso_urls = vec!["https://idp.example.com/sso".to_string()];
+        validate_authn_request(raw, &sp, "https://idp.example.com/sso", &sso_urls)
+            .expect("validate")
+    }
+
     fn parsed_authn_request_fixture() -> ParsedAuthnRequest {
         use crate::authn::request_parse::parse_authn_request;
         let xml = build_unsigned_authn_request("_req-issue", true);
@@ -1945,6 +2015,41 @@ mod tests {
             subject_confirmation_lifetime: Duration::from_mins(5),
             holder_of_key_cert: None,
         })
+    }
+
+    /// An IdP should not sign a weaker class than the SP's validated request
+    /// demanded. The SP is expected to re-check on receipt, but an SP that
+    /// omits that check has no other line of defence — and the proxy is not
+    /// the only caller that reaches issuance.
+    #[test]
+    fn issue_response_refuses_a_class_the_request_does_not_accept() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+        // The requirement must live in the private provenance, so this
+        // validates a request that genuinely carries it rather than touching
+        // the `pub` field — which issuance deliberately ignores.
+        let req = parsed_authn_request_with_authn_context(RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::MultiFactorAuth],
+            comparison: AuthnContextComparison::Exact,
+        });
+
+        let err = issue_to(&idp, &sp, &req)
+            .expect_err("PasswordProtectedTransport does not satisfy Exact(MFA)");
+        assert!(matches!(err, Error::AuthnContextDowngrade), "got {err:?}");
+    }
+
+    /// Control: the same path issues normally when the class does satisfy the
+    /// request, so the guard above is not simply refusing everything.
+    #[test]
+    fn issue_response_allows_a_class_the_request_accepts() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+        let req = parsed_authn_request_with_authn_context(RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::PasswordProtectedTransport],
+            comparison: AuthnContextComparison::Exact,
+        });
+
+        issue_to(&idp, &sp, &req).expect("the emitted class satisfies the request");
     }
 
     #[test]

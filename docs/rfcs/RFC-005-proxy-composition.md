@@ -70,7 +70,7 @@ impl ProxyContextCodec for Aes256GcmCodec { /* ... */ }
 
 The codec deals in `ProxyContextPayload`: a transparent `Serialize`/`Deserialize` struct with public fields, so callers can implement their own codec. It carries no authority on its own.
 
-`Proxy::relay_to_downstream` instead requires a `ProxyContext` — an opaque wrapper with no public constructor, no public fields and no `Deserialize` impl, obtainable only from `Proxy::decode_context`, which runs the codec's authentication first. The split exists because relay mints a *signed* downstream assertion from the context: every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result. An authentic identity could otherwise be paired with an invented context naming any registered SP and ACS.
+`Proxy::relay_to_downstream` instead requires an `UpstreamFlow`, obtainable only from `Proxy::consume_upstream_response`, which authenticates the relay token and validates the upstream Response against *that context's* tracker in one step and records the `Proxy` instance that did so. `ProxyContext` — an opaque wrapper with no public constructor, no public fields and no `Deserialize` impl — is what the codec's authentication yields, via `Proxy::decode_context`. The split exists because relay mints a *signed* downstream assertion from the context: every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result. An authentic identity could otherwise be paired with an invented context naming any registered SP and ACS.
 
 The default implementation uses AES-256-GCM with a caller-supplied 32-byte key. The wire format is `base64url(nonce_12 || ciphertext || tag_16)` where the plaintext is the postcard-serialized `ProxyContextPayload`. Callers can plug HMAC-only, signed-JWT-style, or HSM-backed codecs by implementing the trait.
 
@@ -108,7 +108,7 @@ impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
         let mut bytes = vec![0u8; self.handle_byte_len];
         rand::rng().fill_bytes(&mut bytes);
         let handle = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
-        self.store.put(&handle, grant.payload(), self.ttl)?;
+        self.store.put(&handle, grant, self.ttl)?;
         Ok(handle)
     }
 
@@ -136,7 +136,10 @@ Custom codecs (signed-JWT, KMS envelope encryption, HSM-backed) implement `Proxy
 Two types, deliberately:
 
 - **`ProxyContextPayload`** — the transparent wire form below. `Serialize`/`Deserialize` with public fields so callers can implement their own codec. It carries no authority.
-- **`ProxyContext`** — opaque: no public constructor, no public fields, no `Deserialize`. Obtainable only from `Proxy::decode_context`, which runs the configured codec's authentication first. `relay_to_downstream` accepts only this.
+- **`ProxyContext`** — opaque: no public constructor, no public fields, no `Deserialize`. Obtainable only from `Proxy::decode_context`, which runs the configured codec's authentication first.
+- **`UpstreamFlow`** — a `ProxyContext` together with the `Identity` validated against *its* tracker, plus the identity of the `Proxy` that produced it. Only `Proxy::consume_upstream_response` makes one, and `relay_to_downstream` accepts nothing else.
+
+Attesting the context and the identity separately says nothing about the pair: `Identity` records no issuer, tracker or request ID, so identity B could be relayed under context A and authenticate the wrong subject into A's transaction. Binding the flow to its originating `Proxy` closes the matching gap for the *instance* — a second `Proxy` over the same roles, with a codec of the caller's choosing, otherwise produces flows the production proxy would honour.
 
 The split exists because relay mints a *signed* downstream assertion from the context. Every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result — an authentic identity could be paired with an invented context naming any registered SP and ACS. For the same reason `encode` takes a `SealingGrant` — a type with no public constructor, issued only by `bounce_to_upstream`. Removing `Proxy`'s codec accessor was not enough on its own: `Aes256GcmCodec` is public and the caller supplies its key, so a second instance over the same key is trivial to build.
 
@@ -232,9 +235,10 @@ Internally:
 
 ```rust
 pub struct RelayToDownstream<'a> {
-    /// From `Proxy::decode_context` — the only source of one.
-    pub context: &'a ProxyContext,
-    pub upstream_identity: &'a Identity,
+    /// From `Proxy::consume_upstream_response` — the only source of one.
+    /// Carries the context, the identity validated under it, and the `Proxy`
+    /// instance that produced both.
+    pub flow: &'a UpstreamFlow,
     /// Downstream SP descriptor. The context must belong to it; relay refuses
     /// the pairing otherwise.
     pub downstream_sp: &'a SpDescriptor,
@@ -262,9 +266,9 @@ impl<'a> Proxy<'a> {
 Internally:
 
 1. Look up the downstream SP descriptor by `context.downstream_sp_entity_id()`. (Caller-managed registry; the library does not maintain one.) For ergonomics, the caller can pass a closure for SP lookup via `ProxyConfig` (future addition).
-2. **Enforce AuthnContext non-downgrade** (§7) using `context.payload().requested_authn_context` and `upstream_identity.authn_context_class_ref()`. → `Error::AuthnContextDowngrade`.
-3. Compute downstream attributes via `attribute_release.release(upstream_identity.attributes(), &downstream_sp)`.
-4. Compute downstream NameID via `name_id_transform.transform(upstream_identity.name_id(), upstream_identity.attributes(), &downstream_sp)`.
+2. **Select the class the response will advertise**, then **enforce AuthnContext non-downgrade** (§7) against *that* value using `flow.context().payload().requested_authn_context`. → `Error::AuthnContextDowngrade`. Where there is nothing to pass through, the emitted class is `Unspecified` rather than a synthesized `PasswordProtectedTransport`, which would claim more than upstream attested.
+3. Compute downstream attributes via `attribute_release.release(flow.identity().attributes(), &downstream_sp)`.
+4. Compute downstream NameID via `name_id_transform.transform(flow.identity().name_id(), flow.identity().attributes(), &downstream_sp)`.
 5. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id()`).
 6. Call `self.idp.issue_response(...)` with the synthesized request and transformed identity.
 7. Return the resulting `Dispatch`.
@@ -369,9 +373,6 @@ pub struct StandardComparator;  // built-in: exact / minimum / maximum / better
 
 `StandardComparator` ranks the standard class refs and treats anything else as unrankable. An ordered comparison (`minimum` / `maximum` / `better`) whose requested set contains *any* unrankable class returns `NotComparable` rather than deciding on the rankable remainder — nothing places a vendor-defined class in the standard hierarchy, so no ordered verdict against it is sound.
 
-```rust
-```
-
 ---
 
 ## 8. What is NOT in `Proxy`
@@ -428,26 +429,28 @@ let bounce = proxy.bounce_to_upstream(BounceToUpstream {
 // RelayState query/form parameter. Carries downstream context across the round-trip.
 
 // --- /saml/acs handler (upstream IdP → proxy) ---
-// `decode_context` authenticates the blob through the configured codec and
-// returns the attested `ProxyContext` — the only value `relay_to_downstream`
-// accepts. Sealing is gated behind a crate-issued `SealingGrant`, so neither
-// the codec nor the store will seal a payload the caller assembled.
-let context: ProxyContext = proxy.decode_context(&form.relay_state)?;
-let upstream_identity = sp.consume_response(ConsumeResponse {
-    idp: &upstream_idp_descriptor,
+// One call: authenticate the RelayState blob through the configured codec and
+// validate the Response against *that* context's tracker. They come back
+// coupled, and tagged with this `Proxy` instance, so relay cannot be handed a
+// pairing — or a trust decision — made anywhere else. Sealing is gated behind
+// a crate-issued `SealingGrant`, so neither the codec nor the store will seal
+// a payload the caller assembled.
+let flow = proxy.consume_upstream_response(ConsumeUpstreamResponse {
+    relay_state: &form.relay_state,
+    upstream_idp: &upstream_idp_descriptor,
     peer_crypto_policy: None,
     saml_response: &form.saml_response,
     binding: SsoResponseBinding::HttpPost,
-    relay_state: Some(&form.relay_state),
-    tracker: Some(&context.payload().upstream_tracker),
     expected_destination: "https://hub.example.com/saml/acs", // proxy ACS URL this handler serves
     now: SystemTime::now(),
     clock_skew: Duration::from_secs(60),
+    replay_cache: None,
+    replay_mode: ReplayMode::All,
+    holder_of_key_cert: None,
 })?;
 
 let dispatch = proxy.relay_to_downstream(RelayToDownstream {
-    context: &context,
-    upstream_identity: &upstream_identity,
+    flow: &flow,
     // Required: the context must belong to this SP, or relay refuses.
     downstream_sp: &downstream_sp_descriptor,
     attribute_release: &ReleaseAllowList {
