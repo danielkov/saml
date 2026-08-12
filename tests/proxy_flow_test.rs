@@ -22,8 +22,8 @@ use saml::binding::{Binding, Dispatch, SsoResponseBinding, SsoResponseDispatch};
 use saml::idp::{ConsumeAuthnRequest, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
 use saml::proxy::{
-    Aes256GcmCodec, BounceToUpstream, PersistentPerSpHmac, Proxy, ProxyContext, RelayToDownstream,
-    ReleaseAllowList,
+    Aes256GcmCodec, BounceToUpstream, ConsumeUpstreamResponse, PersistentPerSpHmac, Proxy,
+    RelayToDownstream, ReleaseAllowList, UpstreamFlow,
 };
 use saml::replay::ReplayMode;
 use saml::sp::{ConsumeResponse, StartLogin};
@@ -209,20 +209,16 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     };
 
     // ---- 6. Proxy (SP face) consumes the upstream Response. -------------
-    // `decode_context` runs the codec's authentication and returns the
-    // attested `ProxyContext` — the only value `relay_to_downstream` accepts.
-    let proxy_context: ProxyContext = proxy
-        .decode_context(&upstream_relay_state)
-        .expect("proxy context decodes");
-
-    let upstream_identity = proxy_sp
-        .consume_response(ConsumeResponse {
-            idp: &upstream_idp_descriptor,
+    // One call authenticates the RelayState blob and validates the Response
+    // against *that* context's tracker. The two arrive coupled, so relay
+    // cannot be handed an identity validated under a different context.
+    let flow: UpstreamFlow = proxy
+        .consume_upstream_response(ConsumeUpstreamResponse {
+            relay_state: &upstream_relay_state,
+            upstream_idp: &upstream_idp_descriptor,
             peer_crypto_policy: None,
             saml_response: &upstream_response_xml,
             binding: SsoResponseBinding::HttpPost,
-            relay_state: Some(&upstream_relay_state),
-            tracker: Some(&proxy_context.payload().upstream_tracker),
             expected_destination: PROXY_SP_ACS_URL,
             now,
             clock_skew: Duration::from_mins(2),
@@ -230,7 +226,16 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             replay_mode: ReplayMode::All,
             holder_of_key_cert: None,
         })
-        .expect("proxy sp consume_response");
+        .expect("proxy consumes the upstream response under its own context");
+    let upstream_identity = flow.identity();
+
+    // The coupled context is the one `bounce_to_upstream` sealed: the identity
+    // above was correlated against *its* tracker, not one the test supplied.
+    assert_eq!(
+        flow.context().downstream_request_id(),
+        parsed_downstream_request.id,
+        "flow must carry the context the upstream response was validated under"
+    );
 
     // The proxy saw all four upstream attributes.
     assert_eq!(upstream_identity.attributes().len(), 4);
@@ -252,8 +257,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
 
     let downstream_dispatch = proxy
         .relay_to_downstream(RelayToDownstream {
-            context: &proxy_context,
-            upstream_identity: &upstream_identity,
+            flow: &flow,
             downstream_sp: &downstream_sp_descriptor,
             attribute_release: &release_policy,
             name_id_transform: &name_id_transform,
