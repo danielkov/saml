@@ -420,6 +420,15 @@ pub trait ProxyContextStore: Send + Sync {
     /// Remove and return the payload stored under `handle`, if any.
     ///
     /// Must be atomic and one-shot — see the contract on [`put`](Self::put).
+    ///
+    /// Whatever this returns is what [`Proxy::decode_context`] attests and
+    /// [`Proxy::relay_to_downstream`] then signs a downstream assertion from.
+    /// Under [`OpaqueHandleCodec`] the store *is* the trust anchor, exactly as
+    /// a custom [`ProxyContextCodec`] would be: the grant on
+    /// [`put`](Self::put) constrains what this crate will hand you, not what
+    /// your implementation chooses to return. An implementation that returns a
+    /// payload it was never given — or one belonging to a different handle —
+    /// forges a context, and nothing downstream can tell.
     fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
 
