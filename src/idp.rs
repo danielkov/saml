@@ -284,12 +284,27 @@ impl IdentityProvider {
             self.config.want_authn_requests_signed || input.sp.authn_requests_signed;
 
         match input.binding {
-            Binding::HttpRedirect => verify_redirect_request_signature(
-                signature_required,
-                input.detached_signature.as_ref(),
-                &input.sp.signing_certs,
-                &policy.allowed_signature_algorithms,
-            )?,
+            Binding::HttpRedirect => {
+                verify_redirect_request_signature(
+                    signature_required,
+                    input.detached_signature.as_ref(),
+                    &input.sp.signing_certs,
+                    &policy.allowed_signature_algorithms,
+                )?;
+                // Verifying the signature over `raw_query_string` establishes
+                // what the SP signed — not that it is what we just parsed.
+                // `saml_request`, `relay_state` and `detached_signature` are
+                // three independent arguments here, so a caller can present a
+                // genuine signed query alongside different XML or a different
+                // RelayState and every check still passes. Bind them.
+                if let Some(detached) = input.detached_signature.as_ref() {
+                    ensure_signed_query_matches(
+                        detached.raw_query_string,
+                        input.saml_request,
+                        input.relay_state,
+                    )?;
+                }
+            }
             Binding::HttpPost | Binding::Soap => {
                 verify_envelope_signature(
                     signature_required,
@@ -713,6 +728,38 @@ fn ensure_authn_context_satisfies_request(
             Err(Error::AuthnContextDowngrade)
         }
     }
+}
+
+/// Confirm the XML and RelayState we were handed are the ones inside the
+/// signed Redirect query.
+///
+/// The signature covers `raw_query_string`; without this, that proves only
+/// that *some* request was signed by the SP. A caller holding one genuine
+/// signed query could pair it with any XML — a request for a different ACS,
+/// a different subject, a different `ForceAuthn` — and the signature check
+/// would still pass.
+fn ensure_signed_query_matches(
+    raw_query_string: &str,
+    saml_request: &[u8],
+    relay_state: Option<&str>,
+) -> Result<(), Error> {
+    let decoded = crate::binding::decode_wire(
+        raw_query_string.as_bytes(),
+        Binding::HttpRedirect,
+        crate::binding::WireDirection::Request,
+    )?;
+
+    if decoded.xml != saml_request {
+        return Err(Error::SignatureVerification {
+            reason: "saml_request is not the XML covered by the detached Redirect signature",
+        });
+    }
+    if decoded.relay_state.as_deref() != relay_state {
+        return Err(Error::SignatureVerification {
+            reason: "relay_state is not the value covered by the detached Redirect signature",
+        });
+    }
+    Ok(())
 }
 
 fn ensure_request_belongs_to_sp(

@@ -225,8 +225,65 @@ pub struct LoginTracker {
     pub issued_at: SystemTime,
     pub idp_entity_id: String,
     pub acs_endpoint: SsoResponseEndpoint,
-    pub requested_authn_context: Option<RequestedAuthnContext>,
-    pub requested_name_id_format: Option<NameIdFormat>,
+    /// What this login asked the IdP for, as issued.
+    ///
+    /// Private: these drive response-side policy checks, so a caller that
+    /// could clear them after `start_login` would simply switch those checks
+    /// off — `requested_authn_context` disables non-downgrade enforcement,
+    /// `requested_name_id_format` disables the returned-format check. Read via
+    /// [`requested_authn_context`](Self::requested_authn_context) and
+    /// [`requested_name_id_format`](Self::requested_name_id_format).
+    ///
+    /// # Serialized trackers
+    ///
+    /// A tracker is usually stashed in a cookie or session store across the
+    /// round trip. Privacy here constrains this process, not that storage: if
+    /// you serialize a tracker, the serialized form MUST be
+    /// integrity-protected, or an attacker who can rewrite it can strip these
+    /// requirements exactly as a caller with public fields could.
+    requested_authn_context: Option<RequestedAuthnContext>,
+    requested_name_id_format: Option<NameIdFormat>,
+}
+
+impl LoginTracker {
+    /// Assemble a tracker.
+    ///
+    /// Normally you get one from [`ServiceProvider::start_login`]; this exists
+    /// for callers rehydrating one from their own storage. It does not weaken
+    /// the guarantee the private fields provide: the response-side checks are
+    /// already opt-in via `ConsumeResponse::tracker`, so the property worth
+    /// protecting is that a *genuine* tracker cannot be quietly stripped of
+    /// its requirements in flight — not that no tracker can be built.
+    #[must_use]
+    pub fn new(
+        request_id: String,
+        issued_at: SystemTime,
+        idp_entity_id: String,
+        acs_endpoint: SsoResponseEndpoint,
+        requested_authn_context: Option<RequestedAuthnContext>,
+        requested_name_id_format: Option<NameIdFormat>,
+    ) -> Self {
+        Self {
+            request_id,
+            issued_at,
+            idp_entity_id,
+            acs_endpoint,
+            requested_authn_context,
+            requested_name_id_format,
+        }
+    }
+
+    /// The `<samlp:RequestedAuthnContext>` this login was issued with.
+    #[must_use]
+    pub fn requested_authn_context(&self) -> Option<&RequestedAuthnContext> {
+        self.requested_authn_context.as_ref()
+    }
+
+    /// The `<samlp:NameIDPolicy>/@Format` this login was issued with.
+    #[must_use]
+    pub fn requested_name_id_format(&self) -> Option<&NameIdFormat> {
+        self.requested_name_id_format.as_ref()
+    }
 }
 
 impl ServiceProvider {
@@ -595,7 +652,7 @@ impl ServiceProvider {
             clock_skew: input.clock_skew,
             requested_authn_context: input
                 .tracker
-                .and_then(|t| t.requested_authn_context.as_ref()),
+                .and_then(LoginTracker::requested_authn_context),
             holder_of_key_cert: input.holder_of_key_cert,
         })?;
 
@@ -609,7 +666,7 @@ impl ServiceProvider {
         // silently defeats the reason the format was specified.
         if let Some(requested) = input
             .tracker
-            .and_then(|t| t.requested_name_id_format.as_ref())
+            .and_then(LoginTracker::requested_name_id_format)
             && identity.name_id().format != *requested
         {
             return Err(Error::UnsupportedNameIdPolicy {
