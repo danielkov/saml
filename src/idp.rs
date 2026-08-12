@@ -623,7 +623,7 @@ impl IdentityProvider {
         let inputs = IssueResponseInputs {
             sp: input.sp,
             idp_entity_id: &self.config.entity_id,
-            in_response_to: Some(input.in_response_to.id.as_str()),
+            in_response_to: Some(input.in_response_to.validated_request_id()),
             name_id,
             attributes: input.attributes,
             authn_instant: input.authn_instant,
@@ -670,7 +670,7 @@ impl IdentityProvider {
 
         let inputs = IssueErrorResponseInputs {
             idp_entity_id: &self.config.entity_id,
-            in_response_to: Some(input.in_response_to.id.as_str()),
+            in_response_to: Some(input.in_response_to.validated_request_id()),
             now: input.now,
             status_code: input.status_code,
             second_level_status_code: input.second_level_status_code,
@@ -2308,6 +2308,38 @@ mod tests {
             subject_confirmation_lifetime: Duration::from_mins(5),
             holder_of_key_cert: None,
         })
+    }
+
+    /// `@ID` is caller-mutable after validation, and it becomes the Response's
+    /// `@InResponseTo` — which the SP correlates against its own tracker. So
+    /// rewriting it to another outstanding request from the *same* SP
+    /// cross-wires the two transactions without tripping any issuer or ACS
+    /// check. Issuance echoes the validated ID instead.
+    #[test]
+    fn issuance_echoes_the_validated_request_id_not_the_mutable_one() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+        let mut req = parsed_authn_request_fixture();
+        let genuine = req.validated_request_id().to_owned();
+
+        // Post-validation tampering: claim to answer a different transaction.
+        req.id = "_some-other-outstanding-request".to_owned();
+
+        let dispatch = issue_to(&idp, &sp, &req).expect("issue");
+        let SsoResponseDispatch::Post(form) = dispatch else {
+            panic!("expected Post");
+        };
+        let decoded = crate::binding::post::decode(&form.saml_response, None).expect("decode");
+        let xml = String::from_utf8(decoded.xml).expect("utf8");
+
+        assert!(
+            xml.contains(&format!("InResponseTo=\"{genuine}\"")),
+            "must echo the validated request ID, got: {xml}"
+        );
+        assert!(
+            !xml.contains("_some-other-outstanding-request"),
+            "must not echo the rewritten ID: {xml}"
+        );
     }
 
     /// An IdP should not sign a weaker class than the SP's validated request
