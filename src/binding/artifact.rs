@@ -200,10 +200,27 @@ pub fn build_artifact_resolve(
     issuer_entity_id: &str,
     destination: &str,
     artifact: &str,
-) -> Result<String, Error> {
-    let (resolve_elem, _id) =
+) -> Result<ArtifactResolveEnvelope, Error> {
+    let (resolve_elem, request_id) =
         build_artifact_resolve_element(issuer_entity_id, destination, artifact)?;
-    soap::wrap_element(resolve_elem)
+    Ok(ArtifactResolveEnvelope {
+        soap_envelope: soap::wrap_element(resolve_elem)?,
+        request_id,
+    })
+}
+
+/// A SOAP-wrapped `<samlp:ArtifactResolve>` and the `@ID` it carries.
+///
+/// The ID is returned rather than discarded because the caller needs it to
+/// correlate the answer: [`parse_artifact_response`] requires it. Returning
+/// only the envelope left the manual exchange uncorrelated, so a substituted
+/// or replayed `ArtifactResponse` was indistinguishable from the real one.
+#[derive(Debug, Clone)]
+pub struct ArtifactResolveEnvelope {
+    /// The SOAP envelope to POST to the ArtifactResolutionService.
+    pub soap_envelope: String,
+    /// `ArtifactResolve/@ID`. Pass to [`parse_artifact_response`].
+    pub request_id: String,
 }
 
 /// Build the bare `<samlp:ArtifactResolve>` element (no SOAP envelope), so the
@@ -258,7 +275,10 @@ pub(crate) fn build_artifact_resolve_element(
 /// 3. The `ArtifactResponse` contains a payload protocol message — the first
 ///    `samlp:*` child that is neither `Status` nor `Issuer`. The whole subtree
 ///    of that payload is serialized and returned.
-pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn parse_artifact_response(
+    soap_envelope: &[u8],
+    expected_request_id: &str,
+) -> Result<Vec<u8>, Error> {
     let body = soap::unwrap(soap_envelope)?;
     let artifact_response = body.payload();
     if artifact_response.qname().namespace() != Some(SAMLP_NS)
@@ -267,6 +287,16 @@ pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
         return Err(Error::XmlParse(
             "ArtifactResponse: SOAP body payload is not samlp:ArtifactResponse".to_string(),
         ));
+    }
+
+    // Correlate before trusting the status, for the same reason the
+    // back-channel client does: a Success status on somebody else's response
+    // is not a Success for this request.
+    let in_response_to = artifact_response
+        .attribute(None, "InResponseTo")
+        .ok_or(Error::InResponseToMismatch)?;
+    if in_response_to != expected_request_id {
+        return Err(Error::InResponseToMismatch);
     }
 
     check_artifact_response_status(artifact_response)?;
@@ -1031,12 +1061,13 @@ mod tests {
 
     #[test]
     fn build_artifact_resolve_is_well_formed_soap() {
-        let xml = build_artifact_resolve(
+        let resolve = build_artifact_resolve(
             "https://sp.example.com",
             "https://idp.example.com/ars",
             "AAQAA...",
         )
         .unwrap();
+        let xml = resolve.soap_envelope;
 
         let doc = Document::parse(xml.as_bytes()).expect("re-parse");
         let env = doc.root();
@@ -1101,7 +1132,7 @@ mod tests {
         </samlp:Response>"#;
         let env = success_envelope_xml(payload);
 
-        let inner_bytes = parse_artifact_response(&env).expect("parse");
+        let inner_bytes = parse_artifact_response(&env, "_req1").expect("parse");
         let inner_doc = Document::parse(&inner_bytes).expect("re-parse inner");
         assert_eq!(inner_doc.root().qname().namespace(), Some(SAMLP_NS));
         assert_eq!(inner_doc.root().qname().local(), "Response");
@@ -1115,6 +1146,7 @@ mod tests {
   <soap:Body>
     <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                             ID="_resp1" Version="2.0"
+                            InResponseTo="_req1"
                             IssueInstant="2026-01-01T00:00:00Z">
       <saml:Issuer>https://idp.example.com</saml:Issuer>
       <samlp:Status>
@@ -1125,7 +1157,7 @@ mod tests {
   </soap:Body>
 </soap:Envelope>"#,
         );
-        let err = parse_artifact_response(xml.as_bytes()).unwrap_err();
+        let err = parse_artifact_response(xml.as_bytes(), "_req1").unwrap_err();
         match err {
             Error::StatusNotSuccess { code, message } => {
                 assert_eq!(code, "urn:oasis:names:tc:SAML:2.0:status:Responder");
@@ -1135,11 +1167,42 @@ mod tests {
         }
     }
 
+    /// The manual `build_artifact_resolve` / `parse_artifact_response` pairing
+    /// must correlate too, not just the back-channel client. Returning only
+    /// the envelope from the builder left callers with no way to: the request
+    /// ID was generated internally and discarded, so a substituted response
+    /// was indistinguishable from the real one.
+    #[test]
+    fn parse_artifact_response_rejects_a_substituted_response() {
+        let resolve = build_artifact_resolve(
+            "https://sp.example.com",
+            "https://idp.example.com/ars",
+            "AAQAA...",
+        )
+        .expect("build resolve");
+
+        // A complete, Success-status ArtifactResponse — for a different
+        // request. `_req1` is the fixture's ID; the real one is random.
+        let env = success_envelope_xml(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                               ID="_inner" Version="2.0"
+                               IssueInstant="2026-01-01T00:00:00Z"/>"#,
+        );
+
+        let err = parse_artifact_response(&env, &resolve.request_id)
+            .expect_err("a response to a different request must be refused");
+        assert!(matches!(err, Error::InResponseToMismatch), "got {err:?}");
+
+        // Sanity: the same envelope parses for the ID it actually answers, so
+        // the rejection above is the correlation and not a malformed fixture.
+        parse_artifact_response(&env, "_req1").expect("correlates with its own request ID");
+    }
+
     #[test]
     fn parse_artifact_response_rejects_missing_envelope() {
         // Wrong root element.
         let xml = r"<not-soap/>";
-        let err = parse_artifact_response(xml.as_bytes()).unwrap_err();
+        let err = parse_artifact_response(xml.as_bytes(), "_req1").unwrap_err();
         assert!(matches!(err, Error::XmlParse(_)));
     }
 
@@ -1151,6 +1214,7 @@ mod tests {
   <soap:Body>
     <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                             ID="_resp1" Version="2.0"
+                            InResponseTo="_req1"
                             IssueInstant="2026-01-01T00:00:00Z">
       <saml:Issuer>https://idp.example.com</saml:Issuer>
       <samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status>
@@ -1158,7 +1222,7 @@ mod tests {
   </soap:Body>
 </soap:Envelope>"#,
         );
-        let err = parse_artifact_response(xml.as_bytes()).unwrap_err();
+        let err = parse_artifact_response(xml.as_bytes(), "_req1").unwrap_err();
         match err {
             Error::XmlParse(msg) => {
                 assert!(msg.contains("payload"), "got: {msg}");
@@ -1337,6 +1401,7 @@ mod tests {
   <soap:Body>
     <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                             ID="_resp1" Version="2.0"
+                            InResponseTo="_req1"
                             IssueInstant="2026-01-01T00:00:00Z">
       <saml:Issuer>https://idp.example.com</saml:Issuer>
       <samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status>

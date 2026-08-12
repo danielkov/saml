@@ -991,8 +991,11 @@ fn pick_slo_binding(entry: &SpEntry) -> Option<Binding> {
 /// 1. Peek the requesting SP's `<saml:Issuer>` to pick its descriptor.
 /// 2. Parse + issuer-verify the resolve via the IdP role layer.
 /// 3. One-time consume the stashed `<samlp:Response>` keyed by the artifact.
-/// 4. Wrap it in a signed `<samlp:ArtifactResponse>` SOAP envelope and return
-///    it with `Content-Type: text/xml`.
+/// 4. Wrap it in an **unsigned** `<samlp:ArtifactResponse>` SOAP envelope and
+///    return it with `Content-Type: text/xml`. The inner `<samlp:Response>`
+///    carries its own signature, which is what the SP verifies; the envelope
+///    itself is not signed here. An SP configured with `require_signed` on the
+///    back-channel would reject this — sign the envelope for that case.
 #[cfg(feature = "artifact-binding")]
 use crate::ArtifactTake;
 
