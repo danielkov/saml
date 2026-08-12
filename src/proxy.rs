@@ -15,7 +15,7 @@ use rand::RngCore as _;
 use sha2::Sha256;
 
 use crate::attribute::Attribute;
-use crate::authn::request_validate::{AcsSelection, ParsedAuthnRequest};
+use crate::authn::request_validate::ParsedAuthnRequest;
 use crate::authn_context::{
     AuthnContextClassRef, AuthnContextComparison, ComparatorOutcome, RequestedAuthnContext,
 };
@@ -428,21 +428,20 @@ impl Proxy<'_> {
         //    `SsoResponseEndpoint`; narrow the stashed `Endpoint` accordingly.
         let acs_endpoint =
             SsoResponseEndpoint::try_from_endpoint(input.context.downstream_acs.clone())?;
-        let protocol_binding = Some(acs_endpoint.binding);
-        let synthetic = ParsedAuthnRequest {
-            id: input.context.downstream_request_id.clone(),
-            issuer: input.context.downstream_sp_entity_id.clone(),
-            issue_instant: input.context.issued_at,
-            destination: None,
-            assertion_consumer_service: acs_endpoint,
-            protocol_binding,
-            assertion_consumer_service_selection: AcsSelection::Default,
-            force_authn: false,
-            is_passive: false,
-            requested_name_id_format: input.context.requested_name_id_format.clone(),
-            requested_authn_context: input.context.requested_authn_context.clone(),
-            relay_state: input.context.downstream_relay_state.clone(),
-        };
+        // The sanctioned construction path: it re-resolves the ACS against the
+        // downstream SP's metadata and records the provenance binding that
+        // issuance correlates on. A struct literal cannot be used here — the
+        // binding is private precisely so a synthetic request cannot claim an
+        // SP it was never checked against.
+        let synthetic = ParsedAuthnRequest::for_proxy_reissue(
+            input.downstream_sp,
+            input.context.downstream_request_id.clone(),
+            input.context.issued_at,
+            acs_endpoint,
+            input.context.requested_name_id_format.clone(),
+            input.context.requested_authn_context.clone(),
+            input.context.downstream_relay_state.clone(),
+        )?;
 
         // 6. Hand off to the IdP role for `<samlp:Response>` issuance.
         let session_index = make_session_index();
@@ -901,7 +900,6 @@ impl FrontChannelChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binding::SsoResponseBinding;
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
     use crate::crypto::keypair::KeyPair;
@@ -1203,27 +1201,40 @@ mod tests {
     // ---------- bounce_to_upstream ----------
 
     fn synthetic_downstream_request() -> ParsedAuthnRequest {
-        ParsedAuthnRequest {
-            id: "_req-downstream".into(),
-            issuer: "https://downstream-sp.example.com".into(),
-            issue_instant: SystemTime::now(),
-            destination: Some("https://proxy.example.com/sso".into()),
-            assertion_consumer_service: SsoResponseEndpoint::post(
+        // Goes through the sanctioned constructor like production code does;
+        // the provenance binding is private, so a struct literal is not
+        // available here either.
+        let sp = SpDescriptor {
+            entity_id: "https://downstream-sp.example.com".into(),
+            assertion_consumer_services: vec![SsoResponseEndpoint::post(
                 "https://downstream-sp.example.com/acs",
                 0,
                 true,
-            ),
-            protocol_binding: Some(SsoResponseBinding::HttpPost),
-            assertion_consumer_service_selection: AcsSelection::Default,
-            force_authn: false,
-            is_passive: false,
-            requested_name_id_format: Some(NameIdFormat::Persistent),
-            requested_authn_context: Some(RequestedAuthnContext {
+            )],
+            single_logout_services: vec![],
+            signing_certs: vec![],
+            encryption_certs: vec![],
+            supported_name_id_formats: vec![],
+            want_assertions_signed: false,
+            authn_requests_signed: false,
+            #[cfg(feature = "idp-disco")]
+            discovery_response_endpoints: vec![],
+            valid_until: None,
+            cache_duration: None,
+        };
+        ParsedAuthnRequest::for_proxy_reissue(
+            &sp,
+            "_req-downstream".into(),
+            SystemTime::now(),
+            SsoResponseEndpoint::post("https://downstream-sp.example.com/acs", 0, true),
+            Some(NameIdFormat::Persistent),
+            Some(RequestedAuthnContext {
                 class_refs: vec![AuthnContextClassRef::PasswordProtectedTransport],
                 comparison: AuthnContextComparison::Minimum,
             }),
-            relay_state: Some("downstream-rs".into()),
-        }
+            Some("downstream-rs".into()),
+        )
+        .expect("the fixture ACS is registered on the fixture SP")
     }
 
     #[test]

@@ -926,20 +926,30 @@ mod tests {
     }
 
     fn synthetic_parsed_authn_request() -> ParsedAuthnRequest {
-        use saml::{AcsSelection, SsoResponseEndpoint};
-        ParsedAuthnRequest {
-            id: "_req-1".into(),
-            issuer: "sp".into(),
-            destination: Some("http://test/saml/sso".into()),
-            issue_instant: SystemTime::UNIX_EPOCH,
-            force_authn: false,
-            is_passive: false,
-            requested_name_id_format: None,
-            requested_authn_context: None,
-            assertion_consumer_service: SsoResponseEndpoint::post("http://sp/acs", 0, true),
-            assertion_consumer_service_selection: AcsSelection::Default,
-            relay_state: None,
-            protocol_binding: None,
-        }
+        use saml::SsoResponseEndpoint;
+        // `ParsedAuthnRequest` records privately which SP it was validated
+        // against, so a struct literal is not available — it comes from the
+        // validator or from the sanctioned proxy path. The descriptor is
+        // parsed from metadata rather than hand-built so this fixture does not
+        // need updating every time `SpDescriptor` grows a field.
+        let metadata =
+            br#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="sp">
+  <md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <md:AssertionConsumerService index="0" isDefault="true"
+      Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+      Location="http://sp/acs"/>
+  </md:SPSSODescriptor>
+</md:EntityDescriptor>"#;
+        let sp = saml::SpDescriptor::from_metadata_xml(metadata).expect("fixture SP metadata");
+        ParsedAuthnRequest::for_proxy_reissue(
+            &sp,
+            "_req-1".into(),
+            SystemTime::UNIX_EPOCH,
+            SsoResponseEndpoint::post("http://sp/acs", 0, true),
+            None,
+            None,
+            None,
+        )
+        .expect("fixture ACS is registered")
     }
 }

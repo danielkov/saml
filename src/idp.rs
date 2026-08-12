@@ -521,7 +521,10 @@ impl IdentityProvider {
     /// See RFC-004 §3.1.
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
         ensure_request_belongs_to_sp(input.in_response_to, input.sp)?;
-        let acs_endpoint = &input.in_response_to.assertion_consumer_service;
+        // Canonical endpoint from the SP's metadata, not the `pub` field:
+        // `SsoResponseEndpoint::index` is public too, and artifact issuance
+        // names the endpoint by index.
+        let acs_endpoint = input.in_response_to.validated_acs();
         let relay_state = input.in_response_to.relay_state.as_deref();
 
         // Resolve outbound `NameID` Format: honor the SP's requested format
@@ -576,7 +579,10 @@ impl IdentityProvider {
         input: IssueErrorResponse<'_>,
     ) -> Result<SsoResponseDispatch, Error> {
         ensure_request_belongs_to_sp(input.in_response_to, input.sp)?;
-        let acs_endpoint = &input.in_response_to.assertion_consumer_service;
+        // Canonical endpoint from the SP's metadata, not the `pub` field:
+        // `SsoResponseEndpoint::index` is public too, and artifact issuance
+        // names the endpoint by index.
+        let acs_endpoint = input.in_response_to.validated_acs();
         let relay_state = input.in_response_to.relay_state.as_deref();
 
         let inputs = IssueErrorResponseInputs {
@@ -662,32 +668,18 @@ fn ensure_request_belongs_to_sp(
     request: &ParsedAuthnRequest,
     sp: &SpDescriptor,
 ) -> Result<(), Error> {
-    if request.issuer != sp.entity_id {
-        return Err(Error::IssuerMismatch {
-            expected: request.issuer.clone(),
-            got: Some(sp.entity_id.clone()),
-        });
-    }
-
-    // Re-resolve the ACS against this SP's metadata rather than trusting the
-    // one carried on the request.
+    // Correlate on the provenance binding, not on the wire-derived fields.
     //
-    // `ParsedAuthnRequest` has public, mutable fields, so `issuer` above is
-    // caller-controlled: a caller can validate against SP-A, overwrite
-    // `issuer` with SP-B, keep SP-A's ACS, and the comparison passes. The
-    // check that does not depend on any field being honest is this one — the
-    // endpoint the assertion is about to be POSTed to must belong to the SP
-    // whose audience and encryption key it was built with. `SsoResponseEndpoint`
-    // carries no interior state beyond URL, binding and index, so matching
-    // URL-and-binding against the descriptor is a complete membership test.
-    let acs = &request.assertion_consumer_service;
-    let registered = sp
-        .assertion_consumer_services
-        .iter()
-        .any(|e| e.url == acs.url && e.binding == acs.binding);
-    if !registered {
-        return Err(Error::UnregisteredAcs {
-            entity_id: sp.entity_id.clone(),
+    // `issuer` and `assertion_consumer_service` are both `pub`, so neither can
+    // carry provenance: a caller can validate against SP-A and rewrite either
+    // or both to SP-B's values, and a check built on them agrees. Comparing
+    // ACS membership does not close it either — SP-A and SP-B may legitimately
+    // share a URL and binding. `validated_sp()` records what
+    // `validate_authn_request` actually saw and no caller can set it.
+    if request.validated_sp() != sp.entity_id {
+        return Err(Error::IssuerMismatch {
+            expected: request.validated_sp().to_owned(),
+            got: Some(sp.entity_id.clone()),
         });
     }
     Ok(())
@@ -1833,13 +1825,13 @@ mod tests {
         ));
     }
 
-    /// The exact bypass the issuer comparison alone permits: validate against
-    /// SP-A, overwrite the public `issuer` field with SP-B, keep SP-A's ACS,
-    /// and issue to SP-B. `ParsedAuthnRequest` exposes both fields as `pub`,
-    /// so nothing stops a caller doing this. The ACS membership check is what
-    /// catches it, because it does not trust any field on the request.
+    /// Rewriting the wire-derived fields must not relabel a validated
+    /// request. Both are `pub`, so a caller can set `issuer` *and*
+    /// `assertion_consumer_service` to SP-B's values after validating against
+    /// SP-A — at which point every check built on those fields agrees. Only
+    /// the private provenance binding still disagrees.
     #[test]
-    fn mutating_the_parsed_issuer_does_not_bypass_the_binding() {
+    fn mutating_both_wire_fields_does_not_relabel_the_request() {
         let idp = idp_with(false, false);
         let mut other_sp = sp_descriptor(false);
         other_sp.entity_id = "https://other-sp.example.com".to_owned();
@@ -1849,34 +1841,110 @@ mod tests {
             true,
         )];
 
-        // Validated against the default SP, then relabelled as the other one.
         let mut parsed_req = parsed_authn_request_fixture();
         parsed_req.issuer = other_sp.entity_id.clone();
+        parsed_req.assertion_consumer_service = other_sp.assertion_consumer_services[0].clone();
 
-        let err = idp
-            .issue_response(IssueResponse {
-                sp: &other_sp,
-                in_response_to: &parsed_req,
-                name_id: NameId::email("alice@example.com"),
-                attributes: vec![],
-                authn_instant: fixed_now(),
-                session_index: "sess-1".into(),
-                session_not_on_or_after: None,
-                authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
-                force_encrypt_assertion: Some(false),
-                now: fixed_now(),
-                assertion_lifetime: Duration::from_mins(10),
-                subject_confirmation_lifetime: Duration::from_mins(5),
-                holder_of_key_cert: None,
-            })
-            .expect_err("the ACS still belongs to the original SP");
-
-        // Not IssuerMismatch: the mutated issuer agrees with the descriptor.
-        // The ACS is what gives it away.
+        let err = issue_to(&idp, &other_sp, &parsed_req)
+            .expect_err("the request was validated against a different SP");
         assert!(
-            matches!(err, Error::UnregisteredAcs { ref entity_id } if entity_id == &other_sp.entity_id),
+            matches!(err, Error::IssuerMismatch { ref expected, .. }
+                if expected == "https://sp.example.com/saml"),
             "got {err:?}"
         );
+    }
+
+    /// Two SPs may legitimately register the same ACS URL and binding, so ACS
+    /// membership alone cannot establish which one a request was validated
+    /// against. Rewriting `issuer` is then enough to pass every wire-derived
+    /// check.
+    #[test]
+    fn shared_acs_between_sps_does_not_permit_relabelling() {
+        let idp = idp_with(false, false);
+        let original = sp_descriptor(false);
+        let mut twin = sp_descriptor(false);
+        twin.entity_id = "https://twin-sp.example.com".to_owned();
+        // Same ACS URL and binding as the SP the request was validated against.
+        twin.assertion_consumer_services = original.assertion_consumer_services.clone();
+
+        let mut parsed_req = parsed_authn_request_fixture();
+        parsed_req.issuer = twin.entity_id.clone();
+
+        let err = issue_to(&idp, &twin, &parsed_req)
+            .expect_err("a shared ACS does not make these the same SP");
+        assert!(matches!(err, Error::IssuerMismatch { .. }), "got {err:?}");
+    }
+
+    /// `SsoResponseEndpoint::index` is public, and the artifact encodes the
+    /// endpoint index in bytes 2..4. Issuance therefore takes the canonical
+    /// endpoint from metadata, so a mutated index never reaches the wire.
+    ///
+    /// Exercised through the artifact binding specifically: under POST the
+    /// index is unused, so a POST-based test would pass either way.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn mutating_the_acs_index_does_not_reach_the_artifact() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        const CANONICAL_INDEX: u16 = 3;
+        let idp = idp_with(false, false);
+        let mut sp = sp_descriptor(false);
+        sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs-artifact",
+            CANONICAL_INDEX,
+            true,
+        )];
+
+        let mut parsed_req = ParsedAuthnRequest::for_proxy_reissue(
+            &sp,
+            "_req-artifact".into(),
+            fixed_now(),
+            sp.assertion_consumer_services[0].clone(),
+            None,
+            None,
+            None,
+        )
+        .expect("the fixture ACS is registered");
+
+        // Rewrite the public field the way a caller could.
+        parsed_req.assertion_consumer_service.index = Some(99);
+
+        let dispatch = issue_to(&idp, &sp, &parsed_req).expect("issuance succeeds");
+        let SsoResponseDispatch::Artifact(redirect) = dispatch else {
+            panic!("expected an artifact dispatch");
+        };
+
+        let decoded = BASE64
+            .decode(redirect.artifact.as_bytes())
+            .expect("artifact is base64");
+        let emitted_index = u16::from_be_bytes([decoded[2], decoded[3]]);
+        assert_eq!(
+            emitted_index, CANONICAL_INDEX,
+            "the artifact must name the registered endpoint, not the mutated one"
+        );
+    }
+
+    fn issue_to(
+        idp: &IdentityProvider,
+        sp: &SpDescriptor,
+        req: &ParsedAuthnRequest,
+    ) -> Result<SsoResponseDispatch, Error> {
+        idp.issue_response(IssueResponse {
+            sp,
+            in_response_to: req,
+            name_id: NameId::email("alice@example.com"),
+            attributes: vec![],
+            authn_instant: fixed_now(),
+            session_index: "sess-1".into(),
+            session_not_on_or_after: None,
+            authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+            force_encrypt_assertion: Some(false),
+            now: fixed_now(),
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
+        })
     }
 
     #[test]
