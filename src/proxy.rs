@@ -1641,8 +1641,13 @@ mod tests {
     }
 
     /// At `now = UNIX_EPOCH` every addition succeeds, so an overflow-only
-    /// preflight let both callbacks run — and issuance then failed computing
-    /// `Conditions/@NotBefore = now - 1 minute`, which underflows.
+    /// preflight let both callbacks run — and issuance then failed on
+    /// `Conditions/@NotBefore = now - 1 minute`.
+    ///
+    /// This is also the portable half of the *formatting* regression:
+    /// `checked_sub` succeeds here on every platform, and it is
+    /// `format_xs_datetime` that rejects the pre-epoch result. A preflight
+    /// doing arithmetic alone fails this test everywhere.
     #[test]
     fn relay_validates_not_before_underflow_before_callbacks() {
         let sp = proxy_sp();
@@ -1688,9 +1693,15 @@ mod tests {
         );
     }
 
-    /// Timestamp *formatting* can fail too — `format_xs_datetime` rejects
-    /// instants it cannot represent. A preflight that only did the arithmetic
-    /// would run both callbacks and fail afterwards.
+    /// The other formatting failure: a civil date outside the representable
+    /// range, rather than a pre-epoch one.
+    ///
+    /// Unix-only. Windows models `SystemTime` as a `FILETIME`, whose range
+    /// ends around year 30828 — far short of where `civil_from_days` gives
+    /// up — so no such instant is constructible there and `checked_add`
+    /// returns `None`. The pre-epoch test above covers formatting on every
+    /// platform; this one adds the second path where it is reachable.
+    #[cfg(not(windows))]
     #[test]
     fn relay_validates_timestamp_formatting_before_callbacks() {
         let sp = proxy_sp();
