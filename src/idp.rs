@@ -210,6 +210,12 @@ impl IdentityProvider {
                 reason: "IdentityProviderConfig.sso must contain at least one endpoint",
             });
         }
+        // The IdP nominates one of these in every artifact it mints, so an
+        // unaddressable or ambiguous set is a configuration error, not
+        // something to discover at issuance time.
+        crate::descriptor::idp::validate_artifact_resolution_endpoints(
+            &config.artifact_resolution,
+        )?;
         Ok(Self { config })
     }
 
@@ -540,15 +546,22 @@ impl IdentityProvider {
     /// configuration error rather than defaulting to index 0, which would
     /// name an endpoint the metadata never advertised.
     fn artifact_resolution_index(&self) -> Option<u16> {
-        let endpoint = self
-            .config
-            .artifact_resolution
-            .iter()
-            .find(|e| e.is_default)
-            .or_else(|| self.config.artifact_resolution.first())?;
-        // An ARS with no explicit index is index 0 (metadata `index` is
-        // REQUIRED on IndexedEndpoint, so this is a tolerant fallback).
-        Some(endpoint.index.unwrap_or(0))
+        // SOAP only: an ArtifactResolutionService is a SOAP endpoint
+        // (Bindings §3.6.3), and `parse_artifact_resolve` enforces that on the
+        // receiving side. Nominating a POST or Redirect endpoint here would
+        // mint an artifact pointing at somewhere resolution cannot happen.
+        let soap = || {
+            self.config
+                .artifact_resolution
+                .iter()
+                .filter(|e| e.binding == Binding::Soap)
+        };
+        let endpoint = soap().find(|e| e.is_default).or_else(|| soap().next())?;
+        // `index` is REQUIRED on a metadata IndexedEndpoint. An unnumbered
+        // endpoint cannot be named in an artifact, so it is not nominated —
+        // defaulting to 0 would point resolvers at a different endpoint, or at
+        // none.
+        endpoint.index
     }
 
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
@@ -1591,7 +1604,7 @@ mod tests {
                 Endpoint::redirect("https://idp.example.com/sso", 1, false),
             ],
             slo: vec![Endpoint::post("https://idp.example.com/slo", 0, true)],
-            artifact_resolution: vec![Endpoint::soap("https://idp.example.com/ars", None, true)],
+            artifact_resolution: vec![Endpoint::soap("https://idp.example.com/ars", Some(0), true)],
             supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
             default_name_id_format: NameIdFormat::Persistent,
             signing_key: rsa_keypair_with_cert(),
@@ -1997,7 +2010,7 @@ mod tests {
     fn signed_resolve_with_sha1_digest(issuer: &str) -> Vec<u8> {
         use crate::dsig::algorithms::DigestAlgorithm;
 
-        let resolve = crate::binding::artifact::build_artifact_resolve_element(
+        let (resolve, _id) = crate::binding::artifact::build_artifact_resolve_element(
             issuer,
             "https://idp.example.com/ars",
             "AAQAAK1234567890",

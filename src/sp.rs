@@ -3188,18 +3188,49 @@ mod tests {
         const ARS_URL: &str = "https://idp.example.com/ars";
 
         /// Mock `HttpClient` returning a fixed SOAP envelope body.
+        /// Builds an ArtifactResponse from the request's `@ID`.
+        type ResponderFn = Box<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
         struct MockClient {
-            response: Vec<u8>,
+            /// Builds the response from the ArtifactResolve `@ID`, so signed
+            /// fixtures can set `@InResponseTo` before signing.
+            respond: ResponderFn,
+        }
+
+        impl MockClient {
+            /// Canned response; `_req1` is rewritten to the actual request ID.
+            fn canned(response: Vec<u8>) -> Self {
+                Self {
+                    respond: Box::new(move |id| {
+                        String::from_utf8_lossy(&response)
+                            .replace("_req1", id)
+                            .into_bytes()
+                    }),
+                }
+            }
+
+            fn building(f: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
+                Self {
+                    respond: Box::new(f),
+                }
+            }
         }
 
         impl HttpClient for MockClient {
             fn send(
                 &self,
-                _request: HttpRequest,
+                request: HttpRequest,
             ) -> impl Future<
                 Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
             > + Send {
-                let body = self.response.clone();
+                // A real ARS echoes the ArtifactResolve `@ID` as
+                // `@InResponseTo`, and signs afterwards. Build per request so
+                // the signature covers the correlation.
+                let id = String::from_utf8_lossy(&request.body)
+                    .split_once(" ID=\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map_or_else(String::new, |(id, _)| id.to_owned());
+                let body = (self.respond)(&id);
                 async move {
                     Ok(HttpResponse {
                         status: 200,
@@ -3223,7 +3254,7 @@ mod tests {
         /// artifact path resolves an ARS endpoint.
         fn artifact_idp() -> IdpDescriptor {
             let mut idp = fixture_idp();
-            idp.artifact_resolution_endpoints = vec![Endpoint::post(ARS_URL, 0, true)];
+            idp.artifact_resolution_endpoints = vec![Endpoint::soap(ARS_URL, Some(0), true)];
             idp
         }
 
@@ -3241,7 +3272,7 @@ mod tests {
         /// ArtifactResponse element is enveloped-signed with the fixture key.
         /// When `tamper` is set, an attribute is mutated after signing so the
         /// envelope signature no longer verifies.
-        fn signed_envelope(tamper: bool) -> Vec<u8> {
+        fn signed_envelope(tamper: bool, in_response_to: &str) -> Vec<u8> {
             let kp = rsa_signing_key();
             let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
             let inner_doc = Document::parse(inner.as_bytes()).expect("inner parse");
@@ -3262,6 +3293,8 @@ mod tests {
                 .with_attribute(QName::new(None, "ID"), "_art-resp".to_owned())
                 .with_attribute(QName::new(None, "Version"), "2.0")
                 .with_attribute(QName::new(None, "IssueInstant"), "2026-01-01T00:00:00Z")
+                // Set before signing, as a real ARS does.
+                .with_attribute(QName::new(None, "InResponseTo"), in_response_to.to_owned())
                 .with_child(Node::Element(issuer))
                 .with_child(Node::Element(status))
                 .with_child(Node::Element(inner_elem))
@@ -3372,9 +3405,11 @@ mod tests {
         /// one gets called is observable.
         fn multi_ars_idp() -> IdpDescriptor {
             let mut idp = fixture_idp();
+            // SOAP: an ArtifactResolutionService is a SOAP endpoint
+            // (Bindings §3.6.3) and selection now requires it.
             idp.artifact_resolution_endpoints = vec![
-                Endpoint::post(ARS_URL, 0, true),
-                Endpoint::post(ARS_INDEX_7_URL, 7, false),
+                Endpoint::soap(ARS_URL, Some(0), true),
+                Endpoint::soap(ARS_INDEX_7_URL, Some(7), false),
             ];
             idp
         }
@@ -3564,9 +3599,7 @@ mod tests {
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
             let policy = PeerCryptoPolicy::strong_defaults();
-            let client = MockClient {
-                response: signed_envelope(false),
-            };
+            let client = MockClient::building(|id| signed_envelope(false, id));
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3603,9 +3636,7 @@ mod tests {
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
             let policy = PeerCryptoPolicy::strong_defaults();
-            let client = MockClient {
-                response: signed_envelope(true),
-            };
+            let client = MockClient::building(|id| signed_envelope(true, id));
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3642,7 +3673,7 @@ mod tests {
             )
             .expect("build unsigned envelope")
             .into_bytes();
-            let client = MockClient { response: unsigned };
+            let client = MockClient::canned(unsigned);
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3675,7 +3706,7 @@ mod tests {
             )
             .expect("build unsigned envelope")
             .into_bytes();
-            let client = MockClient { response: unsigned };
+            let client = MockClient::canned(unsigned);
 
             let err = sp
                 .consume_response_artifact(&client, consume_input(&idp, None))
