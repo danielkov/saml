@@ -616,10 +616,17 @@ impl IdentityProvider {
     /// [`IdentityProvider::build_artifact_response`].
     ///
     /// Authenticates the requester against `sp.signing_certs` when
-    /// [`want_artifact_resolve_signed`] is set, using the effective peer
-    /// policy's signature allow-list, and requires the signature to cover the
-    /// whole `ArtifactResolve` (the XSW check). A present-but-invalid
+    /// [`want_artifact_resolve_signed`] is set, and requires the signature to
+    /// cover the whole `ArtifactResolve` (the XSW check). A present-but-invalid
     /// signature is rejected regardless of that flag.
+    ///
+    /// `peer_crypto_policy` overrides
+    /// [`IdentityProviderConfig::default_peer_crypto_policy`] for this call,
+    /// as on every other inbound path. Without it, relaxing an algorithm for
+    /// one legacy SP would relax it for every SP's `ArtifactResolve` — the
+    /// per-peer scoping the policy exists to provide. The whole policy is
+    /// threaded through, so the reference-digest and canonicalization
+    /// allow-lists apply here too, not just the signature method.
     ///
     /// The `<saml:Issuer>` comparison against `sp.entity_id` is a routing and
     /// consistency check, not authentication: `Issuer` is attacker-controlled
@@ -632,14 +639,13 @@ impl IdentityProvider {
     pub fn parse_artifact_resolve(
         &self,
         sp: &SpDescriptor,
+        peer_crypto_policy: Option<&PeerCryptoPolicy>,
         soap_envelope: &[u8],
     ) -> Result<crate::binding::artifact::ArtifactResolveRequest, Error> {
+        let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
         let verify = crate::binding::artifact::VerifyResolveConfig {
             certs: &sp.signing_certs,
-            allowed_algorithms: &self
-                .config
-                .default_peer_crypto_policy
-                .allowed_signature_algorithms,
+            policy,
             require_signed: self.config.want_artifact_resolve_signed,
         };
         let req =
@@ -1809,7 +1815,7 @@ mod tests {
         .expect("build resolve");
 
         let err = idp
-            .parse_artifact_resolve(&sp, envelope.as_bytes())
+            .parse_artifact_resolve(&sp, None, envelope.as_bytes())
             .expect_err("an unauthenticated resolve must not be honoured");
         assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
     }
@@ -1829,10 +1835,79 @@ mod tests {
         .expect("build resolve");
 
         let req = idp
-            .parse_artifact_resolve(&sp, envelope.as_bytes())
+            .parse_artifact_resolve(&sp, None, envelope.as_bytes())
             .expect("accepted without a signature");
         assert!(!req.signature_verified);
         assert_eq!(req.artifact, "AAQAAK1234567890");
+    }
+
+    /// A per-peer policy must actually reach the verifier: relaxing an
+    /// algorithm for one legacy SP must not require relaxing it for every
+    /// SP's ArtifactResolve, which is the scoping `PeerCryptoPolicy` exists
+    /// to provide.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_honours_a_per_peer_policy_override() {
+        use crate::dsig::algorithms::DigestAlgorithm;
+
+        let idp = idp_with_artifact_resolve_signed(true);
+        let sp = sp_descriptor(false);
+        let envelope = signed_resolve_with_sha1_digest(&sp.entity_id);
+
+        // The IdP default is strong, so the SHA-1 reference digest is refused.
+        let err = idp
+            .parse_artifact_resolve(&sp, None, &envelope)
+            .expect_err("default policy rejects a SHA-1 reference digest");
+        assert!(
+            matches!(err, Error::DisallowedAlgorithm { ref alg } if alg.contains("sha1")),
+            "got {err:?}"
+        );
+
+        // A policy scoped to this one peer admits it, without touching the
+        // IdP's default.
+        let mut legacy = PeerCryptoPolicy::strong_defaults();
+        legacy.allowed_digest_algorithms.push(DigestAlgorithm::Sha1);
+        let req = idp
+            .parse_artifact_resolve(&sp, Some(&legacy), &envelope)
+            .expect("per-peer override admits the legacy digest");
+        assert!(req.signature_verified);
+
+        assert!(
+            !idp.config
+                .default_peer_crypto_policy
+                .allowed_digest_algorithms
+                .contains(&DigestAlgorithm::Sha1),
+            "the override must not have widened the IdP default"
+        );
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn signed_resolve_with_sha1_digest(issuer: &str) -> Vec<u8> {
+        use crate::dsig::algorithms::DigestAlgorithm;
+
+        let resolve = crate::binding::artifact::build_artifact_resolve_element(
+            issuer,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+        let doc = Document::new(resolve).expect("doc");
+        let signed = crate::dsig::sign::sign_element(
+            doc.root().clone(),
+            &doc,
+            crate::dsig::sign::SignOptions {
+                signing_key: &rsa_keypair_with_cert(),
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha1,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign");
+        crate::binding::soap::wrap_element(signed)
+            .expect("wrap")
+            .into_bytes()
     }
 
     /// The `<saml:Issuer>` cross-check still applies, and is reported as an
@@ -1850,7 +1925,7 @@ mod tests {
         .expect("build resolve");
 
         let err = idp
-            .parse_artifact_resolve(&sp, envelope.as_bytes())
+            .parse_artifact_resolve(&sp, None, envelope.as_bytes())
             .expect_err("issuer does not match the supplied descriptor");
         assert!(matches!(
             err,
