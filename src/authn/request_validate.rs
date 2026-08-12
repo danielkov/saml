@@ -100,12 +100,17 @@ impl ParsedAuthnRequest {
     /// Construct a request that was not parsed from the wire, for a proxy
     /// re-issuing downstream.
     ///
+    /// Crate-internal: this mints the same provenance the validator produces,
+    /// so exposing it would let any caller manufacture a trusted binding from
+    /// an arbitrary descriptor — reopening exactly what the private field
+    /// closes.
+    ///
     /// `sp` is the descriptor the resulting response will be issued to; the
     /// ACS must be one it registers, which is checked here rather than taken
     /// on trust. This is the only way to obtain a `ParsedAuthnRequest` outside
     /// the crate-internal validator, so the provenance binding cannot be
     /// forged by constructing the struct directly.
-    pub fn for_proxy_reissue(
+    pub(crate) fn for_proxy_reissue(
         sp: &SpDescriptor,
         id: String,
         issue_instant: SystemTime,
@@ -114,10 +119,14 @@ impl ParsedAuthnRequest {
         requested_authn_context: Option<RequestedAuthnContext>,
         relay_state: Option<String>,
     ) -> Result<Self, Error> {
+        // URL and binding do not identify an endpoint on their own: an SP may
+        // register several Artifact endpoints at the same location with
+        // different indices, and the artifact encodes the index. Matching on
+        // the first URL/binding hit would emit the wrong one.
         let canonical = sp
             .assertion_consumer_services
             .iter()
-            .find(|e| e.url == acs.url && e.binding == acs.binding)
+            .find(|e| e.url == acs.url && e.binding == acs.binding && e.index == acs.index)
             .cloned()
             .ok_or_else(|| Error::UnregisteredAcs {
                 entity_id: sp.entity_id.clone(),
@@ -650,5 +659,35 @@ mod tests {
             parsed.assertion_consumer_service.binding,
             SsoResponseBinding::HttpArtifact
         );
+    }
+
+    /// Two Artifact endpoints may share a URL and binding while differing by
+    /// index, and the artifact encodes the index. Matching on URL and binding
+    /// alone selects the first and emits the wrong endpoint.
+    #[test]
+    fn canonical_acs_lookup_distinguishes_duplicate_endpoints_by_index() {
+        let mut sp = default_sp();
+        sp.assertion_consumer_services = vec![
+            SsoResponseEndpoint::artifact("https://sp.example.com/acs", 0, true),
+            SsoResponseEndpoint::artifact("https://sp.example.com/acs", 1, false),
+        ];
+
+        for want in [0u16, 1u16] {
+            let parsed = ParsedAuthnRequest::for_proxy_reissue(
+                &sp,
+                "_req".into(),
+                SystemTime::UNIX_EPOCH,
+                SsoResponseEndpoint::artifact("https://sp.example.com/acs", want, false),
+                None,
+                None,
+                None,
+            )
+            .expect("both endpoints are registered");
+            assert_eq!(
+                parsed.validated_acs().index,
+                Some(want),
+                "canonical lookup must not collapse endpoints that differ only by index"
+            );
+        }
     }
 }

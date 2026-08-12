@@ -926,31 +926,98 @@ mod tests {
         assert!(store.take("_req-1").is_none());
     }
 
+    /// A `ParsedAuthnRequest` obtained the only way an external crate can:
+    /// by running a real `AuthnRequest` through the validator.
+    ///
+    /// The provenance binding is crate-internal to `saml`, so there is no
+    /// constructor to call here — which is the point. Nothing outside the
+    /// library can mint a request that claims an SP it was never checked
+    /// against.
     fn synthetic_parsed_authn_request() -> ParsedAuthnRequest {
-        use saml::SsoResponseEndpoint;
-        // `ParsedAuthnRequest` records privately which SP it was validated
-        // against, so a struct literal is not available — it comes from the
-        // validator or from the sanctioned proxy path. The descriptor is
-        // parsed from metadata rather than hand-built so this fixture does not
-        // need updating every time `SpDescriptor` grows a field.
-        let metadata =
-            br#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="sp">
-  <md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
-    <md:AssertionConsumerService index="0" isDefault="true"
-      Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
-      Location="http://sp/acs"/>
-  </md:SPSSODescriptor>
-</md:EntityDescriptor>"#;
-        let sp = saml::SpDescriptor::from_metadata_xml(metadata).expect("fixture SP metadata");
-        ParsedAuthnRequest::for_proxy_reissue(
-            &sp,
-            "_req-1".into(),
-            SystemTime::UNIX_EPOCH,
-            SsoResponseEndpoint::post("http://sp/acs", 0, true),
-            None,
-            None,
-            None,
+        use saml::{
+            Binding, Dispatch, ServiceProvider, ServiceProviderConfig, SpDescriptor,
+            SsoResponseEndpoint, StartLogin,
+        };
+
+        let cfg = AppConfig {
+            bind_addr: "127.0.0.1:3001".parse().unwrap(),
+            idp_entity_id: "http://test/idp".into(),
+            idp_base_url: "http://test".into(),
+            session_signing_key: [0u8; 32],
+            users_toml_path: None,
+            sps_toml_path: None,
+        };
+        let idp = build_identity_provider(&cfg).expect("idp builds");
+
+        let sp = ServiceProvider::new(ServiceProviderConfig {
+            entity_id: "sp".into(),
+            acs: vec![SsoResponseEndpoint::post("http://sp/acs", 0, true)],
+            slo: vec![],
+            name_id_formats: vec![saml::NameIdFormat::EmailAddress],
+            signing_key: Some(
+                saml::KeyPair::from_pkcs8_pem(IDP_KEY_PEM)
+                    .expect("key")
+                    .with_certificate(saml::X509Certificate::from_pem(IDP_CERT_PEM).expect("cert")),
+            ),
+            decryption_key: None,
+            sign_authn_requests: true,
+            want_signed: saml::SpWantSigned {
+                response: false,
+                assertions: true,
+            },
+            allow_unsolicited: false,
+            logout_signing: saml::SpLogoutSigning::default(),
+            logout_want_signed: saml::SpLogoutWantSigned::default(),
+            default_peer_crypto_policy: saml::PeerCryptoPolicy::strong_defaults(),
+            outbound_signature_algorithm: saml::SignatureAlgorithm::RsaSha256,
+            outbound_digest_algorithm: saml::DigestAlgorithm::Sha256,
+        })
+        .expect("sp builds");
+
+        let idp_descriptor = saml::IdpDescriptor::from_metadata_xml(
+            idp.metadata_xml(false).expect("idp metadata").as_bytes(),
         )
-        .expect("fixture ACS is registered")
+        .expect("idp descriptor");
+
+        let start = sp
+            .start_login(
+                &idp_descriptor,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpPost,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start_login");
+        let Dispatch::Post(form) = start.dispatch else {
+            unreachable!("HttpPost dispatch");
+        };
+
+        let sp_descriptor = SpDescriptor::from_metadata_xml(
+            sp.metadata_xml(false).expect("sp metadata").as_bytes(),
+        )
+        .expect("sp descriptor");
+
+        idp.consume_authn_request_wire(saml::ConsumeAuthnRequestWire {
+            sp: &sp_descriptor,
+            peer_crypto_policy: None,
+            wire_body: form
+                .saml_request
+                .as_deref()
+                .expect("POST dispatch carries SAMLRequest")
+                .as_bytes(),
+            binding: Binding::HttpPost,
+            relay_state: None,
+            expected_destination: "http://test/saml/sso",
+            now: SystemTime::now(),
+            clock_skew: Duration::from_mins(1),
+        })
+        .expect("the validator produces the provenance binding")
     }
 }
