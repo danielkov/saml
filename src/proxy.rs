@@ -219,6 +219,16 @@ pub struct ProxyContextPayload {
     pub upstream_tracker: LoginTracker,
     /// Issued-at timestamp. Codec rejects blobs older than its `max_age`.
     pub issued_at: SystemTime,
+    /// SHA-256 fingerprints of the upstream IdP signing certificates that
+    /// were trusted when this login was started.
+    ///
+    /// The `LoginTracker` correlates the upstream response by entity ID
+    /// alone, and `consume_upstream_response` takes a fresh `IdpDescriptor`
+    /// from the caller. Without this, a descriptor bearing the expected entity
+    /// ID and an attacker's signing certificate validates an attacker-signed
+    /// response and yields a genuine `UpstreamFlow` — the trust root is
+    /// substituted after the transaction began.
+    pub upstream_signing_cert_fingerprints: Vec<[u8; 32]>,
 }
 
 /// A relay token that this crate has seen come back out of an authenticated
@@ -611,9 +621,13 @@ impl UpstreamFlow {
 /// Inputs for [`Proxy::relay_to_downstream`]. See RFC-005 §4.2.
 pub struct RelayToDownstream<'a> {
     /// From [`Proxy::consume_upstream_response`] — the only source of one.
-    /// Carries the context together with the identity validated under it, so
-    /// the two cannot be mismatched.
-    pub flow: &'a UpstreamFlow,
+    ///
+    /// Taken **by value**. One upstream authentication authorizes one
+    /// downstream assertion: borrowing let a caller call relay repeatedly on
+    /// the same flow, minting a fresh signed assertion and re-running the
+    /// attribute-release and NameID callbacks each time. Moving it makes the
+    /// single use a type-level fact rather than a caller obligation.
+    pub flow: UpstreamFlow,
     /// Downstream SP descriptor (caller looks it up from
     /// `flow.context().downstream_sp_entity_id()`).
     pub downstream_sp: &'a SpDescriptor,
@@ -697,6 +711,12 @@ impl Proxy<'_> {
             requested_name_id_format: downstream.validated_name_id_format().cloned(),
             upstream_tracker: result.tracker,
             issued_at: input.now,
+            upstream_signing_cert_fingerprints: input
+                .upstream_idp
+                .signing_certs
+                .iter()
+                .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+                .collect(),
         };
 
         // 3. Encode the context for the wire.
@@ -737,6 +757,25 @@ impl Proxy<'_> {
         input: ConsumeUpstreamResponse<'_>,
     ) -> Result<UpstreamFlow, Error> {
         let context = self.decode_context(input.relay_state)?;
+
+        // The descriptor validating this response must be the trust root the
+        // login was started against. The tracker correlates on entity ID only,
+        // so without this a caller could supply a descriptor carrying the
+        // expected entity ID and their own signing certificate, and an
+        // attacker-signed response would produce a genuine flow.
+        //
+        // Subset rather than equality: retiring a key mid-flow is ordinary
+        // rotation, introducing one is the attack.
+        let sealed = &context.payload().upstream_signing_cert_fingerprints;
+        if !input
+            .upstream_idp
+            .signing_certs
+            .iter()
+            .all(|cert| sealed.contains(&cert.fingerprint_sha256()))
+        {
+            return Err(Error::UpstreamTrustRootMismatch);
+        }
+
         let identity = self.sp.consume_response(crate::sp::ConsumeResponse {
             idp: input.upstream_idp,
             peer_crypto_policy: input.peer_crypto_policy,
@@ -947,17 +986,32 @@ impl Proxy<'_> {
         //     An earlier version checked only the additions and so missed
         //     `now = UNIX_EPOCH`, where `NotBefore = now - 1min` underflows,
         //     and missed the formatting failures entirely.
-        let session_not_on_or_after =
-            input
-                .now
-                .checked_add(input.session_lifetime)
-                .ok_or(Error::InvalidConfiguration {
-                    reason: "session_not_on_or_after overflow",
-                })?;
+        // The downstream assertion cannot outlive the upstream authentication
+        // it rests on. Without a cap, a proxy re-issues a 1-hour downstream
+        // session from an upstream assertion with five minutes left — and can
+        // keep doing so, laundering a short-lived authentication into an
+        // indefinite one.
+        let upstream_expiry = input.flow.identity().not_on_or_after();
+        if upstream_expiry <= input.now {
+            return Err(Error::Expired);
+        }
+        let session_not_on_or_after = input
+            .now
+            .checked_add(input.session_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "session_not_on_or_after overflow",
+            })?
+            .min(upstream_expiry);
+        let effective_session_lifetime = session_not_on_or_after
+            .duration_since(input.now)
+            .unwrap_or(Duration::ZERO);
+        let effective_subject_confirmation_lifetime = input
+            .subject_confirmation_lifetime
+            .min(effective_session_lifetime);
         crate::response::issue::issuance_instants(
             input.now,
-            input.session_lifetime,
-            input.subject_confirmation_lifetime,
+            effective_session_lifetime,
+            effective_subject_confirmation_lifetime,
             input.flow.identity().authn_instant(),
             Some(session_not_on_or_after),
         )?;
@@ -1022,8 +1076,8 @@ impl Proxy<'_> {
             authn_context_class_ref: downstream_class_ref,
             force_encrypt_assertion: None,
             now: input.now,
-            assertion_lifetime: input.session_lifetime,
-            subject_confirmation_lifetime: input.subject_confirmation_lifetime,
+            assertion_lifetime: effective_session_lifetime,
+            subject_confirmation_lifetime: effective_subject_confirmation_lifetime,
             holder_of_key_cert: None,
         })
     }
@@ -1619,6 +1673,7 @@ mod tests {
                 comparison: AuthnContextComparison::Minimum,
             }),
             requested_name_id_format: Some(NameIdFormat::Persistent),
+            upstream_signing_cert_fingerprints: vec![],
             upstream_tracker: LoginTracker {
                 request_id: "_upstream-1".into(),
                 issued_at: tracker_issued_at,
@@ -1879,7 +1934,7 @@ mod tests {
 
         let err = production
             .relay_to_downstream(RelayToDownstream {
-                flow: &foreign,
+                flow: foreign,
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -1913,7 +1968,7 @@ mod tests {
 
         let dispatch = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context, identity),
+                flow: flow(&proxy, context, identity),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2013,7 +2068,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2029,7 +2084,7 @@ mod tests {
         // Control: with passthrough on, the emitted class *is* MFA and it passes.
         proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context, identity.clone()),
+                flow: flow(&proxy, context, identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2158,7 +2213,14 @@ mod tests {
     // ---------- relay_to_downstream ----------
 
     fn make_upstream_identity(class_ref_uri: &str) -> Identity {
-        let now = SystemTime::now();
+        make_upstream_identity_expiring(class_ref_uri, SystemTime::now())
+    }
+
+    /// As above, but with the upstream validity window anchored at `anchor`.
+    /// Relay caps downstream deadlines at the upstream expiry, so a test that
+    /// runs at an unusual `now` needs an identity that is live at that `now`.
+    fn make_upstream_identity_expiring(class_ref_uri: &str, anchor: SystemTime) -> Identity {
+        let now = anchor;
         let session_not_on_or_after = now
             .checked_add(Duration::from_hours(1))
             .expect("session_not_on_or_after within range");
@@ -2234,7 +2296,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2282,7 +2344,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2327,9 +2389,6 @@ mod tests {
         let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([5u8; 32])));
         let downstream_sp = downstream_sp_descriptor();
         let context = sample_context();
-        let identity = make_upstream_identity(
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
-        );
         let release = SpyRelease::default();
         let transform = SpyNameId::default();
 
@@ -2338,10 +2397,16 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_secs(100_000_000_000_000_000))
             .expect("constructible");
+        // Live at that `now`, so the expiry cap does not short-circuit before
+        // the formatting step this test is about.
+        let identity = make_upstream_identity_expiring(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+            now,
+        );
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2366,45 +2431,53 @@ mod tests {
         );
     }
 
-    /// The same, for the subject-confirmation bound — which issuance computes
-    /// separately, so a check that only covered `session_lifetime` would miss it.
+    /// A downstream assertion cannot outlive the upstream authentication it
+    /// rests on, and an already-expired upstream must not reach the callbacks
+    /// at all — re-issuing from one would launder a dead authentication into a
+    /// live downstream session.
+    ///
+    /// This replaces a subject-confirmation overflow test. That bound is now
+    /// clamped to the session bound, so it can no longer overflow on its own;
+    /// keeping the old assertion would have been asserting nothing.
     #[test]
-    fn relay_validates_subject_confirmation_bound_before_callbacks() {
+    fn relay_refuses_an_expired_upstream_before_callbacks() {
         let sp = proxy_sp();
         let idp = proxy_idp();
-        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([5u8; 32])));
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([13u8; 32])));
         let downstream_sp = downstream_sp_descriptor();
-        let context = sample_context();
-        let identity = make_upstream_identity(
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
-        );
         let release = SpyRelease::default();
         let transform = SpyNameId::default();
 
+        // Upstream window anchored an hour ago, so it has already closed.
+        let past = SystemTime::now()
+            .checked_sub(Duration::from_hours(1))
+            .expect("representable");
+        let identity = make_upstream_identity_expiring(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+            past,
+        );
+
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, sample_context(), identity),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
                 passthrough_authn_context: true,
                 now: SystemTime::now(),
                 session_lifetime: Duration::from_hours(1),
-                subject_confirmation_lifetime: Duration::MAX,
+                subject_confirmation_lifetime: Duration::from_mins(5),
             })
-            .expect_err("subject_confirmation_lifetime of Duration::MAX overflows");
+            .expect_err("an expired upstream cannot authorize a downstream assertion");
 
-        assert!(
-            matches!(err, Error::InvalidConfiguration { .. }),
-            "got {err:?}"
-        );
+        assert!(matches!(err, Error::Expired), "got {err:?}");
         assert!(
             !release.called.load(std::sync::atomic::Ordering::SeqCst),
-            "attribute release ran despite an unsatisfiable time bound"
+            "attribute release ran for an expired upstream"
         );
         assert!(
             !transform.called.load(std::sync::atomic::Ordering::SeqCst),
-            "NameID transformation ran despite an unsatisfiable time bound"
+            "NameID transformation ran for an expired upstream"
         );
     }
 
@@ -2423,7 +2496,7 @@ mod tests {
 
         let dispatch = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAllowList {
                     names: vec!["urn:oid:0.9.2342.19200300.100.1.3".into()],
@@ -2473,7 +2546,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2684,7 +2757,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2715,7 +2788,7 @@ mod tests {
 
         proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2828,7 +2901,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp_descriptor(),
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2868,7 +2941,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &twin,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2900,7 +2973,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                flow: &flow(&proxy, context.clone(), identity.clone()),
+                flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,

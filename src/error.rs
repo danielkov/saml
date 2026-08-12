@@ -215,6 +215,25 @@ pub enum Error {
     /// nothing.
     #[error("UpstreamFlow belongs to a different Proxy instance")]
     ForeignProxyFlow,
+    /// The `IdpDescriptor` supplied to
+    /// [`Proxy::consume_upstream_response`](crate::Proxy::consume_upstream_response)
+    /// carries signing certificates that were not trusted when the login
+    /// began.
+    ///
+    /// The upstream `LoginTracker` correlates by entity ID, so a descriptor
+    /// bearing the expected entity ID and a different signing key would
+    /// otherwise validate an attacker-signed response into a genuine flow.
+    #[error("upstream IdP signing certificates differ from those sealed at bounce")]
+    UpstreamTrustRootMismatch,
+    /// The `SpDescriptor` supplied to issuance carries different encryption
+    /// key material than the one the request was validated against.
+    ///
+    /// Entity ID and ACS pin the SP's identity but not its keys. A substituted
+    /// encryption certificate would have the assertion encrypted to that key;
+    /// a removed one silently downgrades opportunistic encryption to
+    /// plaintext.
+    #[error("SP encryption certificates differ from those seen at validation")]
+    SpKeyMaterialMismatch,
     /// The SP's `<samlp:NameIDPolicy>/@Format` names a format this IdP cannot
     /// produce.
     ///
