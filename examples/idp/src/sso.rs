@@ -1147,10 +1147,16 @@ fn finalize_sso_dispatch(
 #[cfg(feature = "artifact-binding")]
 fn finalize_artifact_dispatch(
     state: &AppState,
-    sp_entity_id: &str,
+    _sp_entity_id: &str,
     redirect: saml::ArtifactRedirect,
 ) -> Response {
-    let entry = crate::StashedArtifact::new(redirect.response_xml, sp_entity_id.to_owned());
+    // Store the recipient the library recorded on the redirect, not one
+    // threaded separately through this function. The two agree today, but the
+    // whole point of `recipient_entity_id` is to be the authoritative record
+    // of who the artifact was minted for; re-deriving it here would leave the
+    // ownership check trusting a value the library never vouched for.
+    let recipient = redirect.recipient_entity_id.clone();
+    let entry = crate::StashedArtifact::new(redirect.response_xml, recipient.clone());
     if let Err(e) = state.stash_artifact(redirect.artifact.clone(), entry) {
         warn!(error = %e, "/saml/sso: artifact store unavailable");
         return error_page(
@@ -1159,7 +1165,7 @@ fn finalize_artifact_dispatch(
         );
     }
     info!(
-        sp = %sp_entity_id,
+        sp = %recipient,
         acs = %redirect.redirect_to,
         "/saml/sso: dispatching SSO Response over HTTP-Artifact binding",
     );

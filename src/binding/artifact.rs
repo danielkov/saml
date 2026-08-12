@@ -527,14 +527,16 @@ pub struct ArtifactResolveRequest {
     /// `samlp:ArtifactResolve/@ID` — echoed back in the response's
     /// `InResponseTo`.
     pub request_id: String,
-    /// `samlp:Issuer` text content — the SP entity ID requesting resolution.
+    /// Resolver provenance, established by the parser.
     ///
-    /// This is unauthenticated wire content on its own. It identifies who the
-    /// sender *claims* to be; only [`signature_verified`] (or transport-level
-    /// client authentication) establishes that the claim is true.
-    ///
-    /// [`signature_verified`]: ArtifactResolveRequest::signature_verified
-    pub issuer: String,
+    /// Private: authorization reads these, so a `pub` field would let a caller
+    /// take a request verified as SP-A, rewrite the issuer to SP-B, or
+    /// construct one asserting `signature_verified: true`, and collect SP-B's
+    /// stashed response without ever authenticating as SP-B. Read them via
+    /// [`issuer`](Self::issuer) and
+    /// [`signature_verified`](Self::signature_verified); only
+    /// `parse_artifact_resolve_with` can set them.
+    authenticated: ResolverProvenance,
     /// `samlp:Artifact` text content — the opaque token to look up.
     pub artifact: String,
     /// `samlp:ArtifactResolve/@Destination`, when present.
@@ -543,6 +545,26 @@ pub struct ArtifactResolveRequest {
     /// that actually received the message; see
     /// [`IdentityProvider::parse_artifact_resolve`](crate::IdentityProvider::parse_artifact_resolve).
     pub destination: Option<String>,
+}
+
+/// Who a resolve came from, as established while parsing it.
+#[derive(Debug, Clone)]
+struct ResolverProvenance {
+    issuer: String,
+    signature_verified: bool,
+}
+
+impl ArtifactResolveRequest {
+    /// `samlp:Issuer` text content — the SP entity ID requesting resolution.
+    ///
+    /// Read-only. On its own this is a claim; it is authenticated exactly when
+    /// [`signature_verified`](Self::signature_verified) is true, or by
+    /// client authentication at the transport.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.authenticated.issuer
+    }
+
     /// Whether an enveloped `<ds:Signature>` covering the whole
     /// `<samlp:ArtifactResolve>` was present and verified.
     ///
@@ -550,7 +572,10 @@ pub struct ArtifactResolveRequest {
     /// require one — never that an invalid signature was tolerated, which is
     /// always an error. Treat `false` as "this request is authenticated only
     /// to the extent the transport authenticates it".
-    pub signature_verified: bool,
+    #[must_use]
+    pub fn signature_verified(&self) -> bool {
+        self.authenticated.signature_verified
+    }
 }
 
 /// How to verify the enveloped signature on an inbound
@@ -637,10 +662,12 @@ pub fn parse_artifact_resolve_with(
 
     Ok(ArtifactResolveRequest {
         request_id,
-        issuer,
         artifact,
         destination,
-        signature_verified,
+        authenticated: ResolverProvenance {
+            issuer,
+            signature_verified,
+        },
     })
 }
 
@@ -1296,8 +1323,8 @@ mod tests {
         let req = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
             .expect("a correctly signed resolve must verify");
 
-        assert!(req.signature_verified);
-        assert_eq!(req.issuer, RESOLVE_ISSUER);
+        assert!(req.signature_verified());
+        assert_eq!(req.issuer(), RESOLVE_ISSUER);
         assert_eq!(req.artifact, "AAQAAK1234567890");
     }
 
@@ -1324,7 +1351,7 @@ mod tests {
         let req =
             parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, false)))
                 .expect("unsigned is acceptable when not required");
-        assert!(!req.signature_verified);
+        assert!(!req.signature_verified());
     }
 
     #[test]
@@ -1416,7 +1443,7 @@ mod tests {
         let req =
             parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &permissive, true)))
                 .expect("explicit SHA-1 digest opt-in");
-        assert!(req.signature_verified);
+        assert!(req.signature_verified());
     }
 
     /// `signature_verified: false` is documented to mean "no signature was
@@ -1449,7 +1476,7 @@ mod tests {
 
         let req = parse_artifact_resolve(&envelope).expect("parses");
         assert!(
-            !req.signature_verified,
+            !req.signature_verified(),
             "no config supplied -> nothing was verified"
         );
     }
