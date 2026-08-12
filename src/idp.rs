@@ -169,8 +169,15 @@ pub struct IdentityProviderConfig {
     /// *repeat* within the window needs request-ID bookkeeping, which the
     /// caller owns.
     ///
-    /// Defaults to [`IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE`].
-    /// Set `Duration::MAX` to disable the check.
+    /// This is a required field with no automatic default —
+    /// [`IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE`] is the
+    /// recommended value to pass, not a fallback applied on your behalf.
+    ///
+    /// `Duration::MAX` disables *age* enforcement only. A request dated into
+    /// the future is still rejected beyond the call's `clock_skew`: that
+    /// bound comes from the skew, not from this field, and dropping it would
+    /// make a future-dated request acceptable indefinitely — the same hole
+    /// this setting exists to close, wearing a different sign.
     pub max_authn_request_age: Duration,
     pub default_peer_crypto_policy: PeerCryptoPolicy,
     pub outbound_signature_algorithm: SignatureAlgorithm,
@@ -189,10 +196,12 @@ pub struct IdentityProvider {
 }
 
 impl IdentityProviderConfig {
-    /// Default [`max_authn_request_age`]: five minutes.
+    /// Recommended [`max_authn_request_age`]: five minutes.
     ///
     /// A browser-mediated `AuthnRequest` is redirected on within seconds, so
     /// this is generous for real flows while keeping the replay window short.
+    /// The field is required, so nothing applies this automatically — pass it
+    /// explicitly, or a value your deployment justifies.
     ///
     /// [`max_authn_request_age`]: IdentityProviderConfig::max_authn_request_age
     pub const DEFAULT_MAX_AUTHN_REQUEST_AGE: Duration = Duration::from_mins(5);
@@ -1825,6 +1834,51 @@ mod tests {
         assert_eq!(
             idp.config.max_authn_request_age, default_max,
             "the override must not have mutated the IdP default"
+        );
+    }
+
+    /// `Duration::MAX` opts out of the *age* bound, not of future-dating.
+    /// A request dated arbitrarily far ahead stays rejected, because that
+    /// bound comes from `clock_skew`. Covered at both the config level and
+    /// the per-call override, since either could have been wired to skip the
+    /// whole check.
+    #[test]
+    fn max_duration_opt_out_still_rejects_future_dated_requests() {
+        let skew = Duration::from_mins(1);
+        let far_behind = fixed_now() - skew - Duration::from_hours(24);
+
+        // Config-level opt-out.
+        let mut cfg = idp_config_with(true, false);
+        cfg.max_authn_request_age = Duration::MAX;
+        let idp = IdentityProvider::new(cfg).expect("idp config valid");
+        let err = consume_at(&idp, far_behind, skew)
+            .expect_err("future-dated beyond skew is still refused");
+        assert!(
+            matches!(err, Error::AuthnRequestNotYetValid { .. }),
+            "config opt-out: got {err:?}"
+        );
+
+        // Per-call opt-out.
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(true);
+        let xml = build_signed_authn_request("_req-fresh");
+        let err = idp
+            .consume_authn_request(ConsumeAuthnRequest {
+                sp: &sp,
+                peer_crypto_policy: None,
+                max_authn_request_age: Some(Duration::MAX),
+                saml_request: &xml,
+                binding: Binding::HttpPost,
+                relay_state: None,
+                detached_signature: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: far_behind,
+                clock_skew: skew,
+            })
+            .expect_err("per-call opt-out does not waive the skew bound either");
+        assert!(
+            matches!(err, Error::AuthnRequestNotYetValid { .. }),
+            "per-call opt-out: got {err:?}"
         );
     }
 

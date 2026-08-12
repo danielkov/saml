@@ -36,6 +36,13 @@ pub struct IdentityProviderConfig {
 
     /// If true, AuthnRequests from SPs must be signed.
     pub want_authn_requests_signed: bool,
+    /// Maximum age of an inbound `<samlp:AuthnRequest>`, measured from its
+    /// `IssueInstant` and widened by the call's `clock_skew`. `AuthnRequest`
+    /// has no `NotOnOrAfter`, so this bound comes from the IdP. Required —
+    /// `DEFAULT_MAX_AUTHN_REQUEST_AGE` is the recommended value, not a
+    /// fallback. `Duration::MAX` disables *age* enforcement only;
+    /// future-dating stays bounded by `clock_skew`.
+    pub max_authn_request_age: Duration,
     /// If true, the outbound Response root is signed.
     pub sign_responses: bool,
     /// If true, each outbound Assertion is signed.
@@ -335,6 +342,7 @@ let idp = IdentityProvider::new(IdentityProviderConfig {
     artifact_resolution: vec![],
     supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
     default_name_id_format: NameIdFormat::Persistent,
+    max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
     signing_key: KeyPair::from_pkcs8_pem(IDP_PRIV)?,
     decryption_key: None,
     want_authn_requests_signed: true,
@@ -358,6 +366,7 @@ let sp = sp_registry.lookup_by_entity_id(&issuer_from_request)?;
 let parsed = idp.consume_authn_request(ConsumeAuthnRequest {
     sp: &sp,
     peer_crypto_policy: None,
+    max_authn_request_age: None,   // use the IdP default
     saml_request: &body.saml_request,
     binding: Binding::HttpRedirect,
     relay_state: query.relay_state.as_deref(),

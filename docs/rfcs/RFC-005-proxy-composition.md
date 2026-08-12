@@ -377,6 +377,7 @@ let downstream_sp = sp_registry.lookup_by_entity_id(&issuer)?;
 let parsed = idp.consume_authn_request(ConsumeAuthnRequest {
     sp: &downstream_sp,
     peer_crypto_policy: None,
+    max_authn_request_age: None,   // use the IdP default
     saml_request: &body.saml_request,
     binding: Binding::HttpPost,
     relay_state: form.relay_state.as_deref(),
