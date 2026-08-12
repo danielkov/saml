@@ -121,9 +121,8 @@ pub enum Error {
     },
     /// An ECP PAOS POST's `<paos:Response>/@refToMessageID` (step 6) did not
     /// match the `messageID` the SP issued in its `<paos:Request>` (step 2).
-    /// Surfaced by
-    /// [`SpEcp::consume_paos_response`](crate::binding::ecp::SpEcp::consume_paos_response)
-    /// before the inner `<samlp:Response>` reaches the consume path.
+    /// Surfaced by `SpEcp::consume_paos_response` (feature `ecp`) before the
+    /// inner `<samlp:Response>` reaches the consume path.
     #[error("ECP PAOS refToMessageID does not match the issued messageID")]
     EcpMessageIdMismatch,
     /// A required ECP / PAOS SOAP header block (or one of its attributes) was
@@ -145,15 +144,15 @@ pub enum Error {
     /// protocol: missing/empty `entityID`, a duplicated parameter, an
     /// unsupported `policy`, a non-boolean `isPassive`, or a `returnIDParam`
     /// that is not a plain URL-parameter token. Surfaced by
-    /// [`parse_discovery_request_query`](crate::disco::parse_discovery_request_query)
-    /// and the discovery request/response builders.
+    /// `parse_discovery_request_query` (feature `idp-disco`) and the
+    /// discovery request/response builders.
     #[error("IdP discovery request malformed: {reason}")]
     DiscoveryRequestMalformed { reason: &'static str },
     /// The discovery service's return redirect was malformed — currently
     /// only a duplicated chosen-IdP parameter, which is rejected outright so
     /// an attacker-appended second value can never win a first-match parse.
     /// Surfaced by
-    /// [`parse_discovery_response_query`](crate::disco::parse_discovery_response_query).
+    /// `parse_discovery_response_query` (feature `idp-disco`).
     #[error("IdP discovery response malformed: {reason}")]
     DiscoveryResponseMalformed { reason: &'static str },
     /// **The** discovery-service trust check: the `return` URL in a
@@ -161,12 +160,12 @@ pub enum Error {
     /// endpoint registered in the requesting SP's metadata. Redirecting
     /// there anyway would be an open redirect that hands the user agent (and
     /// the chosen IdP hint) to an attacker. Surfaced by
-    /// [`validate_discovery_return_url`](crate::disco::validate_discovery_return_url).
+    /// `validate_discovery_return_url` (feature `idp-disco`).
     #[error("IdP discovery return URL not registered in SP metadata: {return_url}")]
     DiscoveryReturnUrlNotRegistered { return_url: String },
     /// The `_saml_idp` Common Domain Cookie value did not decode
     /// (percent-encoding, base64, or UTF-8 layer). Surfaced by
-    /// [`CommonDomainCookie::parse`](crate::disco::CommonDomainCookie::parse).
+    /// `CommonDomainCookie::parse` (feature `idp-disco`).
     #[error("Common Domain Cookie malformed: {reason}")]
     CommonDomainCookieMalformed { reason: &'static str },
 
