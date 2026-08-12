@@ -596,11 +596,13 @@ pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveReq
 /// Parse an inbound `<samlp:ArtifactResolve>`, verifying its enveloped
 /// signature against `verify`.
 ///
-/// Passing `None` skips signature verification entirely and yields
-/// `signature_verified: false`; only do that when the endpoint authenticates
-/// the requester some other way (see [`VerifyResolveConfig`]). Verification
-/// runs before any field is read, so an unauthenticated tree never reaches
-/// the caller's artifact store.
+/// Passing `None` skips signature verification. An *unsigned* resolve then
+/// parses with `signature_verified: false`; a *signed* one is rejected rather
+/// than accepted unexamined, since reporting `false` for a signature nobody
+/// checked would misstate what the field means. Only pass `None` when the
+/// endpoint authenticates the requester some other way (see
+/// [`VerifyResolveConfig`]). Verification runs before any field is read, so
+/// an unauthenticated tree never reaches the caller's artifact store.
 pub fn parse_artifact_resolve_with(
     soap_envelope: &[u8],
     verify: Option<&VerifyResolveConfig<'_>>,

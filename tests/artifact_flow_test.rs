@@ -341,6 +341,7 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
     let now = common::flow_now();
+    let sp_signing_key = common::rsa_keypair_with_cert().expect("sp signing key");
 
     let empty_stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let ars = ArtifactResolutionService {
@@ -364,7 +365,19 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The IdP requires a signed ArtifactResolve. Sending an
+                // unsigned one would be refused for the missing signature and
+                // never reach the store, so this assertion would pass without
+                // exercising the unknown-artifact path at all.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
