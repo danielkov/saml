@@ -71,6 +71,14 @@ pub struct ParsedAuthnRequest {
 struct ValidatedBinding {
     sp_entity_id: String,
     acs: SsoResponseEndpoint,
+    /// The `@ID` this request carried when it was validated.
+    ///
+    /// It becomes the Response's `@InResponseTo`, which the SP correlates
+    /// against its own tracker — so it decides which transaction the assertion
+    /// claims to answer. The `pub` copy is caller-mutable, and rewriting it to
+    /// another outstanding request from the *same* SP cross-wires the two
+    /// without tripping any issuer or ACS check.
+    request_id: String,
     /// The policies the request actually carried when it was validated.
     ///
     /// Held here for the same reason as the SP and ACS: the `pub` copies are
@@ -83,6 +91,15 @@ struct ValidatedBinding {
 }
 
 impl ParsedAuthnRequest {
+    /// The `@ID` this request carried when it was validated.
+    ///
+    /// Unlike [`id`](Self::id) this cannot be rewritten by the caller, so it
+    /// is what issuance echoes as `@InResponseTo`.
+    #[must_use]
+    pub fn validated_request_id(&self) -> &str {
+        &self.validated.request_id
+    }
+
     /// The `<samlp:RequestedAuthnContext>` this request carried when it was
     /// validated.
     ///
@@ -160,7 +177,7 @@ impl ParsedAuthnRequest {
             })?;
         let protocol_binding = Some(canonical.binding);
         Ok(Self {
-            id,
+            id: id.clone(),
             issuer: sp.entity_id.clone(),
             issue_instant,
             destination: None,
@@ -170,6 +187,7 @@ impl ParsedAuthnRequest {
             validated: ValidatedBinding {
                 sp_entity_id: sp.entity_id.clone(),
                 acs: canonical,
+                request_id: id.clone(),
                 requested_authn_context: requested_authn_context.clone(),
                 requested_name_id_format: requested_name_id_format.clone(),
             },
@@ -285,7 +303,7 @@ pub(crate) fn validate_authn_request(
     }
 
     Ok(ParsedAuthnRequest {
-        id: raw.id,
+        id: raw.id.clone(),
         issuer: raw.issuer,
         issue_instant: raw.issue_instant,
         destination: raw.destination,
@@ -295,6 +313,7 @@ pub(crate) fn validate_authn_request(
         validated: ValidatedBinding {
             sp_entity_id: sp.entity_id.clone(),
             acs: resolved_canonical,
+            request_id: raw.id.clone(),
             requested_authn_context: raw.requested_authn_context.clone(),
             requested_name_id_format: raw.requested_name_id_format.clone(),
         },
