@@ -528,14 +528,24 @@ impl Proxy<'_> {
         let downstream = input.downstream_request;
 
         // 1. Build StartLogin honoring propagate flags.
+        //
+        //    These flags decide what the *upstream* IdP is asked for. They
+        //    must not touch what the context records about the downstream
+        //    request: that is the authoritative statement of what the
+        //    downstream SP required, and relay enforces non-downgrade against
+        //    it. Folding the flags into the stored values erased the
+        //    requirement — `propagate_authn_context: false` left the context
+        //    with no requested context at all, so relay skipped the
+        //    non-downgrade check entirely and a proxy that merely declined to
+        //    forward the request upstream silently stopped enforcing it.
         let force_authn = input.propagate_request_flags && downstream.force_authn;
         let is_passive = input.propagate_request_flags && downstream.is_passive;
-        let requested_name_id_format = if input.propagate_name_id_policy {
+        let upstream_name_id_format = if input.propagate_name_id_policy {
             downstream.requested_name_id_format.clone()
         } else {
             None
         };
-        let requested_authn_context = if input.propagate_authn_context {
+        let upstream_authn_context = if input.propagate_authn_context {
             downstream.requested_authn_context.clone()
         } else {
             None
@@ -549,8 +559,8 @@ impl Proxy<'_> {
                 binding: input.upstream_binding,
                 force_authn,
                 is_passive,
-                requested_name_id_format: requested_name_id_format.clone(),
-                requested_authn_context: requested_authn_context.clone(),
+                requested_name_id_format: upstream_name_id_format,
+                requested_authn_context: upstream_authn_context,
                 acs_index: None,
                 acs_url: None,
                 response_binding: None,
@@ -569,8 +579,9 @@ impl Proxy<'_> {
             downstream_sp_entity_id: downstream.validated_sp().to_owned(),
             downstream_acs: downstream.validated_acs().as_endpoint(),
             downstream_relay_state: downstream.relay_state.clone(),
-            requested_authn_context,
-            requested_name_id_format,
+            // Unconditionally what downstream asked for — see step 1.
+            requested_authn_context: downstream.requested_authn_context.clone(),
+            requested_name_id_format: downstream.requested_name_id_format.clone(),
             upstream_tracker: result.tracker,
             issued_at: input.now,
         };
@@ -714,19 +725,32 @@ impl Proxy<'_> {
             });
         }
 
-        // 1. Enforce AuthnContext non-downgrade (§7). The set-aggregating
-        //    semantics — in particular, `Better` requires the actual class ref
-        //    to be strictly stronger than the *max* of the requested set, per
-        //    SAML 2.0 Core §3.3.2.2.1 — live in
-        //    [`crate::authn_context::StandardComparator`]. We collapse both
-        //    `NotSatisfied` and `NotComparable` to `AuthnContextDowngrade`
+        // 1. Decide the class this response will actually advertise, then
+        //    enforce non-downgrade against *that*.
+        //
+        //    Order matters. Validating the upstream class and emitting a
+        //    different one proves nothing about what downstream receives:
+        //    with `passthrough_authn_context: false` an upstream MFA identity
+        //    satisfied a downstream `Exact(MultiFactorAuth)` request, and the
+        //    signed assertion then advertised PasswordProtectedTransport. The
+        //    check has to bind to the emitted value.
+        let downstream_class_ref = if input.passthrough_authn_context {
+            input.upstream_identity.authn_context_class_ref().map_or(
+                AuthnContextClassRef::PasswordProtectedTransport,
+                AuthnContextClassRef::from_uri,
+            )
+        } else {
+            AuthnContextClassRef::PasswordProtectedTransport
+        };
+
+        //    The set-aggregating semantics — in particular, `Better` requires
+        //    the class to be strictly stronger than the *max* of the requested
+        //    set, per SAML 2.0 Core §3.3.2.2.1 — live in
+        //    [`crate::authn_context::StandardComparator`]. Both `NotSatisfied`
+        //    and `NotComparable` collapse to `AuthnContextDowngrade`
         //    (fail-closed), matching the SP-side response validator.
         if let Some(requested) = &input.context.payload().requested_authn_context {
-            let actual = input
-                .upstream_identity
-                .authn_context_class_ref()
-                .ok_or(Error::AuthnContextDowngrade)?;
-            match StandardComparator.evaluate(requested, actual) {
+            match StandardComparator.evaluate(requested, downstream_class_ref.as_uri()) {
                 ComparatorOutcome::Satisfied => {}
                 ComparatorOutcome::NotSatisfied | ComparatorOutcome::NotComparable => {
                     return Err(Error::AuthnContextDowngrade);
@@ -773,16 +797,6 @@ impl Proxy<'_> {
             input.upstream_identity.attributes(),
             input.downstream_sp,
         )?;
-
-        // 4. Decide downstream AuthnContextClassRef.
-        let downstream_class_ref = if input.passthrough_authn_context {
-            input.upstream_identity.authn_context_class_ref().map_or(
-                AuthnContextClassRef::PasswordProtectedTransport,
-                AuthnContextClassRef::from_uri,
-            )
-        } else {
-            AuthnContextClassRef::PasswordProtectedTransport
-        };
 
         // 5. Build a synthetic ParsedAuthnRequest from the proxy context.
         //    The `assertion_consumer_service` field is type-narrowed to
@@ -1591,6 +1605,142 @@ mod tests {
             Some("downstream-rs".into()),
         )
         .expect("the fixture ACS is registered on the fixture SP")
+    }
+
+    /// The propagate flags govern what the *upstream* IdP is asked for. The
+    /// context is the authoritative record of what the downstream SP required,
+    /// and relay enforces non-downgrade against it — so folding the flags into
+    /// the stored values erased the requirement. With
+    /// `propagate_authn_context: false` the context carried no requested
+    /// context at all, and relay skipped non-downgrade entirely: a proxy that
+    /// merely declined to forward the request upstream silently stopped
+    /// enforcing what downstream asked for.
+    #[test]
+    fn context_preserves_downstream_requirements_when_propagation_is_off() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([7u8; 32])));
+        let upstream = upstream_idp_descriptor();
+        let downstream = synthetic_downstream_request();
+
+        let bounce = proxy
+            .bounce_to_upstream(BounceToUpstream {
+                upstream_idp: &upstream,
+                downstream_request: &downstream,
+                propagate_request_flags: false,
+                propagate_authn_context: false,
+                propagate_name_id_policy: false,
+                upstream_binding: Binding::HttpRedirect,
+                now: SystemTime::now(),
+            })
+            .expect("bounce ok");
+
+        let context = proxy
+            .decode_context(&bounce.upstream_relay_state)
+            .expect("decode context");
+        let payload = context.payload();
+
+        assert_eq!(
+            payload
+                .requested_authn_context
+                .as_ref()
+                .map(|r| &r.class_refs),
+            Some(&vec![AuthnContextClassRef::PasswordProtectedTransport]),
+            "downstream's requested AuthnContext must survive propagate_authn_context: false"
+        );
+        assert_eq!(
+            payload.requested_name_id_format,
+            Some(NameIdFormat::Persistent),
+            "downstream's NameIDPolicy must survive propagate_name_id_policy: false"
+        );
+    }
+
+    /// Non-downgrade must bind to the class the response will *advertise*, not
+    /// the one the upstream asserted. With `passthrough_authn_context: false`
+    /// the emitted class is PasswordProtectedTransport regardless of upstream,
+    /// so a downstream `Exact(MultiFactorAuth)` request must be refused —
+    /// previously the upstream MFA identity satisfied the check and the signed
+    /// assertion then advertised the weaker class.
+    #[test]
+    fn non_downgrade_binds_to_the_emitted_class_not_the_upstream_one() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([8u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+
+        let mut context = sample_context();
+        context.requested_authn_context = Some(RequestedAuthnContext {
+            class_refs: vec![AuthnContextClassRef::MultiFactorAuth],
+            comparison: AuthnContextComparison::Exact,
+        });
+        // Upstream genuinely did MFA.
+        // Via the constant: the URI is `...MultiFactorAuthentication`, and a
+        // literal that drifts parses as a Custom class, which is unrankable.
+        let identity = make_upstream_identity(AuthnContextClassRef::MultiFactorAuth.as_uri());
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &ProxyContext::attested(context.clone()),
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                // ...but the response will advertise PasswordProtectedTransport.
+                passthrough_authn_context: false,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("the emitted class does not satisfy Exact(MultiFactorAuth)");
+        assert!(matches!(err, Error::AuthnContextDowngrade), "got {err:?}");
+
+        // Control: with passthrough on, the emitted class *is* MFA and it passes.
+        proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &ProxyContext::attested(context),
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect("passthrough emits MFA, which satisfies the request");
+    }
+
+    /// The handle is a bearer credential in a URL; a short one is worse than
+    /// the AEAD codec this is chosen over. `0` produced an empty handle shared
+    /// by every caller.
+    #[test]
+    fn opaque_handle_codec_rejects_insufficient_entropy() {
+        let context = sample_context();
+        let grant = SealingGrant::issue(&context);
+
+        for len in [0usize, 1, 8, 15] {
+            let codec = OpaqueHandleCodec {
+                store: InMemoryStore::new(),
+                handle_byte_len: len,
+                ttl: Duration::from_mins(10),
+            };
+            let err = codec
+                .encode(&grant)
+                .expect_err("handle_byte_len below the minimum must be refused");
+            assert!(
+                matches!(err, Error::InvalidConfiguration { .. }),
+                "len {len}: got {err:?}"
+            );
+        }
+
+        // 16 bytes is the boundary and must be accepted.
+        let codec = OpaqueHandleCodec {
+            store: InMemoryStore::new(),
+            handle_byte_len: 16,
+            ttl: Duration::from_mins(10),
+        };
+        let handle = codec.encode(&grant).expect("16 bytes is sufficient");
+        assert!(!handle.is_empty());
     }
 
     #[test]

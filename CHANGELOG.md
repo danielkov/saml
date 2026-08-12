@@ -51,6 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context under a chosen handle, then present that handle to `decode_context`.
   Its documented contract now also states that implementations must honour
   `ttl` and make `take` atomic and one-shot.
+- `Proxy::bounce_to_upstream` records the downstream SP's requested
+  AuthnContext and NameIDPolicy in the context unconditionally. The
+  `propagate_authn_context` / `propagate_name_id_policy` flags govern only what
+  the upstream IdP is asked for; folding them into the stored context erased
+  the downstream requirement, so `propagate_authn_context: false` made relay
+  skip non-downgrade enforcement entirely.
+- `Proxy::relay_to_downstream` selects the AuthnContext class the response will
+  advertise *before* enforcing non-downgrade, and evaluates that class. It
+  previously validated the upstream class and could then emit a different one:
+  with `passthrough_authn_context: false`, an upstream MFA identity satisfied a
+  downstream `Exact(MultiFactorAuth)` request and the signed assertion
+  advertised PasswordProtectedTransport.
+- **Breaking:** an ordered `AuthnContext` comparison (`minimum` / `maximum` /
+  `better`) whose requested set contains any unrankable class now returns
+  `NotComparable` instead of deciding on the rankable remainder. Nothing places
+  a vendor-defined class in the standard hierarchy, so `Better([Custom,
+  Password])` reporting `Satisfied` for an MFA actual answered a question the
+  caller never asked.
 - `OpaqueHandleCodec` rejects a `handle_byte_len` below 16 bytes. The handle is
   a bearer credential that travels in a URL, and `0` produced an empty handle
   shared by every caller.
