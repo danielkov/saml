@@ -311,19 +311,27 @@ pub struct ConsumeResponse<'a> {
     pub clock_skew: Duration,
 }
 
-pub struct Identity {
-    pub name_id: NameId,
-    pub session_index: Option<String>,
-    pub authn_instant: SystemTime,
-    pub session_not_on_or_after: Option<SystemTime>,
-    pub authn_context_class_ref: Option<String>,
-    pub attributes: Vec<Attribute>,
+/// Read-only by construction: every field is private and reached through an
+/// accessor. `Proxy::relay_to_downstream` mints a *signed* downstream
+/// assertion from an `Identity`, so a mutable one is a signing oracle — a
+/// caller could authenticate once, rewrite the subject or attributes, and
+/// have the proxy sign the rewritten claims.
+pub struct Identity { /* private fields */ }
+
+impl Identity {
+    pub fn name_id(&self) -> &NameId;
+    pub fn session_index(&self) -> Option<&str>;
+    pub fn authn_instant(&self) -> SystemTime;
+    pub fn session_not_on_or_after(&self) -> Option<SystemTime>;
+    pub fn authn_context_class_ref(&self) -> Option<&str>;
+    pub fn attributes(&self) -> &[Attribute];
     /// For replay defense: the caller should dedupe on this ID until
     /// `not_on_or_after` passes.
-    pub assertion_id: String,
-    pub not_on_or_after: SystemTime,
+    pub fn assertion_id(&self) -> &str;
+    pub fn not_on_or_after(&self) -> SystemTime;
     /// Fingerprint of the cert that verified the signature.
-    pub verifying_cert_fingerprint: [u8; 32],
+    pub fn verifying_cert_fingerprint(&self) -> [u8; 32];
+    pub fn is_one_time_use(&self) -> bool;
 }
 
 impl ServiceProvider {

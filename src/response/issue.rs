@@ -368,6 +368,62 @@ struct BuildAssertionParams<'a> {
     holder_of_key_cert: Option<&'a X509Certificate>,
 }
 
+/// Every `xs:dateTime` an assertion carries, computed and formatted together.
+///
+/// This exists so that "can this assertion be issued at all?" is answerable
+/// *before* anything irreversible happens — notably before
+/// [`Proxy::relay_to_downstream`](crate::Proxy::relay_to_downstream) runs its
+/// caller-supplied attribute-release and NameID-transform callbacks, which may
+/// write to a pseudonym store or an audit log.
+///
+/// Both the preflight and the assertion builder go through this one function,
+/// so the check cannot drift from what issuance actually does. Every operation
+/// that can fail lives here: the additions and the subtraction can overflow or
+/// underflow `SystemTime`, and the formatting rejects pre-epoch and
+/// non-representable instants. `now = UNIX_EPOCH` fails on `NotBefore`, which
+/// an overflow-only check missed.
+pub(crate) struct IssuanceInstants {
+    pub conditions_not_before: String,
+    pub conditions_not_on_or_after: String,
+    pub subject_confirmation_not_on_or_after: String,
+    pub authn_instant: String,
+    pub session_not_on_or_after: Option<String>,
+}
+
+pub(crate) fn issuance_instants(
+    now: SystemTime,
+    assertion_lifetime: Duration,
+    subject_confirmation_lifetime: Duration,
+    authn_instant: SystemTime,
+    session_not_on_or_after: Option<SystemTime>,
+) -> Result<IssuanceInstants, Error> {
+    let not_before =
+        now.checked_sub(Duration::from_mins(1))
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now - 1min underflows SystemTime",
+            })?;
+    let conditions_noa =
+        now.checked_add(assertion_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now + assertion_lifetime overflows SystemTime",
+            })?;
+    let scd_noa =
+        now.checked_add(subject_confirmation_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now + subject_confirmation_lifetime overflows SystemTime",
+            })?;
+
+    Ok(IssuanceInstants {
+        conditions_not_before: format_xs_datetime(not_before)?,
+        conditions_not_on_or_after: format_xs_datetime(conditions_noa)?,
+        subject_confirmation_not_on_or_after: format_xs_datetime(scd_noa)?,
+        authn_instant: format_xs_datetime(authn_instant)?,
+        session_not_on_or_after: session_not_on_or_after
+            .map(format_xs_datetime)
+            .transpose()?,
+    })
+}
+
 fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> {
     let &BuildAssertionParams {
         assertion_id,
@@ -386,6 +442,15 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
         attributes,
         holder_of_key_cert,
     } = params;
+
+    // Single source for every timestamp, shared with the relay preflight.
+    let instants = issuance_instants(
+        now,
+        assertion_lifetime,
+        subject_confirmation_lifetime,
+        authn_instant,
+        session_not_on_or_after,
+    )?;
 
     let issuer = Element::build(saml_qname("Issuer"))
         .with_text(idp_entity_id.to_owned())
@@ -416,16 +481,11 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     }
     let name_id_elem = name_id_builder.finish();
 
-    let subject_confirmation_not_on_or_after = now
-        .checked_add(subject_confirmation_lifetime)
-        .ok_or(Error::InvalidConfiguration {
-            reason: "now + subject_confirmation_lifetime overflows SystemTime",
-        })?;
     let mut scd_builder = Element::build(saml_qname("SubjectConfirmationData"))
         .with_attribute(QName::new(None, "Recipient"), acs_url.to_owned())
         .with_attribute(
             QName::new(None, "NotOnOrAfter"),
-            format_xs_datetime(subject_confirmation_not_on_or_after)?,
+            instants.subject_confirmation_not_on_or_after,
         );
     if let Some(irt) = in_response_to {
         scd_builder = scd_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
@@ -461,24 +521,14 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     let audience_restriction = Element::build(saml_qname("AudienceRestriction"))
         .with_child(Node::Element(audience))
         .finish();
-    let conditions_not_before =
-        now.checked_sub(Duration::from_mins(1))
-            .ok_or(Error::InvalidConfiguration {
-                reason: "now - 1min underflows SystemTime",
-            })?;
-    let conditions_not_on_or_after =
-        now.checked_add(assertion_lifetime)
-            .ok_or(Error::InvalidConfiguration {
-                reason: "now + assertion_lifetime overflows SystemTime",
-            })?;
     let conditions = Element::build(saml_qname("Conditions"))
         .with_attribute(
             QName::new(None, "NotBefore"),
-            format_xs_datetime(conditions_not_before)?,
+            instants.conditions_not_before,
         )
         .with_attribute(
             QName::new(None, "NotOnOrAfter"),
-            format_xs_datetime(conditions_not_on_or_after)?,
+            instants.conditions_not_on_or_after,
         )
         .with_child(Node::Element(audience_restriction))
         .finish();
@@ -491,16 +541,11 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
         .with_child(Node::Element(class_ref))
         .finish();
     let mut authn_stmt_builder = Element::build(saml_qname("AuthnStatement"))
-        .with_attribute(
-            QName::new(None, "AuthnInstant"),
-            format_xs_datetime(authn_instant)?,
-        )
+        .with_attribute(QName::new(None, "AuthnInstant"), instants.authn_instant)
         .with_attribute(QName::new(None, "SessionIndex"), session_index.to_owned());
-    if let Some(snoa) = session_not_on_or_after {
-        authn_stmt_builder = authn_stmt_builder.with_attribute(
-            QName::new(None, "SessionNotOnOrAfter"),
-            format_xs_datetime(snoa)?,
-        );
+    if let Some(snoa) = instants.session_not_on_or_after {
+        authn_stmt_builder =
+            authn_stmt_builder.with_attribute(QName::new(None, "SessionNotOnOrAfter"), snoa);
     }
     let authn_stmt = authn_stmt_builder
         .with_child(Node::Element(authn_context))
