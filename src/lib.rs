@@ -269,7 +269,7 @@
 //! })?;
 //!
 //! let _dispatch = proxy.relay_to_downstream(RelayToDownstream {
-//!     flow: &flow,
+//!     flow,
 //!     downstream_sp: &downstream_sp,
 //!     attribute_release: &ReleaseAllowList {
 //!         names: vec!["email".into(), "displayName".into(), "groups".into()],
