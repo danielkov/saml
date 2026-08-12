@@ -397,6 +397,31 @@ impl Proxy<'_> {
             });
         }
 
+        // 0b. Resolve the downstream ACS before any caller callback runs.
+        //
+        //     Attribute release and NameID transformation are caller-supplied
+        //     and may touch a database, a directory, or a pseudonym store. An
+        //     invalid or stale context must not drive those side effects only
+        //     to fail afterwards on `UnregisteredAcs`. `for_proxy_reissue`
+        //     re-resolves the same endpoint below; doing it here first costs a
+        //     lookup and makes the failure ordering observable.
+        let downstream_acs =
+            SsoResponseEndpoint::try_from_endpoint(input.context.downstream_acs.clone())?;
+        if !input
+            .downstream_sp
+            .assertion_consumer_services
+            .iter()
+            .any(|e| {
+                e.url == downstream_acs.url
+                    && e.binding == downstream_acs.binding
+                    && e.index == downstream_acs.index
+            })
+        {
+            return Err(Error::UnregisteredAcs {
+                entity_id: input.downstream_sp.entity_id.clone(),
+            });
+        }
+
         // 1. Enforce AuthnContext non-downgrade (§7). The set-aggregating
         //    semantics — in particular, `Better` requires the actual class ref
         //    to be strictly stronger than the *max* of the requested set, per
@@ -447,8 +472,7 @@ impl Proxy<'_> {
         // 5. Build a synthetic ParsedAuthnRequest from the proxy context.
         //    The `assertion_consumer_service` field is type-narrowed to
         //    `SsoResponseEndpoint`; narrow the stashed `Endpoint` accordingly.
-        let acs_endpoint =
-            SsoResponseEndpoint::try_from_endpoint(input.context.downstream_acs.clone())?;
+        let acs_endpoint = downstream_acs;
         // The sanctioned construction path: it re-resolves the ACS against the
         // downstream SP's metadata and records the provenance binding that
         // issuance correlates on. A struct literal cannot be used here — the
@@ -1349,22 +1373,22 @@ mod tests {
         let not_on_or_after = now
             .checked_add(Duration::from_mins(5))
             .expect("not_on_or_after within range");
-        Identity {
-            name_id: NameId::email("alice@example.com"),
-            session_index: Some("upstream-sess-1".into()),
-            authn_instant: now,
-            session_not_on_or_after: Some(session_not_on_or_after),
-            authn_context_class_ref: Some(class_ref_uri.to_string()),
-            attributes: vec![
+        Identity::new(
+            NameId::email("alice@example.com"),
+            Some("upstream-sess-1".into()),
+            now,
+            Some(session_not_on_or_after),
+            Some(class_ref_uri.to_string()),
+            vec![
                 Attribute::email("alice@example.com"),
                 Attribute::display_name("Alice Anderson"),
                 Attribute::single("department", "platform"),
             ],
-            assertion_id: "_a-upstream".into(),
+            "_a-upstream".into(),
             not_on_or_after,
-            verifying_cert_fingerprint: [0u8; 32],
-            is_one_time_use: false,
-        }
+            [0u8; 32],
+            false,
+        )
     }
 
     #[test]
@@ -1740,6 +1764,75 @@ mod tests {
         assert_eq!(
             sealed.downstream_acs.url, real_acs_url,
             "the sealed context must carry the canonical ACS, not the rewritten one"
+        );
+    }
+
+    /// Caller callbacks must not run for a context that will be rejected.
+    ///
+    /// Attribute release and NameID transformation are caller-supplied and may
+    /// hit a directory or a pseudonym store. A stale or invalid context
+    /// driving those side effects — and only then failing on
+    /// `UnregisteredAcs` — is a real defect, so ACS validation is ordered
+    /// ahead of them and this test spies on the callbacks to prove it.
+    #[test]
+    fn callbacks_do_not_run_when_the_acs_is_unregistered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SpyRelease(AtomicUsize);
+        impl AttributeReleasePolicy for SpyRelease {
+            fn release(&self, upstream: &[Attribute], _sp: &SpDescriptor) -> Vec<Attribute> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                upstream.to_vec()
+            }
+        }
+        struct SpyTransform(AtomicUsize);
+        impl NameIdTransform for SpyTransform {
+            fn transform(
+                &self,
+                upstream_subject: &NameId,
+                _upstream_attributes: &[Attribute],
+                _downstream_sp: &SpDescriptor,
+            ) -> Result<NameId, Error> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(upstream_subject.clone())
+            }
+        }
+
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let codec = Box::new(Aes256GcmCodec::new([11u8; 32]));
+        let proxy = Proxy::new(&sp, &idp, codec);
+
+        // Context names an ACS this SP does not register.
+        let mut context = sample_context();
+        context.downstream_acs =
+            SsoResponseEndpoint::post("https://downstream-sp.example.com/not-registered", 0, true)
+                .as_endpoint();
+
+        let release = SpyRelease(AtomicUsize::new(0));
+        let transform = SpyTransform(AtomicUsize::new(0));
+        let identity = make_upstream_identity(AuthnContextClassRef::Password.as_uri());
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &context,
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp_descriptor(),
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("the ACS is not registered for this SP");
+
+        assert!(matches!(err, Error::UnregisteredAcs { .. }), "got {err:?}");
+        assert_eq!(release.0.load(Ordering::SeqCst), 0, "attribute release ran");
+        assert_eq!(
+            transform.0.load(Ordering::SeqCst),
+            0,
+            "NameID transform ran"
         );
     }
 
