@@ -216,9 +216,18 @@ pub struct ProxyContextPayload {
     pub requested_authn_context: Option<RequestedAuthnContext>,
     pub requested_name_id_format: Option<NameIdFormat>,
     /// Upstream LoginTracker, stashed inside the context.
-    pub upstream_tracker: LoginTracker,
+    pub upstream_tracker: crate::sp::LoginTrackerPayload,
     /// Issued-at timestamp. Codec rejects blobs older than its `max_age`.
     pub issued_at: SystemTime,
+    /// SHA-256 fingerprints of the *downstream* SP's encryption certificates
+    /// as seen when its AuthnRequest was validated.
+    ///
+    /// `for_proxy_reissue` builds its synthetic request from the descriptor
+    /// supplied at relay time, so the issuance-side key check compares that
+    /// descriptor against itself — tautological. Carrying the fingerprints in
+    /// the sealed context is what makes the comparison mean something: they
+    /// come from the request the downstream SP actually sent.
+    pub downstream_encryption_cert_fingerprints: Vec<[u8; 32]>,
     /// SHA-256 fingerprints of the upstream IdP signing certificates that
     /// were trusted when this login was started.
     ///
@@ -731,8 +740,11 @@ impl Proxy<'_> {
             // from the private provenance, not the caller-mutable `pub` copies.
             requested_authn_context: downstream.validated_authn_context().cloned(),
             requested_name_id_format: downstream.validated_name_id_format().cloned(),
-            upstream_tracker: result.tracker,
+            upstream_tracker: result.tracker.to_payload(),
             issued_at: input.now,
+            downstream_encryption_cert_fingerprints: downstream
+                .validated_encryption_cert_fingerprints()
+                .to_vec(),
             upstream_signing_cert_fingerprints: input
                 .upstream_idp
                 .signing_certs
@@ -805,7 +817,9 @@ impl Proxy<'_> {
             binding: input.binding,
             relay_state: Some(input.relay_state),
             // From the context, never from the caller — this is the coupling.
-            tracker: Some(&context.payload().upstream_tracker),
+            tracker: Some(&LoginTracker::from_payload(
+                context.payload().upstream_tracker.clone(),
+            )),
             expected_destination: input.expected_destination,
             now: input.now,
             clock_skew: input.clock_skew,
@@ -910,6 +924,35 @@ impl Proxy<'_> {
         //    decision was made by an instance the caller controls.
         if input.flow.instance != self.instance {
             return Err(Error::ForeignProxyFlow);
+        }
+
+        // 0aa. The downstream SP's key material must be the one whose request
+        //      we sealed.
+        //
+        //      Issuance re-checks this, but from a synthetic request built out
+        //      of the descriptor passed here — so that comparison is against
+        //      itself. The sealed fingerprints come from the AuthnRequest the
+        //      downstream SP actually sent, which is the only non-circular
+        //      reference available at relay time. Compared as a set, since
+        //      metadata ordering carries no meaning.
+        {
+            let mut sealed = input
+                .flow
+                .context()
+                .payload()
+                .downstream_encryption_cert_fingerprints
+                .clone();
+            let mut current: Vec<[u8; 32]> = input
+                .downstream_sp
+                .encryption_certs
+                .iter()
+                .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+                .collect();
+            sealed.sort_unstable();
+            current.sort_unstable();
+            if sealed != current {
+                return Err(Error::SpKeyMaterialMismatch);
+            }
         }
 
         // 0a. The context must belong to the SP being relayed to.
@@ -1694,15 +1737,16 @@ mod tests {
                 comparison: AuthnContextComparison::Minimum,
             }),
             requested_name_id_format: Some(NameIdFormat::Persistent),
+            downstream_encryption_cert_fingerprints: vec![],
             upstream_signing_cert_fingerprints: vec![],
-            upstream_tracker: LoginTracker::new(
-                "_upstream-1".into(),
-                tracker_issued_at,
-                "https://upstream-idp.example.com".into(),
-                SsoResponseEndpoint::post("https://proxy.example.com/acs", 0, true),
-                None,
-                None,
-            ),
+            upstream_tracker: crate::sp::LoginTrackerPayload {
+                request_id: "_upstream-1".into(),
+                issued_at: tracker_issued_at,
+                idp_entity_id: "https://upstream-idp.example.com".into(),
+                acs_endpoint: SsoResponseEndpoint::post("https://proxy.example.com/acs", 0, true),
+                requested_authn_context: None,
+                requested_name_id_format: None,
+            },
             issued_at: SystemTime::now(),
         }
     }
