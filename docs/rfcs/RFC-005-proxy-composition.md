@@ -84,14 +84,21 @@ For Redirect-binding proxies, use `OpaqueHandleCodec`: a short random handle is 
 
 ```rust
 pub trait ProxyContextStore: Send + Sync {
-    fn put(&self, handle: &str, context: &ProxyContextPayload, ttl: Duration) -> Result<(), Error>;
+    /// Takes a crate-issued `SealingGrant`, not a bare payload: the caller
+    /// owns the store, so a `put` accepting a payload would let them insert an
+    /// invented context under a handle of their choosing and redeem it.
+    fn put(&self, handle: &str, grant: &SealingGrant<'_>, ttl: Duration) -> Result<(), Error>;
+    /// Must be atomic and one-shot. Whatever this returns is what
+    /// `decode_context` attests and relay signs from, so a custom store is a
+    /// trust anchor in the same way a custom codec is.
     fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
 
 pub struct OpaqueHandleCodec<S: ProxyContextStore> {
     pub store: S,
     /// Bytes of entropy in the handle. Default 24 → 32 base64url chars,
-    /// well under the 80-byte RelayState ceiling.
+    /// well under the 80-byte RelayState ceiling. Minimum 16; sealing fails
+    /// below that, since the handle is a bearer credential in a URL.
     pub handle_byte_len: usize,
     pub ttl: Duration,
 }
@@ -346,16 +353,9 @@ pub struct PerSpFormat {
 
 ## 7. AuthnContext non-downgrade
 
-If `context.payload().requested_authn_context` requested `MultiFactorAuth` and `upstream_identity.authn_context_class_ref()` is `PasswordProtectedTransport`, the proxy must reject — silently downgrading authentication strength is a transitive trust violation.
+If `context.payload().requested_authn_context` requested `MultiFactorAuth` and the response would advertise `PasswordProtectedTransport`, the proxy must reject — silently downgrading authentication strength is a transitive trust violation.
 
-Built into `relay_to_downstream` as:
-
-```rust
-pub(crate) fn enforce_authn_context_floor(
-    requested: &RequestedAuthnContext,
-    actual: Option<&str>,
-) -> Result<(), Error>;
-```
+`relay_to_downstream` selects the class the downstream response will advertise **first**, then evaluates that exact class against the downstream request. The order matters: validating the upstream class and then emitting a different one (which `passthrough_authn_context: false` does, substituting `PasswordProtectedTransport`) proves nothing about what the downstream SP receives.
 
 Comparison rules per SAML 2.0 §3.3.2.2.1 (`Comparison` attribute: `exact` / `minimum` / `maximum` / `better`). Default is `exact`. `relay_to_downstream` applies `StandardComparator` unconditionally — the `AuthnContextComparator` trait is public, but there is no override plumbed through `RelayToDownstream`, so a deployment with a custom AuthnContext hierarchy cannot substitute its own today. Both `NotSatisfied` and `NotComparable` collapse to `Error::AuthnContextDowngrade`, i.e. fail closed.
 
@@ -364,7 +364,12 @@ pub trait AuthnContextComparator: Send + Sync {
     fn satisfies(&self, requested: &str, actual: &str) -> bool;
 }
 
-pub struct StandardComparator;  // built-in: exact + minimum + better per spec
+pub struct StandardComparator;  // built-in: exact / minimum / maximum / better
+```
+
+`StandardComparator` ranks the standard class refs and treats anything else as unrankable. An ordered comparison (`minimum` / `maximum` / `better`) whose requested set contains *any* unrankable class returns `NotComparable` rather than deciding on the rankable remainder — nothing places a vendor-defined class in the standard hierarchy, so no ordered verdict against it is sound.
+
+```rust
 ```
 
 ---
