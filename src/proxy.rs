@@ -70,11 +70,6 @@ impl<'a> Proxy<'a> {
     pub fn idp(&self) -> &IdentityProvider {
         self.idp
     }
-
-    /// Borrow the context codec.
-    pub fn context_codec(&self) -> &dyn ProxyContextCodec {
-        &*self.context_codec
-    }
 }
 
 // =============================================================================
@@ -83,8 +78,37 @@ impl<'a> Proxy<'a> {
 
 /// AEAD wrapper for the stateless context blob carried in `RelayState` across
 /// the upstream round-trip. See RFC-005 §2.
+///
+/// # Security-critical
+///
+/// An implementation of this trait **is** the proxy's trust anchor. Whatever
+/// [`decode`](Self::decode) returns is what [`Proxy::decode_context`] attests
+/// and [`Proxy::relay_to_downstream`] then signs a downstream assertion from.
+/// Wrapping the result in a [`ProxyContext`] is not independent evidence of
+/// authenticity — it records that *this codec* vouched for the blob, nothing
+/// more.
+///
+/// A correct implementation must therefore:
+///
+/// - Authenticate the blob, not merely parse it. An unauthenticated
+///   deserialize (`decode -> Ok(payload)` for any well-formed input) hands an
+///   attacker the ability to name any registered SP and ACS.
+/// - Bind the blob to this deployment's key or store, so a token minted
+///   elsewhere is refused.
+/// - Reject stale blobs. [`ProxyContextPayload::issued_at`] exists for this;
+///   [`Aes256GcmCodec`] enforces a `max_age`.
+///
+/// [`Aes256GcmCodec`] (AEAD over a caller-supplied key) and
+/// [`OpaqueHandleCodec`] (server-side store lookup) both satisfy this. Prefer
+/// them to a hand-rolled codec.
 pub trait ProxyContextCodec: Send + Sync {
+    /// Seal a payload into a blob. Called by
+    /// [`Proxy::bounce_to_upstream`]; there is no public path to it, because
+    /// a caller able to seal an arbitrary payload could round-trip it through
+    /// [`Proxy::decode_context`] and obtain a genuine attestation for a
+    /// context they invented.
     fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error>;
+    /// Authenticate a blob and return the payload it carries.
     fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error>;
 }
 
@@ -472,6 +496,23 @@ impl Proxy<'_> {
     ///
     /// Whatever the codec returns for a blob it will not vouch for: tampered,
     /// expired, unknown, or malformed.
+    ///
+    /// # The sealing side is not reachable
+    ///
+    /// Authentication establishes that a blob came from whoever holds the
+    /// key. If a caller could also *seal* a blob, that would be everyone: they
+    /// would build a payload naming any registered SP and ACS, encode it, and
+    /// decode it straight back into an authoritative context. So the codec
+    /// accessor is crate-internal and this does not compile:
+    ///
+    /// ```compile_fail
+    /// # use saml::{Proxy, ProxyContextPayload};
+    /// fn forge(proxy: &Proxy<'_>, payload: &ProxyContextPayload) -> String {
+    ///     // There is no public accessor for the codec, so its `encode` is
+    ///     // unreachable from outside the crate.
+    ///     proxy.context_codec().encode(payload).unwrap()
+    /// }
+    /// ```
     pub fn decode_context(&self, blob: &str) -> Result<ProxyContext, Error> {
         let payload = self.context_codec.decode(blob)?;
         Ok(ProxyContext::attested(payload))
@@ -551,16 +592,19 @@ impl Proxy<'_> {
             }
         }
 
-        // 1b. Validate every issuance time bound before any caller callback.
+        // 1b. Verify the assertion can actually be issued, before any
+        //     caller callback runs.
         //
         //     Attribute release and NameID transformation are caller-supplied
         //     and may write to a pseudonym store, a directory, or an audit
-        //     log. Issuance computes three deadlines from `now` and each can
-        //     overflow; discovering that afterwards means those side effects
-        //     have already happened for a response that will never be issued.
-        //     The values are recomputed inside issuance — this is a
-        //     precondition check, not the source of truth — so the ordering is
-        //     the entire point.
+        //     log. If issuance then fails, those side effects have happened
+        //     for a response that will never exist.
+        //
+        //     This goes through the same `issuance_instants` the assertion
+        //     builder uses, so the preflight cannot drift from the real thing.
+        //     An earlier version checked only the additions and so missed
+        //     `now = UNIX_EPOCH`, where `NotBefore = now - 1min` underflows,
+        //     and missed the formatting failures entirely.
         let session_not_on_or_after =
             input
                 .now
@@ -568,21 +612,13 @@ impl Proxy<'_> {
                 .ok_or(Error::InvalidConfiguration {
                     reason: "session_not_on_or_after overflow",
                 })?;
-        input
-            .now
-            .checked_add(input.subject_confirmation_lifetime)
-            .ok_or(Error::InvalidConfiguration {
-                reason: "subject_confirmation_lifetime overflow",
-            })?;
-        // Issuance uses `session_lifetime` as the assertion lifetime too, so
-        // this is the same bound; kept explicit so the two stay tied together
-        // if that ever changes.
-        input
-            .now
-            .checked_add(input.session_lifetime)
-            .ok_or(Error::InvalidConfiguration {
-                reason: "assertion_lifetime overflow",
-            })?;
+        crate::response::issue::issuance_instants(
+            input.now,
+            input.session_lifetime,
+            input.subject_confirmation_lifetime,
+            input.upstream_identity.authn_instant(),
+            Some(session_not_on_or_after),
+        )?;
 
         // 2. Attribute release.
         let attributes = input
@@ -1452,9 +1488,9 @@ mod tests {
 
         // The encoded RelayState round-trips through the codec.
         let decoded = proxy
-            .context_codec()
-            .decode(&bounce.upstream_relay_state)
+            .decode_context(&bounce.upstream_relay_state)
             .expect("decode context");
+        let decoded = decoded.payload();
         assert_eq!(decoded.downstream_request_id, "_req-downstream");
         assert_eq!(
             decoded.downstream_relay_state.as_deref(),
@@ -1601,6 +1637,104 @@ mod tests {
         assert!(
             !transform.called.load(std::sync::atomic::Ordering::SeqCst),
             "NameID transformation ran despite an unsatisfiable time bound"
+        );
+    }
+
+    /// At `now = UNIX_EPOCH` every addition succeeds, so an overflow-only
+    /// preflight let both callbacks run — and issuance then failed computing
+    /// `Conditions/@NotBefore = now - 1 minute`, which underflows.
+    #[test]
+    fn relay_validates_not_before_underflow_before_callbacks() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([5u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let context = sample_context();
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default();
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &ProxyContext::attested(context.clone()),
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                // Additions from here all succeed; the subtraction does not.
+                now: SystemTime::UNIX_EPOCH,
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("NotBefore is pre-epoch at the epoch");
+
+        // `checked_sub` succeeds — `SystemTime` represents pre-epoch instants
+        // fine — and `format_xs_datetime` is what rejects it. That is exactly
+        // why the preflight has to format, not just do the arithmetic.
+        assert!(
+            matches!(err, Error::XmlEmit(_)),
+            "expected the pre-epoch formatting failure, got {err:?}"
+        );
+        assert!(
+            !release.called.load(std::sync::atomic::Ordering::SeqCst),
+            "attribute release ran despite an unissuable assertion"
+        );
+        assert!(
+            !transform.called.load(std::sync::atomic::Ordering::SeqCst),
+            "NameID transformation ran despite an unissuable assertion"
+        );
+    }
+
+    /// Timestamp *formatting* can fail too — `format_xs_datetime` rejects
+    /// instants it cannot represent. A preflight that only did the arithmetic
+    /// would run both callbacks and fail afterwards.
+    #[test]
+    fn relay_validates_timestamp_formatting_before_callbacks() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([5u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let context = sample_context();
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default();
+
+        // Constructible, and the additions below succeed, but the civil date
+        // is outside the representable range.
+        let now = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(100_000_000_000_000_000))
+            .expect("constructible");
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &ProxyContext::attested(context.clone()),
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now,
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("this instant cannot be formatted as xs:dateTime");
+
+        assert!(
+            matches!(err, Error::XmlEmit(_)),
+            "expected a formatting failure, got {err:?}"
+        );
+        assert!(
+            !release.called.load(std::sync::atomic::Ordering::SeqCst),
+            "attribute release ran despite an unformattable timestamp"
+        );
+        assert!(
+            !transform.called.load(std::sync::atomic::Ordering::SeqCst),
+            "NameID transformation ran despite an unformattable timestamp"
         );
     }
 
@@ -2009,9 +2143,9 @@ mod tests {
             .expect("bounce ok");
 
         let sealed = proxy
-            .context_codec()
-            .decode(&bounce.upstream_relay_state)
+            .decode_context(&bounce.upstream_relay_state)
             .expect("decode context");
+        let sealed = sealed.payload();
 
         assert_eq!(
             sealed.downstream_sp_entity_id, real_sp,
