@@ -2227,7 +2227,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/ars",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect_err("an unauthenticated resolve must not be honoured");
         assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
@@ -2252,7 +2252,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/ars",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect("accepted without a signature");
         assert!(!req.signature_verified());
@@ -2349,7 +2349,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/ars",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect("resolve parses");
 
@@ -2386,7 +2386,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/ars",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect_err("Destination names a different endpoint");
         assert!(matches!(err, Error::DestinationMismatch), "got {err:?}");
@@ -2411,7 +2411,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/not-registered",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect_err("destination is not a registered ARS");
         assert!(
@@ -2446,7 +2446,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/ars",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect("resolve parses");
 
@@ -2494,7 +2494,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/dual",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect_err("that URL is registered, but not as a SOAP ARS");
         assert!(
@@ -2598,7 +2598,7 @@ mod tests {
                 &sp,
                 None,
                 "https://idp.example.com/ars",
-                envelope.as_bytes(),
+                envelope.soap_envelope.as_bytes(),
             )
             .expect_err("issuer does not match the supplied descriptor");
         assert!(matches!(

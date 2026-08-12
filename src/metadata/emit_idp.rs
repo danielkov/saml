@@ -135,9 +135,21 @@ pub(super) fn build_idp_entity_descriptor(
     // ArtifactResolutionService endpoints (indexed; the schema requires an
     // `index` attribute on each — we emit one even if the caller forgot, to
     // keep the output schema-valid).
+    // Publishing an ARS set that cannot route an artifact is the same defect
+    // as accepting one: `index` is REQUIRED and must identify exactly one
+    // endpoint. Checked here so both the standalone and aggregate emitters
+    // inherit it — they share this builder.
+    crate::descriptor::idp::validate_artifact_resolution_endpoints(inputs.artifact_resolution)?;
     for endpoint in inputs.artifact_resolution {
         idp_descriptor =
-            idp_descriptor.with_child(Node::Element(build_artifact_resolution_endpoint(endpoint)));
+            idp_descriptor.with_child(Node::Element(build_artifact_resolution_endpoint(
+                endpoint,
+                endpoint
+                    .index
+                    .ok_or(Error::AmbiguousArtifactEndpointIndex {
+                        reason: "ArtifactResolutionService is missing the required index attribute",
+                    })?,
+            )));
     }
 
     let idp_descriptor = idp_descriptor.finish();
@@ -189,14 +201,14 @@ fn build_slo_endpoint(endpoint: &Endpoint) -> Element {
         .finish()
 }
 
-fn build_artifact_resolution_endpoint(endpoint: &Endpoint) -> Element {
+fn build_artifact_resolution_endpoint(endpoint: &Endpoint, index: u16) -> Element {
     let mut builder = Element::build(md_qname("ArtifactResolutionService"))
         .with_attribute(QName::new(None, "Binding"), endpoint.binding.uri())
-        .with_attribute(QName::new(None, "Location"), endpoint.url.clone());
-    // Schema requires an `index` attribute on ArtifactResolutionService.
-    // Fall back to `0` if the caller did not supply one.
-    let index = endpoint.index.unwrap_or(0);
-    builder = builder.with_attribute(QName::new(None, "index"), index.to_string());
+        .with_attribute(QName::new(None, "Location"), endpoint.url.clone())
+        // Validated by the caller: emitting `unwrap_or(0)` here published
+        // metadata that named an endpoint the operator never chose, and could
+        // publish the same index twice.
+        .with_attribute(QName::new(None, "index"), index.to_string());
     if endpoint.is_default {
         builder = builder.with_attribute(QName::new(None, "isDefault"), "true");
     }
@@ -225,6 +237,72 @@ mod tests {
 
     fn rsa_cert() -> X509Certificate {
         X509Certificate::from_pem(RSA_CERT_PEM).unwrap()
+    }
+
+    /// Publishing an ARS set that cannot route an artifact is the same defect
+    /// as accepting one, so emission enforces the rule too. `index` is
+    /// REQUIRED on an IndexedEndpoint and must identify exactly one endpoint;
+    /// emitting `unwrap_or(0)` named an endpoint the operator never chose.
+    #[test]
+    fn emit_rejects_artifact_resolution_without_an_index() {
+        let cert = rsa_cert();
+        let ars = [Endpoint::soap("https://idp.example.com/ars", None, true)];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+
+        let err = emit_idp_metadata(&inputs, None)
+            .expect_err("index is REQUIRED on ArtifactResolutionService");
+        assert!(
+            matches!(err, Error::AmbiguousArtifactEndpointIndex { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn emit_rejects_duplicate_artifact_resolution_indices() {
+        let cert = rsa_cert();
+        let ars = [
+            Endpoint::soap("https://idp.example.com/ars-a", Some(0), true),
+            Endpoint::soap("https://idp.example.com/ars-b", Some(0), false),
+        ];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+
+        let err =
+            emit_idp_metadata(&inputs, None).expect_err("two endpoints cannot share an index");
+        assert!(
+            matches!(err, Error::AmbiguousArtifactEndpointIndex { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// The aggregate emitter shares `build_idp_entity_descriptor`, so it must
+    /// inherit the rule rather than needing its own copy.
+    #[test]
+    fn aggregate_emit_inherits_the_artifact_index_rule() {
+        let cert = rsa_cert();
+        let ars = [Endpoint::soap("https://idp.example.com/ars", None, true)];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+
+        let err = build_idp_entity_descriptor(&inputs, "_agg-child")
+            .expect_err("the shared builder is where the rule lives");
+        assert!(
+            matches!(err, Error::AmbiguousArtifactEndpointIndex { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A well-formed set still emits, and carries the operator's index rather
+    /// than a defaulted one.
+    #[test]
+    fn emit_publishes_the_declared_artifact_index() {
+        let cert = rsa_cert();
+        let ars = [Endpoint::soap("https://idp.example.com/ars", Some(7), true)];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+
+        let xml = emit_idp_metadata(&inputs, None).expect("valid ARS set emits");
+        assert!(
+            xml.contains(r#"index="7""#),
+            "must publish the declared index, got: {xml}"
+        );
     }
 
     fn signing_keypair() -> KeyPair {

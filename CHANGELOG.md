@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ServiceProvider::consume_response_artifact` now decodes the index and
   selects that exact endpoint, refusing an index the IdP does not advertise.
 
+- **Breaking:** `binding::artifact::build_artifact_resolve` returns an
+  `ArtifactResolveEnvelope` carrying both the SOAP envelope and the
+  `ArtifactResolve/@ID`, and `parse_artifact_response` takes that ID and
+  requires the response's `@InResponseTo` to match. The pair previously
+  discarded the generated ID and checked nothing, so callers of the manual
+  low-level exchange had no way to correlate a response at all.
+- **Breaking:** IdP metadata emission rejects an `ArtifactResolutionService`
+  with no `index`, or two sharing one, instead of emitting `index="0"`.
+  Publishing metadata that names an endpoint the operator never chose, or the
+  same index twice, is the same defect as accepting it. Both the standalone and
+  aggregate emitters share the validated builder.
 - `BackchannelClient::resolve_artifact` now requires the
   `ArtifactResponse/@InResponseTo` to match the `ArtifactResolve/@ID` it sent.
   It previously accepted any otherwise-valid `ArtifactResponse`, so a
