@@ -500,13 +500,73 @@ pub struct BounceResult {
     pub upstream_relay_state: String,
 }
 
+/// Inputs for [`Proxy::consume_upstream_response`].
+///
+/// Mirrors [`ConsumeResponse`](crate::ConsumeResponse) minus `tracker`, which
+/// is taken from the authenticated context rather than supplied — that
+/// substitution is the entire point of routing through this method.
+pub struct ConsumeUpstreamResponse<'a> {
+    /// The `RelayState` blob the upstream IdP returned.
+    pub relay_state: &'a str,
+    /// Descriptor of the upstream IdP whose signature must verify.
+    pub upstream_idp: &'a IdpDescriptor,
+    pub peer_crypto_policy: Option<&'a crate::dsig::algorithms::PeerCryptoPolicy>,
+    /// Raw `<samlp:Response>` XML, already base64-decoded by the binding layer.
+    pub saml_response: &'a [u8],
+    pub binding: crate::binding::SsoResponseBinding,
+    /// The proxy's own ACS URL that received this Response.
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+    pub replay_cache: Option<&'a dyn crate::replay::ReplayCache>,
+    pub replay_mode: crate::replay::ReplayMode,
+    pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
+}
+
+/// An upstream `Identity` together with the context it was validated under.
+///
+/// # Why these travel as one value
+///
+/// [`Proxy::relay_to_downstream`] used to take a [`ProxyContext`] and an
+/// [`Identity`] as separate arguments. Both were individually attested — the
+/// context by the codec, the identity by response validation — and neither
+/// carried anything tying it to the other. `Identity` records no issuer, no
+/// request or tracker ID, no trust root. So a caller could pair identity B
+/// with context A and the proxy would mint a downstream assertion
+/// authenticating B's subject into A's transaction, with every individual
+/// check passing.
+///
+/// [`Proxy::consume_upstream_response`] authenticates the context and
+/// validates the response against *that context's* upstream tracker in one
+/// step, and returns this. Relay accepts only this type, so the pairing cannot
+/// be chosen by the caller.
+pub struct UpstreamFlow {
+    context: ProxyContext,
+    identity: Identity,
+}
+
+impl UpstreamFlow {
+    /// The authenticated context this response was validated against.
+    #[must_use]
+    pub fn context(&self) -> &ProxyContext {
+        &self.context
+    }
+
+    /// The validated upstream identity.
+    #[must_use]
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+}
+
 /// Inputs for [`Proxy::relay_to_downstream`]. See RFC-005 §4.2.
 pub struct RelayToDownstream<'a> {
-    /// Obtained from [`Proxy::decode_context`] — the only source of one.
-    pub context: &'a ProxyContext,
-    pub upstream_identity: &'a Identity,
+    /// From [`Proxy::consume_upstream_response`] — the only source of one.
+    /// Carries the context together with the identity validated under it, so
+    /// the two cannot be mismatched.
+    pub flow: &'a UpstreamFlow,
     /// Downstream SP descriptor (caller looks it up from
-    /// `context.downstream_sp_entity_id`).
+    /// `flow.context().downstream_sp_entity_id()`).
     pub downstream_sp: &'a SpDescriptor,
     /// Pluggable: which upstream attributes to release downstream.
     pub attribute_release: &'a dyn AttributeReleasePolicy,
@@ -605,6 +665,43 @@ impl Proxy<'_> {
         })
     }
 
+    /// Authenticate the relay token and validate the upstream Response
+    /// against *that* context, in one step.
+    ///
+    /// This is the only way to obtain an [`UpstreamFlow`], and therefore the
+    /// only way to reach [`relay_to_downstream`](Self::relay_to_downstream).
+    /// Doing the two together is what couples them: the `LoginTracker` the
+    /// response is correlated against comes from the context just
+    /// authenticated, not from an argument, so the caller cannot pair a
+    /// response with a context it was never validated under.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the codec returns for a blob it will not vouch for, or
+    /// whatever response validation rejects.
+    pub fn consume_upstream_response(
+        &self,
+        input: ConsumeUpstreamResponse<'_>,
+    ) -> Result<UpstreamFlow, Error> {
+        let context = self.decode_context(input.relay_state)?;
+        let identity = self.sp.consume_response(crate::sp::ConsumeResponse {
+            idp: input.upstream_idp,
+            peer_crypto_policy: input.peer_crypto_policy,
+            saml_response: input.saml_response,
+            binding: input.binding,
+            relay_state: Some(input.relay_state),
+            // From the context, never from the caller — this is the coupling.
+            tracker: Some(&context.payload().upstream_tracker),
+            expected_destination: input.expected_destination,
+            now: input.now,
+            clock_skew: input.clock_skew,
+            replay_cache: input.replay_cache,
+            replay_mode: input.replay_mode,
+            holder_of_key_cert: input.holder_of_key_cert,
+        })?;
+        Ok(UpstreamFlow { context, identity })
+    }
+
     /// Authenticate a relay token and return the context it carries.
     ///
     /// This is the only way to obtain a [`ProxyContext`], and therefore the
@@ -693,9 +790,9 @@ impl Proxy<'_> {
         //    it, replacing the binding rather than carrying it. Checked before
         //    any attribute release or NameID transformation, so nothing is
         //    computed for a pairing that will be refused.
-        if input.context.downstream_sp_entity_id() != input.downstream_sp.entity_id {
+        if input.flow.context().downstream_sp_entity_id() != input.downstream_sp.entity_id {
             return Err(Error::IssuerMismatch {
-                expected: input.context.downstream_sp_entity_id().to_owned(),
+                expected: input.flow.context().downstream_sp_entity_id().to_owned(),
                 got: Some(input.downstream_sp.entity_id.clone()),
             });
         }
@@ -708,8 +805,9 @@ impl Proxy<'_> {
         //     to fail afterwards on `UnregisteredAcs`. `for_proxy_reissue`
         //     re-resolves the same endpoint below; doing it here first costs a
         //     lookup and makes the failure ordering observable.
-        let downstream_acs =
-            SsoResponseEndpoint::try_from_endpoint(input.context.payload().downstream_acs.clone())?;
+        let downstream_acs = SsoResponseEndpoint::try_from_endpoint(
+            input.flow.context().payload().downstream_acs.clone(),
+        )?;
         if !input
             .downstream_sp
             .assertion_consumer_services
@@ -735,7 +833,7 @@ impl Proxy<'_> {
         //    signed assertion then advertised PasswordProtectedTransport. The
         //    check has to bind to the emitted value.
         let downstream_class_ref = if input.passthrough_authn_context {
-            input.upstream_identity.authn_context_class_ref().map_or(
+            input.flow.identity().authn_context_class_ref().map_or(
                 AuthnContextClassRef::PasswordProtectedTransport,
                 AuthnContextClassRef::from_uri,
             )
@@ -749,7 +847,7 @@ impl Proxy<'_> {
         //    [`crate::authn_context::StandardComparator`]. Both `NotSatisfied`
         //    and `NotComparable` collapse to `AuthnContextDowngrade`
         //    (fail-closed), matching the SP-side response validator.
-        if let Some(requested) = &input.context.payload().requested_authn_context {
+        if let Some(requested) = &input.flow.context().payload().requested_authn_context {
             match StandardComparator.evaluate(requested, downstream_class_ref.as_uri()) {
                 ComparatorOutcome::Satisfied => {}
                 ComparatorOutcome::NotSatisfied | ComparatorOutcome::NotComparable => {
@@ -782,19 +880,19 @@ impl Proxy<'_> {
             input.now,
             input.session_lifetime,
             input.subject_confirmation_lifetime,
-            input.upstream_identity.authn_instant(),
+            input.flow.identity().authn_instant(),
             Some(session_not_on_or_after),
         )?;
 
         // 2. Attribute release.
         let attributes = input
             .attribute_release
-            .release(input.upstream_identity.attributes(), input.downstream_sp);
+            .release(input.flow.identity().attributes(), input.downstream_sp);
 
         // 3. NameID transformation.
         let downstream_name_id = input.name_id_transform.transform(
-            input.upstream_identity.name_id(),
-            input.upstream_identity.attributes(),
+            input.flow.identity().name_id(),
+            input.flow.identity().attributes(),
             input.downstream_sp,
         )?;
 
@@ -809,12 +907,27 @@ impl Proxy<'_> {
         // SP it was never checked against.
         let synthetic = ParsedAuthnRequest::for_proxy_reissue(
             input.downstream_sp,
-            input.context.payload().downstream_request_id.clone(),
-            input.context.payload().issued_at,
+            input.flow.context().payload().downstream_request_id.clone(),
+            input.flow.context().payload().issued_at,
             acs_endpoint,
-            input.context.payload().requested_name_id_format.clone(),
-            input.context.payload().requested_authn_context.clone(),
-            input.context.payload().downstream_relay_state.clone(),
+            input
+                .flow
+                .context()
+                .payload()
+                .requested_name_id_format
+                .clone(),
+            input
+                .flow
+                .context()
+                .payload()
+                .requested_authn_context
+                .clone(),
+            input
+                .flow
+                .context()
+                .payload()
+                .downstream_relay_state
+                .clone(),
         )?;
 
         // 6. Hand off to the IdP role for `<samlp:Response>` issuance.
@@ -825,7 +938,7 @@ impl Proxy<'_> {
             in_response_to: &synthetic,
             name_id: downstream_name_id,
             attributes,
-            authn_instant: input.upstream_identity.authn_instant(),
+            authn_instant: input.flow.identity().authn_instant(),
             session_index,
             session_not_on_or_after: Some(session_not_on_or_after),
             authn_context_class_ref: downstream_class_ref,
@@ -1399,6 +1512,20 @@ mod tests {
         }
     }
 
+    /// Couple a context and an identity for tests.
+    ///
+    /// Production code can only get an `UpstreamFlow` from
+    /// `consume_upstream_response`, which validates the response against the
+    /// context's own tracker. These tests exercise relay's logic downstream of
+    /// that, so they assemble the pair directly — which is possible here only
+    /// because this module is inside the crate.
+    fn flow(context: ProxyContextPayload, identity: Identity) -> UpstreamFlow {
+        UpstreamFlow {
+            context: ProxyContext::attested(context),
+            identity,
+        }
+    }
+
     fn sample_context() -> ProxyContextPayload {
         let tracker_issued_at = SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_hours(494_388))
@@ -1681,8 +1808,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -1698,8 +1824,7 @@ mod tests {
         // Control: with passthrough on, the emitted class *is* MFA and it passes.
         proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context),
-                upstream_identity: &identity,
+                flow: &flow(context, identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -1904,8 +2029,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -1953,8 +2077,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2013,8 +2136,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2056,8 +2178,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2097,8 +2218,7 @@ mod tests {
 
         let dispatch = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAllowList {
                     names: vec!["urn:oid:0.9.2342.19200300.100.1.3".into()],
@@ -2148,8 +2268,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2360,8 +2479,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2392,8 +2510,7 @@ mod tests {
 
         proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2506,8 +2623,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp_descriptor(),
                 attribute_release: &release,
                 name_id_transform: &transform,
@@ -2547,8 +2663,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &twin,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
@@ -2580,8 +2695,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &ProxyContext::attested(context.clone()),
-                upstream_identity: &identity,
+                flow: &flow(context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
                 name_id_transform: &PassThroughNameId,
