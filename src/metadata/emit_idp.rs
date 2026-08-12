@@ -139,17 +139,12 @@ pub(super) fn build_idp_entity_descriptor(
     // as accepting one: `index` is REQUIRED and must identify exactly one
     // endpoint. Checked here so both the standalone and aggregate emitters
     // inherit it — they share this builder.
-    crate::descriptor::idp::validate_artifact_resolution_endpoints(inputs.artifact_resolution)?;
-    for endpoint in inputs.artifact_resolution {
-        idp_descriptor =
-            idp_descriptor.with_child(Node::Element(build_artifact_resolution_endpoint(
-                endpoint,
-                endpoint
-                    .index
-                    .ok_or(Error::AmbiguousArtifactEndpointIndex {
-                        reason: "ArtifactResolutionService is missing the required index attribute",
-                    })?,
-            )));
+    let ars_indices =
+        crate::descriptor::idp::validate_artifact_resolution_endpoints(inputs.artifact_resolution)?;
+    for (endpoint, index) in inputs.artifact_resolution.iter().zip(ars_indices) {
+        idp_descriptor = idp_descriptor.with_child(Node::Element(
+            build_artifact_resolution_endpoint(endpoint, index),
+        ));
     }
 
     let idp_descriptor = idp_descriptor.finish();

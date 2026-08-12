@@ -165,9 +165,12 @@ impl IdpDescriptor {
 /// artifact carries. Accepting a missing one leaves the endpoint unaddressable;
 /// accepting duplicates makes routing depend on ordering. Both are refused at
 /// the boundary rather than producing a silently wrong resolve later.
+/// Returns the validated indices, in endpoint order, so a caller that needs
+/// them does not have to re-unwrap `Option` and carry an unreachable error
+/// branch for a case this already rejected.
 pub(crate) fn validate_artifact_resolution_endpoints(
     endpoints: &[crate::binding::Endpoint],
-) -> Result<(), Error> {
+) -> Result<Vec<u16>, Error> {
     let mut seen = Vec::with_capacity(endpoints.len());
     for endpoint in endpoints {
         let Some(index) = endpoint.index else {
@@ -182,7 +185,7 @@ pub(crate) fn validate_artifact_resolution_endpoints(
         }
         seen.push(index);
     }
-    Ok(())
+    Ok(seen)
 }
 
 #[cfg(test)]
