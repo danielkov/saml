@@ -730,14 +730,18 @@ impl IdentityProvider {
         // The caller must have routed this to an endpoint it actually
         // advertises — the same caller-bug guard the AuthnRequest and SLO
         // paths apply.
+        // Binding matters as well as URL: an ArtifactResolutionService is a
+        // SOAP endpoint (SAML 2.0 Bindings §3.6.3), and an IdP may advertise
+        // a POST or Redirect endpoint at the same location for a different
+        // profile. Matching on URL alone would accept one of those as an ARS.
         if !self
             .config
             .artifact_resolution
             .iter()
-            .any(|e| e.url == expected_destination)
+            .any(|e| e.url == expected_destination && e.binding == Binding::Soap)
         {
             return Err(Error::InvalidConfiguration {
-                reason: "expected_destination is not a registered ArtifactResolutionService",
+                reason: "expected_destination is not a registered SOAP ArtifactResolutionService",
             });
         }
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
@@ -763,7 +767,7 @@ impl IdentityProvider {
             Some(dest) if dest != expected_destination => {
                 return Err(Error::DestinationMismatch);
             }
-            None if req.signature_verified => {
+            None if req.signature_verified() => {
                 return Err(Error::SchemaViolation {
                     element: "{urn:oasis:names:tc:SAML:2.0:protocol}ArtifactResolve".to_owned(),
                     reason: "signed ArtifactResolve must carry @Destination (SAML Core §3.2.1)",
@@ -771,10 +775,10 @@ impl IdentityProvider {
             }
             _ => {}
         }
-        if req.issuer != sp.entity_id {
+        if req.issuer() != sp.entity_id {
             return Err(Error::IssuerMismatch {
                 expected: sp.entity_id.clone(),
-                got: Some(req.issuer.clone()),
+                got: Some(req.issuer().to_owned()),
             });
         }
         Ok(req)
@@ -801,7 +805,7 @@ impl IdentityProvider {
     /// The strength of the check is bounded by how the resolver was
     /// authenticated: with
     /// [`want_artifact_resolve_signed`](IdentityProviderConfig::want_artifact_resolve_signed)
-    /// set, `request.issuer` is signature-authenticated and this is a real
+    /// set, `request.issuer()` is signature-authenticated and this is a real
     /// authorization boundary. Without it, `issuer` is an unauthenticated
     /// claim, so the comparison catches misrouting but not a determined
     /// attacker — authenticate the back-channel, by signature or client TLS.
@@ -814,10 +818,10 @@ impl IdentityProvider {
         recipient_entity_id: &str,
         payload_xml: &str,
     ) -> Result<String, Error> {
-        if request.issuer != recipient_entity_id {
+        if request.issuer() != recipient_entity_id {
             return Err(Error::ArtifactRecipientMismatch {
                 expected: recipient_entity_id.to_owned(),
-                received: request.issuer.clone(),
+                received: request.issuer().to_owned(),
             });
         }
         crate::binding::artifact::build_artifact_response(
@@ -2209,7 +2213,7 @@ mod tests {
                 envelope.as_bytes(),
             )
             .expect("accepted without a signature");
-        assert!(!req.signature_verified);
+        assert!(!req.signature_verified());
         assert_eq!(req.artifact, "AAQAAK1234567890");
     }
 
@@ -2242,7 +2246,7 @@ mod tests {
         let req = idp
             .parse_artifact_resolve(&sp, Some(&legacy), "https://idp.example.com/ars", &envelope)
             .expect("per-peer override admits the legacy digest");
-        assert!(req.signature_verified);
+        assert!(req.signature_verified());
 
         assert!(
             !idp.config
@@ -2374,6 +2378,89 @@ mod tests {
         );
     }
 
+    /// Authorization reads the resolver's identity, so that identity must not
+    /// be writable. With `issuer` and `signature_verified` public, a caller
+    /// could take a request verified as SP-A, rewrite the issuer to SP-B, and
+    /// collect SP-B's stashed response — or construct one outright asserting
+    /// `signature_verified: true`. Both fields are now private with read-only
+    /// accessors, and `ArtifactResolveRequest` has no public constructor.
+    ///
+    /// This compiles only because neither mutation nor construction is
+    /// expressible; the test documents the property the type enforces.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn resolver_identity_is_read_only_and_parser_established() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let req = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/ars",
+                envelope.as_bytes(),
+            )
+            .expect("resolve parses");
+
+        // Only the parser sets these; they are readable, never assignable.
+        assert_eq!(req.issuer(), sp.entity_id);
+        assert!(!req.signature_verified());
+
+        // `req.issuer = ...`, `req.signature_verified = true`, and
+        // `ArtifactResolveRequest { .. }` are all rejected at compile time.
+        // Authorization therefore cannot be handed a forged identity.
+        let err = idp
+            .build_artifact_response(
+                &req,
+                "https://other-sp.example.com",
+                r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_r1" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#,
+            )
+            .expect_err("the parsed issuer is what authorization sees");
+        assert!(
+            matches!(err, Error::ArtifactRecipientMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// An ArtifactResolutionService is a SOAP endpoint. Matching the caller's
+    /// `expected_destination` on URL alone would accept a POST or Redirect
+    /// endpoint an IdP advertises at the same location for another profile.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_destination_must_be_a_soap_endpoint() {
+        let mut idp = idp_with_artifact_resolve_signed(false);
+        idp.config.artifact_resolution = vec![
+            Endpoint::post("https://idp.example.com/dual", 0, true),
+            Endpoint::soap("https://idp.example.com/ars", None, true),
+        ];
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/dual",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/dual",
+                envelope.as_bytes(),
+            )
+            .expect_err("that URL is registered, but not as a SOAP ARS");
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+    }
+
     /// SAML Core §3.2.1 makes `@Destination` REQUIRED on a signed protocol
     /// message. Tolerating its absence on a *signed* resolve would hand back
     /// the cross-endpoint replay the signature was meant to prevent.
@@ -2407,7 +2494,7 @@ mod tests {
         let req = idp
             .parse_artifact_resolve(&sp, None, "https://idp.example.com/ars", &envelope)
             .expect("unsigned resolves may omit Destination");
-        assert!(!req.signature_verified);
+        assert!(!req.signature_verified());
         assert!(req.destination.is_none());
     }
 

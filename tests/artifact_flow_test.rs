@@ -63,7 +63,7 @@ fn make_artifact_idp() -> common::TestResult<IdentityProvider> {
         entity_id: IDP_ENTITY_ID.to_owned(),
         sso: vec![Endpoint::post(IDP_SSO_URL, 0, true)],
         slo: vec![],
-        artifact_resolution: vec![Endpoint::post(IDP_ARS_URL, 0, true)],
+        artifact_resolution: vec![Endpoint::soap(IDP_ARS_URL, None, true)],
         supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
         default_name_id_format: NameIdFormat::EmailAddress,
         signing_key,
