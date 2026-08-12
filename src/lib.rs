@@ -201,7 +201,8 @@
 //! use saml::{
 //!     Binding, BounceToUpstream, ConsumeAuthnRequest, ConsumeResponse, IdpDescriptor,
 //!     IdentityProvider, NameIdFormat, OpaqueHandleCodec, PersistentPerSpHmac, Proxy,
-//!     ConsumeUpstreamResponse, ProxyContextStore, RelayToDownstream, ReleaseAllowList, ReplayMode,
+//!     ConsumeUpstreamResponse, InMemoryReplayCache, ProxyContextStore, RelayToDownstream,
+//!     ReleaseAllowList, ReplayMode,
 //!     ServiceProvider, SpDescriptor, SsoResponseBinding,
 //! };
 //!
@@ -257,6 +258,7 @@
 //! // One call: authenticate the RelayState blob and validate the Response
 //! // against *that* context's tracker. They come back coupled, so relay
 //! // cannot be handed an identity validated under a different context.
+//! let replay_cache = InMemoryReplayCache::new(1024);
 //! let flow = proxy.consume_upstream_response(ConsumeUpstreamResponse {
 //!     relay_state: &upstream_relay_state,
 //!     upstream_idp: &upstream_idp,
@@ -266,8 +268,9 @@
 //!     expected_destination: "https://hub.example.com/saml/acs",
 //!     now: SystemTime::now(),
 //!     clock_skew: Duration::from_secs(60),
-//!     replay_cache: None,
-//!     replay_mode: ReplayMode::All,
+//!     // Required here: consuming the upstream assertion is what makes one
+//!     // authentication yield one downstream assertion.
+//!     replay_cache: &replay_cache,
 //!     holder_of_key_cert: None,
 //! })?;
 //!
