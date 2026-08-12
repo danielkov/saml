@@ -295,18 +295,18 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // surfaces the parsed flag here and leaves enforcement (replay cache
     // keyed on `assertion_id`) to the caller. See `Identity::is_one_time_use`
     // for the contract.
-    Ok(Identity {
-        name_id: assertion.subject_name_id,
+    Ok(Identity::new(
+        assertion.subject_name_id,
         session_index,
         authn_instant,
         session_not_on_or_after,
         authn_context_class_ref,
-        attributes: assertion.attributes,
-        assertion_id: assertion.id,
-        not_on_or_after: conditions_not_on_or_after,
-        verifying_cert_fingerprint: verified_cert_fingerprint,
-        is_one_time_use: assertion.conditions.one_time_use,
-    })
+        assertion.attributes,
+        assertion.id,
+        conditions_not_on_or_after,
+        verified_cert_fingerprint,
+        assertion.conditions.one_time_use,
+    ))
 }
 
 // =============================================================================
