@@ -339,10 +339,16 @@ impl Proxy<'_> {
         )?;
 
         // 2. Build the ProxyContext from the parsed downstream request.
+        // Seal the provenance the validator established, not the `pub`
+        // wire-derived copies. Those are caller-mutable: validate against
+        // SP-A, rewrite `issuer` and `assertion_consumer_service` to SP-B,
+        // then bounce, and the proxy would preserve the rewritten values into
+        // a context downstream treats as authenticated — laundering a mutation
+        // into a trusted binding.
         let context = ProxyContext {
             downstream_request_id: downstream.id.clone(),
-            downstream_sp_entity_id: downstream.issuer.clone(),
-            downstream_acs: downstream.assertion_consumer_service.as_endpoint(),
+            downstream_sp_entity_id: downstream.validated_sp().to_owned(),
+            downstream_acs: downstream.validated_acs().as_endpoint(),
             downstream_relay_state: downstream.relay_state.clone(),
             requested_authn_context,
             requested_name_id_format,
@@ -376,6 +382,21 @@ impl Proxy<'_> {
         &self,
         input: RelayToDownstream<'_>,
     ) -> Result<SsoResponseDispatch, Error> {
+        // 0. The context must belong to the SP being relayed to.
+        //
+        //    Without this an authentic SP-A context can be paired with SP-B —
+        //    they may legitimately share an ACS URL and binding — and
+        //    `for_proxy_reissue` below would then stamp SP-B's provenance onto
+        //    it, replacing the binding rather than carrying it. Checked before
+        //    any attribute release or NameID transformation, so nothing is
+        //    computed for a pairing that will be refused.
+        if input.context.downstream_sp_entity_id != input.downstream_sp.entity_id {
+            return Err(Error::IssuerMismatch {
+                expected: input.context.downstream_sp_entity_id.clone(),
+                got: Some(input.downstream_sp.entity_id.clone()),
+            });
+        }
+
         // 1. Enforce AuthnContext non-downgrade (§7). The set-aggregating
         //    semantics — in particular, `Better` requires the actual class ref
         //    to be strictly stronger than the *max* of the requested set, per
@@ -1668,6 +1689,97 @@ mod tests {
                 subject_confirmation_lifetime: Duration::from_mins(5),
             })
             .expect("MultiFactorAuth > max(Password, Smartcard) under Better");
+    }
+
+    /// End-to-end laundering regression: rewriting the `pub` wire fields and
+    /// then bouncing must not carry the mutation into the sealed context.
+    ///
+    /// The proxy seals what downstream is later trusted to be, so if it read
+    /// the mutable copies a caller could validate against SP-A, rewrite both
+    /// fields to SP-B, bounce, and have the proxy launder the rewrite into a
+    /// context that downstream treats as authenticated. Decoding the sealed
+    /// blob is what makes this end-to-end — asserting on the request's own
+    /// accessors would pass whatever the proxy did with them.
+    #[test]
+    fn bouncing_does_not_launder_mutated_wire_fields_into_the_context() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let codec = Box::new(Aes256GcmCodec::new([9u8; 32]));
+        let proxy = Proxy::new(&sp, &idp, codec);
+        let upstream = upstream_idp_descriptor();
+
+        let mut downstream = synthetic_downstream_request();
+        let real_sp = downstream.validated_sp().to_owned();
+        let real_acs_url = downstream.validated_acs().url.clone();
+
+        // Everything a caller can reach.
+        downstream.issuer = "https://attacker-sp.example.com".into();
+        downstream.assertion_consumer_service =
+            SsoResponseEndpoint::post("https://attacker-sp.example.com/acs", 7, true);
+
+        let bounce = proxy
+            .bounce_to_upstream(BounceToUpstream {
+                upstream_idp: &upstream,
+                downstream_request: &downstream,
+                propagate_request_flags: true,
+                propagate_authn_context: true,
+                propagate_name_id_policy: true,
+                upstream_binding: Binding::HttpRedirect,
+                now: SystemTime::now(),
+            })
+            .expect("bounce ok");
+
+        let sealed = proxy
+            .context_codec()
+            .decode(&bounce.upstream_relay_state)
+            .expect("decode context");
+
+        assert_eq!(
+            sealed.downstream_sp_entity_id, real_sp,
+            "the sealed context must carry validated provenance, not the rewritten issuer"
+        );
+        assert_eq!(
+            sealed.downstream_acs.url, real_acs_url,
+            "the sealed context must carry the canonical ACS, not the rewritten one"
+        );
+    }
+
+    /// An authentic context for SP-A must not be relayable to SP-B, even when
+    /// the two legitimately share an ACS URL and binding. Without the check,
+    /// `for_proxy_reissue` would stamp SP-B's provenance onto SP-A's context —
+    /// replacing the binding rather than carrying it forward.
+    #[test]
+    fn relay_refuses_a_context_belonging_to_another_sp() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let codec = Box::new(Aes256GcmCodec::new([7u8; 32]));
+        let proxy = Proxy::new(&sp, &idp, codec);
+
+        // Same ACS as the real downstream SP; only the entity ID differs.
+        let mut twin = downstream_sp_descriptor();
+        twin.entity_id = "https://twin-sp.example.com".into();
+
+        let context = sample_context();
+        let identity = make_upstream_identity(AuthnContextClassRef::Password.as_uri());
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &context,
+                upstream_identity: &identity,
+                downstream_sp: &twin,
+                attribute_release: &ReleaseAll,
+                name_id_transform: &PassThroughNameId,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("the context was minted for a different SP");
+        assert!(
+            matches!(err, Error::IssuerMismatch { ref got, .. }
+                if got.as_deref() == Some("https://twin-sp.example.com")),
+            "got {err:?}"
+        );
     }
 
     #[test]
