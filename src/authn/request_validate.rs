@@ -71,6 +71,19 @@ pub struct ParsedAuthnRequest {
 struct ValidatedBinding {
     sp_entity_id: String,
     acs: SsoResponseEndpoint,
+    /// `@ForceAuthn` and `@IsPassive` as validated.
+    ///
+    /// `ForceAuthn` is a security requirement, not a preference: clearing it
+    /// after validation lets a proxy satisfy the request with a cached
+    /// upstream session when the SP demanded fresh authentication.
+    force_authn: bool,
+    is_passive: bool,
+    /// RelayState as the role layer sealed it, straight from the binding.
+    ///
+    /// The `pub` copy is caller-mutable and rewriting it cross-wires
+    /// application state: the downstream SP correlates its own session on this
+    /// value when the response comes back.
+    relay_state: Option<String>,
     /// The `@ID` this request carried when it was validated.
     ///
     /// It becomes the Response's `@InResponseTo`, which the SP correlates
@@ -91,6 +104,36 @@ struct ValidatedBinding {
 }
 
 impl ParsedAuthnRequest {
+    /// RelayState as the role layer sealed it from the binding.
+    ///
+    /// Read-only: the `pub` copy is caller-mutable, and this is what the
+    /// downstream SP correlates its session on.
+    #[must_use]
+    pub fn validated_relay_state(&self) -> Option<&str> {
+        self.validated.relay_state.as_deref()
+    }
+
+    /// Seal the RelayState the binding layer produced. Crate-internal: only
+    /// the role layer, immediately after validation, may vouch for it.
+    pub(crate) fn seal_relay_state(&mut self, relay_state: Option<String>) {
+        self.relay_state.clone_from(&relay_state);
+        self.validated.relay_state = relay_state;
+    }
+
+    /// `@ForceAuthn` as validated. Read-only: clearing the `pub` copy would
+    /// let a proxy answer with a cached upstream session when the SP required
+    /// fresh authentication.
+    #[must_use]
+    pub fn validated_force_authn(&self) -> bool {
+        self.validated.force_authn
+    }
+
+    /// `@IsPassive` as validated. Read-only for the same reason.
+    #[must_use]
+    pub fn validated_is_passive(&self) -> bool {
+        self.validated.is_passive
+    }
+
     /// The `@ID` this request carried when it was validated.
     ///
     /// Unlike [`id`](Self::id) this cannot be rewritten by the caller, so it
@@ -188,6 +231,9 @@ impl ParsedAuthnRequest {
                 sp_entity_id: sp.entity_id.clone(),
                 acs: canonical,
                 request_id: id.clone(),
+                force_authn: false,
+                is_passive: false,
+                relay_state: relay_state.clone(),
                 requested_authn_context: requested_authn_context.clone(),
                 requested_name_id_format: requested_name_id_format.clone(),
             },
@@ -314,8 +360,12 @@ pub(crate) fn validate_authn_request(
             sp_entity_id: sp.entity_id.clone(),
             acs: resolved_canonical,
             request_id: raw.id.clone(),
+            force_authn: raw.force_authn,
+            is_passive: raw.is_passive,
             requested_authn_context: raw.requested_authn_context.clone(),
             requested_name_id_format: raw.requested_name_id_format.clone(),
+            // The role layer seals this immediately after validate.
+            relay_state: None,
         },
         force_authn: raw.force_authn,
         is_passive: raw.is_passive,

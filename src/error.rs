@@ -190,6 +190,18 @@ pub enum Error {
     /// nothing.
     #[error("UpstreamFlow belongs to a different Proxy instance")]
     ForeignProxyFlow,
+    /// The SP's `<samlp:NameIDPolicy>/@Format` names a format this IdP cannot
+    /// produce.
+    ///
+    /// SAML 2.0 Core §3.4.1.1: when the IdP cannot honour the requested
+    /// format, it must respond with `InvalidNameIDPolicy` rather than
+    /// substituting one. Silently returning a different format hands the SP an
+    /// identifier with different semantics — a persistent pseudonym where a
+    /// transient one was asked for, say — under a request it believes was
+    /// satisfied. Callers should map this to
+    /// `SamlStatusCode::InvalidNameIdPolicy`.
+    #[error("requested NameIDPolicy format {requested} is not supported")]
+    UnsupportedNameIdPolicy { requested: String },
     /// A solicited Response arrived over a different binding than the ACS
     /// endpoint recorded in the `LoginTracker` when the `AuthnRequest` was
     /// issued. Both bindings are legal for SSO responses — they simply do not
