@@ -205,6 +205,16 @@ pub enum Error {
     UnsupportedByPeer { binding: Binding },
     #[error("AuthnRequest/@ProtocolBinding is not legal for SSO Response: {requested:?}")]
     IllegalResponseBinding { requested: Binding },
+    /// An [`UpstreamFlow`](crate::UpstreamFlow) was presented to a different
+    /// `Proxy` than the one that produced it.
+    ///
+    /// A flow carries a trust decision — the context this proxy's codec
+    /// authenticated, and the response validated against it. Honouring one
+    /// from another instance would mean acting on that instance's codec, and
+    /// a caller is free to construct a proxy whose codec authenticates
+    /// nothing.
+    #[error("UpstreamFlow belongs to a different Proxy instance")]
+    ForeignProxyFlow,
     /// A solicited Response arrived over a different binding than the ACS
     /// endpoint recorded in the `LoginTracker` when the `AuthnRequest` was
     /// issued. Both bindings are legal for SSO responses — they simply do not

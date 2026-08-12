@@ -41,8 +41,8 @@ pub struct ParsedAuthnRequest {
     pub protocol_binding: Option<SsoResponseBinding>,
     /// Raw selection from the request, kept for logging.
     pub assertion_consumer_service_selection: AcsSelection,
-    /// The SP this request was validated against, and the canonical ACS
-    /// endpoint resolved from that SP's metadata.
+    /// The SP this request was validated against, the canonical ACS endpoint
+    /// resolved from that SP's metadata, and the policies it carried.
     ///
     /// Private on purpose. Every other field here is wire-derived and `pub`,
     /// so provenance cannot be reconstructed from them: a caller can validate
@@ -71,9 +71,36 @@ pub struct ParsedAuthnRequest {
 struct ValidatedBinding {
     sp_entity_id: String,
     acs: SsoResponseEndpoint,
+    /// The policies the request actually carried when it was validated.
+    ///
+    /// Held here for the same reason as the SP and ACS: the `pub` copies are
+    /// caller-mutable, and these decide what gets enforced. A caller could
+    /// validate a request demanding `Exact(MultiFactorAuth)`, clear the field,
+    /// and have the weakened policy sealed into the proxy context as
+    /// authoritative — or drive direct issuance with nothing to check against.
+    requested_authn_context: Option<RequestedAuthnContext>,
+    requested_name_id_format: Option<NameIdFormat>,
 }
 
 impl ParsedAuthnRequest {
+    /// The `<samlp:RequestedAuthnContext>` this request carried when it was
+    /// validated.
+    ///
+    /// Unlike [`requested_authn_context`](Self::requested_authn_context) this
+    /// cannot be rewritten by the caller, so it is what enforcement uses.
+    #[must_use]
+    pub fn validated_authn_context(&self) -> Option<&RequestedAuthnContext> {
+        self.validated.requested_authn_context.as_ref()
+    }
+
+    /// The `<samlp:NameIDPolicy>/@Format` this request carried when it was
+    /// validated. Read-only for the same reason as
+    /// [`validated_authn_context`](Self::validated_authn_context).
+    #[must_use]
+    pub fn validated_name_id_format(&self) -> Option<&NameIdFormat> {
+        self.validated.requested_name_id_format.as_ref()
+    }
+
     /// Entity ID of the SP this request was validated against.
     ///
     /// Unlike [`issuer`](Self::issuer) this cannot be rewritten by the
@@ -143,6 +170,8 @@ impl ParsedAuthnRequest {
             validated: ValidatedBinding {
                 sp_entity_id: sp.entity_id.clone(),
                 acs: canonical,
+                requested_authn_context: requested_authn_context.clone(),
+                requested_name_id_format: requested_name_id_format.clone(),
             },
             force_authn: false,
             is_passive: false,
@@ -266,6 +295,8 @@ pub(crate) fn validate_authn_request(
         validated: ValidatedBinding {
             sp_entity_id: sp.entity_id.clone(),
             acs: resolved_canonical,
+            requested_authn_context: raw.requested_authn_context.clone(),
+            requested_name_id_format: raw.requested_name_id_format.clone(),
         },
         force_authn: raw.force_authn,
         is_passive: raw.is_passive,
