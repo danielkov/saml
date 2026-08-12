@@ -210,9 +210,8 @@ ecdsa-sha = []
 xmlenc = []
 slo = []
 metadata-emit = []
-artifact-binding = []
-weak-algos = ["dep:sha1"]            # SHA-1 verify, RSA-1.5 key transport, DSA
 artifact-binding = ["dep:sha1"]      # SHA-1 SourceID only — independent of weak-algos
+weak-algos = ["dep:sha1"]            # SHA-1 verify, RSA-1.5 key transport, DSA
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

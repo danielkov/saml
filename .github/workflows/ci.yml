@@ -236,6 +236,14 @@ jobs:
           esac
       - name: cargo test -p saml (artifact-binding only)
         run: cargo test -p saml --no-default-features --features artifact-binding
+      # `tests/artifact_flow_test.rs` is gated on `xmlenc` as well, so the
+      # run above executes none of it. Add `xmlenc` — still without
+      # `weak-algos` — so the end-to-end artifact flow is actually exercised
+      # in a build that has no weak signature or digest algorithms.
+      - name: cargo test -p saml (artifact-binding + xmlenc, no weak-algos)
+        run: |
+          cargo test -p saml --no-default-features \
+            --features artifact-binding,xmlenc,rsa-sha
       - name: cargo clippy -p saml (artifact-binding only)
         run: |
           cargo clippy -p saml --all-targets --no-default-features \
