@@ -431,7 +431,7 @@ pub use crate::proxy::{
     NameIdFromAttribute, NameIdTransform, OpaqueHandleCodec, PassThroughNameId, PerSpFormat,
     PersistentPerSpHmac, Proxy, ProxyContext, ProxyContextCodec, ProxyContextPayload,
     ProxyContextStore, RelayToDownstream, ReleaseAll, ReleaseAllowList, ReleaseNone, ReleasePerSp,
-    StandardComparator,
+    SealingGrant, StandardComparator,
 };
 #[cfg(feature = "slo")]
 pub use crate::proxy::{FrontChannelChain, FrontChannelState, FrontChannelTarget};
