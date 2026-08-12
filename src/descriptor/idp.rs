@@ -134,6 +134,25 @@ impl IdpDescriptor {
         }
         self.artifact_resolution_endpoints.first()
     }
+
+    /// Locate the `<md:ArtifactResolutionService>` carrying `index`.
+    ///
+    /// A type `0x0004` artifact nominates the endpoint to resolve against by
+    /// index (Bindings §3.6.4), so this — not
+    /// [`artifact_resolution_endpoint`](Self::artifact_resolution_endpoint) —
+    /// is the correct lookup when resolving one. An IdP that advertises
+    /// several ARS endpoints (say, one per key rollover generation) routes to
+    /// the wrong one otherwise.
+    pub fn artifact_resolution_endpoint_by_index(&self, index: u16) -> Option<&Endpoint> {
+        // `index` is REQUIRED on a metadata IndexedEndpoint, but this crate's
+        // `Endpoint` models it as optional, so an unnumbered endpoint is
+        // treated as index 0 — matching what issuance writes for the same
+        // endpoint. Comparing against `Some(index)` instead would make every
+        // unnumbered ARS unresolvable.
+        self.artifact_resolution_endpoints
+            .iter()
+            .find(|e| e.index.unwrap_or(0) == index)
+    }
 }
 
 #[cfg(test)]

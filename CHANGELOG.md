@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Breaking:** a type `0x0004` artifact now carries the issuing IdP's
+  `<md:ArtifactResolutionService>` index in bytes 2..4, as SAML 2.0 Bindings
+  §3.6.4 requires. Issuance previously wrote the *service provider's* ACS
+  index and consumption ignored the field entirely, always resolving against
+  the default/first ARS. Any IdP advertising more than one ARS was misrouted.
+  `ServiceProvider::consume_response_artifact` now decodes the index and
+  selects that exact endpoint, refusing an index the IdP does not advertise.
+
+### Added
+
+- `binding::artifact::parse_artifact` and `ParsedArtifact`, exposing the
+  endpoint index and `SourceID` of a type `0x0004` artifact.
+- `IdpDescriptor::artifact_resolution_endpoint_by_index`.
+- `Error::InvalidArtifact` and `Error::UnknownArtifactEndpointIndex`.
+
+### Security
+
+- `IdentityProvider::build_artifact_response` now refuses an
+  `ArtifactResolveRequest` that did not come from
+  `IdentityProvider::parse_artifact_resolve`. The low-level
+  `binding::artifact::parse_artifact_resolve` is public and applies none of the
+  role-layer checks — configured certificates, issuer-vs-`IDPSSODescriptor`,
+  the SOAP endpoint, `@Destination` — so a caller could previously parse
+  unsigned XML and have it answered as though it had been authenticated.
+
 ## [0.0.1-alpha.2] - 2026-08-08
 
 ### Fixed

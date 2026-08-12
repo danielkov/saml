@@ -646,11 +646,23 @@ impl ServiceProvider {
             SsoResponseBinding::HttpArtifact,
         )?;
 
+        // Bindings §3.6.4: a type 0x0004 artifact names the issuer's
+        // ArtifactResolutionService by index. Resolving against the default
+        // endpoint instead sends the artifact somewhere the IdP never
+        // nominated — wrong for any IdP advertising more than one ARS, and
+        // silently so, since the mismatch only shows up as a failed resolve.
+        let parsed = crate::binding::artifact::parse_artifact(input.artifact)?;
+        if input.idp.artifact_resolution_endpoints.is_empty() {
+            return Err(Error::UnsupportedByPeer {
+                binding: Binding::HttpArtifact,
+            });
+        }
         let ars = input
             .idp
-            .artifact_resolution_endpoint()
-            .ok_or(Error::UnsupportedByPeer {
-                binding: Binding::HttpArtifact,
+            .artifact_resolution_endpoint_by_index(parsed.endpoint_index)
+            .ok_or_else(|| Error::UnknownArtifactEndpointIndex {
+                entity_id: input.idp.entity_id.clone(),
+                index: parsed.endpoint_index,
             })?;
 
         // Route through the first-class BackchannelClient so callers can opt
@@ -3198,6 +3210,15 @@ mod tests {
             }
         }
 
+        /// A real type 0x0004 artifact naming ARS index 0 — the index
+        /// [`artifact_idp`] advertises. The SP now decodes bytes 2..4 to pick
+        /// the endpoint, so a placeholder string no longer reaches the
+        /// backchannel these tests are about.
+        static ARTIFACT_INDEX_0: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            crate::binding::artifact::make_artifact("https://idp.example.com", 0)
+                .expect("mint fixture artifact")
+        });
+
         /// IdP descriptor advertising an `ArtifactResolutionService` so the SP
         /// artifact path resolves an ARS endpoint.
         fn artifact_idp() -> IdpDescriptor {
@@ -3275,7 +3296,7 @@ mod tests {
             ConsumeArtifactResponse {
                 idp,
                 peer_crypto_policy: None,
-                artifact: "AAQAA-sample",
+                artifact: &ARTIFACT_INDEX_0,
                 relay_state: None,
                 tracker: None,
                 expected_destination: "https://sp.example.com/acs",
@@ -3321,6 +3342,139 @@ mod tests {
             }
         }
 
+        /// Records the URL the backchannel resolve was sent to, then fails.
+        /// The failure is irrelevant — these tests assert on *routing*, which
+        /// is decided before any response comes back.
+        #[derive(Default)]
+        struct UrlRecordingClient {
+            url: std::sync::Mutex<Option<String>>,
+        }
+
+        impl HttpClient for UrlRecordingClient {
+            fn send(
+                &self,
+                request: HttpRequest,
+            ) -> impl Future<
+                Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send {
+                *self.url.lock().expect("url lock") = Some(request.url.clone());
+                async move {
+                    Err::<HttpResponse, Box<dyn std::error::Error + Send + Sync>>(
+                        "routing recorded; response not needed".into(),
+                    )
+                }
+            }
+        }
+
+        const ARS_INDEX_7_URL: &str = "https://idp.example.com/ars/seven";
+
+        /// An IdP advertising two ARS endpoints at *different* URLs, so which
+        /// one gets called is observable.
+        fn multi_ars_idp() -> IdpDescriptor {
+            let mut idp = fixture_idp();
+            idp.artifact_resolution_endpoints = vec![
+                Endpoint::post(ARS_URL, 0, true),
+                Endpoint::post(ARS_INDEX_7_URL, 7, false),
+            ];
+            idp
+        }
+
+        /// Bindings §3.6.4: bytes 2..4 select the issuer's ARS. Index 7 is not
+        /// the default endpoint, so resolving the default instead would send
+        /// the ArtifactResolve to `ARS_URL` and this would fail.
+        #[tokio::test]
+        async fn artifact_endpoint_index_selects_the_named_ars_not_the_default() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+            let artifact = crate::binding::artifact::make_artifact("https://idp.example.com", 7)
+                .expect("mint artifact naming index 7");
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = &artifact;
+            let outcome = sp.consume_response_artifact(&client, input).await;
+            // The mock never returns a usable envelope; routing is decided
+            // before that and is what this asserts on.
+            assert!(outcome.is_err(), "mock always fails the resolve");
+
+            assert_eq!(
+                client.url.lock().expect("url lock").as_deref(),
+                Some(ARS_INDEX_7_URL),
+                "artifact named ARS index 7; the resolve must go there"
+            );
+        }
+
+        /// The default endpoint is still selected when the artifact names it —
+        /// otherwise the test above would pass for an implementation that just
+        /// always picked the last endpoint.
+        #[tokio::test]
+        async fn artifact_endpoint_index_zero_selects_the_index_zero_ars() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+            let artifact = crate::binding::artifact::make_artifact("https://idp.example.com", 0)
+                .expect("mint artifact naming index 0");
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = &artifact;
+            let outcome = sp.consume_response_artifact(&client, input).await;
+            assert!(outcome.is_err(), "mock always fails the resolve");
+
+            assert_eq!(
+                client.url.lock().expect("url lock").as_deref(),
+                Some(ARS_URL),
+                "artifact named ARS index 0; the resolve must go there"
+            );
+        }
+
+        /// An index the IdP never advertised is refused rather than quietly
+        /// falling back to the default endpoint.
+        #[tokio::test]
+        async fn artifact_naming_an_unadvertised_ars_index_is_refused() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+            let artifact = crate::binding::artifact::make_artifact("https://idp.example.com", 9)
+                .expect("mint artifact naming index 9");
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = &artifact;
+            let err = sp
+                .consume_response_artifact(&client, input)
+                .await
+                .expect_err("index 9 is not advertised");
+
+            assert!(
+                matches!(err, Error::UnknownArtifactEndpointIndex { index: 9, .. }),
+                "got {err:?}"
+            );
+            assert!(
+                client.url.lock().expect("url lock").is_none(),
+                "no backchannel call may be made for an unresolvable index"
+            );
+        }
+
+        /// A malformed artifact is rejected before any backchannel call.
+        #[tokio::test]
+        async fn malformed_artifact_is_refused_before_the_backchannel() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = "AAQAA-not-a-real-artifact";
+            let err = sp
+                .consume_response_artifact(&client, input)
+                .await
+                .expect_err("malformed artifact must be refused");
+
+            assert!(matches!(err, Error::InvalidArtifact { .. }), "got {err:?}");
+            assert!(
+                client.url.lock().expect("url lock").is_none(),
+                "no backchannel call may be made for a malformed artifact"
+            );
+        }
+
         fn artifact_tracker(sp: &ServiceProvider, idp_entity_id: &str) -> LoginTracker {
             LoginTracker {
                 request_id: "_req1".to_owned(),
@@ -3343,7 +3497,7 @@ mod tests {
                 ConsumeArtifactResponse {
                     idp,
                     peer_crypto_policy: None,
-                    artifact: "AAQAAK1234567890",
+                    artifact: &ARTIFACT_INDEX_0,
                     relay_state: None,
                     tracker: Some(tracker),
                     expected_destination: "https://sp.example.com/acs",

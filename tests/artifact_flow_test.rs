@@ -344,6 +344,8 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     let sp_signing_key = common::rsa_keypair_with_cert().expect("sp signing key");
 
     let empty_stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let unknown_artifact = saml::binding::artifact::make_artifact(IDP_ENTITY_ID, 0)
+        .expect("mint an artifact the store has never seen");
     let ars = ArtifactResolutionService {
         idp: &idp,
         sp_descriptor: &sp_descriptor,
@@ -356,7 +358,10 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
             ConsumeArtifactResponse {
                 idp: &idp_descriptor,
                 peer_crypto_policy: None,
-                artifact: "AAQAA-totally-unknown",
+                // Well-formed type 0x0004 naming the IdP's ARS, so the SP
+                // routes it to the backchannel and the store — not rejected
+                // as malformed before the path under test is reached.
+                artifact: &unknown_artifact,
                 relay_state: None,
                 tracker: None,
                 expected_destination: SP_ACS_URL,
@@ -388,5 +393,60 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     assert!(
         matches!(err, saml::error::Error::Http(_)),
         "expected Error::Http, got {err:?}"
+    );
+}
+
+/// The low-level [`parse_artifact_resolve`] is public and applies none of the
+/// role-layer checks — configured certificates, issuer-vs-`IDPSSODescriptor`,
+/// the SOAP `ArtifactResolutionService` endpoint, or the `@Destination` rules.
+/// It returns the same type the role builder consumes, so without an explicit
+/// provenance marker a caller could parse attacker-supplied XML and hand it
+/// straight to `build_artifact_response`, leaving only the issuer/recipient
+/// comparison standing.
+///
+/// This is the runtime half of that gate; the compile-time half is the
+/// `compile_fail` pair on `ArtifactResolveRequest::issuer`, which proves the
+/// marker cannot be set from outside the crate.
+#[test]
+fn build_artifact_response_refuses_a_request_the_role_layer_did_not_validate() {
+    let idp = make_artifact_idp().expect("idp builds");
+
+    // Well-formed and correctly addressed: the *only* thing wrong with it is
+    // that it never passed through `IdentityProvider::parse_artifact_resolve`.
+    // If the gate keyed off anything else, this would still be accepted.
+    let envelope = format!(
+        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+             <soap:Body>
+               <samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                      xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                      ID="_unvalidated" Version="2.0"
+                                      IssueInstant="2024-01-01T00:00:00Z"
+                                      Destination="{IDP_ARS_URL}">
+                 <saml:Issuer>{SP_ENTITY_ID}</saml:Issuer>
+                 <samlp:Artifact>AAQAA-artifact</samlp:Artifact>
+               </samlp:ArtifactResolve>
+             </soap:Body>
+           </soap:Envelope>"#
+    );
+
+    let unvalidated = saml::binding::artifact::parse_artifact_resolve(envelope.as_bytes())
+        .expect("the low-level parser accepts well-formed XML without any verification");
+    assert!(
+        !unvalidated.role_validated(),
+        "the low-level parser must not vouch for a request"
+    );
+    assert_eq!(unvalidated.issuer(), SP_ENTITY_ID);
+
+    let err = idp
+        .build_artifact_response(&unvalidated, SP_ENTITY_ID, "<samlp:Response/>")
+        .expect_err("an unvalidated request must not yield an ArtifactResponse");
+    assert!(
+        matches!(
+            err,
+            saml::error::Error::SignatureVerification {
+                reason: "ArtifactResolve was not validated by IdentityProvider::parse_artifact_resolve"
+            }
+        ),
+        "expected the provenance gate to fire, got {err:?}"
     );
 }
