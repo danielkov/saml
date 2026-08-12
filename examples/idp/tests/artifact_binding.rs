@@ -295,9 +295,9 @@ async fn artifact_round_trip_through_example_handlers() {
         .await
         .expect("consume_response_artifact");
 
-    assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
-    assert_eq!(identity.name_id.value, USER_EMAIL);
-    assert_eq!(identity.session_index.as_deref(), Some("sess-artifact-1"));
+    assert_eq!(identity.name_id().format, NameIdFormat::EmailAddress);
+    assert_eq!(identity.name_id().value, USER_EMAIL);
+    assert_eq!(identity.session_index(), Some("sess-artifact-1"));
 
     // 6. The artifact is single-use. A second resolve hits the now-empty
     //    store: handle_artifact returns a 404 error page instead of a SOAP

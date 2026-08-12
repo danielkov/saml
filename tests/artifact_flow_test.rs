@@ -298,11 +298,11 @@ async fn artifact_flow_end_to_end() {
         .expect("consume_response_artifact");
 
     // 8. Assertions on the recovered Identity.
-    assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
-    assert_eq!(identity.name_id.value, USER_EMAIL);
-    assert_eq!(identity.session_index.as_deref(), Some("sess-artifact-1"));
+    assert_eq!(identity.name_id().format, NameIdFormat::EmailAddress);
+    assert_eq!(identity.name_id().value, USER_EMAIL);
+    assert_eq!(identity.session_index(), Some("sess-artifact-1"));
     let mail = identity
-        .attributes
+        .attributes()
         .iter()
         .find(|a| a.friendly_name.as_deref() == Some("mail"))
         .expect("mail attribute");

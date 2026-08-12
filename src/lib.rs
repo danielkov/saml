@@ -251,14 +251,16 @@
 //! let _ = bounce;
 //!
 //! // --- /saml/acs handler (upstream IdP → proxy) ---
-//! let context: ProxyContext = proxy.context_codec().decode(&upstream_relay_state)?;
+//! // `decode_context` authenticates the blob via the configured codec and
+//! // returns the attested context — the only value `relay_to_downstream` takes.
+//! let context: ProxyContext = proxy.decode_context(&upstream_relay_state)?;
 //! let upstream_identity = sp.consume_response(ConsumeResponse {
 //!     idp: &upstream_idp,
 //!     peer_crypto_policy: None,
 //!     saml_response,
 //!     binding: SsoResponseBinding::HttpPost,
 //!     relay_state: Some(&upstream_relay_state),
-//!     tracker: Some(&context.upstream_tracker),
+//!     tracker: Some(&context.payload().upstream_tracker),
 //!     expected_destination: "https://hub.example.com/saml/acs",
 //!     now: SystemTime::now(),
 //!     clock_skew: Duration::from_secs(60),
@@ -427,8 +429,9 @@ pub use crate::idp::{
 pub use crate::proxy::{
     Aes256GcmCodec, AttributeReleasePolicy, AuthnContextComparator, BounceResult, BounceToUpstream,
     NameIdFromAttribute, NameIdTransform, OpaqueHandleCodec, PassThroughNameId, PerSpFormat,
-    PersistentPerSpHmac, Proxy, ProxyContext, ProxyContextCodec, ProxyContextStore,
-    RelayToDownstream, ReleaseAll, ReleaseAllowList, ReleaseNone, ReleasePerSp, StandardComparator,
+    PersistentPerSpHmac, Proxy, ProxyContext, ProxyContextCodec, ProxyContextPayload,
+    ProxyContextStore, RelayToDownstream, ReleaseAll, ReleaseAllowList, ReleaseNone, ReleasePerSp,
+    StandardComparator,
 };
 #[cfg(feature = "slo")]
 pub use crate::proxy::{FrontChannelChain, FrontChannelState, FrontChannelTarget};
