@@ -32,11 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   issuance computes — including `Conditions/@NotBefore = now - 1 minute`,
   which underflows at the epoch, and the `xs:dateTime` formatting, which
   rejects pre-epoch and non-representable instants.
-- **Breaking:** `Proxy::context_codec` is removed. It exposed the codec's
-  sealing side, so a caller could build a `ProxyContextPayload` naming any
-  registered SP and ACS, `encode` it, and pass the blob to `decode_context` —
-  obtaining a genuine attestation for a context they invented. Use
-  `Proxy::decode_context`; `bounce_to_upstream` mints tokens.
+- **Breaking:** `Proxy::context_codec` is removed and
+  `ProxyContextCodec::encode` takes a `SealingGrant` instead of a
+  `ProxyContextPayload`. A caller could otherwise build a payload naming any
+  registered SP and ACS, seal it, and pass the blob to `decode_context` for a
+  genuine attestation. Removing the accessor alone was insufficient:
+  `Aes256GcmCodec` is public and the caller supplies its key, so a second
+  instance over the same key is trivial. `SealingGrant` has no public
+  constructor, so only `bounce_to_upstream` can seal.
+
+  This closes the API route, not the underlying one — whoever holds the AEAD
+  key can reimplement the documented wire format and mint blobs without this
+  crate. Use `OpaqueHandleCodec` where the application's own key material is
+  in scope.
 
 ### Added
 
