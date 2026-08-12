@@ -99,8 +99,6 @@ K0dYsJzrrDnL23ajO1yzAak=
 // Builders
 // =============================================================================
 
-/// Deterministic test timestamp — 2026-05-26T12:00:30Z. Keeps NotBefore /
-/// NotOnOrAfter checks stable when callers thread `fixed_now()` everywhere.
 /// Clock for live end-to-end flow tests.
 ///
 /// `ServiceProvider::start_login` stamps the `AuthnRequest`'s `IssueInstant`
@@ -116,6 +114,8 @@ pub fn flow_now() -> SystemTime {
     SystemTime::now()
 }
 
+/// Deterministic test timestamp — 2026-05-26T12:00:30Z. Keeps NotBefore /
+/// NotOnOrAfter checks stable when callers thread `fixed_now()` everywhere.
 pub fn fixed_now() -> TestResult<SystemTime> {
     UNIX_EPOCH
         .checked_add(Duration::from_secs(1_779_796_830))
