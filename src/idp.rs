@@ -145,6 +145,20 @@ pub struct IdentityProviderConfig {
     /// (rare in practice).
     pub decryption_key: Option<KeyPair>,
     pub want_authn_requests_signed: bool,
+    /// Require inbound `<samlp:ArtifactResolve>` to carry a verified
+    /// enveloped signature from the requesting SP.
+    ///
+    /// SAML 2.0 Bindings §3.6.3 requires the requester be authenticated
+    /// before an artifact is resolved. An artifact travels in a URL query
+    /// parameter, so it leaks into access logs, `Referer` headers and browser
+    /// history; unauthenticated resolution makes it a bearer token that
+    /// anyone who obtains it can redeem for the full assertion.
+    ///
+    /// Set false only when the artifact-resolution endpoint sits behind
+    /// mutually-authenticated TLS, the other mode §3.6.3 permits. A
+    /// present-but-invalid signature is rejected either way.
+    #[cfg(feature = "artifact-binding")]
+    pub want_artifact_resolve_signed: bool,
     /// Outbound assertion / Response signing flags.
     pub assertion_signing: IdpAssertionSigning,
     pub encrypt_assertions_when_possible: bool,
@@ -196,6 +210,12 @@ impl IdentityProvider {
                 reason: "IdentityProviderConfig.sso must contain at least one endpoint",
             });
         }
+        // The IdP nominates one of these in every artifact it mints, so an
+        // unaddressable or ambiguous set is a configuration error, not
+        // something to discover at issuance time.
+        crate::descriptor::idp::validate_artifact_resolution_endpoints(
+            &config.artifact_resolution,
+        )?;
         Ok(Self { config })
     }
 
@@ -519,6 +539,31 @@ pub struct IssueErrorResponse<'a> {
 impl IdentityProvider {
     /// Mint and binding-encode a success `<samlp:Response>` for an SP.
     /// See RFC-004 §3.1.
+    /// Index of the `<md:ArtifactResolutionService>` this IdP nominates in
+    /// artifacts it mints, preferring the one flagged `isDefault`.
+    ///
+    /// `None` when no ARS is registered — issuance turns that into a
+    /// configuration error rather than defaulting to index 0, which would
+    /// name an endpoint the metadata never advertised.
+    fn artifact_resolution_index(&self) -> Option<u16> {
+        // SOAP only: an ArtifactResolutionService is a SOAP endpoint
+        // (Bindings §3.6.3), and `parse_artifact_resolve` enforces that on the
+        // receiving side. Nominating a POST or Redirect endpoint here would
+        // mint an artifact pointing at somewhere resolution cannot happen.
+        let soap = || {
+            self.config
+                .artifact_resolution
+                .iter()
+                .filter(|e| e.binding == Binding::Soap)
+        };
+        let endpoint = soap().find(|e| e.is_default).or_else(|| soap().next())?;
+        // `index` is REQUIRED on a metadata IndexedEndpoint. An unnumbered
+        // endpoint cannot be named in an artifact, so it is not nominated —
+        // defaulting to 0 would point resolvers at a different endpoint, or at
+        // none.
+        endpoint.index
+    }
+
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
         let acs_endpoint = &input.in_response_to.assertion_consumer_service;
         let relay_state = input.in_response_to.relay_state.as_deref();
@@ -534,6 +579,7 @@ impl IdentityProvider {
         name_id.format = chosen_format;
 
         let inputs = IssueResponseInputs {
+            artifact_resolution_index: self.artifact_resolution_index(),
             sp: input.sp,
             idp_entity_id: &self.config.entity_id,
             in_response_to: Some(input.in_response_to.id.as_str()),
@@ -578,6 +624,7 @@ impl IdentityProvider {
         let relay_state = input.in_response_to.relay_state.as_deref();
 
         let inputs = IssueErrorResponseInputs {
+            artifact_resolution_index: self.artifact_resolution_index(),
             idp_entity_id: &self.config.entity_id,
             in_response_to: Some(input.in_response_to.id.as_str()),
             now: input.now,
@@ -591,6 +638,7 @@ impl IdentityProvider {
             outbound_c14n: self.config.outbound_c14n,
             acs_endpoint,
             relay_state,
+            recipient_entity_id: &input.sp.entity_id,
         };
 
         issue_error_response(inputs)
@@ -601,21 +649,94 @@ impl IdentityProvider {
     /// the artifact value in its store and constructs the response via
     /// [`IdentityProvider::build_artifact_response`].
     ///
-    /// Verifies the requesting SP's issuer matches the supplied
-    /// [`SpDescriptor`]; mismatches return [`Error::IssuerMismatch`].
+    /// Authenticates the requester against `sp.signing_certs` when
+    /// [`want_artifact_resolve_signed`] is set, and requires the signature to
+    /// cover the whole `ArtifactResolve` (the XSW check). A present-but-invalid
+    /// signature is rejected regardless of that flag.
+    ///
+    /// `peer_crypto_policy` overrides
+    /// [`IdentityProviderConfig::default_peer_crypto_policy`] for this call,
+    /// as on every other inbound path. Without it, relaxing an algorithm for
+    /// one legacy SP would relax it for every SP's `ArtifactResolve` — the
+    /// per-peer scoping the policy exists to provide. The whole policy is
+    /// threaded through, so the reference-digest and canonicalization
+    /// allow-lists apply here too, not just the signature method.
+    ///
+    /// `expected_destination` is the ArtifactResolutionService endpoint that
+    /// actually received the message. It must be one this IdP advertises, and
+    /// is compared against `@Destination` when the resolve carries one —
+    /// matching how `consume_authn_request` and the SLO paths treat it.
+    ///
+    /// The `<saml:Issuer>` comparison against `sp.entity_id` is a routing and
+    /// consistency check, not authentication: `Issuer` is attacker-controlled
+    /// wire content, so on its own it proves only that the sender named the
+    /// SP whose descriptor the caller passed. Authenticity comes from the
+    /// signature, or from client authentication at the transport.
+    ///
+    /// [`want_artifact_resolve_signed`]: IdentityProviderConfig::want_artifact_resolve_signed
     #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
     pub fn parse_artifact_resolve(
         &self,
         sp: &SpDescriptor,
+        peer_crypto_policy: Option<&PeerCryptoPolicy>,
+        expected_destination: &str,
         soap_envelope: &[u8],
     ) -> Result<crate::binding::artifact::ArtifactResolveRequest, Error> {
-        let req = crate::binding::artifact::parse_artifact_resolve(soap_envelope)?;
-        if req.issuer != sp.entity_id {
-            return Err(Error::IssuerMismatch {
-                expected: sp.entity_id.clone(),
-                got: Some(req.issuer.clone()),
+        // The caller must have routed this to an endpoint it actually
+        // advertises — the same caller-bug guard the AuthnRequest and SLO
+        // paths apply.
+        // Binding matters as well as URL: an ArtifactResolutionService is a
+        // SOAP endpoint (SAML 2.0 Bindings §3.6.3), and an IdP may advertise
+        // a POST or Redirect endpoint at the same location for a different
+        // profile. Matching on URL alone would accept one of those as an ARS.
+        if !self
+            .config
+            .artifact_resolution
+            .iter()
+            .any(|e| e.url == expected_destination && e.binding == Binding::Soap)
+        {
+            return Err(Error::InvalidConfiguration {
+                reason: "expected_destination is not a registered SOAP ArtifactResolutionService",
             });
         }
+        let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
+        let verify = crate::binding::artifact::VerifyResolveConfig {
+            certs: &sp.signing_certs,
+            policy,
+            require_signed: self.config.want_artifact_resolve_signed,
+        };
+        let mut req =
+            crate::binding::artifact::parse_artifact_resolve_with(soap_envelope, Some(&verify))?;
+        // `@Destination` binds the message to the endpoint that received it.
+        // Without it, a captured resolve replays at any ARS sharing keys or
+        // configuration — a tenant boundary in a multi-tenant deployment.
+        //
+        // SAML Core §3.2.1 makes the attribute REQUIRED on a signed protocol
+        // message, so for a signature-authenticated resolve absence is itself
+        // a failure: tolerating it would hand back exactly the replay the
+        // signature was supposed to prevent. An unsigned resolve is a
+        // different case — it is authenticated by the transport, if at all,
+        // and the spec does not require the attribute there — so absence
+        // stays tolerated and presence stays binding.
+        match req.destination.as_deref() {
+            Some(dest) if dest != expected_destination => {
+                return Err(Error::DestinationMismatch);
+            }
+            None if req.signature_verified() => {
+                return Err(Error::SchemaViolation {
+                    element: "{urn:oasis:names:tc:SAML:2.0:protocol}ArtifactResolve".to_owned(),
+                    reason: "signed ArtifactResolve must carry @Destination (SAML Core §3.2.1)",
+                });
+            }
+            _ => {}
+        }
+        if req.issuer() != sp.entity_id {
+            return Err(Error::IssuerMismatch {
+                expected: sp.entity_id.clone(),
+                got: Some(req.issuer().to_owned()),
+            });
+        }
+        req.mark_role_validated();
         Ok(req)
     }
 
@@ -627,12 +748,46 @@ impl IdentityProvider {
     ///
     /// The returned SOAP envelope is ready to be served as the HTTP response
     /// body with `Content-Type: text/xml`.
+    ///
+    /// `recipient_entity_id` is the SP the artifact was minted for, as
+    /// recorded from [`ArtifactRedirect::recipient_entity_id`] when the
+    /// response was stashed. The resolve is refused with
+    /// [`Error::ArtifactRecipientMismatch`] when it does not match the
+    /// resolver, so a registered SP cannot redeem another SP's leaked
+    /// artifact. Authenticating the resolver answers *who is asking*; this
+    /// answers *whether they are entitled to this artifact*, and the two are
+    /// not the same question.
+    ///
+    /// The strength of the check is bounded by how the resolver was
+    /// authenticated: with
+    /// [`want_artifact_resolve_signed`](IdentityProviderConfig::want_artifact_resolve_signed)
+    /// set, `request.issuer()` is signature-authenticated and this is a real
+    /// authorization boundary. Without it, `issuer` is an unauthenticated
+    /// claim, so the comparison catches misrouting but not a determined
+    /// attacker — authenticate the back-channel, by signature or client TLS.
+    ///
+    /// [`ArtifactRedirect::recipient_entity_id`]: crate::ArtifactRedirect::recipient_entity_id
     #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
     pub fn build_artifact_response(
         &self,
         request: &crate::binding::artifact::ArtifactResolveRequest,
+        recipient_entity_id: &str,
         payload_xml: &str,
     ) -> Result<String, Error> {
+        // Refuse anything the role layer did not validate. The low-level
+        // parser is public and applies none of the configured checks, so
+        // accepting its output here would make those checks optional.
+        if !request.role_validated() {
+            return Err(Error::SignatureVerification {
+                reason: "ArtifactResolve was not validated by IdentityProvider::parse_artifact_resolve",
+            });
+        }
+        if request.issuer() != recipient_entity_id {
+            return Err(Error::ArtifactRecipientMismatch {
+                expected: recipient_entity_id.to_owned(),
+                received: request.issuer().to_owned(),
+            });
+        }
         crate::binding::artifact::build_artifact_response(
             &self.config.entity_id,
             &request.request_id,
@@ -1449,12 +1604,14 @@ mod tests {
                 Endpoint::redirect("https://idp.example.com/sso", 1, false),
             ],
             slo: vec![Endpoint::post("https://idp.example.com/slo", 0, true)],
-            artifact_resolution: vec![],
+            artifact_resolution: vec![Endpoint::soap("https://idp.example.com/ars", Some(0), true)],
             supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
             default_name_id_format: NameIdFormat::Persistent,
             signing_key: rsa_keypair_with_cert(),
             decryption_key: None,
             want_authn_requests_signed,
+            #[cfg(feature = "artifact-binding")]
+            want_artifact_resolve_signed: true,
             assertion_signing: IdpAssertionSigning {
                 sign_responses,
                 sign_assertions: true,
@@ -1743,6 +1900,419 @@ mod tests {
             .expect("validate");
         parsed.relay_state = Some("rs-token".into());
         parsed
+    }
+
+    // ---------- inbound ArtifactResolve authentication ----------------------
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn idp_with_artifact_resolve_signed(require: bool) -> IdentityProvider {
+        // `config` is private but reachable from this child module; flipping
+        // one flag post-construction keeps the fixture to the knob under test
+        // instead of restating every field.
+        let mut idp = idp_with(false, false);
+        idp.config.want_artifact_resolve_signed = require;
+        idp
+    }
+
+    /// `want_artifact_resolve_signed` must actually reach the verifier: an
+    /// unsigned resolve is refused before the caller ever sees the artifact,
+    /// so a leaked artifact cannot be redeemed by an unauthenticated party.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn unsigned_artifact_resolve_rejected_when_idp_requires_signing() {
+        let idp = idp_with_artifact_resolve_signed(true);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/ars",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect_err("an unauthenticated resolve must not be honoured");
+        assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn unsigned_artifact_resolve_allowed_when_idp_does_not_require_signing() {
+        // The mutual-TLS shape: authentication happens at the transport, and
+        // the parsed request reports that nothing was verified here.
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let req = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/ars",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect("accepted without a signature");
+        assert!(!req.signature_verified());
+        assert_eq!(req.artifact, "AAQAAK1234567890");
+    }
+
+    /// A per-peer policy must actually reach the verifier: relaxing an
+    /// algorithm for one legacy SP must not require relaxing it for every
+    /// SP's ArtifactResolve, which is the scoping `PeerCryptoPolicy` exists
+    /// to provide.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_honours_a_per_peer_policy_override() {
+        use crate::dsig::algorithms::DigestAlgorithm;
+
+        let idp = idp_with_artifact_resolve_signed(true);
+        let sp = sp_descriptor(false);
+        let envelope = signed_resolve_with_sha1_digest(&sp.entity_id);
+
+        // The IdP default is strong, so the SHA-1 reference digest is refused.
+        let err = idp
+            .parse_artifact_resolve(&sp, None, "https://idp.example.com/ars", &envelope)
+            .expect_err("default policy rejects a SHA-1 reference digest");
+        assert!(
+            matches!(err, Error::DisallowedAlgorithm { ref alg } if alg.contains("sha1")),
+            "got {err:?}"
+        );
+
+        // A policy scoped to this one peer admits it, without touching the
+        // IdP's default.
+        let mut legacy = PeerCryptoPolicy::strong_defaults();
+        legacy.allowed_digest_algorithms.push(DigestAlgorithm::Sha1);
+        let req = idp
+            .parse_artifact_resolve(&sp, Some(&legacy), "https://idp.example.com/ars", &envelope)
+            .expect("per-peer override admits the legacy digest");
+        assert!(req.signature_verified());
+
+        assert!(
+            !idp.config
+                .default_peer_crypto_policy
+                .allowed_digest_algorithms
+                .contains(&DigestAlgorithm::Sha1),
+            "the override must not have widened the IdP default"
+        );
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn signed_resolve_with_sha1_digest(issuer: &str) -> Vec<u8> {
+        use crate::dsig::algorithms::DigestAlgorithm;
+
+        let (resolve, _id) = crate::binding::artifact::build_artifact_resolve_element(
+            issuer,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+        let doc = Document::new(resolve).expect("doc");
+        let signed = crate::dsig::sign::sign_element(
+            doc.root().clone(),
+            &doc,
+            crate::dsig::sign::SignOptions {
+                signing_key: &rsa_keypair_with_cert(),
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha1,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign");
+        crate::binding::soap::wrap_element(signed)
+            .expect("wrap")
+            .into_bytes()
+    }
+
+    // ---------- artifact recipient binding + Destination --------------------
+
+    /// Authenticating the resolver says *who* is asking. This says whether
+    /// they are entitled to *this* artifact — the separate question that
+    /// leaves a leaked artifact redeemable by any registered SP if skipped.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_response_refuses_a_resolver_it_was_not_minted_for() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+        let req = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/ars",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect("resolve parses");
+
+        let err = idp
+            .build_artifact_response(&req, "https://other-sp.example.com", r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_r1" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#)
+            .expect_err("artifact was minted for a different SP");
+        assert!(matches!(
+            err,
+            Error::ArtifactRecipientMismatch { ref expected, ref received }
+                if expected == "https://other-sp.example.com" && received == &sp.entity_id
+        ));
+
+        idp.build_artifact_response(&req, &sp.entity_id, r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_r1" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#)
+            .expect("the recipient itself is served");
+    }
+
+    /// A signed resolve captured at one ARS endpoint must not replay at
+    /// another sharing the same configuration — the tenant boundary in a
+    /// multi-tenant deployment.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_destination_must_match_the_receiving_endpoint() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://other-tenant.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/ars",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect_err("Destination names a different endpoint");
+        assert!(matches!(err, Error::DestinationMismatch), "got {err:?}");
+    }
+
+    /// The caller must route to an endpoint this IdP actually advertises —
+    /// the same caller-bug guard `consume_authn_request` and SLO apply.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_rejects_an_unregistered_destination() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/not-registered",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect_err("destination is not a registered ARS");
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// Authorization reads the resolver's identity, so that identity must not
+    /// be writable. With `issuer` and `signature_verified` public, a caller
+    /// could take a request verified as SP-A, rewrite the issuer to SP-B, and
+    /// collect SP-B's stashed response — or construct one outright asserting
+    /// `signature_verified: true`. Both fields are now private with read-only
+    /// accessors, and `ArtifactResolveRequest` has no public constructor.
+    ///
+    /// This compiles only because neither mutation nor construction is
+    /// expressible; the test documents the property the type enforces.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn resolver_identity_is_read_only_and_parser_established() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let req = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/ars",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect("resolve parses");
+
+        // Only the parser sets these; they are readable, never assignable.
+        assert_eq!(req.issuer(), sp.entity_id);
+        assert!(!req.signature_verified());
+
+        // `req.issuer = ...`, `req.signature_verified = true`, and
+        // `ArtifactResolveRequest { .. }` are all rejected at compile time.
+        // Authorization therefore cannot be handed a forged identity.
+        let err = idp
+            .build_artifact_response(
+                &req,
+                "https://other-sp.example.com",
+                r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_r1" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#,
+            )
+            .expect_err("the parsed issuer is what authorization sees");
+        assert!(
+            matches!(err, Error::ArtifactRecipientMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// An ArtifactResolutionService is a SOAP endpoint. Matching the caller's
+    /// `expected_destination` on URL alone would accept a POST or Redirect
+    /// endpoint an IdP advertises at the same location for another profile.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_destination_must_be_a_soap_endpoint() {
+        let mut idp = idp_with_artifact_resolve_signed(false);
+        idp.config.artifact_resolution = vec![
+            Endpoint::post("https://idp.example.com/dual", 0, true),
+            Endpoint::soap("https://idp.example.com/ars", None, true),
+        ];
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            &sp.entity_id,
+            "https://idp.example.com/dual",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/dual",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect_err("that URL is registered, but not as a SOAP ARS");
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// SAML Core §3.2.1 makes `@Destination` REQUIRED on a signed protocol
+    /// message. Tolerating its absence on a *signed* resolve would hand back
+    /// the cross-endpoint replay the signature was meant to prevent.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn signed_artifact_resolve_without_destination_rejected() {
+        let idp = idp_with_artifact_resolve_signed(true);
+        let sp = sp_descriptor(false);
+        let envelope = signed_resolve_without_destination(&sp.entity_id);
+
+        let err = idp
+            .parse_artifact_resolve(&sp, None, "https://idp.example.com/ars", &envelope)
+            .expect_err("a signed resolve must carry Destination");
+        assert!(
+            matches!(err, Error::SchemaViolation { reason, .. }
+                if reason.contains("@Destination")),
+            "got {err:?}"
+        );
+    }
+
+    /// The unsigned case is different: the spec does not require the attribute
+    /// there, and such a resolve is authenticated by the transport if at all.
+    /// Absence stays tolerated so mutual-TLS deployments are not broken.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn unsigned_artifact_resolve_without_destination_still_accepted() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = unsigned_resolve_without_destination(&sp.entity_id);
+
+        let req = idp
+            .parse_artifact_resolve(&sp, None, "https://idp.example.com/ars", &envelope)
+            .expect("unsigned resolves may omit Destination");
+        assert!(!req.signature_verified());
+        assert!(req.destination.is_none());
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn resolve_element_without_destination(issuer: &str) -> crate::xml::parse::Element {
+        let xml = format!(
+            r#"<samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_ar1" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>{issuer}</saml:Issuer><samlp:Artifact>AAQAAK1234567890</samlp:Artifact></samlp:ArtifactResolve>"#
+        );
+        Document::parse(xml.as_bytes())
+            .expect("parse resolve without Destination")
+            .root()
+            .clone()
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn unsigned_resolve_without_destination(issuer: &str) -> Vec<u8> {
+        crate::binding::soap::wrap_element(resolve_element_without_destination(issuer))
+            .expect("wrap")
+            .into_bytes()
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn signed_resolve_without_destination(issuer: &str) -> Vec<u8> {
+        let doc = Document::new(resolve_element_without_destination(issuer)).expect("doc");
+        let signed = crate::dsig::sign::sign_element(
+            doc.root().clone(),
+            &doc,
+            crate::dsig::sign::SignOptions {
+                signing_key: &rsa_keypair_with_cert(),
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign");
+        crate::binding::soap::wrap_element(signed)
+            .expect("wrap")
+            .into_bytes()
+    }
+
+    /// The `<saml:Issuer>` cross-check still applies, and is reported as an
+    /// issuer mismatch rather than a signature failure.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_resolve_from_a_different_issuer_rejected() {
+        let idp = idp_with_artifact_resolve_signed(false);
+        let sp = sp_descriptor(false);
+        let envelope = crate::binding::artifact::build_artifact_resolve(
+            "https://other-sp.example.com/saml",
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        let err = idp
+            .parse_artifact_resolve(
+                &sp,
+                None,
+                "https://idp.example.com/ars",
+                envelope.soap_envelope.as_bytes(),
+            )
+            .expect_err("issuer does not match the supplied descriptor");
+        assert!(matches!(
+            err,
+            Error::IssuerMismatch { ref got, .. }
+                if got.as_deref() == Some("https://other-sp.example.com/saml")
+        ));
     }
 
     #[test]

@@ -965,6 +965,8 @@ mod tests {
             signing_key: rsa_keypair(),
             decryption_key: None,
             want_authn_requests_signed: false,
+            #[cfg(feature = "artifact-binding")]
+            want_artifact_resolve_signed: true,
             assertion_signing: crate::idp::IdpAssertionSigning {
                 sign_responses: false,
                 sign_assertions: true,

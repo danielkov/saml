@@ -294,14 +294,30 @@ pub struct SsoResponsePostForm {
     pub relay_state: Option<String>,
 }
 
-/// Artifact redirect payload. The IdP MUST persist `response_xml` keyed by
-/// `artifact` and serve it from its ArtifactResolutionService.
+/// Artifact redirect payload.
+///
+/// The IdP MUST persist **both** `response_xml` and `recipient_entity_id`
+/// keyed by `artifact`, and serve them from its ArtifactResolutionService.
+///
+/// Storing only `artifact -> response_xml` is not enough. An artifact travels
+/// in a URL query parameter, so it reaches access logs, `Referer` headers and
+/// browser history; a store with no notion of who it was minted for lets any
+/// *registered* SP redeem another SP's leaked artifact. Authenticating the
+/// resolver (see
+/// [`want_artifact_resolve_signed`](crate::IdentityProviderConfig::want_artifact_resolve_signed))
+/// establishes who is asking, not whether they are entitled to this artifact.
+/// Pass the stored recipient to
+/// [`IdentityProvider::build_artifact_response`](crate::IdentityProvider::build_artifact_response),
+/// which refuses to answer a resolver it was not minted for.
 #[derive(Debug, Clone)]
 pub struct ArtifactRedirect {
     /// Redirect the user agent here. URL contains `?SAMLart=...&RelayState=...`.
     pub redirect_to: url::Url,
     /// The artifact value embedded in `redirect_to`.
     pub artifact: String,
+    /// Entity ID of the SP this artifact was minted for — the only peer
+    /// entitled to resolve it. Persist alongside `response_xml`.
+    pub recipient_entity_id: String,
     /// The full `<samlp:Response>` XML to return when the SP resolves the
     /// artifact via SOAP. Library is stateless; persistence is the caller's
     /// responsibility.
