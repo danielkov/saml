@@ -154,7 +154,7 @@ pub fn build_artifact_resolve(
 
 /// Build the bare `<samlp:ArtifactResolve>` element (no SOAP envelope), so the
 /// back-channel client can optionally enveloped-sign it before wrapping.
-fn build_artifact_resolve_element(
+pub(crate) fn build_artifact_resolve_element(
     issuer_entity_id: &str,
     destination: &str,
     artifact: &str,
@@ -554,9 +554,16 @@ pub struct ArtifactResolveRequest {
 pub struct VerifyResolveConfig<'a> {
     /// Candidate certificates for the SP the resolve claims to come from.
     pub certs: &'a [X509Certificate],
-    /// Signature algorithms accepted on the resolve (anything else is
-    /// rejected as [`Error::DisallowedAlgorithm`]).
-    pub allowed_algorithms: &'a [SignatureAlgorithm],
+    /// Per-peer policy for the signature, reference digest, and
+    /// canonicalization algorithms accepted on the resolve.
+    ///
+    /// The whole policy, not just its signature allow-list: a strong
+    /// `RSA-SHA256` signature over a SHA-1 `<ds:Reference>` digest is only as
+    /// strong as SHA-1, and the artifact binding requires `weak-algos` to
+    /// compile at all, so `DigestAlgorithm::Sha1` is always present in these
+    /// builds. Threading only the signature slice would let it through in
+    /// spite of `strong_defaults`.
+    pub policy: &'a PeerCryptoPolicy,
     /// When true, an `ArtifactResolve` with no `<ds:Signature>` is rejected
     /// with [`Error::SignatureMissing`]. When false, an unsigned resolve is
     /// accepted (and [`ArtifactResolveRequest::signature_verified`] is
@@ -633,19 +640,28 @@ fn verify_artifact_resolve(
     body: &soap::UnwrappedBody,
     verify: Option<&VerifyResolveConfig<'_>>,
 ) -> Result<bool, Error> {
-    let Some(cfg) = verify else {
-        return Ok(false);
-    };
     let document = body.document_ref();
     let root = document.root();
-    match root.child_element(Some(crate::dsig::reference::DS_NS), "Signature") {
+    let signature = root.child_element(Some(crate::dsig::reference::DS_NS), "Signature");
+
+    let Some(cfg) = verify else {
+        // No verifier configured. Returning `Ok(false)` for a message that
+        // *does* carry a signature would report `signature_verified: false`
+        // for an unexamined — possibly forged — one, and `false` is
+        // documented to mean "no signature was present". Refuse instead:
+        // silently discarding a signature the sender asked us to check is
+        // never the safe reading.
+        if signature.is_some() {
+            return Err(Error::SignatureVerification {
+                reason: "ArtifactResolve carries a signature but no verifier was configured",
+            });
+        }
+        return Ok(false);
+    };
+    match signature {
         Some(sig) => {
-            let verified = crate::dsig::verify::verify_signature(
-                document,
-                sig,
-                cfg.certs,
-                cfg.allowed_algorithms,
-            )?;
+            let verified =
+                crate::dsig::verify::verify_signature(document, sig, cfg.certs, cfg.policy)?;
             if verified.signed_element != root.id() {
                 return Err(Error::SignatureVerification {
                     reason: "ArtifactResolve signature does not cover the message root",
@@ -1144,6 +1160,24 @@ mod tests {
         soap::wrap_element(signed_elem).expect("wrap").into_bytes()
     }
 
+    /// As [`artifact_resolve_envelope`], signed with a caller-chosen
+    /// `<ds:Reference>` digest so digest policy can be exercised independently
+    /// of the signature method.
+    fn artifact_resolve_envelope_with_digest(digest_alg: DigestAlgorithm) -> Vec<u8> {
+        let resolve = build_artifact_resolve_element(
+            RESOLVE_ISSUER,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+        let stash = Document::new(resolve).expect("stash doc");
+        let mut opts = test_sign_options();
+        opts.digest_alg = digest_alg;
+        let signed = crate::dsig::sign::sign_element(stash.root().clone(), &stash, opts)
+            .expect("sign resolve");
+        soap::wrap_element(signed).expect("wrap").into_bytes()
+    }
+
     fn test_sign_options() -> crate::dsig::sign::SignOptions<'static> {
         // `test_keypair` returns by value; leak one for a 'static borrow so
         // the options can be shared between fixtures.
@@ -1216,10 +1250,14 @@ mod tests {
         vec![X509Certificate::from_pem(RSA_CERT_PEM).expect("cert")]
     }
 
-    fn resolve_cfg(certs: &[X509Certificate], require_signed: bool) -> VerifyResolveConfig<'_> {
+    fn resolve_cfg<'a>(
+        certs: &'a [X509Certificate],
+        policy: &'a PeerCryptoPolicy,
+        require_signed: bool,
+    ) -> VerifyResolveConfig<'a> {
         VerifyResolveConfig {
             certs,
-            allowed_algorithms: &[SignatureAlgorithm::RsaSha256],
+            policy,
             require_signed,
         }
     }
@@ -1228,8 +1266,9 @@ mod tests {
     fn signed_artifact_resolve_verifies() {
         let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
         let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
 
-        let req = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, true)))
+        let req = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
             .expect("a correctly signed resolve must verify");
 
         assert!(req.signature_verified);
@@ -1241,8 +1280,9 @@ mod tests {
     fn unsigned_artifact_resolve_rejected_when_required() {
         let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
         let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
 
-        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, true)))
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
             .expect_err("an unsigned resolve must not authenticate the requester");
         assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
     }
@@ -1254,9 +1294,11 @@ mod tests {
         // see that nothing was verified at this layer.
         let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
         let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
 
-        let req = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, false)))
-            .expect("unsigned is acceptable when not required");
+        let req =
+            parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, false)))
+                .expect("unsigned is acceptable when not required");
         assert!(!req.signature_verified);
     }
 
@@ -1270,11 +1312,14 @@ mod tests {
             .replace("AAQAAK1234567890", "AAQAAK0000000000")
             .into_bytes();
         let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
 
         for require_signed in [true, false] {
-            let err =
-                parse_artifact_resolve_with(&tampered, Some(&resolve_cfg(&certs, require_signed)))
-                    .expect_err("tampered payload must fail the digest check");
+            let err = parse_artifact_resolve_with(
+                &tampered,
+                Some(&resolve_cfg(&certs, &strong, require_signed)),
+            )
+            .expect_err("tampered payload must fail the digest check");
             assert!(
                 matches!(err, Error::SignatureVerification { .. }),
                 "require_signed={require_signed}: got {err:?}"
@@ -1286,8 +1331,9 @@ mod tests {
     fn artifact_resolve_signed_by_an_untrusted_key_rejected() {
         let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
         let other = vec![X509Certificate::from_pem(EC_P256_CERT_PEM).expect("other cert")];
+        let strong = PeerCryptoPolicy::strong_defaults();
 
-        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&other, true)))
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&other, &strong, true)))
             .expect_err("a signature from outside the SP's key set must be rejected");
         assert!(
             matches!(err, Error::SignatureVerification { .. }),
@@ -1303,8 +1349,9 @@ mod tests {
         // someone else's artifact.
         let envelope = xsw_artifact_resolve_envelope();
         let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
 
-        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, true)))
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
             .expect_err("a signature not covering the root must be rejected");
         assert!(
             matches!(
@@ -1317,11 +1364,63 @@ mod tests {
         );
     }
 
+    /// A strong signature method over a weak reference digest is only as
+    /// strong as that digest. The artifact binding requires `weak-algos` to
+    /// compile, so `DigestAlgorithm::Sha1` exists in every build that can
+    /// reach this code — policy, not compilation, has to be what rejects it.
+    #[test]
+    fn artifact_resolve_with_sha1_reference_digest_rejected_by_strong_policy() {
+        let envelope = artifact_resolve_envelope_with_digest(DigestAlgorithm::Sha1);
+        let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
+            .expect_err("strong defaults must reject a SHA-1 reference digest");
+        assert!(
+            matches!(err, Error::DisallowedAlgorithm { ref alg } if alg.contains("sha1")),
+            "got {err:?}"
+        );
+
+        // The same message verifies once the peer's policy admits SHA-1,
+        // proving the rejection came from policy rather than a broken
+        // signature.
+        let mut permissive = PeerCryptoPolicy::strong_defaults();
+        permissive
+            .allowed_digest_algorithms
+            .push(DigestAlgorithm::Sha1);
+        let req =
+            parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &permissive, true)))
+                .expect("explicit SHA-1 digest opt-in");
+        assert!(req.signature_verified);
+    }
+
+    /// `signature_verified: false` is documented to mean "no signature was
+    /// present". A signed message parsed with no verifier must therefore not
+    /// come back as unverified — that would report an unexamined, possibly
+    /// forged signature as a benign absence.
+    #[test]
+    fn signed_artifact_resolve_rejected_when_no_verifier_is_configured() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+
+        let err = parse_artifact_resolve(&envelope)
+            .expect_err("a signature we will not check must not be silently dropped");
+        assert!(
+            matches!(
+                err,
+                Error::SignatureVerification {
+                    reason: "ArtifactResolve carries a signature but no verifier was configured"
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn parse_artifact_resolve_without_config_reports_unverified() {
-        // The no-verification entry point must never claim verification it
-        // did not perform, even for a genuinely signed message.
-        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+        // The no-verification entry point never claims verification it did
+        // not perform. For an *unsigned* message that is simply `false`; a
+        // signed one is refused outright, covered above.
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
 
         let req = parse_artifact_resolve(&envelope).expect("parses");
         assert!(

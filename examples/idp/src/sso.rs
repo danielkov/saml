@@ -1011,7 +1011,7 @@ pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::By
         );
     };
 
-    let resolve = match state.idp.parse_artifact_resolve(&entry.sp, &body) {
+    let resolve = match state.idp.parse_artifact_resolve(&entry.sp, None, &body) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, sp = %entry.sp.entity_id, "/saml/artifact: parse_artifact_resolve failed");

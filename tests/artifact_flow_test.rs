@@ -137,7 +137,7 @@ impl HttpClient for ArtifactResolutionService<'_> {
     {
         let parsed = self
             .idp
-            .parse_artifact_resolve(self.sp_descriptor, &request.body)
+            .parse_artifact_resolve(self.sp_descriptor, None, &request.body)
             .map_err(|e| format!("parse_artifact_resolve: {e:?}"));
         let stash = self.stash.clone();
         let idp_response = parsed.and_then(|req| {
