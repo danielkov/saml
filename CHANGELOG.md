@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key can reimplement the documented wire format and mint blobs without this
   crate. Use `OpaqueHandleCodec` where the application's own key material is
   in scope.
+- **Breaking:** `ProxyContextStore::put` takes a `SealingGrant` instead of a
+  `ProxyContextPayload`. The caller constructs the store, so a `put` accepting
+  a bare payload was a sealing oracle needing no key at all: insert an invented
+  context under a chosen handle, then present that handle to `decode_context`.
+  Its documented contract now also states that implementations must honour
+  `ttl` and make `take` atomic and one-shot.
+- `OpaqueHandleCodec` rejects a `handle_byte_len` below 16 bytes. The handle is
+  a bearer credential that travels in a URL, and `0` produced an empty handle
+  shared by every caller.
 
 ### Added
 

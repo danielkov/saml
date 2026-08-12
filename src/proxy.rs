@@ -393,26 +393,68 @@ impl ProxyContextCodec for Aes256GcmCodec {
 
 /// Caller-supplied storage for the opaque-handle codec. `take` is one-shot.
 pub trait ProxyContextStore: Send + Sync {
-    fn put(&self, handle: &str, context: &ProxyContextPayload, ttl: Duration) -> Result<(), Error>;
+    /// Store the granted payload under `handle`.
+    ///
+    /// Takes a [`SealingGrant`] for the same reason
+    /// [`ProxyContextCodec::encode`] does. With a plain payload this method is
+    /// a sealing oracle in its own right: a caller holding the store — which
+    /// they must, since they construct it — could insert an invented context
+    /// under a handle of their choosing and hand that handle to
+    /// [`Proxy::decode_context`]. No AEAD key and no dishonest codec required.
+    ///
+    /// # Contract
+    ///
+    /// Implementations MUST:
+    ///
+    /// - **Honour `ttl`.** An entry that outlives it extends the window in
+    ///   which a leaked `RelayState` is redeemable. [`Aes256GcmCodec`]
+    ///   enforces its age limit itself; here the store is the only thing that
+    ///   can.
+    /// - **Make [`take`](Self::take) atomic and one-shot.** Returning the same
+    ///   handle twice makes the proxy round-trip replayable. A check-then-
+    ///   delete that is not atomic is a race, not a one-shot.
+    ///
+    /// Neither property is checkable from inside this crate, which is why they
+    /// are stated as obligations rather than assumed.
+    fn put(&self, handle: &str, grant: &SealingGrant<'_>, ttl: Duration) -> Result<(), Error>;
+    /// Remove and return the payload stored under `handle`, if any.
+    ///
+    /// Must be atomic and one-shot — see the contract on [`put`](Self::put).
     fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
+
+/// Minimum handle entropy, in bytes. 128 bits — the handle is a bearer
+/// credential redeemable by anyone who presents it, and it travels in a URL.
+const MIN_HANDLE_BYTE_LEN: usize = 16;
 
 /// Short random handle as `RelayState`; context lives in a caller-supplied
 /// store. See RFC-005 §2.1.
 pub struct OpaqueHandleCodec<S: ProxyContextStore> {
     pub store: S,
     /// Bytes of entropy in the handle. Default 24 → 32 base64url chars.
+    /// Must be at least 16; sealing fails otherwise.
     pub handle_byte_len: usize,
     pub ttl: Duration,
 }
 
 impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
     fn encode(&self, grant: &SealingGrant<'_>) -> Result<String, Error> {
-        let context = grant.payload();
+        // The handle *is* the credential: anyone presenting it redeems the
+        // context. This codec is the one recommended when the token must be
+        // unforgeable, so a short handle here is worse than the AEAD it was
+        // chosen over — `0` would hand every caller the same empty handle.
+        if self.handle_byte_len < MIN_HANDLE_BYTE_LEN {
+            return Err(Error::InvalidConfiguration {
+                reason: "OpaqueHandleCodec.handle_byte_len must be at least 16 bytes",
+            });
+        }
         let mut bytes = vec![0u8; self.handle_byte_len];
         rand::rng().fill_bytes(&mut bytes);
         let handle = URL_SAFE_NO_PAD.encode(&bytes);
-        self.store.put(&handle, context, self.ttl)?;
+        // Forward the grant rather than the payload: `put` is public, so a
+        // caller who could call it with a bare payload would not need this
+        // codec at all.
+        self.store.put(&handle, grant, self.ttl)?;
         Ok(handle)
     }
 
@@ -583,6 +625,19 @@ impl Proxy<'_> {
     /// # use saml::ProxyContextPayload;
     /// fn grant(payload: &ProxyContextPayload) -> SealingGrant<'_> {
     ///     SealingGrant::issue(payload)
+    /// }
+    /// ```
+    ///
+    /// The store behind [`OpaqueHandleCodec`] is the same authority wearing a
+    /// different hat — the caller owns it, so inserting an invented context
+    /// under a handle of their choosing would be a sealing oracle needing no
+    /// key at all. [`ProxyContextStore::put`] therefore takes a grant too:
+    ///
+    /// ```compile_fail
+    /// # use saml::{ProxyContextPayload, ProxyContextStore};
+    /// # use std::time::Duration;
+    /// fn forge<S: ProxyContextStore>(store: &S, payload: &ProxyContextPayload) {
+    ///     store.put("handle-i-picked", payload, Duration::from_secs(600)).unwrap();
     /// }
     /// ```
     ///
@@ -1427,12 +1482,7 @@ mod tests {
     }
 
     impl ProxyContextStore for InMemoryStore {
-        fn put(
-            &self,
-            handle: &str,
-            context: &ProxyContextPayload,
-            ttl: Duration,
-        ) -> Result<(), Error> {
+        fn put(&self, handle: &str, grant: &SealingGrant<'_>, ttl: Duration) -> Result<(), Error> {
             let expires_at =
                 SystemTime::now()
                     .checked_add(ttl)
@@ -1445,7 +1495,7 @@ mod tests {
                 .map_err(|_err| Error::InvalidConfiguration {
                     reason: "InMemoryStore: lock poisoned",
                 })?;
-            guard.insert(handle.to_string(), (context.clone(), expires_at));
+            guard.insert(handle.to_string(), (grant.payload().clone(), expires_at));
             Ok(())
         }
 
