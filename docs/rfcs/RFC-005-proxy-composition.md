@@ -256,8 +256,8 @@ Internally:
 
 1. Look up the downstream SP descriptor by `context.downstream_sp_entity_id()`. (Caller-managed registry; the library does not maintain one.) For ergonomics, the caller can pass a closure for SP lookup via `ProxyConfig` (future addition).
 2. **Enforce AuthnContext non-downgrade** (§7) using `context.payload().requested_authn_context` and `upstream_identity.authn_context_class_ref()`. → `Error::AuthnContextDowngrade`.
-3. Compute downstream attributes via `attribute_release.release(&upstream_identity.attributes, &downstream_sp)`.
-4. Compute downstream NameID via `name_id_transform.transform(&upstream_identity.name_id, &downstream_sp)`.
+3. Compute downstream attributes via `attribute_release.release(upstream_identity.attributes(), &downstream_sp)`.
+4. Compute downstream NameID via `name_id_transform.transform(upstream_identity.name_id(), upstream_identity.attributes(), &downstream_sp)`.
 5. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id()`).
 6. Call `self.idp.issue_response(...)` with the synthesized request and transformed identity.
 7. Return the resulting `Dispatch`.
@@ -357,7 +357,7 @@ pub(crate) fn enforce_authn_context_floor(
 ) -> Result<(), Error>;
 ```
 
-Comparison rules per SAML 2.0 §3.3.2.2.1 (`Comparison` attribute: `exact` / `minimum` / `maximum` / `better`). Default is `exact`. The library exposes the comparator function and accepts a caller override for non-standard hierarchies (some enterprise IdPs define custom AuthnContext class hierarchies).
+Comparison rules per SAML 2.0 §3.3.2.2.1 (`Comparison` attribute: `exact` / `minimum` / `maximum` / `better`). Default is `exact`. `relay_to_downstream` applies `StandardComparator` unconditionally — the `AuthnContextComparator` trait is public, but there is no override plumbed through `RelayToDownstream`, so a deployment with a custom AuthnContext hierarchy cannot substitute its own today. Both `NotSatisfied` and `NotComparable` collapse to `Error::AuthnContextDowngrade`, i.e. fail closed.
 
 ```rust
 pub trait AuthnContextComparator: Send + Sync {
@@ -425,7 +425,8 @@ let bounce = proxy.bounce_to_upstream(BounceToUpstream {
 // --- /saml/acs handler (upstream IdP → proxy) ---
 // `decode_context` authenticates the blob through the configured codec and
 // returns the attested `ProxyContext` — the only value `relay_to_downstream`
-// accepts. The codec's sealing side is deliberately not public.
+// accepts. Sealing is gated behind a crate-issued `SealingGrant`, so neither
+// the codec nor the store will seal a payload the caller assembled.
 let context: ProxyContext = proxy.decode_context(&form.relay_state)?;
 let upstream_identity = sp.consume_response(ConsumeResponse {
     idp: &upstream_idp_descriptor,
@@ -442,6 +443,8 @@ let upstream_identity = sp.consume_response(ConsumeResponse {
 let dispatch = proxy.relay_to_downstream(RelayToDownstream {
     context: &context,
     upstream_identity: &upstream_identity,
+    // Required: the context must belong to this SP, or relay refuses.
+    downstream_sp: &downstream_sp_descriptor,
     attribute_release: &ReleaseAllowList {
         names: vec!["email".into(), "displayName".into(), "groups".into()],
     },
