@@ -958,8 +958,13 @@ impl Proxy<'_> {
                 .iter()
                 .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
                 .collect();
+            // Sorted *and* deduplicated: a descriptor listing the same
+            // certificate twice is the same key set, and comparing multisets
+            // would refuse it.
             sealed.sort_unstable();
+            sealed.dedup();
             current.sort_unstable();
+            current.dedup();
             if sealed != current {
                 return Err(Error::SpKeyMaterialMismatch);
             }

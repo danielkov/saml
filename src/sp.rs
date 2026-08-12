@@ -826,7 +826,7 @@ impl ServiceProvider {
         // enforced. For other assertions the spec recommends but does not
         // mandate replay defense; `input.replay_mode` selects the policy.
         if let Some(cache) = input.replay_cache
-            && replay_check_needed(input.replay_mode, identity.is_one_time_use)
+            && replay_check_needed(input.replay_mode, identity.is_one_time_use())
         {
             // The tombstone must outlive every instant at which the assertion
             // would still validate — see `replay_expires_at`.

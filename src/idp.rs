@@ -845,7 +845,9 @@ fn ensure_sp_key_material_matches(
         .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
         .collect();
     sealed.sort_unstable();
+    sealed.dedup();
     current.sort_unstable();
+    current.dedup();
     if current == sealed {
         Ok(())
     } else {
