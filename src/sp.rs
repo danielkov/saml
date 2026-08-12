@@ -5,6 +5,12 @@
 
 use std::time::{Duration, SystemTime};
 
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::RngCore as _;
+
 use crate::authn::request_build::{AcsRequest, BuildAuthnRequest, build_authn_request_xml};
 use crate::authn_context::RequestedAuthnContext;
 use crate::binding::post::encode_request as post_encode_request;
@@ -219,7 +225,7 @@ pub struct StartLoginResult {
 
 /// Caller-side state captured at AuthnRequest time and replayed into
 /// [`ServiceProvider::consume_response`] to verify the matching Response.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LoginTracker {
     pub request_id: String,
     pub issued_at: SystemTime,
@@ -245,32 +251,167 @@ pub struct LoginTracker {
     requested_name_id_format: Option<NameIdFormat>,
 }
 
-impl LoginTracker {
-    /// Assemble a tracker.
+/// Serialized form of a [`LoginTracker`].
+///
+/// Transparent and inert, exactly like
+/// [`ProxyContextPayload`](crate::ProxyContextPayload): it exists so the
+/// tracker can be embedded in something the crate authenticates as a whole,
+/// and it carries no authority of its own. Turning one back into a
+/// `LoginTracker` — the type the response-side policy checks trust — happens
+/// only inside this crate, and only after such an authentication.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LoginTrackerPayload {
+    pub request_id: String,
+    pub issued_at: SystemTime,
+    pub idp_entity_id: String,
+    pub acs_endpoint: SsoResponseEndpoint,
+    pub requested_authn_context: Option<RequestedAuthnContext>,
+    pub requested_name_id_format: Option<NameIdFormat>,
+}
+
+impl LoginTrackerPayload {
+    /// Seal this payload into an authenticated blob for the caller's storage.
     ///
-    /// Normally you get one from [`ServiceProvider::start_login`]; this exists
-    /// for callers rehydrating one from their own storage. It does not weaken
-    /// the guarantee the private fields provide: the response-side checks are
-    /// already opt-in via `ConsumeResponse::tracker`, so the property worth
-    /// protecting is that a *genuine* tracker cannot be quietly stripped of
-    /// its requirements in flight — not that no tracker can be built.
+    /// A tracker crosses the round trip in a cookie or session store, so it
+    /// leaves this process and comes back. Private fields say nothing about
+    /// what happens in between: a plain `Deserialize`, or any public
+    /// constructor, lets whoever controls that storage rebuild the tracker
+    /// with `requested_authn_context` and `requested_name_id_format` cleared —
+    /// which switches off non-downgrade enforcement and the returned-format
+    /// check exactly as mutating the fields would have.
+    ///
+    /// Sealing is therefore the only honest way to hand a tracker out. Same
+    /// construction as [`Aes256GcmCodec`](crate::Aes256GcmCodec):
+    /// `base64url(nonce_12 || ciphertext || tag_16)` under a 32-byte key the
+    /// application holds.
+    ///
+    /// # Errors
+    ///
+    /// If serialization or encryption fails.
+    pub fn seal(&self, key: &[u8; 32]) -> Result<String, Error> {
+        let wire = self;
+        let plaintext =
+            postcard::to_allocvec(&wire).map_err(|_err| Error::InvalidConfiguration {
+                reason: "login tracker serialize",
+            })?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|_err| Error::InvalidConfiguration {
+                reason: "AES-256-GCM key size mismatch",
+            })?;
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let ct = cipher
+            .encrypt(
+                aes_gcm::Nonce::from_slice(&nonce_bytes),
+                aes_gcm::aead::Payload {
+                    msg: &plaintext,
+                    aad: &[],
+                },
+            )
+            .map_err(|_err| Error::DecryptFailed {
+                reason: "login tracker",
+            })?;
+        let mut buf = Vec::with_capacity(12usize.saturating_add(ct.len()));
+        buf.extend_from_slice(&nonce_bytes);
+        buf.extend_from_slice(&ct);
+        Ok(URL_SAFE_NO_PAD.encode(&buf))
+    }
+}
+
+impl LoginTracker {
+    /// The inert wire form, for embedding in something the crate authenticates.
     #[must_use]
-    pub fn new(
-        request_id: String,
-        issued_at: SystemTime,
-        idp_entity_id: String,
-        acs_endpoint: SsoResponseEndpoint,
-        requested_authn_context: Option<RequestedAuthnContext>,
-        requested_name_id_format: Option<NameIdFormat>,
-    ) -> Self {
-        Self {
-            request_id,
-            issued_at,
-            idp_entity_id,
-            acs_endpoint,
-            requested_authn_context,
-            requested_name_id_format,
+    pub fn to_payload(&self) -> LoginTrackerPayload {
+        LoginTrackerPayload {
+            request_id: self.request_id.clone(),
+            issued_at: self.issued_at,
+            idp_entity_id: self.idp_entity_id.clone(),
+            acs_endpoint: self.acs_endpoint.clone(),
+            requested_authn_context: self.requested_authn_context.clone(),
+            requested_name_id_format: self.requested_name_id_format.clone(),
         }
+    }
+
+    /// Rebuild from a payload. Crate-internal: the caller reaching this would
+    /// be able to clear the policy fields, which is what privacy prevents.
+    pub(crate) fn from_payload(payload: LoginTrackerPayload) -> Self {
+        Self {
+            request_id: payload.request_id,
+            issued_at: payload.issued_at,
+            idp_entity_id: payload.idp_entity_id,
+            acs_endpoint: payload.acs_endpoint,
+            requested_authn_context: payload.requested_authn_context,
+            requested_name_id_format: payload.requested_name_id_format,
+        }
+    }
+
+    /// Recover a tracker sealed by [`LoginTrackerPayload::seal`].
+    ///
+    /// This is the only way to obtain a `LoginTracker` other than
+    /// [`ServiceProvider::start_login`], so a tracker presented to
+    /// [`ConsumeResponse`] is always one this crate issued and this key
+    /// vouches for.
+    ///
+    /// `max_age` bounds how long a sealed tracker stays usable. An
+    /// authenticated blob is still a bearer token: without a bound, one
+    /// captured from a log or a stale cookie authorizes a correlation
+    /// indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// If the blob is malformed, fails authentication, or is older than
+    /// `max_age`.
+    pub fn open(
+        blob: &str,
+        key: &[u8; 32],
+        now: SystemTime,
+        max_age: Duration,
+    ) -> Result<Self, Error> {
+        let bytes =
+            URL_SAFE_NO_PAD
+                .decode(blob.as_bytes())
+                .map_err(|_err| Error::DecryptFailed {
+                    reason: "login tracker",
+                })?;
+        if bytes.len() < 12 + 16 {
+            return Err(Error::DecryptFailed {
+                reason: "login tracker",
+            });
+        }
+        let (nonce_bytes, ct) = bytes.split_at(12);
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|_err| Error::InvalidConfiguration {
+                reason: "AES-256-GCM key size mismatch",
+            })?;
+        let plaintext = cipher
+            .decrypt(
+                aes_gcm::Nonce::from_slice(nonce_bytes),
+                aes_gcm::aead::Payload { msg: ct, aad: &[] },
+            )
+            .map_err(|_err| Error::DecryptFailed {
+                reason: "login tracker",
+            })?;
+        let wire: LoginTrackerPayload =
+            postcard::from_bytes(&plaintext).map_err(|_err| Error::DecryptFailed {
+                reason: "login tracker",
+            })?;
+
+        // Bounded in both directions, for the same reason the proxy context is:
+        // `issued_at` is whatever was sealed, so an unbounded future date would
+        // make `max_age` meaningless.
+        match now.duration_since(wire.issued_at) {
+            Ok(age) if age > max_age => {
+                return Err(Error::Expired);
+            }
+            Err(ahead) if ahead.duration() > Duration::from_mins(5) => {
+                return Err(Error::InvalidConfiguration {
+                    reason: "login tracker is dated too far in the future",
+                });
+            }
+            _ => {}
+        }
+
+        Ok(Self::from_payload(wire))
     }
 
     /// The `<samlp:RequestedAuthnContext>` this login was issued with.

@@ -631,6 +631,7 @@ impl IdentityProvider {
     /// See RFC-004 §3.1.
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
         ensure_request_belongs_to_sp(input.in_response_to, input.sp)?;
+        ensure_sp_key_material_matches(input.in_response_to, input.sp)?;
         ensure_authn_context_satisfies_request(
             input.in_response_to,
             &input.authn_context_class_ref,
@@ -816,6 +817,42 @@ fn ensure_authn_context_satisfies_request(
 /// signed query could pair it with any XML — a request for a different ACS,
 /// a different subject, a different `ForceAuthn` — and the signature check
 /// would still pass.
+/// Confirm the SP descriptor carries the encryption key material this request
+/// was validated against.
+///
+/// Issuance encrypts the assertion to `sp`'s certificate, and entity ID plus
+/// ACS do not pin that: a descriptor with the same identity and a substituted
+/// certificate has the assertion encrypted to the substituted key, and one
+/// with the certificate removed silently downgrades opportunistic encryption
+/// to plaintext.
+///
+/// Compared as a set. Metadata ordering is not semantically meaningful, and an
+/// order-sensitive check refuses a peer that merely re-serialized its
+/// descriptor — a false positive that teaches callers to work around the
+/// check.
+///
+/// Applied only where an assertion is actually encrypted. Error responses
+/// carry none, so failing them on key material would reject the very path a
+/// deployment uses to report trouble.
+fn ensure_sp_key_material_matches(
+    request: &ParsedAuthnRequest,
+    sp: &SpDescriptor,
+) -> Result<(), Error> {
+    let mut sealed = request.validated_encryption_cert_fingerprints().to_vec();
+    let mut current: Vec<[u8; 32]> = sp
+        .encryption_certs
+        .iter()
+        .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+        .collect();
+    sealed.sort_unstable();
+    current.sort_unstable();
+    if current == sealed {
+        Ok(())
+    } else {
+        Err(Error::SpKeyMaterialMismatch)
+    }
+}
+
 fn ensure_signed_query_matches(
     raw_query_string: &str,
     saml_request: &[u8],
@@ -852,23 +889,6 @@ fn ensure_request_belongs_to_sp(
     // ACS membership does not close it either — SP-A and SP-B may legitimately
     // share a URL and binding. `validated_sp()` records what
     // `validate_authn_request` actually saw and no caller can set it.
-    // Key material, not just identity.
-    //
-    // Issuance encrypts the assertion to `sp`'s encryption certificate, and
-    // entity ID plus ACS do not pin that: a descriptor with the same identity
-    // and a substituted certificate has the assertion encrypted to the
-    // substituted key, and one with the certificate removed silently
-    // downgrades opportunistic encryption to plaintext.
-    let sealed = request.validated_encryption_cert_fingerprints();
-    let current: Vec<[u8; 32]> = sp
-        .encryption_certs
-        .iter()
-        .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
-        .collect();
-    if current != sealed {
-        return Err(Error::SpKeyMaterialMismatch);
-    }
-
     if request.validated_sp() != sp.entity_id {
         return Err(Error::IssuerMismatch {
             expected: request.validated_sp().to_owned(),
