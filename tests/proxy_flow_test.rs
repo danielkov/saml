@@ -206,6 +206,8 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
         SsoResponseDispatch::Artifact(_) => panic!("expected POST"),
     };
 
+    let replay_cache = saml::InMemoryReplayCache::new(256);
+
     // ---- 6. Proxy (SP face) consumes the upstream Response. -------------
     // One call authenticates the RelayState blob and validates the Response
     // against *that* context's tracker. The two arrive coupled, so relay
@@ -220,8 +222,9 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             expected_destination: PROXY_SP_ACS_URL,
             now,
             clock_skew: Duration::from_mins(2),
-            replay_cache: None,
-            replay_mode: ReplayMode::All,
+            // Required on the proxy path: without consuming the upstream
+            // assertion, replaying {RelayState, Response} mints another flow.
+            replay_cache: &replay_cache,
             holder_of_key_cert: None,
         })
         .expect("proxy consumes the upstream response under its own context");

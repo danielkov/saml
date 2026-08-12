@@ -584,8 +584,15 @@ pub struct ConsumeUpstreamResponse<'a> {
     pub expected_destination: &'a str,
     pub now: SystemTime,
     pub clock_skew: Duration,
-    pub replay_cache: Option<&'a dyn crate::replay::ReplayCache>,
-    pub replay_mode: crate::replay::ReplayMode,
+    /// Required, unlike on the bare SP path.
+    ///
+    /// Moving the `UpstreamFlow` into `relay_to_downstream` stops *that value*
+    /// being reused, but the RelayState blob and the Response are just bytes:
+    /// replaying both produces a second, equally genuine flow. Only consuming
+    /// the upstream assertion makes one authentication yield one downstream
+    /// assertion, and nothing else in this crate can do it — so it is not
+    /// optional here.
+    pub replay_cache: &'a dyn crate::replay::ReplayCache,
     pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
 }
 
@@ -823,8 +830,11 @@ impl Proxy<'_> {
             expected_destination: input.expected_destination,
             now: input.now,
             clock_skew: input.clock_skew,
-            replay_cache: input.replay_cache,
-            replay_mode: input.replay_mode,
+            replay_cache: Some(input.replay_cache),
+            // `All`, not the caller's choice: a relaxed mode would let the
+            // upstream assertion be redeemed twice, which is the whole point
+            // of requiring a cache here.
+            replay_mode: crate::replay::ReplayMode::All,
             holder_of_key_cert: input.holder_of_key_cert,
         })?;
         Ok(UpstreamFlow {
@@ -1056,7 +1066,14 @@ impl Proxy<'_> {
         // session from an upstream assertion with five minutes left — and can
         // keep doing so, laundering a short-lived authentication into an
         // indefinite one.
-        let upstream_expiry = input.flow.identity().not_on_or_after();
+        // The earlier of the two upstream deadlines. `not_on_or_after` bounds
+        // the assertion; `session_not_on_or_after` bounds the authenticated
+        // session, and can be sooner — capping only on the former let a
+        // downstream session outlive the upstream session it represents.
+        let upstream_expiry = match input.flow.identity().session_not_on_or_after() {
+            Some(session_end) => input.flow.identity().not_on_or_after().min(session_end),
+            None => input.flow.identity().not_on_or_after(),
+        };
         if upstream_expiry <= input.now {
             return Err(Error::Expired);
         }
