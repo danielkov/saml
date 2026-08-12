@@ -378,9 +378,9 @@ Each step short-circuits on error to a specific `Error` variant:
 
 ### 4.2 What the caller does after
 
-- **Replay defense**: dedupe on `identity.assertion_id` until `identity.not_on_or_after` passes. The library does not own this store.
-- **Application session**: create a session keyed off `identity.name_id` + `identity.session_index`.
-- **Authorization**: apply policy to `identity.attributes`.
+- **Replay defense**: dedupe on `identity.assertion_id()` until `identity.not_on_or_after()` passes. The library does not own this store.
+- **Application session**: create a session keyed off `identity.name_id()` + `identity.session_index()`.
+- **Authorization**: apply policy to `identity.attributes()`.
 
 ---
 
@@ -469,8 +469,8 @@ let identity = sp.consume_response(ConsumeResponse {
     now: SystemTime::now(),
     clock_skew: Duration::from_secs(60),
 })?;
-// Dedupe identity.assertion_id against your replay store.
-// Create app session keyed off identity.name_id + identity.session_index.
+// Dedupe identity.assertion_id() against your replay store.
+// Create app session keyed off identity.name_id() + identity.session_index().
 ```
 
 ---

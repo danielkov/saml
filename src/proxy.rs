@@ -102,14 +102,72 @@ impl<'a> Proxy<'a> {
 /// [`OpaqueHandleCodec`] (server-side store lookup) both satisfy this. Prefer
 /// them to a hand-rolled codec.
 pub trait ProxyContextCodec: Send + Sync {
-    /// Seal a payload into a blob. Called by
-    /// [`Proxy::bounce_to_upstream`]; there is no public path to it, because
-    /// a caller able to seal an arbitrary payload could round-trip it through
-    /// [`Proxy::decode_context`] and obtain a genuine attestation for a
-    /// context they invented.
-    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error>;
+    /// Seal the granted payload into a blob.
+    ///
+    /// Takes a [`SealingGrant`] rather than a bare [`ProxyContextPayload`]
+    /// because the payload type is public and constructible: if this method
+    /// accepted one, a caller could build a context naming any registered SP
+    /// and ACS, seal it, and pass the blob to [`Proxy::decode_context`] for a
+    /// genuine attestation. A grant has no public constructor, so only
+    /// [`Proxy::bounce_to_upstream`] can produce the input this needs.
+    ///
+    /// Implementations read the payload via [`SealingGrant::payload`].
+    fn encode(&self, grant: &SealingGrant<'_>) -> Result<String, Error>;
     /// Authenticate a blob and return the payload it carries.
     fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error>;
+}
+
+/// Permission to seal one payload, issued only by
+/// [`Proxy::bounce_to_upstream`].
+///
+/// # What this does and does not buy
+///
+/// It closes the *API* route to sealing. Without it, `encode` is a public
+/// method on public types such as [`Aes256GcmCodec`], so removing
+/// `Proxy`'s codec accessor achieved nothing: a caller could construct a
+/// second codec over the same key and seal whatever they liked.
+///
+/// It does **not** make a stateless keyed codec unforgeable. Whoever holds
+/// the AEAD key can reimplement the wire format — it is documented in
+/// RFC-005 §2 — and mint blobs without going through this crate at all. That
+/// is inherent to sealing state into a token the client carries: the key is
+/// the only thing standing between an attacker and a valid blob, and with
+/// [`Aes256GcmCodec`] the application holds that key.
+///
+/// If the application's own key material is part of your threat model, use
+/// [`OpaqueHandleCodec`]: the token is an opaque handle and the context lives
+/// server-side, so forging one means guessing a random handle rather than
+/// holding a key.
+pub struct SealingGrant<'a> {
+    payload: &'a ProxyContextPayload,
+    /// Denies struct-literal construction outside this crate. That is the
+    /// entire mechanism.
+    #[expect(
+        dead_code,
+        reason = "never read: its purpose is to make the type externally \
+                  unconstructible, which a read would not demonstrate"
+    )]
+    issued: IssuedByCrate,
+}
+
+/// Zero-sized proof that a [`SealingGrant`] came from this crate.
+struct IssuedByCrate;
+
+impl<'a> SealingGrant<'a> {
+    /// Issue a grant. Crate-internal: `bounce_to_upstream` is the only
+    /// legitimate reason to seal a context.
+    pub(crate) fn issue(payload: &'a ProxyContextPayload) -> Self {
+        Self {
+            payload,
+            issued: IssuedByCrate,
+        }
+    }
+
+    /// The payload to seal.
+    #[must_use]
+    pub fn payload(&self) -> &ProxyContextPayload {
+        self.payload
+    }
 }
 
 /// The serialized body of a proxy relay token. See RFC-005 §3.
@@ -244,7 +302,8 @@ impl Aes256GcmCodec {
 }
 
 impl ProxyContextCodec for Aes256GcmCodec {
-    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error> {
+    fn encode(&self, grant: &SealingGrant<'_>) -> Result<String, Error> {
+        let context = grant.payload();
         let plaintext =
             postcard::to_allocvec(context).map_err(|_err| Error::InvalidConfiguration {
                 reason: "proxy context serialize",
@@ -348,7 +407,8 @@ pub struct OpaqueHandleCodec<S: ProxyContextStore> {
 }
 
 impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
-    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error> {
+    fn encode(&self, grant: &SealingGrant<'_>) -> Result<String, Error> {
+        let context = grant.payload();
         let mut bytes = vec![0u8; self.handle_byte_len];
         rand::rng().fill_bytes(&mut bytes);
         let handle = URL_SAFE_NO_PAD.encode(&bytes);
@@ -465,7 +525,7 @@ impl Proxy<'_> {
         };
 
         // 3. Encode the context for the wire.
-        let upstream_relay_state = self.context_codec.encode(&context)?;
+        let upstream_relay_state = self.context_codec.encode(&SealingGrant::issue(&context))?;
 
         // 4. Inject the encoded RelayState into the dispatch. For POST we set
         //    the form field; for Redirect we append to the URL query. NOTE
@@ -497,22 +557,40 @@ impl Proxy<'_> {
     /// Whatever the codec returns for a blob it will not vouch for: tampered,
     /// expired, unknown, or malformed.
     ///
-    /// # The sealing side is not reachable
+    /// # The sealing side is not reachable through this crate
     ///
     /// Authentication establishes that a blob came from whoever holds the
-    /// key. If a caller could also *seal* a blob, that would be everyone: they
-    /// would build a payload naming any registered SP and ACS, encode it, and
-    /// decode it straight back into an authoritative context. So the codec
-    /// accessor is crate-internal and this does not compile:
+    /// key. If a caller could also *seal* a blob, that would be everyone:
+    /// they would build a payload naming any registered SP and ACS, encode
+    /// it, and decode it straight back into an authoritative context.
+    ///
+    /// Removing `Proxy`'s codec accessor is not sufficient on its own —
+    /// [`Aes256GcmCodec`] is public and the caller supplies its key, so a
+    /// second instance is trivial to build. [`ProxyContextCodec::encode`]
+    /// therefore requires a [`SealingGrant`], which has no public
+    /// constructor. Neither of these compiles:
     ///
     /// ```compile_fail
-    /// # use saml::{Proxy, ProxyContextPayload};
-    /// fn forge(proxy: &Proxy<'_>, payload: &ProxyContextPayload) -> String {
-    ///     // There is no public accessor for the codec, so its `encode` is
-    ///     // unreachable from outside the crate.
-    ///     proxy.context_codec().encode(payload).unwrap()
+    /// # use saml::{Aes256GcmCodec, ProxyContextCodec, ProxyContextPayload};
+    /// // Retain the key, build your own codec — `encode` still wants a grant.
+    /// fn forge(key: [u8; 32], payload: &ProxyContextPayload) -> String {
+    ///     Aes256GcmCodec::new(key).encode(payload).unwrap()
     /// }
     /// ```
+    ///
+    /// ```compile_fail
+    /// # use saml::proxy::SealingGrant;
+    /// # use saml::ProxyContextPayload;
+    /// fn grant(payload: &ProxyContextPayload) -> SealingGrant<'_> {
+    ///     SealingGrant::issue(payload)
+    /// }
+    /// ```
+    ///
+    /// What this does **not** do is make [`Aes256GcmCodec`] unforgeable:
+    /// whoever holds the AEAD key can reimplement the wire format and mint
+    /// blobs without this crate. That is inherent to sealing state into a
+    /// client-carried token. Where the application's own key material is in
+    /// scope, use [`OpaqueHandleCodec`].
     pub fn decode_context(&self, blob: &str) -> Result<ProxyContext, Error> {
         let payload = self.context_codec.decode(blob)?;
         Ok(ProxyContext::attested(payload))
@@ -1275,7 +1353,9 @@ mod tests {
     fn aes_gcm_codec_round_trip() {
         let codec = Aes256GcmCodec::new([7u8; 32]);
         let context = sample_context();
-        let blob = codec.encode(&context).expect("encode");
+        let blob = codec
+            .encode(&SealingGrant::issue(&context))
+            .expect("encode");
         let decoded = codec.decode(&blob).expect("decode");
         assert_eq!(decoded.downstream_request_id, context.downstream_request_id);
         assert_eq!(
@@ -1292,7 +1372,7 @@ mod tests {
     fn aes_gcm_codec_rejects_tampered_blob() {
         let codec = Aes256GcmCodec::new([7u8; 32]);
         let context = sample_context();
-        let blob = codec.encode(&context).unwrap();
+        let blob = codec.encode(&SealingGrant::issue(&context)).unwrap();
 
         // Flip a byte in the middle (covers ciphertext / tag region).
         let mut tampered = URL_SAFE_NO_PAD.decode(blob.as_bytes()).unwrap();
@@ -1315,7 +1395,7 @@ mod tests {
         context.issued_at = SystemTime::now()
             .checked_sub(Duration::from_mins(10))
             .expect("now - 10min within range");
-        let blob = codec.encode(&context).unwrap();
+        let blob = codec.encode(&SealingGrant::issue(&context)).unwrap();
         let err = codec.decode(&blob).unwrap_err();
         match err {
             Error::InvalidConfiguration { reason } => {
@@ -1391,7 +1471,7 @@ mod tests {
             ttl: Duration::from_mins(10),
         };
         let context = sample_context();
-        let handle = codec.encode(&context).unwrap();
+        let handle = codec.encode(&SealingGrant::issue(&context)).unwrap();
         assert!(handle.len() >= 32, "handle len: {}", handle.len());
 
         let decoded = codec.decode(&handle).unwrap();
@@ -1410,7 +1490,7 @@ mod tests {
             ttl: Duration::from_millis(1),
         };
         let context = sample_context();
-        let handle = codec.encode(&context).unwrap();
+        let handle = codec.encode(&SealingGrant::issue(&context)).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let err = codec.decode(&handle).unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));

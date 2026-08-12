@@ -49,7 +49,8 @@ impl<'a> Proxy<'a> {
 
 ```rust
 pub trait ProxyContextCodec: Send + Sync {
-    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error>;
+    /// Takes a crate-issued `SealingGrant`, not a bare payload — see below.
+    fn encode(&self, grant: &SealingGrant<'_>) -> Result<String, Error>;
     fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error>;
 }
 
@@ -96,15 +97,15 @@ pub struct OpaqueHandleCodec<S: ProxyContextStore> {
 }
 
 impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
-    fn encode(&self, context: &ProxyContext) -> Result<String, Error> {
+    fn encode(&self, grant: &SealingGrant<'_>) -> Result<String, Error> {
         let mut bytes = vec![0u8; self.handle_byte_len];
         rand::rng().fill_bytes(&mut bytes);
         let handle = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
-        self.store.put(&handle, context, self.ttl)?;
+        self.store.put(&handle, grant.payload(), self.ttl)?;
         Ok(handle)
     }
 
-    fn decode(&self, blob: &str) -> Result<ProxyContext, Error> {
+    fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error> {
         self.store.take(blob)?.ok_or(Error::InvalidConfiguration {
             reason: "proxy context not found (expired or replay)",
         })
@@ -130,7 +131,9 @@ Two types, deliberately:
 - **`ProxyContextPayload`** — the transparent wire form below. `Serialize`/`Deserialize` with public fields so callers can implement their own codec. It carries no authority.
 - **`ProxyContext`** — opaque: no public constructor, no public fields, no `Deserialize`. Obtainable only from `Proxy::decode_context`, which runs the configured codec's authentication first. `relay_to_downstream` accepts only this.
 
-The split exists because relay mints a *signed* downstream assertion from the context. Every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result — an authentic identity could be paired with an invented context naming any registered SP and ACS. For the same reason the codec's sealing side is crate-internal: a caller who could `encode` an arbitrary payload could round-trip it through `decode_context` and obtain a genuine attestation.
+The split exists because relay mints a *signed* downstream assertion from the context. Every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result — an authentic identity could be paired with an invented context naming any registered SP and ACS. For the same reason `encode` takes a `SealingGrant` — a type with no public constructor, issued only by `bounce_to_upstream`. Removing `Proxy`'s codec accessor was not enough on its own: `Aes256GcmCodec` is public and the caller supplies its key, so a second instance over the same key is trivial to build.
+
+This closes the API route, not the underlying one. Whoever holds the AEAD key can reimplement the wire format described in §2 and mint blobs without this crate at all — inherent to sealing state into a client-carried token. Where the application's own key material is in scope, use `OpaqueHandleCodec`, whose token is an opaque handle with the context held server-side.
 
 Because `ProxyContextCodec` is a public trait, a custom implementation **is** the proxy's trust anchor: whatever its `decode` returns is what gets attested and signed from. Implementations must authenticate rather than merely parse, bind the blob to the deployment's key or store, and reject stale blobs.
 
@@ -222,8 +225,12 @@ Internally:
 
 ```rust
 pub struct RelayToDownstream<'a> {
+    /// From `Proxy::decode_context` — the only source of one.
     pub context: &'a ProxyContext,
     pub upstream_identity: &'a Identity,
+    /// Downstream SP descriptor. The context must belong to it; relay refuses
+    /// the pairing otherwise.
+    pub downstream_sp: &'a SpDescriptor,
     /// Pluggable: which upstream attributes to release downstream, possibly
     /// rewritten / renamed.
     pub attribute_release: &'a dyn AttributeReleasePolicy,
@@ -248,7 +255,7 @@ impl<'a> Proxy<'a> {
 Internally:
 
 1. Look up the downstream SP descriptor by `context.downstream_sp_entity_id()`. (Caller-managed registry; the library does not maintain one.) For ergonomics, the caller can pass a closure for SP lookup via `ProxyConfig` (future addition).
-2. **Enforce AuthnContext non-downgrade** (§7) using `context.requested_authn_context` and `upstream_identity.authn_context_class_ref`. → `Error::AuthnContextDowngrade`.
+2. **Enforce AuthnContext non-downgrade** (§7) using `context.payload().requested_authn_context` and `upstream_identity.authn_context_class_ref()`. → `Error::AuthnContextDowngrade`.
 3. Compute downstream attributes via `attribute_release.release(&upstream_identity.attributes, &downstream_sp)`.
 4. Compute downstream NameID via `name_id_transform.transform(&upstream_identity.name_id, &downstream_sp)`.
 5. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id()`).
@@ -301,6 +308,9 @@ pub trait NameIdTransform: Send + Sync {
     fn transform(
         &self,
         upstream_subject: &NameId,
+        /// Upstream attributes, so a transform can derive the downstream
+        /// NameID from one (e.g. a directory UUID) rather than the subject.
+        upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
     ) -> Result<NameId, Error>;
 }
@@ -336,7 +346,7 @@ pub struct PerSpFormat {
 
 ## 7. AuthnContext non-downgrade
 
-If `context.requested_authn_context` requested `MultiFactorAuth` and `upstream_identity.authn_context_class_ref` is `PasswordProtectedTransport`, the proxy must reject — silently downgrading authentication strength is a transitive trust violation.
+If `context.payload().requested_authn_context` requested `MultiFactorAuth` and `upstream_identity.authn_context_class_ref()` is `PasswordProtectedTransport`, the proxy must reject — silently downgrading authentication strength is a transitive trust violation.
 
 Built into `relay_to_downstream` as:
 
