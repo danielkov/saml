@@ -101,13 +101,17 @@ pub fn make_artifact(issuer_entity_id: &str, endpoint_index: u16) -> Result<Stri
 /// Construct an [`ArtifactRedirect`] for an outbound SSO `<samlp:Response>`.
 ///
 /// `sp_acs_url` is the SP's ACS endpoint URL (where the browser lands).
+/// `issuer_entity_id` is this IdP (it seeds the artifact's `SourceID`).
+/// `recipient_entity_id` is the SP the artifact is minted for.
 /// `response_xml` is the full `<samlp:Response>` XML the IdP will return when
 /// the SP resolves the artifact via SOAP — the library does not persist this;
-/// the caller MUST stash it keyed by the returned `artifact` string and serve
-/// it from its `ArtifactResolutionService`.
+/// the caller MUST stash it, together with the recipient, keyed by the
+/// returned `artifact` string. See [`ArtifactRedirect`] for why the recipient
+/// is part of that contract rather than optional bookkeeping.
 pub fn build_artifact_redirect(
     sp_acs_url: &Url,
     issuer_entity_id: &str,
+    recipient_entity_id: &str,
     endpoint_index: u16,
     response_xml: String,
     relay_state: Option<&str>,
@@ -128,6 +132,7 @@ pub fn build_artifact_redirect(
     Ok(ArtifactRedirect {
         redirect_to,
         artifact,
+        recipient_entity_id: recipient_entity_id.to_owned(),
         response_xml,
     })
 }
@@ -532,6 +537,12 @@ pub struct ArtifactResolveRequest {
     pub issuer: String,
     /// `samlp:Artifact` text content — the opaque token to look up.
     pub artifact: String,
+    /// `samlp:ArtifactResolve/@Destination`, when present.
+    ///
+    /// Optional on the wire. The role layer compares it against the endpoint
+    /// that actually received the message; see
+    /// [`IdentityProvider::parse_artifact_resolve`](crate::IdentityProvider::parse_artifact_resolve).
+    pub destination: Option<String>,
     /// Whether an enveloped `<ds:Signature>` covering the whole
     /// `<samlp:ArtifactResolve>` was present and verified.
     ///
@@ -620,10 +631,13 @@ pub fn parse_artifact_resolve_with(
         .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing samlp:Artifact".to_string()))?
         .text_content();
 
+    let destination = resolve.attribute(None, "Destination").map(str::to_owned);
+
     Ok(ArtifactResolveRequest {
         request_id,
         issuer,
         artifact,
+        destination,
         signature_verified,
     })
 }
@@ -790,6 +804,7 @@ mod tests {
         let redirect = build_artifact_redirect(
             &acs,
             "https://idp.example.com",
+            "https://sp.example.com/saml",
             0,
             "<samlp:Response/>".to_owned(),
             None,
@@ -821,6 +836,7 @@ mod tests {
         let redirect = build_artifact_redirect(
             &acs,
             "https://idp.example.com",
+            "https://sp.example.com/saml",
             1,
             "<samlp:Response/>".to_owned(),
             Some("opaque-relay-state"),
@@ -841,8 +857,15 @@ mod tests {
     #[test]
     fn build_artifact_redirect_percent_encodes_relay_state_with_specials() {
         let acs = Url::parse("https://sp.example.com/acs").unwrap();
-        let redirect =
-            build_artifact_redirect(&acs, "issuer", 0, String::new(), Some("a&b=c d")).unwrap();
+        let redirect = build_artifact_redirect(
+            &acs,
+            "issuer",
+            "https://sp.example.com/saml",
+            0,
+            String::new(),
+            Some("a&b=c d"),
+        )
+        .unwrap();
         // url::Url percent-encodes `&`, `=`, and ` ` in the value.
         let raw_query = redirect.redirect_to.query().unwrap();
         assert!(raw_query.contains("RelayState="), "{raw_query}");

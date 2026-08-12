@@ -161,6 +161,7 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
         &xml,
         input.relay_state,
         input.idp_entity_id,
+        &input.sp.entity_id,
     )
 }
 
@@ -254,6 +255,9 @@ pub(crate) struct IssueErrorResponseInputs<'a> {
     pub outbound_c14n: C14nAlgorithm,
     pub acs_endpoint: &'a SsoResponseEndpoint,
     pub relay_state: Option<&'a str>,
+    /// Entity ID of the SP this response is for. Recorded on an artifact so
+    /// the resolve can be bound to its intended recipient.
+    pub recipient_entity_id: &'a str,
 }
 
 /// Issue an error Response — Status != Success, no Assertion.
@@ -295,6 +299,7 @@ pub(crate) fn issue_error_response(
         &xml,
         input.relay_state,
         input.idp_entity_id,
+        input.recipient_entity_id,
     )
 }
 
@@ -616,6 +621,7 @@ fn dispatch_binding(
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
+    recipient_entity_id: &str,
 ) -> Result<SsoResponseDispatch, Error> {
     match acs_endpoint.binding {
         SsoResponseBinding::HttpPost => {
@@ -630,9 +636,13 @@ fn dispatch_binding(
                 relay_state,
             ))
         }
-        SsoResponseBinding::HttpArtifact => {
-            issue_artifact(acs_endpoint, xml, relay_state, idp_entity_id)
-        }
+        SsoResponseBinding::HttpArtifact => issue_artifact(
+            acs_endpoint,
+            xml,
+            relay_state,
+            idp_entity_id,
+            recipient_entity_id,
+        ),
     }
 }
 
@@ -642,6 +652,7 @@ fn issue_artifact(
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
+    recipient_entity_id: &str,
 ) -> Result<SsoResponseDispatch, Error> {
     let url = url::Url::parse(&acs_endpoint.url).map_err(|_url_parse_err| {
         Error::InvalidConfiguration {
@@ -654,6 +665,7 @@ fn issue_artifact(
     let redirect = crate::binding::artifact::build_artifact_redirect(
         &url,
         idp_entity_id,
+        recipient_entity_id,
         acs_endpoint.index.unwrap_or(0),
         xml_str.to_owned(),
         relay_state,
@@ -667,6 +679,7 @@ fn issue_artifact(
     _xml: &[u8],
     _relay_state: Option<&str>,
     _idp_entity_id: &str,
+    _recipient_entity_id: &str,
 ) -> Result<SsoResponseDispatch, Error> {
     Err(Error::UnsupportedByPeer {
         binding: crate::binding::Binding::HttpArtifact,
@@ -1031,6 +1044,7 @@ mod tests {
         let kp = rsa_signing_key();
         let inputs = IssueErrorResponseInputs {
             idp_entity_id: "https://idp.example.com",
+            recipient_entity_id: &sp.entity_id,
             in_response_to: Some("_req1"),
             now: fixed_now(),
             status_code: SamlStatusCode::AuthnFailed,
