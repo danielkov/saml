@@ -573,7 +573,11 @@ impl AppState {
 
     /// One-time consume of a stashed artifact.
     #[cfg(feature = "artifact-binding")]
-    /// Owner-checked, single-locked consume. See [`ArtifactStore::take_for`].
+    /// Owner-checked, single-locked consume.
+    ///
+    /// Ownership is checked *before* removal, in one operation under one lock,
+    /// so a registered SP that is not the recipient cannot burn a victim's
+    /// artifact out from under them.
     pub fn take_artifact_for(
         &self,
         artifact: &str,
