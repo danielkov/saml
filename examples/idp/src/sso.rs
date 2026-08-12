@@ -194,6 +194,7 @@ fn handle_sso_xml(
     let parsed = match state.idp.consume_authn_request(ConsumeAuthnRequest {
         sp: &entry.sp,
         peer_crypto_policy: None,
+        max_authn_request_age: None,
         saml_request: saml_request_xml,
         binding,
         relay_state,

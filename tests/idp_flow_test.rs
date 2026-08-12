@@ -35,7 +35,7 @@ fn idp_consumes_redirect_authn_request_and_emits_response() {
     let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL).expect("idp builds");
     let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
-    let now = common::fixed_now().expect("fixed_now");
+    let now = common::flow_now();
 
     // 1. SP builds an AuthnRequest dispatched over HTTP-Redirect.
     let start = sp
@@ -88,6 +88,7 @@ fn idp_consumes_redirect_authn_request_and_emits_response() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &authn_request_xml,
             binding: Binding::HttpRedirect,
             relay_state: Some(&relay_state_on_wire),

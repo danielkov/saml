@@ -36,6 +36,13 @@ pub struct IdentityProviderConfig {
 
     /// If true, AuthnRequests from SPs must be signed.
     pub want_authn_requests_signed: bool,
+    /// Maximum age of an inbound `<samlp:AuthnRequest>`, measured from its
+    /// `IssueInstant` and widened by the call's `clock_skew`. `AuthnRequest`
+    /// has no `NotOnOrAfter`, so this bound comes from the IdP. Required —
+    /// `DEFAULT_MAX_AUTHN_REQUEST_AGE` is the recommended value, not a
+    /// fallback. `Duration::MAX` disables *age* enforcement only;
+    /// future-dating stays bounded by `clock_skew`.
+    pub max_authn_request_age: Duration,
     /// If true, the outbound Response root is signed.
     pub sign_responses: bool,
     /// If true, each outbound Assertion is signed.
@@ -83,6 +90,11 @@ pub struct ConsumeAuthnRequest<'a> {
     /// Peer-specific inbound crypto policy for this SP. If absent, the IdP's
     /// `default_peer_crypto_policy` is used.
     pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Overrides `IdentityProviderConfig::max_authn_request_age` for this
+    /// call. `None` uses the IdP default. Scoped per call for the same reason
+    /// `peer_crypto_policy` is: one SP with a slow flow must not force a wider
+    /// window on every other SP.
+    pub max_authn_request_age: Option<Duration>,
     pub saml_request: &'a [u8],
     pub binding: Binding,
     pub relay_state: Option<&'a str>,
@@ -172,6 +184,12 @@ impl IdentityProvider {
    - If `AuthnRequest/@ProtocolBinding` was specified (already narrowed to `SsoResponseBinding` in step 5a) AND the resolved ACS endpoint's binding differs from it: → `Error::IllegalResponseBinding { requested }`. The SP cannot ask for the Response on a binding the registered ACS endpoint does not support.
    - If `@ProtocolBinding` was not specified: the resolved ACS endpoint's binding is authoritative.
    - The pair `(resolved_acs.binding, requested_protocol_binding)` is what flows into `IssueResponse` and pins the outbound binding — there is no further negotiation after this step.
+7b. **Freshness** (`IssueInstant`). Runs *after* the signature check. Where the effective policy requires a signature — `self.want_authn_requests_signed` or `input.sp.authn_requests_signed` — that ordering keeps a sender who cannot produce one from probing the accepted window. Where signing is optional the ordering does not achieve that: unsigned requests are accepted at step 6 and then judged here, so such a sender can probe it. The ordering is still the correct one; it is not a probing defence on its own. `AuthnRequest` carries no `NotOnOrAfter` (unlike `LogoutRequest`), so the bound comes from the IdP: `max_age = input.max_authn_request_age.unwrap_or(self.max_authn_request_age)`.
+   - Future-dated: if `IssueInstant - now > clock_skew` → `Error::AuthnRequestNotYetValid { ahead, clock_skew }`.
+   - Stale: if `now - IssueInstant > max_age + clock_skew` → `Error::StaleAuthnRequest { age, limit }`.
+   - Both are distinct from `Error::NotYetValid` / `Error::Expired`, which are documented against an assertion's `Conditions/@NotBefore` and `@NotOnOrAfter` — attributes an `AuthnRequest` does not have.
+   - `Duration::MAX` disables the **stale** branch only. Future-dating stays bounded by `clock_skew`, because that bound comes from the skew rather than from `max_age`; waiving it would leave a request dated arbitrarily far ahead acceptable indefinitely.
+   - This bounds the replay window; it does not close it. Rejecting a *repeat* within the window needs request-ID bookkeeping, which the caller owns.
 8. Build `ParsedAuthnRequest` with the resolved ACS (`SsoResponseEndpoint`), all flags, and the relay state.
 
 ### 2.2 Caller responsibility after consume
@@ -335,6 +353,7 @@ let idp = IdentityProvider::new(IdentityProviderConfig {
     artifact_resolution: vec![],
     supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
     default_name_id_format: NameIdFormat::Persistent,
+    max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
     signing_key: KeyPair::from_pkcs8_pem(IDP_PRIV)?,
     decryption_key: None,
     want_authn_requests_signed: true,
@@ -358,6 +377,7 @@ let sp = sp_registry.lookup_by_entity_id(&issuer_from_request)?;
 let parsed = idp.consume_authn_request(ConsumeAuthnRequest {
     sp: &sp,
     peer_crypto_policy: None,
+    max_authn_request_age: None,   // use the IdP default
     saml_request: &body.saml_request,
     binding: Binding::HttpRedirect,
     relay_state: query.relay_state.as_deref(),

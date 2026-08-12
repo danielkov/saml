@@ -4,6 +4,8 @@
 //! distinct validation rule has its own variant so callers can branch and log
 //! specifically. See `docs/rfcs/RFC-001-architecture.md` §7.
 
+use std::time::Duration;
+
 use crate::binding::Binding;
 
 /// Errors returned by the `saml` crate.
@@ -68,6 +70,29 @@ pub enum Error {
     NotYetValid,
     #[error("Assertion expired (NotOnOrAfter passed)")]
     Expired,
+    /// An inbound `<samlp:AuthnRequest>` was older than the IdP's accepted
+    /// freshness window.
+    ///
+    /// Distinct from [`Error::Expired`], which is about an assertion's
+    /// `Conditions/@NotOnOrAfter`. `AuthnRequest` carries no such attribute —
+    /// the bound is the IdP's
+    /// [`max_authn_request_age`](crate::IdentityProviderConfig::max_authn_request_age),
+    /// widened by the call's `clock_skew`. Both figures are carried so a log
+    /// line says how far outside the window the request fell.
+    #[error("AuthnRequest is stale: IssueInstant is {age:?} old, limit is {limit:?}")]
+    StaleAuthnRequest { age: Duration, limit: Duration },
+    /// An inbound `<samlp:AuthnRequest>` was dated further into the future
+    /// than the call's `clock_skew` tolerates.
+    ///
+    /// Distinct from [`Error::NotYetValid`], which is about an assertion's
+    /// `Conditions/@NotBefore`. Without this bound a future-dated request
+    /// would stay acceptable for as long as its `IssueInstant` runs ahead,
+    /// which is the staleness hole wearing a different sign.
+    #[error("AuthnRequest is dated {ahead:?} ahead, clock skew tolerance is {clock_skew:?}")]
+    AuthnRequestNotYetValid {
+        ahead: Duration,
+        clock_skew: Duration,
+    },
     #[error("SubjectConfirmation Recipient mismatch")]
     RecipientMismatch,
     /// A Holder-of-Key SubjectConfirmation (SAML V2.0 HoK SSO Profile) could

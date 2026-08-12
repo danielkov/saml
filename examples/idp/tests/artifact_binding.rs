@@ -209,6 +209,7 @@ async fn artifact_round_trip_through_example_handlers() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &authn_request_xml,
             binding: Binding::HttpPost,
             relay_state: Some("artifact-relay"),

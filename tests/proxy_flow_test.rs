@@ -65,7 +65,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     let proxy_sp_descriptor = common::sp_descriptor(&proxy_sp).expect("proxy sp descriptor");
     let upstream_idp_descriptor =
         common::idp_descriptor(&upstream_idp).expect("upstream idp descriptor");
-    let now = common::fixed_now().expect("fixed_now");
+    let now = common::flow_now();
 
     // Proxy composes the proxy_sp + proxy_idp roles. Use the in-memory
     // AEAD codec so the test has no extra storage dependency. The codec's
@@ -111,6 +111,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &downstream_sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &downstream_authn_request,
             binding: Binding::HttpPost,
             relay_state: Some("downstream-relay"),
@@ -159,6 +160,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &proxy_sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &upstream_authn_request_xml,
             binding: Binding::HttpPost,
             relay_state: Some(&upstream_relay_state),

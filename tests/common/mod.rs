@@ -99,6 +99,21 @@ K0dYsJzrrDnL23ajO1yzAak=
 // Builders
 // =============================================================================
 
+/// Clock for live end-to-end flow tests.
+///
+/// `ServiceProvider::start_login` stamps the `AuthnRequest`'s `IssueInstant`
+/// from the real clock, and the IdP enforces a freshness window on it. A flow
+/// test must therefore validate on the same clock the request was minted on —
+/// pairing a live request with [`fixed_now`] presents it as dated months into
+/// the future, which is indistinguishable from the replay this check exists to
+/// bound.
+///
+/// Use [`fixed_now`] for tests pinned to recorded fixtures, and this for flows
+/// that generate their own messages.
+pub fn flow_now() -> SystemTime {
+    SystemTime::now()
+}
+
 /// Deterministic test timestamp — 2026-05-26T12:00:30Z. Keeps NotBefore /
 /// NotOnOrAfter checks stable when callers thread `fixed_now()` everywhere.
 pub fn fixed_now() -> TestResult<SystemTime> {
@@ -148,6 +163,7 @@ pub fn make_idp(entity_id: &str, sso_url: &str) -> TestResult<IdentityProvider> 
         #[cfg(feature = "slo")]
         logout_want_signed: saml::IdpLogoutWantSigned::default(),
         default_session_duration: Duration::from_hours(1),
+        max_authn_request_age: saml::IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
