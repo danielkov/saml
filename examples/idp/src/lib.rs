@@ -658,6 +658,7 @@ pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, s
             responses: false,
         },
         default_session_duration: Duration::from_hours(8),
+        max_authn_request_age: saml::IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,

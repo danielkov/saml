@@ -134,6 +134,7 @@ fn build_fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         logout_signing: IdpLogoutSigning::default(),
         logout_want_signed: IdpLogoutWantSigned::default(),
         default_session_duration: Duration::from_secs(3600),
+        max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,

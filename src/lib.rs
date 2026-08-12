@@ -144,6 +144,7 @@
 //!     logout_signing: IdpLogoutSigning { sign_requests: true, sign_responses: true },
 //!     logout_want_signed: IdpLogoutWantSigned { requests: true, responses: true },
 //!     default_session_duration: Duration::from_secs(3600),
+//!     max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
 //!     default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
 //!     outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
 //!     outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -156,6 +157,7 @@
 //! let parsed = idp.consume_authn_request(ConsumeAuthnRequest {
 //!     sp: &sp,
 //!     peer_crypto_policy: None,
+//!     max_authn_request_age: None,
 //!     saml_request,
 //!     binding: Binding::HttpRedirect,
 //!     relay_state,
@@ -229,6 +231,7 @@
 //! let parsed = idp.consume_authn_request(ConsumeAuthnRequest {
 //!     sp: &downstream_sp,
 //!     peer_crypto_policy: None,
+//!     max_authn_request_age: None,
 //!     saml_request,
 //!     binding: Binding::HttpPost,
 //!     relay_state: downstream_relay_state,

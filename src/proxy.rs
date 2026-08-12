@@ -975,6 +975,7 @@ mod tests {
             #[cfg(feature = "slo")]
             logout_want_signed: crate::idp::IdpLogoutWantSigned::default(),
             default_session_duration: Duration::from_hours(1),
+            max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,

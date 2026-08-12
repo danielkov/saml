@@ -37,7 +37,7 @@ fn sp_consumes_real_idp_response() {
     let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL).expect("idp builds");
     let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
-    let now = common::fixed_now().expect("fixed_now");
+    let now = common::flow_now();
 
     // 1. Kick off SP-side login.
     let start = sp
@@ -73,6 +73,7 @@ fn sp_consumes_real_idp_response() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &authn_request_xml,
             binding: Binding::HttpPost,
             relay_state: Some("sp-flow-relay"),
@@ -157,7 +158,7 @@ fn sp_rejects_tampered_response() {
     let idp = common::make_idp(IDP_ENTITY_ID, IDP_SSO_URL).expect("idp builds");
     let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
-    let now = common::fixed_now().expect("fixed_now");
+    let now = common::flow_now();
 
     let start = sp
         .start_login(
@@ -187,6 +188,7 @@ fn sp_rejects_tampered_response() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &authn_request_xml,
             binding: Binding::HttpPost,
             relay_state: None,
