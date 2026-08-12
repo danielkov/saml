@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context under a chosen handle, then present that handle to `decode_context`.
   Its documented contract now also states that implementations must honour
   `ttl` and make `take` atomic and one-shot.
+- **Breaking:** `Proxy::relay_to_downstream` takes a single `UpstreamFlow`
+  instead of a separate `ProxyContext` and `Identity`, obtained from the new
+  `Proxy::consume_upstream_response`. Both values were individually attested
+  but nothing tied them together — `Identity` records no issuer, tracker or
+  request ID — so a caller could pair identity B with context A and have the
+  proxy sign an assertion authenticating B's subject into A's transaction, with
+  every individual check passing. `consume_upstream_response` authenticates the
+  relay token and validates the Response against *that* context's tracker in
+  one step, so the pairing is no longer the caller's to choose.
 - `Proxy::bounce_to_upstream` records the downstream SP's requested
   AuthnContext and NameIDPolicy in the context unconditionally. The
   `propagate_authn_context` / `propagate_name_id_policy` flags govern only what
