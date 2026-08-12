@@ -203,6 +203,15 @@ pub enum Error {
     NoPeerSigningCert,
     #[error("Peer does not advertise the requested binding: {binding:?}")]
     UnsupportedByPeer { binding: Binding },
+    /// An `<samlp:ArtifactResolve>` came from a registered SP other than the
+    /// one the artifact was minted for.
+    ///
+    /// Authenticating the resolver establishes *who* is asking; this is the
+    /// separate question of whether they are entitled to *this* artifact.
+    /// Without it, any registered SP could redeem another's leaked artifact —
+    /// and artifacts travel in URL query parameters, so they leak readily.
+    #[error("artifact was minted for {expected}, resolve came from {received}")]
+    ArtifactRecipientMismatch { expected: String, received: String },
     #[error("AuthnRequest/@ProtocolBinding is not legal for SSO Response: {requested:?}")]
     IllegalResponseBinding { requested: Binding },
     /// A solicited Response arrived over a different binding than the ACS
