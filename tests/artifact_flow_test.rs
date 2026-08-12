@@ -14,11 +14,7 @@
 //! - SP calls `consume_response_artifact(http, ...)` which fetches via SOAP
 //!   and validates the recovered Response.
 
-#![cfg(all(
-    feature = "artifact-binding",
-    feature = "weak-algos",
-    feature = "xmlenc"
-))]
+#![cfg(all(feature = "artifact-binding", feature = "xmlenc"))]
 
 #[path = "common/mod.rs"]
 mod common;
