@@ -805,6 +805,23 @@ fn ensure_request_belongs_to_sp(
     // ACS membership does not close it either — SP-A and SP-B may legitimately
     // share a URL and binding. `validated_sp()` records what
     // `validate_authn_request` actually saw and no caller can set it.
+    // Key material, not just identity.
+    //
+    // Issuance encrypts the assertion to `sp`'s encryption certificate, and
+    // entity ID plus ACS do not pin that: a descriptor with the same identity
+    // and a substituted certificate has the assertion encrypted to the
+    // substituted key, and one with the certificate removed silently
+    // downgrades opportunistic encryption to plaintext.
+    let sealed = request.validated_encryption_cert_fingerprints();
+    let current: Vec<[u8; 32]> = sp
+        .encryption_certs
+        .iter()
+        .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+        .collect();
+    if current != sealed {
+        return Err(Error::SpKeyMaterialMismatch);
+    }
+
     if request.validated_sp() != sp.entity_id {
         return Err(Error::IssuerMismatch {
             expected: request.validated_sp().to_owned(),

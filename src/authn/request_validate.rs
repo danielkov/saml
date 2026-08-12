@@ -78,6 +78,15 @@ struct ValidatedBinding {
     /// upstream session when the SP demanded fresh authentication.
     force_authn: bool,
     is_passive: bool,
+    /// SHA-256 fingerprints of the SP's encryption certificates as validated.
+    ///
+    /// Issuance encrypts the assertion to whichever descriptor the caller
+    /// passes in. Entity ID and ACS alone do not pin the key material, so a
+    /// later descriptor with the same identity and a substituted encryption
+    /// certificate would have the assertion encrypted to that key — and one
+    /// with the certificate removed silently downgrades opportunistic
+    /// encryption to plaintext.
+    encryption_cert_fingerprints: Vec<[u8; 32]>,
     /// RelayState as the role layer sealed it, straight from the binding.
     ///
     /// The `pub` copy is caller-mutable and rewriting it cross-wires
@@ -104,6 +113,13 @@ struct ValidatedBinding {
 }
 
 impl ParsedAuthnRequest {
+    /// SHA-256 fingerprints of the SP encryption certificates seen at
+    /// validation. Issuance refuses a descriptor whose set differs.
+    #[must_use]
+    pub fn validated_encryption_cert_fingerprints(&self) -> &[[u8; 32]] {
+        &self.validated.encryption_cert_fingerprints
+    }
+
     /// RelayState as the role layer sealed it from the binding.
     ///
     /// Read-only: the `pub` copy is caller-mutable, and this is what the
@@ -233,6 +249,11 @@ impl ParsedAuthnRequest {
                 request_id: id.clone(),
                 force_authn: false,
                 is_passive: false,
+                encryption_cert_fingerprints: sp
+                    .encryption_certs
+                    .iter()
+                    .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+                    .collect(),
                 relay_state: relay_state.clone(),
                 requested_authn_context: requested_authn_context.clone(),
                 requested_name_id_format: requested_name_id_format.clone(),
@@ -362,6 +383,11 @@ pub(crate) fn validate_authn_request(
             request_id: raw.id.clone(),
             force_authn: raw.force_authn,
             is_passive: raw.is_passive,
+            encryption_cert_fingerprints: sp
+                .encryption_certs
+                .iter()
+                .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+                .collect(),
             requested_authn_context: raw.requested_authn_context.clone(),
             requested_name_id_format: raw.requested_name_id_format.clone(),
             // The role layer seals this immediately after validate.

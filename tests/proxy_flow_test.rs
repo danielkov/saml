@@ -257,7 +257,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
 
     let downstream_dispatch = proxy
         .relay_to_downstream(RelayToDownstream {
-            flow: &flow,
+            flow,
             downstream_sp: &downstream_sp_descriptor,
             attribute_release: &release_policy,
             name_id_transform: &name_id_transform,
