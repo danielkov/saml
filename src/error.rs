@@ -187,6 +187,19 @@ pub enum Error {
     /// and artifacts travel in URL query parameters, so they leak readily.
     #[error("artifact was minted for {expected}, resolve came from {received}")]
     ArtifactRecipientMismatch { expected: String, received: String },
+    /// An artifact was not a well-formed type `0x0004` value.
+    #[error("malformed artifact: {reason}")]
+    InvalidArtifact { reason: &'static str },
+    /// A type `0x0004` artifact named an `<md:ArtifactResolutionService>`
+    /// endpoint index the issuing IdP's metadata does not advertise.
+    ///
+    /// Resolving against some other endpoint instead would send the artifact
+    /// somewhere its issuer never nominated, so this is refused rather than
+    /// falling back to the default endpoint.
+    #[error(
+        "artifact names ArtifactResolutionService index {index}, which {entity_id} does not advertise"
+    )]
+    UnknownArtifactEndpointIndex { entity_id: String, index: u16 },
     #[error("AuthnRequest/@ProtocolBinding is not legal for SSO Response: {requested:?}")]
     IllegalResponseBinding { requested: Binding },
     /// A solicited Response arrived over a different binding than the ACS

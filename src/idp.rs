@@ -533,6 +533,24 @@ pub struct IssueErrorResponse<'a> {
 impl IdentityProvider {
     /// Mint and binding-encode a success `<samlp:Response>` for an SP.
     /// See RFC-004 §3.1.
+    /// Index of the `<md:ArtifactResolutionService>` this IdP nominates in
+    /// artifacts it mints, preferring the one flagged `isDefault`.
+    ///
+    /// `None` when no ARS is registered — issuance turns that into a
+    /// configuration error rather than defaulting to index 0, which would
+    /// name an endpoint the metadata never advertised.
+    fn artifact_resolution_index(&self) -> Option<u16> {
+        let endpoint = self
+            .config
+            .artifact_resolution
+            .iter()
+            .find(|e| e.is_default)
+            .or_else(|| self.config.artifact_resolution.first())?;
+        // An ARS with no explicit index is index 0 (metadata `index` is
+        // REQUIRED on IndexedEndpoint, so this is a tolerant fallback).
+        Some(endpoint.index.unwrap_or(0))
+    }
+
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
         let acs_endpoint = &input.in_response_to.assertion_consumer_service;
         let relay_state = input.in_response_to.relay_state.as_deref();
@@ -548,6 +566,7 @@ impl IdentityProvider {
         name_id.format = chosen_format;
 
         let inputs = IssueResponseInputs {
+            artifact_resolution_index: self.artifact_resolution_index(),
             sp: input.sp,
             idp_entity_id: &self.config.entity_id,
             in_response_to: Some(input.in_response_to.id.as_str()),
@@ -592,6 +611,7 @@ impl IdentityProvider {
         let relay_state = input.in_response_to.relay_state.as_deref();
 
         let inputs = IssueErrorResponseInputs {
+            artifact_resolution_index: self.artifact_resolution_index(),
             idp_entity_id: &self.config.entity_id,
             in_response_to: Some(input.in_response_to.id.as_str()),
             now: input.now,
@@ -672,7 +692,7 @@ impl IdentityProvider {
             policy,
             require_signed: self.config.want_artifact_resolve_signed,
         };
-        let req =
+        let mut req =
             crate::binding::artifact::parse_artifact_resolve_with(soap_envelope, Some(&verify))?;
         // `@Destination` binds the message to the endpoint that received it.
         // Without it, a captured resolve replays at any ARS sharing keys or
@@ -703,6 +723,7 @@ impl IdentityProvider {
                 got: Some(req.issuer().to_owned()),
             });
         }
+        req.mark_role_validated();
         Ok(req)
     }
 
@@ -740,6 +761,14 @@ impl IdentityProvider {
         recipient_entity_id: &str,
         payload_xml: &str,
     ) -> Result<String, Error> {
+        // Refuse anything the role layer did not validate. The low-level
+        // parser is public and applies none of the configured checks, so
+        // accepting its output here would make those checks optional.
+        if !request.role_validated() {
+            return Err(Error::SignatureVerification {
+                reason: "ArtifactResolve was not validated by IdentityProvider::parse_artifact_resolve",
+            });
+        }
         if request.issuer() != recipient_entity_id {
             return Err(Error::ArtifactRecipientMismatch {
                 expected: recipient_entity_id.to_owned(),

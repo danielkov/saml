@@ -98,6 +98,54 @@ pub fn make_artifact(issuer_entity_id: &str, endpoint_index: u16) -> Result<Stri
     Ok(BASE64.encode(buf))
 }
 
+/// The fields a type `0x0004` artifact carries, per SAML 2.0 Bindings §3.6.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedArtifact {
+    /// Bytes 2..4. Identifies which of the **issuer's** (IdP's)
+    /// `<md:ArtifactResolutionService>` endpoints to resolve against — not
+    /// anything about the recipient. A recipient with several ARS endpoints
+    /// cannot pick correctly without it.
+    pub endpoint_index: u16,
+    /// Bytes 4..24. `SHA-1` of the issuer's entity ID for the derivation this
+    /// crate emits, though Bindings §3.6.4 permits an issuer to assign a
+    /// `SourceID` by other means. It is therefore exposed for callers that
+    /// index their own peers by it, and deliberately not enforced here: a
+    /// conformant IdP using a different derivation would otherwise be
+    /// unresolvable.
+    pub source_id: [u8; 20],
+}
+
+/// Decode a type `0x0004` artifact.
+///
+/// Rejects anything that is not exactly 44 bytes of the right type code, so a
+/// caller cannot read an endpoint index out of an artifact whose framing it
+/// has not established.
+pub fn parse_artifact(artifact: &str) -> Result<ParsedArtifact, Error> {
+    let raw = BASE64
+        .decode(artifact.as_bytes())
+        .map_err(|_decode_err| Error::InvalidArtifact {
+            reason: "artifact is not valid base64",
+        })?;
+    let raw: [u8; 44] = raw.try_into().map_err(|_len_err| Error::InvalidArtifact {
+        reason: "artifact is not 44 bytes",
+    })?;
+
+    let type_code = u16::from_be_bytes([raw[0], raw[1]]);
+    if type_code != ARTIFACT_TYPE_CODE {
+        return Err(Error::InvalidArtifact {
+            reason: "artifact is not type 0x0004",
+        });
+    }
+
+    let mut source_id = [0u8; 20];
+    source_id.copy_from_slice(&raw[4..24]);
+
+    Ok(ParsedArtifact {
+        endpoint_index: u16::from_be_bytes([raw[2], raw[3]]),
+        source_id,
+    })
+}
+
 /// Construct an [`ArtifactRedirect`] for an outbound SSO `<samlp:Response>`.
 ///
 /// `sp_acs_url` is the SP's ACS endpoint URL (where the browser lands).
@@ -537,6 +585,16 @@ pub struct ArtifactResolveRequest {
     /// [`signature_verified`](Self::signature_verified); only
     /// `parse_artifact_resolve_with` can set them.
     authenticated: ResolverProvenance,
+    /// Whether this came from [`IdentityProvider::parse_artifact_resolve`],
+    /// which applies the IdP's configured certificates, issuer-vs-descriptor
+    /// check, SOAP endpoint check and `@Destination` rules.
+    ///
+    /// The low-level parser below is public and applies none of those. Without
+    /// this marker a caller could parse unsigned XML — or XML verified under
+    /// unrelated configuration — and hand it straight to
+    /// `build_artifact_response`, leaving only the issuer/recipient comparison
+    /// standing.
+    role_validated: bool,
     /// `samlp:Artifact` text content — the opaque token to look up.
     pub artifact: String,
     /// `samlp:ArtifactResolve/@Destination`, when present.
@@ -557,12 +615,50 @@ struct ResolverProvenance {
 impl ArtifactResolveRequest {
     /// `samlp:Issuer` text content — the SP entity ID requesting resolution.
     ///
-    /// Read-only. On its own this is a claim; it is authenticated exactly when
+    /// The authenticated fields are private, so no caller outside this crate
+    /// can construct or alter one. Struct-literal construction does not
+    /// compile — this is what stops a caller from fabricating a
+    /// role-validated request and passing it to `build_artifact_response`:
+    ///
+    /// ```compile_fail
+    /// # use saml::ArtifactResolveRequest;
+    /// let forged = ArtifactResolveRequest {
+    ///     request_id: "_id".to_owned(),
+    ///     artifact: "AAQAA...".to_owned(),
+    ///     destination: None,
+    ///     authenticated: unimplemented!(),
+    ///     role_validated: true,
+    /// };
+    /// ```
+    ///
+    /// Nor can the validation marker be flipped on a request obtained from the
+    /// low-level parser:
+    ///
+    /// ```compile_fail
+    /// # use saml::ArtifactResolveRequest;
+    /// fn forge(req: &mut ArtifactResolveRequest) {
+    ///     req.role_validated = true;
+    /// }
+    /// ```
+    ///
+    /// On its own this is a claim; it is authenticated exactly when
     /// [`signature_verified`](Self::signature_verified) is true, or by
     /// client authentication at the transport.
     #[must_use]
     pub fn issuer(&self) -> &str {
         &self.authenticated.issuer
+    }
+
+    /// Whether the IdP role layer validated this request.
+    #[must_use]
+    pub fn role_validated(&self) -> bool {
+        self.role_validated
+    }
+
+    /// Mark this request as role-validated. Crate-internal: only
+    /// `IdentityProvider::parse_artifact_resolve` may vouch for one.
+    pub(crate) fn mark_role_validated(&mut self) {
+        self.role_validated = true;
     }
 
     /// Whether an enveloped `<ds:Signature>` covering the whole
@@ -668,6 +764,8 @@ pub fn parse_artifact_resolve_with(
             issuer,
             signature_verified,
         },
+        // The low-level entry point performs no role-layer validation.
+        role_validated: false,
     })
 }
 
