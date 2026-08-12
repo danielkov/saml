@@ -290,6 +290,17 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
             None => (None, assertion.issue_instant, None, None),
         };
 
+    // An expired `SessionNotOnOrAfter` means the authenticated session is
+    // already over, whatever the assertion's own window says. Surfacing it
+    // unchecked let a caller build a live application session on top of a dead
+    // upstream one — and the proxy caps its downstream deadlines on this
+    // value, so an expired one there is worse than useless.
+    if let Some(session_end) = session_not_on_or_after
+        && session_end <= now.checked_sub(clock_skew).unwrap_or(now)
+    {
+        return Err(Error::Expired);
+    }
+
     // `<saml:OneTimeUse>` (SAML 2.0 Core §2.5.1.5) is a deduplication
     // directive, not a time bound — distinct from `NotOnOrAfter`. The library
     // surfaces the parsed flag here and leaves enforcement (replay cache
