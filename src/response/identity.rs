@@ -9,23 +9,71 @@ use crate::nameid::NameId;
 
 /// What the SP gets back from `consume_response` after all signature, audience,
 /// subject-confirmation, and time-window checks pass. The caller dedupes on
-/// `assertion_id` for replay defense and uses `name_id` + `session_index`
-/// to construct an application session.
+/// [`assertion_id`](Self::assertion_id) for replay defense and uses
+/// [`name_id`](Self::name_id) + [`session_index`](Self::session_index) to
+/// construct an application session.
+///
+/// # Read-only by construction
+///
+/// Every field is private and exposed through an accessor. This is not
+/// ceremony: [`Proxy::relay_to_downstream`](crate::Proxy::relay_to_downstream)
+/// mints signed assertions from an `Identity`, so a mutable one is a signing
+/// oracle. A caller could otherwise authenticate as themselves once, rewrite
+/// the subject, attributes, authentication context or timestamps on the
+/// resulting value, and have the proxy sign the rewritten claims — the
+/// private witness would still hold, because it attests that *some* payload
+/// was validated, not that these values are that payload.
+///
+/// Mutation does not compile:
+///
+/// ```compile_fail
+/// # use saml::Identity;
+/// fn escalate(identity: &mut Identity) {
+///     identity.name_id = saml::NameId::email("admin@example.com");
+/// }
+/// ```
+///
+/// Neither does rewriting the attributes:
+///
+/// ```compile_fail
+/// # use saml::Identity;
+/// fn grant(identity: &mut Identity) {
+///     identity.attributes = vec![saml::Attribute::single("role", "admin")];
+/// }
+/// ```
+///
+/// Nor is one constructible from whole cloth:
+///
+/// ```compile_fail
+/// # use saml::Identity;
+/// let forged = Identity {
+///     name_id: saml::NameId::email("admin@example.com"),
+///     session_index: None,
+///     authn_instant: std::time::SystemTime::UNIX_EPOCH,
+///     session_not_on_or_after: None,
+///     authn_context_class_ref: None,
+///     attributes: vec![],
+///     assertion_id: "_forged".to_owned(),
+///     not_on_or_after: std::time::SystemTime::UNIX_EPOCH,
+///     verifying_cert_fingerprint: [0u8; 32],
+///     is_one_time_use: false,
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct Identity {
-    pub name_id: NameId,
-    pub session_index: Option<String>,
-    pub authn_instant: SystemTime,
-    pub session_not_on_or_after: Option<SystemTime>,
-    pub authn_context_class_ref: Option<String>,
-    pub attributes: Vec<Attribute>,
+    pub(crate) name_id: NameId,
+    pub(crate) session_index: Option<String>,
+    pub(crate) authn_instant: SystemTime,
+    pub(crate) session_not_on_or_after: Option<SystemTime>,
+    pub(crate) authn_context_class_ref: Option<String>,
+    pub(crate) attributes: Vec<Attribute>,
     /// For replay defense, retain this ID until `not_on_or_after` plus the
     /// clock skew used for response validation. If the time calculation
     /// fails, reject the assertion.
-    pub assertion_id: String,
-    pub not_on_or_after: SystemTime,
+    pub(crate) assertion_id: String,
+    pub(crate) not_on_or_after: SystemTime,
     /// Cert that verified the assertion signature. For key-rotation logging.
-    pub verifying_cert_fingerprint: [u8; 32],
+    pub(crate) verifying_cert_fingerprint: [u8; 32],
     /// `<saml:OneTimeUse>` was present in `<saml:Conditions>` (SAML 2.0 Core
     /// §2.5.1.5). When `true` the relying party MUST consume the assertion
     /// only once — i.e. it MUST refuse a second presentation of the same
@@ -36,7 +84,7 @@ pub struct Identity {
     /// validation. Note that single-use is *stricter*
     /// than ordinary expiry-bounded replay defense: even within the validity
     /// window the assertion is good for exactly one consumption.
-    pub is_one_time_use: bool,
+    pub(crate) is_one_time_use: bool,
     /// Witness that this value came out of the SP response validator.
     ///
     /// Private, so `Identity` cannot be constructed outside this crate. It is
@@ -91,6 +139,67 @@ impl Identity {
             is_one_time_use,
             validated: ValidatedUpstream,
         }
+    }
+
+    /// Subject of the validated assertion.
+    #[must_use]
+    pub fn name_id(&self) -> &NameId {
+        &self.name_id
+    }
+
+    /// `<saml:AuthnStatement>/@SessionIndex`, when present.
+    #[must_use]
+    pub fn session_index(&self) -> Option<&str> {
+        self.session_index.as_deref()
+    }
+
+    /// When the subject authenticated at the asserting party.
+    #[must_use]
+    pub fn authn_instant(&self) -> SystemTime {
+        self.authn_instant
+    }
+
+    /// `<saml:AuthnStatement>/@SessionNotOnOrAfter`, when present.
+    #[must_use]
+    pub fn session_not_on_or_after(&self) -> Option<SystemTime> {
+        self.session_not_on_or_after
+    }
+
+    /// The authentication context class the asserting party reported.
+    #[must_use]
+    pub fn authn_context_class_ref(&self) -> Option<&str> {
+        self.authn_context_class_ref.as_deref()
+    }
+
+    /// Attributes carried by the assertion.
+    #[must_use]
+    pub fn attributes(&self) -> &[Attribute] {
+        &self.attributes
+    }
+
+    /// `<saml:Assertion>/@ID` — dedupe on this for replay defense.
+    #[must_use]
+    pub fn assertion_id(&self) -> &str {
+        &self.assertion_id
+    }
+
+    /// Upper bound of the assertion's validity window.
+    #[must_use]
+    pub fn not_on_or_after(&self) -> SystemTime {
+        self.not_on_or_after
+    }
+
+    /// SHA-256 fingerprint of the certificate that verified the signature.
+    #[must_use]
+    pub fn verifying_cert_fingerprint(&self) -> [u8; 32] {
+        self.verifying_cert_fingerprint
+    }
+
+    /// Whether `<saml:OneTimeUse>` was present. See the field documentation
+    /// for the caller's obligation.
+    #[must_use]
+    pub fn is_one_time_use(&self) -> bool {
+        self.is_one_time_use
     }
 }
 
