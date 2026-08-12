@@ -662,7 +662,7 @@ impl Proxy<'_> {
         // a context downstream treats as authenticated — laundering a mutation
         // into a trusted binding.
         let context = ProxyContextPayload {
-            downstream_request_id: downstream.id.clone(),
+            downstream_request_id: downstream.validated_request_id().to_owned(),
             downstream_sp_entity_id: downstream.validated_sp().to_owned(),
             downstream_acs: downstream.validated_acs().as_endpoint(),
             downstream_relay_state: downstream.relay_state.clone(),
