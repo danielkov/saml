@@ -676,20 +676,20 @@ async fn handle_acs(State(state): State<AppState>, Form(form): Form<AcsForm>) ->
 
     let now_unix = unix_now();
     let authn_instant_unix = identity
-        .authn_instant
+        .authn_instant()
         .duration_since(UNIX_EPOCH)
         .map_or(now_unix, |d| d.as_secs());
 
     let session = Session {
-        name_id_value: identity.name_id.value.clone(),
-        name_id_format: identity.name_id.format.as_uri().to_owned(),
-        session_index: identity.session_index.clone(),
+        name_id_value: identity.name_id().value.clone(),
+        name_id_format: identity.name_id().format.as_uri().to_owned(),
+        session_index: identity.session_index().map(str::to_owned),
         authn_instant_unix,
         issued_at_unix: now_unix,
         idp_entity_id: entry.idp.entity_id.clone(),
         provider_id: entry.config.id.clone(),
         attributes: identity
-            .attributes
+            .attributes()
             .iter()
             .map(attribute_to_session)
             .collect(),
@@ -718,8 +718,8 @@ async fn handle_acs(State(state): State<AppState>, Form(form): Form<AcsForm>) ->
 
     info!(
         provider = %entry.config.id,
-        name_id = %identity.name_id.value,
-        attributes = identity.attributes.len(),
+        name_id = %identity.name_id().value,
+        attributes = identity.attributes().len(),
         "ACS: session established"
     );
 

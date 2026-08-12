@@ -49,8 +49,8 @@ impl<'a> Proxy<'a> {
 
 ```rust
 pub trait ProxyContextCodec: Send + Sync {
-    fn encode(&self, context: &ProxyContext) -> Result<String, Error>;
-    fn decode(&self, blob: &str) -> Result<ProxyContext, Error>;
+    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error>;
+    fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error>;
 }
 
 pub struct Aes256GcmCodec {
@@ -67,7 +67,11 @@ impl Aes256GcmCodec {
 impl ProxyContextCodec for Aes256GcmCodec { /* ... */ }
 ```
 
-The default implementation uses AES-256-GCM with a caller-supplied 32-byte key. The wire format is `base64url(nonce_12 || ciphertext || tag_16)` where the plaintext is the bincode-serialized `ProxyContext`. Callers can plug HMAC-only, signed-JWT-style, or HSM-backed codecs by implementing the trait.
+The codec deals in `ProxyContextPayload`: a transparent `Serialize`/`Deserialize` struct with public fields, so callers can implement their own codec. It carries no authority on its own.
+
+`Proxy::relay_to_downstream` instead requires a `ProxyContext` — an opaque wrapper with no public constructor, no public fields and no `Deserialize` impl, obtainable only from `Proxy::decode_context`, which runs the codec's authentication first. The split exists because relay mints a *signed* downstream assertion from the context: every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result. An authentic identity could otherwise be paired with an invented context naming any registered SP and ACS.
+
+The default implementation uses AES-256-GCM with a caller-supplied 32-byte key. The wire format is `base64url(nonce_12 || ciphertext || tag_16)` where the plaintext is the bincode-serialized `ProxyContextPayload`. Callers can plug HMAC-only, signed-JWT-style, or HSM-backed codecs by implementing the trait.
 
 ### 2.1 Codec choice and RelayState size
 

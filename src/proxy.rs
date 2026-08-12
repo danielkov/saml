@@ -78,19 +78,25 @@ impl<'a> Proxy<'a> {
 }
 
 // =============================================================================
-// ProxyContext + codec trait
+// ProxyContextPayload + codec trait
 // =============================================================================
 
 /// AEAD wrapper for the stateless context blob carried in `RelayState` across
 /// the upstream round-trip. See RFC-005 §2.
 pub trait ProxyContextCodec: Send + Sync {
-    fn encode(&self, context: &ProxyContext) -> Result<String, Error>;
-    fn decode(&self, blob: &str) -> Result<ProxyContext, Error>;
+    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error>;
+    fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error>;
 }
 
-/// Opaque context carried across the upstream round-trip. See RFC-005 §3.
+/// The serialized body of a proxy relay token. See RFC-005 §3.
+///
+/// This is the wire form: a [`ProxyContextCodec`] turns it into an opaque blob
+/// and back. It is deliberately transparent so callers can implement their own
+/// codec — and correspondingly carries no authority. Only
+/// [`Proxy::decode_context`] produces the [`ProxyContext`] that
+/// [`Proxy::relay_to_downstream`] will act on.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProxyContext {
+pub struct ProxyContextPayload {
     /// AuthnRequest ID we received from the downstream SP.
     pub downstream_request_id: String,
     /// Downstream SP's entity ID.
@@ -108,11 +114,88 @@ pub struct ProxyContext {
     pub issued_at: SystemTime,
 }
 
+/// A relay token that this crate has seen come back out of an authenticated
+/// [`ProxyContextCodec`]. See RFC-005 §3.
+///
+/// # Why this is not just [`ProxyContextPayload`]
+///
+/// [`Proxy::relay_to_downstream`] mints a signed downstream assertion from the
+/// context paired with an upstream [`Identity`]. Every check it performs —
+/// which SP the context belongs to, which ACS to deliver at, what
+/// authentication context was requested — reads the context. If a caller could
+/// supply that value directly, all of those checks would compare
+/// caller-controlled input against caller-supplied metadata, and the proxy
+/// would sign the result: an authentic identity could be paired with an
+/// invented context naming any registered SP and ACS.
+///
+/// So the payload is transparent and inert, and this type is opaque and
+/// authoritative. It has no public constructor, no public fields and no
+/// `Deserialize` impl; the only way to obtain one is
+/// [`Proxy::decode_context`], which runs the configured codec's authentication
+/// first.
+///
+/// ```compile_fail
+/// # use saml::proxy::{ProxyContext, ProxyContextPayload};
+/// fn forge(payload: ProxyContextPayload) -> ProxyContext {
+///     ProxyContext { payload, attested: unimplemented!() }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ProxyContext {
+    payload: ProxyContextPayload,
+    /// Zero-sized proof the payload came back from an authenticated decode.
+    #[expect(
+        dead_code,
+        reason = "never read: it exists to deny struct-literal construction \
+                  outside this crate, which is the whole guarantee"
+    )]
+    attested: AttestedContext,
+}
+
+/// Zero-sized proof that a [`ProxyContext`] came from an authenticated decode.
+#[derive(Debug, Clone)]
+struct AttestedContext;
+
+impl ProxyContext {
+    /// Wrap an authenticated payload. Crate-internal: only
+    /// [`Proxy::decode_context`] may vouch for one.
+    pub(crate) fn attested(payload: ProxyContextPayload) -> Self {
+        Self {
+            payload,
+            attested: AttestedContext,
+        }
+    }
+
+    /// The authenticated payload, read-only.
+    #[must_use]
+    pub fn payload(&self) -> &ProxyContextPayload {
+        &self.payload
+    }
+
+    /// AuthnRequest ID received from the downstream SP.
+    #[must_use]
+    pub fn downstream_request_id(&self) -> &str {
+        &self.payload.downstream_request_id
+    }
+
+    /// Downstream SP's entity ID.
+    #[must_use]
+    pub fn downstream_sp_entity_id(&self) -> &str {
+        &self.payload.downstream_sp_entity_id
+    }
+
+    /// Downstream SP's RelayState.
+    #[must_use]
+    pub fn downstream_relay_state(&self) -> Option<&str> {
+        self.payload.downstream_relay_state.as_deref()
+    }
+}
+
 // =============================================================================
 // AES-256-GCM codec (RFC-005 §2.1)
 // =============================================================================
 
-/// Stateless AEAD codec: postcard-serialized `ProxyContext` sealed with
+/// Stateless AEAD codec: postcard-serialized `ProxyContextPayload` sealed with
 /// AES-256-GCM, base64url-encoded for `RelayState`.
 pub struct Aes256GcmCodec {
     key: [u8; 32],
@@ -137,7 +220,7 @@ impl Aes256GcmCodec {
 }
 
 impl ProxyContextCodec for Aes256GcmCodec {
-    fn encode(&self, context: &ProxyContext) -> Result<String, Error> {
+    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error> {
         let plaintext =
             postcard::to_allocvec(context).map_err(|_err| Error::InvalidConfiguration {
                 reason: "proxy context serialize",
@@ -171,7 +254,7 @@ impl ProxyContextCodec for Aes256GcmCodec {
         Ok(URL_SAFE_NO_PAD.encode(&buf))
     }
 
-    fn decode(&self, blob: &str) -> Result<ProxyContext, Error> {
+    fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error> {
         let bytes =
             URL_SAFE_NO_PAD
                 .decode(blob.as_bytes())
@@ -201,7 +284,7 @@ impl ProxyContextCodec for Aes256GcmCodec {
                 reason: "proxy context",
             })?;
 
-        let context: ProxyContext =
+        let context: ProxyContextPayload =
             postcard::from_bytes(&plaintext).map_err(|_err| Error::InvalidConfiguration {
                 reason: "proxy context deserialize",
             })?;
@@ -227,8 +310,8 @@ impl ProxyContextCodec for Aes256GcmCodec {
 
 /// Caller-supplied storage for the opaque-handle codec. `take` is one-shot.
 pub trait ProxyContextStore: Send + Sync {
-    fn put(&self, handle: &str, context: &ProxyContext, ttl: Duration) -> Result<(), Error>;
-    fn take(&self, handle: &str) -> Result<Option<ProxyContext>, Error>;
+    fn put(&self, handle: &str, context: &ProxyContextPayload, ttl: Duration) -> Result<(), Error>;
+    fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
 
 /// Short random handle as `RelayState`; context lives in a caller-supplied
@@ -241,7 +324,7 @@ pub struct OpaqueHandleCodec<S: ProxyContextStore> {
 }
 
 impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
-    fn encode(&self, context: &ProxyContext) -> Result<String, Error> {
+    fn encode(&self, context: &ProxyContextPayload) -> Result<String, Error> {
         let mut bytes = vec![0u8; self.handle_byte_len];
         rand::rng().fill_bytes(&mut bytes);
         let handle = URL_SAFE_NO_PAD.encode(&bytes);
@@ -249,7 +332,7 @@ impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
         Ok(handle)
     }
 
-    fn decode(&self, blob: &str) -> Result<ProxyContext, Error> {
+    fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error> {
         let ctx = self.store.take(blob)?.ok_or(Error::InvalidConfiguration {
             reason: "proxy context not found (expired or replay)",
         })?;
@@ -284,6 +367,7 @@ pub struct BounceResult {
 
 /// Inputs for [`Proxy::relay_to_downstream`]. See RFC-005 §4.2.
 pub struct RelayToDownstream<'a> {
+    /// Obtained from [`Proxy::decode_context`] — the only source of one.
     pub context: &'a ProxyContext,
     pub upstream_identity: &'a Identity,
     /// Downstream SP descriptor (caller looks it up from
@@ -325,7 +409,7 @@ impl Proxy<'_> {
         let result = self.sp.start_login(
             input.upstream_idp,
             StartLogin {
-                // We replace RelayState below with the encoded ProxyContext.
+                // We replace RelayState below with the encoded ProxyContextPayload.
                 relay_state: None,
                 binding: input.upstream_binding,
                 force_authn,
@@ -338,14 +422,14 @@ impl Proxy<'_> {
             },
         )?;
 
-        // 2. Build the ProxyContext from the parsed downstream request.
+        // 2. Build the ProxyContextPayload from the parsed downstream request.
         // Seal the provenance the validator established, not the `pub`
         // wire-derived copies. Those are caller-mutable: validate against
         // SP-A, rewrite `issuer` and `assertion_consumer_service` to SP-B,
         // then bounce, and the proxy would preserve the rewritten values into
         // a context downstream treats as authenticated — laundering a mutation
         // into a trusted binding.
-        let context = ProxyContext {
+        let context = ProxyContextPayload {
             downstream_request_id: downstream.id.clone(),
             downstream_sp_entity_id: downstream.validated_sp().to_owned(),
             downstream_acs: downstream.validated_acs().as_endpoint(),
@@ -375,9 +459,34 @@ impl Proxy<'_> {
         })
     }
 
+    /// Authenticate a relay token and return the context it carries.
+    ///
+    /// This is the only way to obtain a [`ProxyContext`], and therefore the
+    /// only way to reach [`relay_to_downstream`](Self::relay_to_downstream).
+    /// The configured [`ProxyContextCodec`] performs the authentication —
+    /// AEAD decryption for [`Aes256GcmCodec`], a store lookup for a
+    /// handle-based codec — and the result is wrapped so the rest of the
+    /// crate can tell an authenticated context from a caller-supplied one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the codec returns for a blob it will not vouch for: tampered,
+    /// expired, unknown, or malformed.
+    pub fn decode_context(&self, blob: &str) -> Result<ProxyContext, Error> {
+        let payload = self.context_codec.decode(blob)?;
+        Ok(ProxyContext::attested(payload))
+    }
+
     /// Translate an upstream `Identity` into a downstream `<samlp:Response>`,
     /// applying attribute release, NameID transformation, and AuthnContext
     /// non-downgrade. See RFC-005 §4.2.
+    ///
+    /// # Errors
+    ///
+    /// If the context does not belong to `downstream_sp`, if its ACS is not
+    /// registered, if the upstream AuthnContext is a downgrade of what the
+    /// downstream requested, if an issuance deadline overflows, or if
+    /// issuance itself fails.
     pub fn relay_to_downstream(
         &self,
         input: RelayToDownstream<'_>,
@@ -390,9 +499,9 @@ impl Proxy<'_> {
         //    it, replacing the binding rather than carrying it. Checked before
         //    any attribute release or NameID transformation, so nothing is
         //    computed for a pairing that will be refused.
-        if input.context.downstream_sp_entity_id != input.downstream_sp.entity_id {
+        if input.context.downstream_sp_entity_id() != input.downstream_sp.entity_id {
             return Err(Error::IssuerMismatch {
-                expected: input.context.downstream_sp_entity_id.clone(),
+                expected: input.context.downstream_sp_entity_id().to_owned(),
                 got: Some(input.downstream_sp.entity_id.clone()),
             });
         }
@@ -406,7 +515,7 @@ impl Proxy<'_> {
         //     re-resolves the same endpoint below; doing it here first costs a
         //     lookup and makes the failure ordering observable.
         let downstream_acs =
-            SsoResponseEndpoint::try_from_endpoint(input.context.downstream_acs.clone())?;
+            SsoResponseEndpoint::try_from_endpoint(input.context.payload().downstream_acs.clone())?;
         if !input
             .downstream_sp
             .assertion_consumer_services
@@ -429,11 +538,10 @@ impl Proxy<'_> {
         //    [`crate::authn_context::StandardComparator`]. We collapse both
         //    `NotSatisfied` and `NotComparable` to `AuthnContextDowngrade`
         //    (fail-closed), matching the SP-side response validator.
-        if let Some(requested) = &input.context.requested_authn_context {
+        if let Some(requested) = &input.context.payload().requested_authn_context {
             let actual = input
                 .upstream_identity
-                .authn_context_class_ref
-                .as_deref()
+                .authn_context_class_ref()
                 .ok_or(Error::AuthnContextDowngrade)?;
             match StandardComparator.evaluate(requested, actual) {
                 ComparatorOutcome::Satisfied => {}
@@ -443,28 +551,57 @@ impl Proxy<'_> {
             }
         }
 
+        // 1b. Validate every issuance time bound before any caller callback.
+        //
+        //     Attribute release and NameID transformation are caller-supplied
+        //     and may write to a pseudonym store, a directory, or an audit
+        //     log. Issuance computes three deadlines from `now` and each can
+        //     overflow; discovering that afterwards means those side effects
+        //     have already happened for a response that will never be issued.
+        //     The values are recomputed inside issuance — this is a
+        //     precondition check, not the source of truth — so the ordering is
+        //     the entire point.
+        let session_not_on_or_after =
+            input
+                .now
+                .checked_add(input.session_lifetime)
+                .ok_or(Error::InvalidConfiguration {
+                    reason: "session_not_on_or_after overflow",
+                })?;
+        input
+            .now
+            .checked_add(input.subject_confirmation_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "subject_confirmation_lifetime overflow",
+            })?;
+        // Issuance uses `session_lifetime` as the assertion lifetime too, so
+        // this is the same bound; kept explicit so the two stay tied together
+        // if that ever changes.
+        input
+            .now
+            .checked_add(input.session_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "assertion_lifetime overflow",
+            })?;
+
         // 2. Attribute release.
         let attributes = input
             .attribute_release
-            .release(&input.upstream_identity.attributes, input.downstream_sp);
+            .release(input.upstream_identity.attributes(), input.downstream_sp);
 
         // 3. NameID transformation.
         let downstream_name_id = input.name_id_transform.transform(
-            &input.upstream_identity.name_id,
-            &input.upstream_identity.attributes,
+            input.upstream_identity.name_id(),
+            input.upstream_identity.attributes(),
             input.downstream_sp,
         )?;
 
         // 4. Decide downstream AuthnContextClassRef.
         let downstream_class_ref = if input.passthrough_authn_context {
-            input
-                .upstream_identity
-                .authn_context_class_ref
-                .as_deref()
-                .map_or(
-                    AuthnContextClassRef::PasswordProtectedTransport,
-                    AuthnContextClassRef::from_uri,
-                )
+            input.upstream_identity.authn_context_class_ref().map_or(
+                AuthnContextClassRef::PasswordProtectedTransport,
+                AuthnContextClassRef::from_uri,
+            )
         } else {
             AuthnContextClassRef::PasswordProtectedTransport
         };
@@ -480,29 +617,23 @@ impl Proxy<'_> {
         // SP it was never checked against.
         let synthetic = ParsedAuthnRequest::for_proxy_reissue(
             input.downstream_sp,
-            input.context.downstream_request_id.clone(),
-            input.context.issued_at,
+            input.context.payload().downstream_request_id.clone(),
+            input.context.payload().issued_at,
             acs_endpoint,
-            input.context.requested_name_id_format.clone(),
-            input.context.requested_authn_context.clone(),
-            input.context.downstream_relay_state.clone(),
+            input.context.payload().requested_name_id_format.clone(),
+            input.context.payload().requested_authn_context.clone(),
+            input.context.payload().downstream_relay_state.clone(),
         )?;
 
         // 6. Hand off to the IdP role for `<samlp:Response>` issuance.
+        //    Every deadline was validated at step 1b, before any callback ran.
         let session_index = make_session_index();
-        let session_not_on_or_after =
-            input
-                .now
-                .checked_add(input.session_lifetime)
-                .ok_or(Error::InvalidConfiguration {
-                    reason: "session_not_on_or_after overflow",
-                })?;
         self.idp.issue_response(IssueResponse {
             sp: input.downstream_sp,
             in_response_to: &synthetic,
             name_id: downstream_name_id,
             attributes,
-            authn_instant: input.upstream_identity.authn_instant,
+            authn_instant: input.upstream_identity.authn_instant(),
             session_index,
             session_not_on_or_after: Some(session_not_on_or_after),
             authn_context_class_ref: downstream_class_ref,
@@ -1076,11 +1207,11 @@ mod tests {
         }
     }
 
-    fn sample_context() -> ProxyContext {
+    fn sample_context() -> ProxyContextPayload {
         let tracker_issued_at = SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_hours(494_388))
             .expect("tracker issued_at within representable range");
-        ProxyContext {
+        ProxyContextPayload {
             downstream_request_id: "_req-downstream".into(),
             downstream_sp_entity_id: "https://downstream-sp.example.com".into(),
             downstream_acs: Endpoint::post("https://downstream-sp.example.com/acs", 0, true),
@@ -1168,7 +1299,7 @@ mod tests {
     // ---------- OpaqueHandleCodec ----------
 
     struct InMemoryStore {
-        inner: Mutex<HashMap<String, (ProxyContext, SystemTime)>>,
+        inner: Mutex<HashMap<String, (ProxyContextPayload, SystemTime)>>,
     }
 
     impl InMemoryStore {
@@ -1180,7 +1311,12 @@ mod tests {
     }
 
     impl ProxyContextStore for InMemoryStore {
-        fn put(&self, handle: &str, context: &ProxyContext, ttl: Duration) -> Result<(), Error> {
+        fn put(
+            &self,
+            handle: &str,
+            context: &ProxyContextPayload,
+            ttl: Duration,
+        ) -> Result<(), Error> {
             let expires_at =
                 SystemTime::now()
                     .checked_add(ttl)
@@ -1197,7 +1333,7 @@ mod tests {
             Ok(())
         }
 
-        fn take(&self, handle: &str) -> Result<Option<ProxyContext>, Error> {
+        fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error> {
             let mut guard = self
                 .inner
                 .lock()
@@ -1392,6 +1528,126 @@ mod tests {
         )
     }
 
+    /// Attribute release and NameID transformation are caller-supplied and
+    /// may write to a pseudonym store or an audit log. These spies record
+    /// whether they ran.
+    #[derive(Default)]
+    struct SpyRelease {
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    impl AttributeReleasePolicy for SpyRelease {
+        fn release(&self, attributes: &[Attribute], _sp: &SpDescriptor) -> Vec<Attribute> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            attributes.to_vec()
+        }
+    }
+
+    #[derive(Default)]
+    struct SpyNameId {
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    impl NameIdTransform for SpyNameId {
+        fn transform(
+            &self,
+            name_id: &NameId,
+            _attributes: &[Attribute],
+            _sp: &SpDescriptor,
+        ) -> Result<NameId, Error> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(name_id.clone())
+        }
+    }
+
+    /// A `session_lifetime` that overflows `now` makes issuance impossible.
+    /// That must be discovered *before* the callbacks run — otherwise the
+    /// pseudonym store has already been written for a response that will
+    /// never exist.
+    #[test]
+    fn relay_validates_time_bounds_before_running_callbacks() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([5u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let context = sample_context();
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default();
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &ProxyContext::attested(context.clone()),
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::MAX,
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("session_lifetime of Duration::MAX cannot be added to now");
+
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !release.called.load(std::sync::atomic::Ordering::SeqCst),
+            "attribute release ran despite an unsatisfiable time bound"
+        );
+        assert!(
+            !transform.called.load(std::sync::atomic::Ordering::SeqCst),
+            "NameID transformation ran despite an unsatisfiable time bound"
+        );
+    }
+
+    /// The same, for the subject-confirmation bound — which issuance computes
+    /// separately, so a check that only covered `session_lifetime` would miss it.
+    #[test]
+    fn relay_validates_subject_confirmation_bound_before_callbacks() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([5u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let context = sample_context();
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default();
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                context: &ProxyContext::attested(context.clone()),
+                upstream_identity: &identity,
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::MAX,
+            })
+            .expect_err("subject_confirmation_lifetime of Duration::MAX overflows");
+
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !release.called.load(std::sync::atomic::Ordering::SeqCst),
+            "attribute release ran despite an unsatisfiable time bound"
+        );
+        assert!(
+            !transform.called.load(std::sync::atomic::Ordering::SeqCst),
+            "NameID transformation ran despite an unsatisfiable time bound"
+        );
+    }
+
     #[test]
     fn relay_to_downstream_end_to_end_returns_post_dispatch() {
         let sp = proxy_sp();
@@ -1407,7 +1663,7 @@ mod tests {
 
         let dispatch = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &context,
+                context: &ProxyContext::attested(context.clone()),
                 upstream_identity: &identity,
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAllowList {
@@ -1458,7 +1714,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &context,
+                context: &ProxyContext::attested(context.clone()),
                 upstream_identity: &identity,
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
@@ -1641,7 +1897,7 @@ mod tests {
     // `actual > min(requested)` — too permissive. These tests pin the fixed
     // behavior to the canonical comparator.
 
-    fn context_with_requested(refs: Vec<AuthnContextClassRef>) -> ProxyContext {
+    fn context_with_requested(refs: Vec<AuthnContextClassRef>) -> ProxyContextPayload {
         let mut ctx = sample_context();
         ctx.requested_authn_context = Some(RequestedAuthnContext {
             class_refs: refs,
@@ -1670,7 +1926,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &context,
+                context: &ProxyContext::attested(context.clone()),
                 upstream_identity: &identity,
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
@@ -1702,7 +1958,7 @@ mod tests {
 
         proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &context,
+                context: &ProxyContext::attested(context.clone()),
                 upstream_identity: &identity,
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
@@ -1816,7 +2072,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &context,
+                context: &ProxyContext::attested(context.clone()),
                 upstream_identity: &identity,
                 downstream_sp: &downstream_sp_descriptor(),
                 attribute_release: &release,
@@ -1857,7 +2113,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &context,
+                context: &ProxyContext::attested(context.clone()),
                 upstream_identity: &identity,
                 downstream_sp: &twin,
                 attribute_release: &ReleaseAll,
@@ -1890,7 +2146,7 @@ mod tests {
 
         let err = proxy
             .relay_to_downstream(RelayToDownstream {
-                context: &context,
+                context: &ProxyContext::attested(context.clone()),
                 upstream_identity: &identity,
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,

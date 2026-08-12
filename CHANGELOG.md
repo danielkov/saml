@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Breaking:** `Identity`'s fields are now private, exposed through accessors.
+  They were public and `Identity` is what `Proxy::relay_to_downstream` mints a
+  signed downstream assertion from, so a caller could authenticate once,
+  rewrite the subject, attributes, authentication context or timestamps on the
+  resulting value, and have the proxy sign the rewritten claims. The private
+  witness attests that *some* payload was validated, not that these values are
+  that payload.
+- **Breaking:** the proxy relay token is split in two. `ProxyContextPayload` is
+  the transparent wire form a `ProxyContextCodec` serializes; `ProxyContext` is
+  an opaque type with no public constructor, no public fields and no
+  `Deserialize` impl, obtainable only from the new `Proxy::decode_context`,
+  which authenticates the blob through the configured codec first.
+  `relay_to_downstream` now accepts only the latter. Previously a caller could
+  construct or deserialize a context naming any registered SP and ACS and pair
+  it with a genuine identity.
+- `Proxy::relay_to_downstream` validates every issuance time bound before
+  running the caller-supplied attribute-release and NameID-transform
+  callbacks. Those callbacks may write to a pseudonym store or an audit log,
+  and an overflowing lifetime previously let both run before issuance failed.
+
+### Added
+
+- `Proxy::decode_context`.
+- `Identity` accessors: `name_id`, `session_index`, `authn_instant`,
+  `session_not_on_or_after`, `authn_context_class_ref`, `attributes`,
+  `assertion_id`, `not_on_or_after`, `verifying_cert_fingerprint`,
+  `is_one_time_use`.
+
 ## [0.0.1-alpha.2] - 2026-08-08
 
 ### Fixed
