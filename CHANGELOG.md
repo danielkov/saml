@@ -24,10 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `relay_to_downstream` now accepts only the latter. Previously a caller could
   construct or deserialize a context naming any registered SP and ACS and pair
   it with a genuine identity.
-- `Proxy::relay_to_downstream` validates every issuance time bound before
-  running the caller-supplied attribute-release and NameID-transform
+- `Proxy::relay_to_downstream` verifies the assertion can be issued at all
+  before running the caller-supplied attribute-release and NameID-transform
   callbacks. Those callbacks may write to a pseudonym store or an audit log,
-  and an overflowing lifetime previously let both run before issuance failed.
+  and issuance failures previously let both run first. The preflight and the
+  assertion builder now share one function, so it covers every timestamp
+  issuance computes — including `Conditions/@NotBefore = now - 1 minute`,
+  which underflows at the epoch, and the `xs:dateTime` formatting, which
+  rejects pre-epoch and non-representable instants.
+- **Breaking:** `Proxy::context_codec` is removed. It exposed the codec's
+  sealing side, so a caller could build a `ProxyContextPayload` naming any
+  registered SP and ACS, `encode` it, and pass the blob to `decode_context` —
+  obtaining a genuine attestation for a context they invented. Use
+  `Proxy::decode_context`; `bounce_to_upstream` mints tokens.
 
 ### Added
 

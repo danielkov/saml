@@ -71,20 +71,20 @@ The codec deals in `ProxyContextPayload`: a transparent `Serialize`/`Deserialize
 
 `Proxy::relay_to_downstream` instead requires a `ProxyContext` — an opaque wrapper with no public constructor, no public fields and no `Deserialize` impl, obtainable only from `Proxy::decode_context`, which runs the codec's authentication first. The split exists because relay mints a *signed* downstream assertion from the context: every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result. An authentic identity could otherwise be paired with an invented context naming any registered SP and ACS.
 
-The default implementation uses AES-256-GCM with a caller-supplied 32-byte key. The wire format is `base64url(nonce_12 || ciphertext || tag_16)` where the plaintext is the bincode-serialized `ProxyContextPayload`. Callers can plug HMAC-only, signed-JWT-style, or HSM-backed codecs by implementing the trait.
+The default implementation uses AES-256-GCM with a caller-supplied 32-byte key. The wire format is `base64url(nonce_12 || ciphertext || tag_16)` where the plaintext is the postcard-serialized `ProxyContextPayload`. Callers can plug HMAC-only, signed-JWT-style, or HSM-backed codecs by implementing the trait.
 
 ### 2.1 Codec choice and RelayState size
 
 The HTTP-POST binding has no practical size limit on `RelayState` (the form field is just an HTTP body parameter; SAML 2.0 §3.5.3 sets no upper bound for that binding). The HTTP-Redirect binding, however, fits everything in a URL — and **SAML 2.0 §3.4.3 specifies `RelayState` MUST NOT exceed 80 bytes** on this binding. Many IdPs enforce this at the byte level and silently truncate or reject longer values, and intermediate proxies / WAFs may truncate URLs anyway.
 
-A bincode-serialized `ProxyContext` carrying the upstream tracker, the downstream request ID, the ACS endpoint, the requested AuthnContext, and the issued-at timestamp easily exceeds 80 bytes even before AEAD framing (12-byte nonce + 16-byte tag + base64url overhead pushes a "small" plaintext past the limit). `Aes256GcmCodec` is therefore appropriate for the POST binding outbound but unreliable for Redirect.
+A postcard-serialized `ProxyContextPayload` carrying the upstream tracker, the downstream request ID, the ACS endpoint, the requested AuthnContext, and the issued-at timestamp easily exceeds 80 bytes even before AEAD framing (12-byte nonce + 16-byte tag + base64url overhead pushes a "small" plaintext past the limit). `Aes256GcmCodec` is therefore appropriate for the POST binding outbound but unreliable for Redirect.
 
 For Redirect-binding proxies, use `OpaqueHandleCodec`: a short random handle is the `RelayState`, and the actual context lives in a caller-supplied store keyed by that handle.
 
 ```rust
 pub trait ProxyContextStore: Send + Sync {
-    fn put(&self, handle: &str, context: &ProxyContext, ttl: Duration) -> Result<(), Error>;
-    fn take(&self, handle: &str) -> Result<Option<ProxyContext>, Error>;
+    fn put(&self, handle: &str, context: &ProxyContextPayload, ttl: Duration) -> Result<(), Error>;
+    fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
 
 pub struct OpaqueHandleCodec<S: ProxyContextStore> {
@@ -125,11 +125,21 @@ Custom codecs (signed-JWT, KMS envelope encryption, HSM-backed) implement `Proxy
 
 ## 3. ProxyContext
 
+Two types, deliberately:
+
+- **`ProxyContextPayload`** — the transparent wire form below. `Serialize`/`Deserialize` with public fields so callers can implement their own codec. It carries no authority.
+- **`ProxyContext`** — opaque: no public constructor, no public fields, no `Deserialize`. Obtainable only from `Proxy::decode_context`, which runs the configured codec's authentication first. `relay_to_downstream` accepts only this.
+
+The split exists because relay mints a *signed* downstream assertion from the context. Every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result — an authentic identity could be paired with an invented context naming any registered SP and ACS. For the same reason the codec's sealing side is crate-internal: a caller who could `encode` an arbitrary payload could round-trip it through `decode_context` and obtain a genuine attestation.
+
+Because `ProxyContextCodec` is a public trait, a custom implementation **is** the proxy's trust anchor: whatever its `decode` returns is what gets attested and signed from. Implementations must authenticate rather than merely parse, bind the blob to the deployment's key or store, and reject stale blobs.
+
 The opaque context carried across the upstream round-trip:
 
 ```rust
+/// The transparent wire form. Carries no authority on its own — see §3.1.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProxyContext {
+pub struct ProxyContextPayload {
     /// AuthnRequest ID we received from the downstream SP.
     pub downstream_request_id: String,
     /// Downstream SP's entity ID.
@@ -237,11 +247,11 @@ impl<'a> Proxy<'a> {
 
 Internally:
 
-1. Look up the downstream SP descriptor by `context.downstream_sp_entity_id`. (Caller-managed registry; the library does not maintain one.) For ergonomics, the caller can pass a closure for SP lookup via `ProxyConfig` (future addition).
+1. Look up the downstream SP descriptor by `context.downstream_sp_entity_id()`. (Caller-managed registry; the library does not maintain one.) For ergonomics, the caller can pass a closure for SP lookup via `ProxyConfig` (future addition).
 2. **Enforce AuthnContext non-downgrade** (§7) using `context.requested_authn_context` and `upstream_identity.authn_context_class_ref`. → `Error::AuthnContextDowngrade`.
 3. Compute downstream attributes via `attribute_release.release(&upstream_identity.attributes, &downstream_sp)`.
 4. Compute downstream NameID via `name_id_transform.transform(&upstream_identity.name_id, &downstream_sp)`.
-5. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id`).
+5. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id()`).
 6. Call `self.idp.issue_response(...)` with the synthesized request and transformed identity.
 7. Return the resulting `Dispatch`.
 
@@ -357,7 +367,7 @@ Explicitly punted to the caller:
 - **SLO chain orchestration loop**. Iterating through N downstream SPs via sequential browser redirects is a state-machine + UX problem, not a protocol problem. Library provides the primitives (`build LogoutRequest`, `parse LogoutResponse`) and a hook to drive the chain; the loop lives in the caller. Backchannel SOAP SLO is fully supported because it's just request/response.
 - **Discovery** (when the proxy fronts multiple upstream IdPs). The caller picks the IdP before calling `bounce_to_upstream`.
 - **Caching** of `IdpDescriptor` / `SpDescriptor` across requests. The library parses metadata XML on demand; whether the caller caches the parse result is up to them.
-- **SP / IdP registry lookup** by entity ID. The caller maintains the registry and looks up by `context.downstream_sp_entity_id`.
+- **SP / IdP registry lookup** by entity ID. The caller maintains the registry and looks up by `context.downstream_sp_entity_id()`.
 
 ---
 
@@ -404,14 +414,17 @@ let bounce = proxy.bounce_to_upstream(BounceToUpstream {
 // RelayState query/form parameter. Carries downstream context across the round-trip.
 
 // --- /saml/acs handler (upstream IdP → proxy) ---
-let context: ProxyContext = proxy.context_codec().decode(&form.relay_state)?;
+// `decode_context` authenticates the blob through the configured codec and
+// returns the attested `ProxyContext` — the only value `relay_to_downstream`
+// accepts. The codec's sealing side is deliberately not public.
+let context: ProxyContext = proxy.decode_context(&form.relay_state)?;
 let upstream_identity = sp.consume_response(ConsumeResponse {
     idp: &upstream_idp_descriptor,
     peer_crypto_policy: None,
     saml_response: &form.saml_response,
     binding: SsoResponseBinding::HttpPost,
     relay_state: Some(&form.relay_state),
-    tracker: Some(&context.upstream_tracker),
+    tracker: Some(&context.payload().upstream_tracker),
     expected_destination: "https://hub.example.com/saml/acs", // proxy ACS URL this handler serves
     now: SystemTime::now(),
     clock_skew: Duration::from_secs(60),
