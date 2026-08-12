@@ -945,17 +945,16 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
     // signature check ever runs, which would let an attacker hide behind
     // the wrong error. Build a matching tracker so the signature check
     // *is* the gating condition.
-    let tracker_owned = meta
-        .in_response_to
-        .as_deref()
-        .map(|in_response_to| LoginTracker {
-            request_id: in_response_to.to_owned(),
-            issued_at: meta.issue_instant,
-            idp_entity_id: meta.issuer.clone(),
-            acs_endpoint: SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
-            requested_authn_context: None,
-            requested_name_id_format: None,
-        });
+    let tracker_owned = meta.in_response_to.as_deref().map(|in_response_to| {
+        LoginTracker::new(
+            in_response_to.to_owned(),
+            meta.issue_instant,
+            meta.issuer.clone(),
+            SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
+            None,
+            None,
+        )
+    });
 
     let result = sp.consume_response(ConsumeResponse {
         idp: &idp,
