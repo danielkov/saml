@@ -42,8 +42,42 @@ use saml::error::Error;
 use saml::nameid::NameIdFormat;
 use saml::replay::ReplayMode;
 use saml::sp::{
-    ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
+    ConsumeResponse, LoginTracker, LoginTrackerPayload, ServiceProvider, ServiceProviderConfig,
+    SpWantSigned,
 };
+
+/// Fixture key for sealing corpus trackers. The corpus replays canned
+/// responses, so there is no `start_login` to obtain a tracker from.
+const TRACKER_KEY: [u8; 32] = [0x5a; 32];
+
+/// Build a corpus tracker the only way one can now exist: seal a payload and
+/// open it, which is the round trip an application makes through its own
+/// session store. The corpus replays canned responses, so there is no
+/// `start_login` to obtain a tracker from.
+fn seal_and_open_tracker(
+    in_response_to: &str,
+    meta: &Extracted,
+    acs_url: &str,
+) -> Result<LoginTracker, String> {
+    let payload = LoginTrackerPayload {
+        request_id: in_response_to.to_owned(),
+        issued_at: meta.issue_instant,
+        idp_entity_id: meta.issuer.clone(),
+        acs_endpoint: SsoResponseEndpoint::post(acs_url, 0, true),
+        requested_authn_context: None,
+        requested_name_id_format: None,
+    };
+    let sealed = payload
+        .seal(&TRACKER_KEY)
+        .map_err(|e| format!("seal tracker: {e:?}"))?;
+    LoginTracker::open(
+        &sealed,
+        &TRACKER_KEY,
+        meta.issue_instant,
+        Duration::from_hours(24),
+    )
+    .map_err(|e| format!("open tracker: {e:?}"))
+}
 use saml::time::parse_xs_datetime;
 
 // =============================================================================
@@ -722,16 +756,11 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         .checked_add(Duration::from_secs(1))
         .ok_or_else(|| "issue_instant + 1s overflowed SystemTime".to_string())?;
 
-    let tracker_owned = meta.in_response_to.as_deref().map(|in_response_to| {
-        LoginTracker::new(
-            in_response_to.to_owned(),
-            meta.issue_instant,
-            meta.issuer.clone(),
-            SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
-            None,
-            None,
-        )
-    });
+    let tracker_owned = meta
+        .in_response_to
+        .as_deref()
+        .map(|in_response_to| seal_and_open_tracker(in_response_to, &meta, acs_url.as_str()))
+        .transpose()?;
 
     sp.consume_response(ConsumeResponse {
         idp: &idp,
@@ -945,16 +974,12 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
     // signature check ever runs, which would let an attacker hide behind
     // the wrong error. Build a matching tracker so the signature check
     // *is* the gating condition.
-    let tracker_owned = meta.in_response_to.as_deref().map(|in_response_to| {
-        LoginTracker::new(
-            in_response_to.to_owned(),
-            meta.issue_instant,
-            meta.issuer.clone(),
-            SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
-            None,
-            None,
-        )
-    });
+    let tracker_owned = meta
+        .in_response_to
+        .as_deref()
+        .map(|in_response_to| seal_and_open_tracker(in_response_to, &meta, acs_url.as_str()))
+        .transpose()
+        .unwrap_or_else(|e| panic!("tracker: {e}"));
 
     let result = sp.consume_response(ConsumeResponse {
         idp: &idp,
