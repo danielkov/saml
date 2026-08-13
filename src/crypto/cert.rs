@@ -243,6 +243,20 @@ impl X509Certificate {
     }
 }
 
+/// Canonical SHA-256 fingerprint set for certificate pinning.
+///
+/// Metadata order and duplicate `<KeyDescriptor>` entries carry no trust
+/// semantics, so provenance comparisons use this sorted, deduplicated form.
+pub(crate) fn certificate_fingerprint_set(certs: &[X509Certificate]) -> Vec<[u8; 32]> {
+    let mut fingerprints: Vec<_> = certs
+        .iter()
+        .map(X509Certificate::fingerprint_sha256)
+        .collect();
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    fingerprints
+}
+
 /// Public-key algorithm family — used to police algorithm/key-family pairings
 /// at sign-time and verify-time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

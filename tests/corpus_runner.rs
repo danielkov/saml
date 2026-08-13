@@ -58,6 +58,7 @@ fn seal_and_open_tracker(
     in_response_to: &str,
     meta: &Extracted,
     acs_url: &str,
+    idp_cert: &X509Certificate,
 ) -> Result<LoginTracker, String> {
     let payload = LoginTrackerPayload {
         request_id: in_response_to.to_owned(),
@@ -66,6 +67,8 @@ fn seal_and_open_tracker(
         acs_endpoint: SsoResponseEndpoint::post(acs_url, 0, true),
         requested_authn_context: None,
         requested_name_id_format: None,
+        idp_signing_cert_fingerprints: vec![idp_cert.fingerprint_sha256()],
+        idp_artifact_resolution_services: vec![],
     };
     let sealed = payload
         .seal(&TRACKER_KEY)
@@ -759,7 +762,13 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
     let tracker_owned = meta
         .in_response_to
         .as_deref()
-        .map(|in_response_to| seal_and_open_tracker(in_response_to, &meta, acs_url.as_str()))
+        .map(|in_response_to| {
+            let signing_cert = idp
+                .signing_certs
+                .first()
+                .ok_or_else(|| "fixture IdP has no signing certificate".to_string())?;
+            seal_and_open_tracker(in_response_to, &meta, acs_url.as_str(), signing_cert)
+        })
         .transpose()?;
 
     sp.consume_response(ConsumeResponse {
@@ -977,7 +986,14 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
     let tracker_owned = meta
         .in_response_to
         .as_deref()
-        .map(|in_response_to| seal_and_open_tracker(in_response_to, &meta, acs_url.as_str()))
+        .map(|in_response_to| {
+            seal_and_open_tracker(
+                in_response_to,
+                &meta,
+                acs_url.as_str(),
+                &idp.signing_certs[0],
+            )
+        })
         .transpose()
         .unwrap_or_else(|e| panic!("tracker: {e}"));
 

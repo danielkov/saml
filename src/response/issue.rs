@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::attribute::Attribute;
 use crate::authn_context::AuthnContextClassRef;
-use crate::binding::{SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint};
+use crate::binding::{Endpoint, SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint};
 use crate::crypto::cert::X509Certificate;
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
@@ -59,6 +59,10 @@ pub(crate) struct IssueResponseInputs<'a> {
     pub outbound_key_transport_algorithm: KeyTransportAlgorithm,
     /// Resolved ACS endpoint (from the SP descriptor); determines POST vs Artifact.
     pub acs_endpoint: &'a SsoResponseEndpoint,
+    /// IdP ArtifactResolutionService selected for a Type-4 artifact. Required
+    /// exactly when `acs_endpoint` uses HTTP-Artifact; its index, not the SP's
+    /// ACS index, is encoded into the artifact (Bindings §3.6.4).
+    pub artifact_resolution_service: Option<&'a Endpoint>,
     pub relay_state: Option<&'a str>,
     /// Opt-in Holder-of-Key (SAML V2.0 HoK SSO Profile). When `Some`, the
     /// assertion's `<saml:SubjectConfirmation>` uses the holder-of-key method
@@ -70,6 +74,7 @@ pub(crate) struct IssueResponseInputs<'a> {
 
 /// Build the SSO Response and return a binding-encoded dispatch.
 pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoResponseDispatch, Error> {
+    ensure_name_id_sp_qualifier(&input.name_id, &input.sp.entity_id)?;
     let response_id = crate::binding::random_xml_id()?;
     let assertion_id = crate::binding::random_xml_id()?;
 
@@ -169,6 +174,7 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
 
     dispatch_binding(
         input.acs_endpoint,
+        input.artifact_resolution_service,
         &xml,
         input.relay_state,
         input.idp_entity_id,
@@ -264,6 +270,7 @@ pub(crate) struct IssueErrorResponseInputs<'a> {
     pub outbound_digest_algorithm: DigestAlgorithm,
     pub outbound_c14n: C14nAlgorithm,
     pub acs_endpoint: &'a SsoResponseEndpoint,
+    pub artifact_resolution_service: Option<&'a Endpoint>,
     pub relay_state: Option<&'a str>,
 }
 
@@ -304,6 +311,7 @@ pub(crate) fn issue_error_response(
 
     dispatch_binding(
         input.acs_endpoint,
+        input.artifact_resolution_service,
         &xml,
         input.relay_state,
         input.idp_entity_id,
@@ -472,7 +480,8 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Element {
             name_id_builder.with_attribute(QName::new(None, "NameQualifier"), nq.clone());
     }
     // For Persistent format: always populate SPNameQualifier with the SP entity
-    // ID for privacy (RFC-004 §3.1). If the caller already set it, prefer that.
+    // ID for privacy (RFC-004 §3.1). A conflicting caller value was rejected
+    // before any signing/encryption work.
     let sp_name_qualifier = name_id.sp_name_qualifier.clone().or_else(|| {
         matches!(name_id.format, NameIdFormat::Persistent).then(|| sp_entity_id.to_owned())
     });
@@ -580,6 +589,19 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Element {
     assertion_builder.finish()
 }
 
+fn ensure_name_id_sp_qualifier(name_id: &NameId, sp_entity_id: &str) -> Result<(), Error> {
+    if matches!(name_id.format, NameIdFormat::Persistent)
+        && let Some(qualifier) = name_id.sp_name_qualifier.as_deref()
+        && qualifier != sp_entity_id
+    {
+        return Err(Error::NameIdSpQualifierMismatch {
+            expected: sp_entity_id.to_owned(),
+            got: qualifier.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Build the Holder-of-Key `<ds:KeyInfo>` subtree carrying the subject cert.
 ///
 /// Declares `xmlns:ds` on the `<ds:KeyInfo>` itself (`declare_ds_ns = true`):
@@ -665,6 +687,7 @@ fn build_response(
 
 fn dispatch_binding(
     acs_endpoint: &SsoResponseEndpoint,
+    artifact_resolution_service: Option<&Endpoint>,
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
@@ -683,7 +706,10 @@ fn dispatch_binding(
             ))
         }
         SsoResponseBinding::HttpArtifact => {
-            issue_artifact(acs_endpoint, xml, relay_state, idp_entity_id)
+            let ars = artifact_resolution_service.ok_or(Error::UnsupportedByPeer {
+                binding: crate::binding::Binding::HttpArtifact,
+            })?;
+            issue_artifact(acs_endpoint, ars, xml, relay_state, idp_entity_id)
         }
     }
 }
@@ -691,6 +717,7 @@ fn dispatch_binding(
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
 fn issue_artifact(
     acs_endpoint: &SsoResponseEndpoint,
+    artifact_resolution_service: &Endpoint,
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
@@ -706,7 +733,11 @@ fn issue_artifact(
     let redirect = crate::binding::artifact::build_artifact_redirect(
         &url,
         idp_entity_id,
-        acs_endpoint.index.unwrap_or(0),
+        artifact_resolution_service
+            .index
+            .ok_or(Error::InvalidConfiguration {
+                reason: "ArtifactResolutionService endpoint is missing its required index",
+            })?,
         xml_str.to_owned(),
         relay_state,
     )?;
@@ -716,6 +747,7 @@ fn issue_artifact(
 #[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
 fn issue_artifact(
     _acs_endpoint: &SsoResponseEndpoint,
+    _artifact_resolution_service: &Endpoint,
     _xml: &[u8],
     _relay_state: Option<&str>,
     _idp_entity_id: &str,
@@ -738,6 +770,8 @@ mod tests {
     use crate::response::parse::parse_response;
     use crate::response::validate::{ValidateResponse, validate_response};
     use crate::xml::parse::Document;
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    use base64::Engine as _;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn rsa_signing_key() -> KeyPair {
@@ -827,6 +861,7 @@ mod tests {
             #[cfg(feature = "xmlenc")]
             outbound_key_transport_algorithm: KeyTransportAlgorithm::RsaOaep,
             acs_endpoint: &sp.assertion_consumer_services[0],
+            artifact_resolution_service: None,
             relay_state: Some("opaque-state"),
             holder_of_key_cert: None,
         }
@@ -991,6 +1026,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persistent_name_id_rejects_foreign_sp_qualifier() {
+        let sp = sp_descriptor(false);
+        let kp = rsa_signing_key();
+        let mut name_id = NameId::new("opaque-pairwise-id", NameIdFormat::Persistent);
+        name_id.sp_name_qualifier = Some("https://other-sp.example.com".to_owned());
+
+        let err = issue_response(make_inputs(&sp, &kp, vec![], name_id))
+            .expect_err("a persistent identifier cannot be relayed across SP scopes");
+        assert!(matches!(err, Error::NameIdSpQualifierMismatch { .. }));
+    }
+
     #[cfg(feature = "xmlenc")]
     #[test]
     fn encryption_is_invoked_when_sp_has_encryption_cert() {
@@ -1134,6 +1181,7 @@ mod tests {
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
             outbound_c14n: C14nAlgorithm::ExclusiveCanonical,
             acs_endpoint: &sp.assertion_consumer_services[0],
+            artifact_resolution_service: None,
             relay_state: None,
         };
         let dispatch = issue_error_response(inputs).expect("issue error");
@@ -1192,12 +1240,14 @@ mod tests {
             true,
         )];
         let kp = rsa_signing_key();
-        let inputs = make_inputs(
+        let ars = Endpoint::soap("https://idp.example.com/ars", Some(41), true);
+        let mut inputs = make_inputs(
             &sp,
             &kp,
             vec![Attribute::email("alice@example.com")],
             NameId::email("alice@example.com"),
         );
+        inputs.artifact_resolution_service = Some(&ars);
         let dispatch = issue_response(inputs).expect("issue");
         match dispatch {
             SsoResponseDispatch::Artifact(redirect) => {
@@ -1208,6 +1258,10 @@ mod tests {
                         .starts_with("https://sp.example.com/acs/art")
                 );
                 assert!(!redirect.artifact.is_empty());
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(redirect.artifact.as_bytes())
+                    .expect("artifact base64");
+                assert_eq!(&decoded[2..4], &41u16.to_be_bytes());
                 assert!(
                     redirect.response_xml.contains("<samlp:Response")
                         || redirect.response_xml.contains("Response")
@@ -1229,7 +1283,9 @@ mod tests {
             true,
         )];
         let kp = rsa_signing_key();
-        let inputs = make_inputs(&sp, &kp, vec![], NameId::email("alice@example.com"));
+        let ars = Endpoint::soap("https://idp.example.com/ars", Some(41), true);
+        let mut inputs = make_inputs(&sp, &kp, vec![], NameId::email("alice@example.com"));
+        inputs.artifact_resolution_service = Some(&ars);
         let err = issue_response(inputs).unwrap_err();
         match err {
             Error::UnsupportedByPeer { binding } => {

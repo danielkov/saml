@@ -208,7 +208,39 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
         SsoResponseDispatch::Artifact(_) => panic!("expected POST"),
     };
 
-    let replay_cache = saml::InMemoryReplayCache::new(256);
+    // A second, separately issued Response has a fresh assertion ID but
+    // answers the same upstream AuthnRequest. The proxy transaction, rather
+    // than merely one assertion ID, must be the one-shot credential.
+    let second_upstream_dispatch = upstream_idp
+        .issue_response(IssueResponse {
+            sp: &proxy_sp_descriptor,
+            in_response_to: &parsed_upstream_request,
+            name_id: NameId::persistent_for_sp("upstream-uid-7", PROXY_SP_ENTITY_ID),
+            attributes: vec![Attribute::email(USER_EMAIL)],
+            authn_instant: now,
+            session_index: "sess-upstream-2".to_owned(),
+            session_not_on_or_after: Some(
+                now.checked_add(Duration::from_hours(1))
+                    .expect("session_not_on_or_after fits"),
+            ),
+            authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+            force_encrypt_assertion: None,
+            now,
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
+        })
+        .expect("second upstream response");
+    let second_upstream_response_xml = match second_upstream_dispatch {
+        SsoResponseDispatch::Post(form) => BASE64
+            .decode(form.saml_response.as_bytes())
+            .expect("base64"),
+        SsoResponseDispatch::Artifact(_) => panic!("expected POST"),
+    };
+
+    // One transaction tombstone is sufficient; a capacity-one cache must not
+    // need a separate assertion-ID slot and partially burn the login.
+    let replay_cache = saml::InMemoryReplayCache::new(1);
 
     // ---- 6. Proxy (SP face) consumes the upstream Response. -------------
     // One call authenticates the RelayState blob and validates the Response
@@ -230,6 +262,22 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
             holder_of_key_cert: None,
         })
         .expect("proxy consumes the upstream response under its own context");
+
+    let Err(replay_err) = proxy.consume_upstream_response(ConsumeUpstreamResponse {
+        relay_state: &upstream_relay_state,
+        upstream_idp: &upstream_idp_descriptor,
+        peer_crypto_policy: None,
+        saml_response: &second_upstream_response_xml,
+        binding: SsoResponseBinding::HttpPost,
+        expected_destination: PROXY_SP_ACS_URL,
+        now,
+        clock_skew: Duration::from_mins(2),
+        replay_cache: &replay_cache,
+        holder_of_key_cert: None,
+    }) else {
+        panic!("a fresh assertion ID cannot redeem one proxy transaction twice");
+    };
+    assert!(matches!(replay_err, saml::Error::ProxyTransactionReplay));
     let upstream_identity = flow.identity();
 
     // The coupled context is the one `bounce_to_upstream` sealed: the identity

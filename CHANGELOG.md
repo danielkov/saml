@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Breaking:** every `LoginTracker` field is private and read-only. The
+  tracker now pins the IdP signing-certificate fingerprints trusted by
+  `start_login`; starting without any signing root is rejected, and response
+  consumption rejects an empty or same-entity descriptor that introduces
+  another signing key. For untrusted cookies/session storage,
+  persist `tracker.to_payload().seal(key)` and recover it with
+  `LoginTracker::open`. The sealing-key holder is explicitly a tracker-issuing
+  trust root because the transparent payload can describe arbitrary policy.
+- **Breaking:** `<saml:OneTimeUse>` now fails closed unless an enabled replay cache can
+  atomically consume the assertion. `ReplayCache::check_and_insert` explicitly
+  changes from a single assertion ID/expiry to a slice of namespaced
+  `ReplayEntry` values plus the supplied validation clock, and requires a
+  linearizable, all-or-nothing reservation. Proxy upstream consumption always requires a
+  replay cache and atomically reserves the proxy transaction, so replaying the
+  same stateless context cannot obtain another flow even with a fresh assertion
+  ID.
+- Proxy contexts pin both the upstream IdP signing roots and downstream SP
+  encryption-key set. Relay rejects substituted metadata before callbacks.
+  Downstream expiry is capped to the earlier of the upstream assertion and
+  session deadlines, and to the selected bearer/Holder-of-Key confirmation's
+  expiry.
+- SP encryption-certificate selection is canonical by SHA-256 fingerprint
+  among RSA certificates, so reordering an otherwise identical metadata key
+  set cannot change the recipient and an EC-only key cannot be selected for
+  RSA key transport. IdP and proxy issuance also refuse to relabel a
+  transformed NameID as another negotiated format, reject a persistent NameID
+  scoped to another SP, and reject unsupported NameID policy before caller
+  callbacks run.
+- Signed low-level Redirect requests now prove that the caller-supplied XML
+  and RelayState are the values covered by the detached signature. Proxying a
+  signed Redirect AuthnRequest is rejected because its tracker-dependent
+  RelayState is not known until after `start_login` signs; POST or unsigned
+  Redirect must be used.
+- HTTP-Artifact now emits and consumes the exact 44-byte SAML 2.0 Type-4
+  structure. The IdP encodes its ArtifactResolutionService index (not the
+  downstream ACS index); the SP verifies the type and SourceID, then routes by
+  that index only through ARS endpoints pinned in the login tracker. Malformed,
+  cross-IdP, unknown-index, and fresh-metadata URL substitution attempts fail
+  before any back-channel HTTP request.
 - **Breaking:** `Identity`'s fields are now private, exposed through accessors.
   They were public and `Identity` is what `Proxy::relay_to_downstream` mints a
   signed downstream assertion from, so a caller could authenticate once,
@@ -50,7 +89,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a bare payload was a sealing oracle needing no key at all: insert an invented
   context under a chosen handle, then present that handle to `decode_context`.
   Its documented contract now also states that implementations must honour
-  `ttl` and make `take` atomic and one-shot.
+  `ttl`. `ProxyContextStore::take` is replaced by non-destructive `get`; the
+  replay cache consumes the authenticated proxy transaction only after
+  response validation, so invalid traffic cannot destroy a valid login.
 - An `UpstreamFlow` is bound to the `Proxy` that produced it;
   `relay_to_downstream` refuses one from another instance with
   `Error::ForeignProxyFlow`. The wrapper being opaque only stopped a caller

@@ -64,9 +64,9 @@ cargo add saml --no-default-features --features rsa-sha,ecdsa-sha,xmlenc,slo,met
 ```rust
 use std::time::{Duration, SystemTime};
 use saml::{
-    Binding, ConsumeResponse, Dispatch, IdpDescriptor, KeyPair, NameIdFormat,
+    Binding, ConsumeResponse, Dispatch, IdpDescriptor, InMemoryReplayCache, KeyPair, NameIdFormat,
     PeerCryptoPolicy, ServiceProvider, ServiceProviderConfig, SpWantSigned,
-    SsoResponseBinding, SsoResponseEndpoint, StartLogin,
+    ReplayMode, SsoResponseBinding, SsoResponseEndpoint, StartLogin,
 };
 
 let sp = ServiceProvider::new(ServiceProviderConfig {
@@ -102,6 +102,14 @@ match start.dispatch {
     Dispatch::Post(form)    => { /* render the auto-submit form */ }
 }
 
+// Persist `start.tracker` in trusted server-side state, or seal its
+// `to_payload()` before placing it in an untrusted cookie/session value.
+let tracker = start.tracker;
+// Keep one durable cache for all response consumptions. Creating one inside
+// each request handler would forget prior assertion IDs and defeat replay
+// protection.
+let replay_cache = InMemoryReplayCache::default();
+
 let identity = sp.consume_response(ConsumeResponse {
     idp: &idp,
     peer_crypto_policy: None,
@@ -112,6 +120,9 @@ let identity = sp.consume_response(ConsumeResponse {
     expected_destination: "https://app.example.com/saml/acs",
     now: SystemTime::now(),
     clock_skew: Duration::from_secs(60),
+    replay_cache: Some(&replay_cache),
+    replay_mode: ReplayMode::All,
+    holder_of_key_cert: None,
 })?;
 ```
 
@@ -127,7 +138,10 @@ Known per-IdP quirks observed during the demo build (Zitadel SLO no-op, Asgardeo
 
 ## Replay protection
 
-SAML 2.0 Core §2.5.1.5 forbids re-consuming the same assertion within its validity window. The library exposes a `ReplayCache` trait and an in-memory default; pass an instance into `ConsumeResponse::replay_cache` to enable the check.
+The library exposes a `ReplayCache` trait and an in-memory default. With
+`ReplayMode::All`, every assertion ID is atomically consumed. Assertions
+carrying SAML Core §2.5.1.5 `<OneTimeUse>` always require an enabled cache and
+fail closed with `OneTimeUseUnenforceable` otherwise.
 
 ```rust
 use saml::{ConsumeResponse, InMemoryReplayCache};
@@ -140,9 +154,9 @@ let identity = sp.consume_response(ConsumeResponse {
 })?;
 ```
 
-The cache is consulted AFTER signature verification and all other spec checks succeed, so forged or malformed responses never pollute the store. A duplicate `assertion_id` within the validity window surfaces as `Error::AssertionReplay`. Passing `None` keeps existing behavior — no check is performed, and the caller is responsible for deduping `Identity::assertion_id` against its own store.
+The cache is consulted AFTER signature verification and all other spec checks succeed, so forged or malformed responses never pollute the store. A duplicate `assertion_id` within the validity window surfaces as `Error::AssertionReplay`. Passing `None` skips optional deduplication only for ordinary assertions; it cannot override `<OneTimeUse>`.
 
-For multi-instance deployments, implement `ReplayCache` against a shared backend (Redis, memcached, a SQL table with a unique constraint on `(id, expires_at)`) so a replay caught by one process is rejected by every process.
+For multi-instance deployments, implement `ReplayCache` against a shared backend (a Redis transaction/Lua script, or a SQL transaction with unique constraints). `check_and_insert` must atomically reserve its complete namespaced batch using the supplied validation clock, so concurrent duplicate presentations have exactly one winner and a backend failure cannot partially consume a login. The proxy reserves one transaction tombstone (bound to the validated assertion through `InResponseTo`), preventing a second valid Response with a fresh assertion ID from reusing one login.
 
 ## Implementation status
 
@@ -175,7 +189,7 @@ Out of scope for v0.1 (see [`docs/rfcs/RFC-001-architecture.md`](docs/rfcs/RFC-0
 - **Weak algorithms are feature-gated.** SHA-1, RSA-PKCS1-v1.5 key transport, and DSA-SHA1 are unavailable unless `weak-algos` is enabled — the dependency is visible in `cargo tree`. Even when compiled in, the per-peer `PeerCryptoPolicy` allow-list still gates acceptance at validation time.
 - **Hard-fail defaults** for signature validity, audience restriction, ACS URL allow-listing, NameID scoping, destination matching, and the XML-DSig transform whitelist (XSLT, XPath, and base64 transforms are rejected).
 - **Caller-owned clock.** Every method that compares against `xs:dateTime` values takes `now: SystemTime` and `clock_skew: Duration` explicitly. Multi-instance deployments avoid drift surprises; tests pass deterministic timestamps.
-- **Replay protection is pluggable.** `ConsumeResponse::replay_cache` accepts an `Option<&dyn ReplayCache>`. The default `InMemoryReplayCache` covers single-process deployments; multi-instance setups implement the trait against Redis or a SQL store. When `None`, no replay check runs and the caller is expected to dedupe `Identity::assertion_id` against their own store. See [Replay protection](#replay-protection) below.
+- **Replay protection is pluggable and atomic.** `ConsumeResponse::replay_cache` accepts an `Option<&dyn ReplayCache>`. Ordinary assertions can still use caller-managed deduplication, but `<OneTimeUse>` fails closed without an enabled cache, and proxy upstream consumption always requires one. See [Replay protection](#replay-protection).
 - **DTD, internal entities, and processing instructions are rejected** at parse time, eliminating the XXE / billion-laughs class.
 - **Detached query-string signatures** (HTTP-Redirect binding) go through a distinct verification entry point with the same `allowed_algorithms` discipline as XML-DSig.
 - **`unsafe_code` is forbidden** at the crate root.

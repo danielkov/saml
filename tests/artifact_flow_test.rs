@@ -6,9 +6,10 @@
 //! - IdP's `issue_response` returns `SsoResponseDispatch::Artifact(...)`
 //!   carrying the redirect URL, the artifact value, and the stashed Response
 //!   XML the IdP must serve from its ArtifactResolutionService.
-//! - We stash the Response XML in a `HashMap<artifact, response_xml>`.
+//! - We stash the Response XML in a `HashMap<artifact, response_xml>` and
+//!   atomically remove it on resolution.
 //! - A mock `HttpClient` simulates the IdP's ARS: on POST, it calls
-//!   `idp.parse_artifact_resolve(...)`, looks up the artifact in the stash,
+//!   `idp.parse_artifact_resolve(...)`, takes the artifact from the stash,
 //!   and emits a `<samlp:ArtifactResponse>` SOAP envelope via
 //!   `idp.build_artifact_response(...)`.
 //! - SP calls `consume_response_artifact(http, ...)` which fetches via SOAP
@@ -59,7 +60,7 @@ fn make_artifact_idp() -> common::TestResult<IdentityProvider> {
         entity_id: IDP_ENTITY_ID.to_owned(),
         sso: vec![Endpoint::post(IDP_SSO_URL, 0, true)],
         slo: vec![],
-        artifact_resolution: vec![Endpoint::post(IDP_ARS_URL, 0, true)],
+        artifact_resolution: vec![Endpoint::soap(IDP_ARS_URL, Some(7), true)],
         supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
         default_name_id_format: NameIdFormat::EmailAddress,
         signing_key,
@@ -133,13 +134,12 @@ impl HttpClient for ArtifactResolutionService<'_> {
             .map_err(|e| format!("parse_artifact_resolve: {e:?}"));
         let stash = self.stash.clone();
         let idp_response = parsed.and_then(|req| {
-            let guard = stash
+            let mut guard = stash
                 .lock()
                 .map_err(|_poison| "stash poisoned".to_string())?;
             let response_xml = guard
-                .get(&req.artifact)
-                .ok_or_else(|| format!("artifact not in stash: {}", req.artifact))?
-                .clone();
+                .remove(&req.artifact)
+                .ok_or_else(|| format!("artifact not in stash: {}", req.artifact))?;
             drop(guard);
             self.idp
                 .build_artifact_response(&req, &response_xml)
@@ -247,7 +247,8 @@ async fn artifact_flow_end_to_end() {
     };
 
     // 5. Caller stashes response_xml keyed by artifact. In a real deployment
-    //    this is a persistent store keyed by the artifact's MessageHandle.
+    //    this is a persistent store keyed by the artifact's MessageHandle
+    //    with an atomic take/delete operation.
     let stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     stash
         .lock()
@@ -299,6 +300,11 @@ async fn artifact_flow_end_to_end() {
         .await
         .expect("consume_response_artifact");
 
+    assert!(
+        stash.lock().expect("stash lock").is_empty(),
+        "successful resolution atomically consumes the one-time artifact"
+    );
+
     // 8. Assertions on the recovered Identity.
     assert_eq!(identity.name_id().format, NameIdFormat::EmailAddress);
     assert_eq!(identity.name_id().value, USER_EMAIL);
@@ -319,6 +325,24 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
     let now = common::flow_now();
+    let start = sp
+        .start_login(
+            &idp_descriptor,
+            StartLogin {
+                relay_state: None,
+                binding: Binding::HttpPost,
+                force_authn: false,
+                is_passive: false,
+                requested_name_id_format: None,
+                requested_authn_context: None,
+                acs_index: None,
+                acs_url: None,
+                response_binding: Some(SsoResponseBinding::HttpArtifact),
+            },
+        )
+        .expect("artifact login starts");
+    let unknown_artifact =
+        saml::binding::artifact::make_artifact(IDP_ENTITY_ID, 7).expect("valid unknown artifact");
 
     let empty_stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let ars = ArtifactResolutionService {
@@ -333,9 +357,9 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
             ConsumeArtifactResponse {
                 idp: &idp_descriptor,
                 peer_crypto_policy: None,
-                artifact: "AAQAA-totally-unknown",
+                artifact: &unknown_artifact,
                 relay_state: None,
-                tracker: None,
+                tracker: Some(&start.tracker),
                 expected_destination: SP_ACS_URL,
                 now,
                 clock_skew: Duration::from_mins(2),
