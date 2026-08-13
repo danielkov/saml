@@ -2111,6 +2111,124 @@ mod tests {
     }
 
     #[test]
+    fn sealed_login_tracker_round_trips_authoritative_policy_and_rejects_tampering() {
+        use crate::authn_context::{AuthnContextClassRef, AuthnContextComparison};
+
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let mut tracker = sp
+            .start_login(
+                &idp,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: Some(NameIdFormat::Persistent),
+                    requested_authn_context: Some(RequestedAuthnContext {
+                        class_refs: vec![AuthnContextClassRef::MultiFactorAuth],
+                        comparison: AuthnContextComparison::Minimum,
+                    }),
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login")
+            .tracker;
+        // Pin deterministic time so expiry/future checks do not depend on the
+        // wall clock used by start_login.
+        tracker.issued_at = fixed_now();
+        let key = [0x5au8; 32];
+        let blob = tracker.to_payload().seal(&key).expect("seal tracker");
+
+        let opened = LoginTracker::open(
+            &blob,
+            &key,
+            fixed_now() + Duration::from_mins(1),
+            Duration::from_mins(2),
+        )
+        .expect("open tracker");
+        assert_eq!(opened.request_id(), tracker.request_id());
+        assert_eq!(opened.issued_at(), fixed_now());
+        assert_eq!(opened.idp_entity_id(), idp.entity_id);
+        assert_eq!(opened.acs_endpoint(), tracker.acs_endpoint());
+        assert_eq!(
+            opened.requested_name_id_format(),
+            Some(&NameIdFormat::Persistent)
+        );
+        assert_eq!(
+            opened.requested_authn_context(),
+            tracker.requested_authn_context()
+        );
+        assert_eq!(
+            opened.idp_signing_cert_fingerprints(),
+            tracker.idp_signing_cert_fingerprints()
+        );
+        assert_eq!(
+            opened.idp_artifact_resolution_services(),
+            tracker.idp_artifact_resolution_services()
+        );
+
+        let mut tampered = URL_SAFE_NO_PAD.decode(&blob).expect("sealed base64");
+        let last = tampered.last_mut().expect("ciphertext tag");
+        *last ^= 1;
+        let tampered = URL_SAFE_NO_PAD.encode(tampered);
+        assert!(matches!(
+            LoginTracker::open(&tampered, &key, fixed_now(), Duration::from_mins(2)),
+            Err(Error::DecryptFailed {
+                reason: "login tracker"
+            })
+        ));
+    }
+
+    #[test]
+    fn sealed_login_tracker_rejects_malformed_expired_and_future_blobs() {
+        let tracker = LoginTracker {
+            request_id: "_sealed".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: "https://idp.example.com".to_owned(),
+            acs_endpoint: SsoResponseEndpoint::post("https://sp.example.com/acs", 0, true),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+            idp_signing_cert_fingerprints: vec![[7; 32]],
+            idp_artifact_resolution_services: vec![],
+        };
+        let key = [0x31u8; 32];
+        let blob = tracker.to_payload().seal(&key).expect("seal tracker");
+
+        let truncated = URL_SAFE_NO_PAD.encode([0u8; 27]);
+        for malformed in ["%%not-base64%%", truncated.as_str()] {
+            assert!(matches!(
+                LoginTracker::open(malformed, &key, fixed_now(), Duration::from_mins(1)),
+                Err(Error::DecryptFailed {
+                    reason: "login tracker"
+                })
+            ));
+        }
+        assert!(matches!(
+            LoginTracker::open(
+                &blob,
+                &key,
+                fixed_now() + Duration::from_secs(61),
+                Duration::from_mins(1),
+            ),
+            Err(Error::Expired)
+        ));
+        assert!(matches!(
+            LoginTracker::open(
+                &blob,
+                &key,
+                fixed_now() - Duration::from_secs(301),
+                Duration::from_mins(1),
+            ),
+            Err(Error::InvalidConfiguration {
+                reason: "login tracker is dated too far in the future"
+            })
+        ));
+    }
+
+    #[test]
     fn start_login_rejects_an_idp_without_a_signing_root() {
         let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
         let mut idp = fixture_idp();
@@ -2378,6 +2496,8 @@ mod tests {
         not_on_or_after: &'a str,
         assertion_id: &'a str,
         one_time_use: bool,
+        name_id_format: NameIdFormat,
+        sp_name_qualifier: Option<&'a str>,
     }
 
     fn build_signed_response_xml(
@@ -2398,6 +2518,8 @@ mod tests {
                 not_on_or_after,
                 assertion_id: "_a1",
                 one_time_use: false,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         )
     }
@@ -2439,10 +2561,15 @@ mod tests {
         let name_id = Element::build(QName::new(Some(saml_ns.to_owned()), "NameID"))
             .with_attribute(
                 QName::new(None, "Format"),
-                "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_owned(),
-            )
-            .with_text("alice@example.com")
-            .finish();
+                opts.name_id_format.as_uri().to_owned(),
+            );
+        let name_id = if let Some(qualifier) = opts.sp_name_qualifier {
+            name_id.with_attribute(QName::new(None, "SPNameQualifier"), qualifier.to_owned())
+        } else {
+            name_id
+        }
+        .with_text("alice@example.com")
+        .finish();
         let subject = Element::build(QName::new(Some(saml_ns.to_owned()), "Subject"))
             .with_child(Node::Element(name_id))
             .with_child(Node::Element(sc))
@@ -2598,6 +2725,109 @@ mod tests {
         assert_eq!(identity.name_id.value, "alice@example.com");
         assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
         assert_eq!(identity.session_index.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn consume_response_enforces_the_tracked_name_id_format() {
+        let kp = rsa_signing_key();
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-nameid-format".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: Some(NameIdFormat::Transient),
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
+        };
+        let xml = build_signed_response_xml(
+            &kp,
+            Some("_req-nameid-format"),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("IdP substituted a different NameID format");
+
+        assert!(matches!(
+            err,
+            Error::UnsupportedNameIdPolicy { ref requested }
+                if requested == NameIdFormat::Transient.as_uri()
+        ));
+    }
+
+    #[test]
+    fn consume_response_rejects_persistent_name_id_scoped_to_another_sp() {
+        let kp = rsa_signing_key();
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-nameid-scope".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: Some(NameIdFormat::Persistent),
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
+        };
+        let xml = build_signed_response_xml_with_options(
+            &kp,
+            &ResponseFixtureOptions {
+                in_response_to: Some("_req-nameid-scope"),
+                recipient_url: "https://sp.example.com/acs",
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T11:59:00Z",
+                not_on_or_after: "2026-05-26T12:10:00Z",
+                assertion_id: "_a-nameid-scope",
+                one_time_use: false,
+                name_id_format: NameIdFormat::Persistent,
+                sp_name_qualifier: Some("https://other-sp.example.com"),
+            },
+        );
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("persistent identifier belongs to another SP");
+
+        assert!(matches!(
+            err,
+            Error::NameIdSpQualifierMismatch { ref expected, ref got }
+                if expected == "https://sp.example.com"
+                    && got == "https://other-sp.example.com"
+        ));
     }
 
     #[test]
@@ -3082,6 +3312,8 @@ mod tests {
                 not_on_or_after: "2099-05-26T12:10:00Z",
                 assertion_id: "_a-otu-skip",
                 one_time_use: false,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         );
         let cache = crate::replay::InMemoryReplayCache::new(32);
@@ -3160,6 +3392,8 @@ mod tests {
                 not_on_or_after: "2099-05-26T12:10:00Z",
                 assertion_id: "_a-otu-must",
                 one_time_use: true,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         );
         let cache = crate::replay::InMemoryReplayCache::new(32);
@@ -3239,6 +3473,8 @@ mod tests {
                 not_on_or_after: "2099-05-26T12:10:00Z",
                 assertion_id: "_a-otu",
                 one_time_use: true,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         );
         let cache = crate::replay::InMemoryReplayCache::new(32);
@@ -3307,6 +3543,8 @@ mod tests {
                 not_on_or_after: "2099-05-26T12:10:00Z",
                 assertion_id: "_a-off",
                 one_time_use: false,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         );
         let cache = crate::replay::InMemoryReplayCache::new(32);

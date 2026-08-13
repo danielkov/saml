@@ -7,7 +7,7 @@
 
 An identity proxy is a SAML entity that acts as an SP toward one set of IdPs and as an IdP toward another set of SPs. It bridges federations, normalizes attribute schemas, brokers between customer IdPs and SaaS apps, and acts as a federation hub.
 
-The crate models proxy as **composition rather than a distinct role**: a `Proxy` borrows one `ServiceProvider` and one `IdentityProvider` plus exposes helpers to carry context across the round-trip statelessly. Library users can also build proxies without `Proxy` by wiring `ServiceProvider` and `IdentityProvider` themselves — `Proxy` is convenience, not gatekeeping.
+The crate models proxy as **composition rather than a distinct role**: a `Proxy` borrows one `ServiceProvider` and one `IdentityProvider` and exposes helpers to carry authenticated context across the upstream round-trip. `Aes256GcmCodec` carries that state in a client token; `OpaqueHandleCodec` keeps it in a server-side store. Library users can also build proxies without `Proxy` by wiring `ServiceProvider` and `IdentityProvider` themselves — `Proxy` is convenience, not gatekeeping.
 
 ---
 
@@ -31,6 +31,7 @@ pub struct Proxy<'a> {
     sp: &'a ServiceProvider,
     idp: &'a IdentityProvider,
     context_codec: Box<dyn ProxyContextCodec>,
+    instance: ProxyInstance,
 }
 
 impl<'a> Proxy<'a> {
@@ -45,7 +46,7 @@ impl<'a> Proxy<'a> {
 }
 ```
 
-`ProxyContextCodec` is a caller-supplied AEAD wrapper for the stateless context blob carried in `RelayState` across the upstream round-trip:
+`ProxyContextCodec` authenticates the context represented by `RelayState`. The built-in AEAD codec carries it in the token; the opaque-handle codec authenticates it through a server-side lookup:
 
 ```rust
 pub trait ProxyContextCodec: Send + Sync {
@@ -72,7 +73,7 @@ The codec deals in `ProxyContextPayload`: a transparent `Serialize`/`Deserialize
 
 `Proxy::relay_to_downstream` instead requires an `UpstreamFlow`, obtainable only from `Proxy::consume_upstream_response`, which authenticates the relay token and validates the upstream Response against *that context's* tracker in one step and records the `Proxy` instance that did so. `ProxyContext` — an opaque wrapper with no public constructor, no public fields and no `Deserialize` impl — is what the codec's authentication yields, via `Proxy::decode_context`. The split exists because relay mints a *signed* downstream assertion from the context: every check it performs reads the context, so a caller-supplied one would mean comparing caller-controlled input against caller-supplied metadata and then signing the result. An authentic identity could otherwise be paired with an invented context naming any registered SP and ACS.
 
-The default implementation uses AES-256-GCM with a caller-supplied 32-byte key. The wire format is `base64url(nonce_12 || ciphertext || tag_16)` where the plaintext is the postcard-serialized `ProxyContextPayload`. Callers can plug HMAC-only, signed-JWT-style, or HSM-backed codecs by implementing the trait.
+The built-in AEAD implementation uses AES-256-GCM with a caller-supplied 32-byte key. The wire format is `base64url(nonce_12 || ciphertext || tag_16)` where the plaintext is the postcard-serialized `ProxyContextPayload`. Callers can plug HMAC-only, signed-JWT-style, or HSM-backed codecs by implementing the trait.
 
 ### 2.1 Codec choice and RelayState size
 
@@ -89,13 +90,15 @@ pub trait ProxyContextStore: Send + Sync {
     /// invented context under a handle of their choosing and redeem it.
     fn put(&self, handle: &str, grant: &SealingGrant<'_>, ttl: Duration) -> Result<(), Error>;
     /// Read without consuming. The authenticated proxy transaction is
-    /// atomically redeemed only after response validation succeeds.
+    /// atomically reserved in the mandatory ReplayCache only after response
+    /// validation succeeds.
     fn get(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
 
 pub struct OpaqueHandleCodec<S: ProxyContextStore> {
     pub store: S,
-    /// Bytes of entropy in the handle. Default 24 → 32 base64url chars,
+    /// Bytes of entropy in the handle. A typical value of 24 produces 32
+    /// base64url characters,
     /// well under the 80-byte RelayState ceiling. Minimum 16; sealing fails
     /// below that, since the handle is a bearer credential in a URL.
     pub handle_byte_len: usize,
@@ -104,10 +107,32 @@ pub struct OpaqueHandleCodec<S: ProxyContextStore> {
 
 impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
     fn encode(&self, grant: &SealingGrant<'_>) -> Result<String, Error> {
+        const MIN_HANDLE_BYTE_LEN: usize = 16;
+        const PROXY_CONTEXT_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+        if self.handle_byte_len < MIN_HANDLE_BYTE_LEN {
+            return Err(Error::InvalidConfiguration {
+                reason: "OpaqueHandleCodec.handle_byte_len must be at least 16 bytes",
+            });
+        }
+        if self.ttl > PROXY_CONTEXT_LIFETIME {
+            return Err(Error::InvalidConfiguration {
+                reason: "OpaqueHandleCodec.ttl must not exceed the proxy context lifetime",
+            });
+        }
+        let remaining_lifetime = grant
+            .payload()
+            .expires_at
+            .duration_since(SystemTime::now())
+            .map_err(|_| Error::InvalidConfiguration {
+                reason: "cannot store an already-expired proxy context",
+            })?;
+        let effective_ttl = self.ttl.min(remaining_lifetime);
+
         let mut bytes = vec![0u8; self.handle_byte_len];
         rand::rng().fill_bytes(&mut bytes);
         let handle = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
-        self.store.put(&handle, grant, self.ttl)?;
+        self.store.put(&handle, grant, effective_ttl)?;
         Ok(handle)
     }
 
@@ -119,7 +144,9 @@ impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
 }
 ```
 
-This trades the "fully stateless" promise for spec-compliant `RelayState` size. The trade is localized: only the proxy uses the store; SP and IdP roles remain stateless. Typical `ProxyContextStore` implementations are a Redis hash with `EXPIRE`, a database table with `expires_at`, or an in-memory `Mutex<HashMap>` for single-instance deployments. Transaction redemption is separate and happens after response validation through the mandatory atomic replay cache, so an invalid Response cannot consume a valid handle.
+The codec refuses fewer than 16 bytes of handle entropy, refuses a configured TTL beyond the universal ten-minute proxy-context lifetime, refuses a context whose `expires_at` is already past, and passes `min(configured_ttl, expires_at - now)` to the store. `ProxyContextStore::put` MUST enforce that effective TTL, and `get` MUST stop returning the payload no later than that deadline. A Redis implementation should set the value and expiry in the same write; a database implementation should store and enforce an absolute expiry. `get` deliberately does not delete a live entry: otherwise anyone who learns a handle can destroy a valid login by presenting it with an invalid Response.
+
+The handle store and the replay cache have separate jobs. The codec generates an unguessable handle and the store authenticates its lookup and bounds its lifetime; neither makes the authenticated login one-shot. After the upstream Response validates, `consume_upstream_response` requires `ReplayCache::check_and_insert` to atomically and linearizably reserve the namespaced proxy-transaction tombstone through `context.expires_at`. A conflict inserts nothing, and a backend error fails closed. This ordering prevents invalid Responses from consuming a transaction while ensuring a second valid Response—even one with a fresh assertion ID—cannot authorize another downstream assertion.
 
 | Outbound upstream binding | Recommended codec | Notes |
 | --- | --- | --- |
@@ -149,8 +176,8 @@ Because `ProxyContextCodec` is a public trait, a custom implementation **is** th
 The opaque context carried across the upstream round-trip:
 
 ```rust
-/// The transparent wire form. Carries no authority on its own — see §3.1.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// The transparent wire form. Carries no authority on its own — see §3.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProxyContextPayload {
     /// AuthnRequest ID we received from the downstream SP.
     pub downstream_request_id: String,
@@ -177,7 +204,7 @@ pub struct ProxyContextPayload {
 }
 ```
 
-Statelessness: the entire downstream round-trip state lives inside this blob. No proxy-side session store is required.
+With `Aes256GcmCodec`, the payload is carried in the token and no context store is required. With `OpaqueHandleCodec`, the payload lives in the server-side handle store. Both modes still require the replay cache used by `consume_upstream_response`.
 
 ---
 
@@ -214,8 +241,8 @@ pub struct BounceToUpstream<'a> {
 
 pub struct BounceResult {
     pub dispatch: Dispatch,
-    /// Encoded context to inject as RelayState on the upstream redirect.
-    /// Already URL-safe; callers serve it as-is.
+    /// Encoded context, already injected into `dispatch` as RelayState.
+    /// Exposed separately for correlation and logging.
     pub upstream_relay_state: String,
 }
 
@@ -229,14 +256,56 @@ impl<'a> Proxy<'a> {
 
 Internally:
 
-1. Build a `StartLogin` for the upstream IdP, propagating flags per `input`.
-2. Call `self.sp.start_login(input.upstream_idp, ...)`.
-3. Stash the returned tracker's transparent payload inside the authenticated
-   `ProxyContextPayload`.
-4. Encode the `ProxyContext` via the codec → `upstream_relay_state`.
-5. Return `BounceResult { dispatch, upstream_relay_state }`.
+1. Reject a signed upstream Redirect request: the tracker-dependent proxy
+   RelayState does not exist until after `start_login` signs its query. Use
+   POST or an unsigned Redirect AuthnRequest.
+2. Build a `StartLogin` for the upstream IdP, propagating flags per `input`,
+   and call `self.sp.start_login(input.upstream_idp, ...)`.
+3. Create a ten-minute context with a random 128-bit transaction ID; preserve
+   the validated downstream provenance, the tracker payload, downstream
+   encryption-key fingerprints, and upstream signing-key fingerprints.
+4. Encode the payload through a crate-issued `SealingGrant`.
+5. Inject the encoded RelayState into the returned POST form or unsigned
+   Redirect URL, then return `BounceResult`. The dispatch is already complete;
+   callers must not append RelayState a second time.
 
-### 4.2 Relay to downstream
+### 4.2 Consume upstream response
+
+```rust
+pub struct ConsumeUpstreamResponse<'a> {
+    pub relay_state: &'a str,
+    pub upstream_idp: &'a IdpDescriptor,
+    pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    pub saml_response: &'a [u8],
+    pub binding: SsoResponseBinding,
+    pub expected_destination: &'a str,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+    /// Mandatory on the proxy path.
+    pub replay_cache: &'a dyn ReplayCache,
+    pub holder_of_key_cert: Option<&'a X509Certificate>,
+}
+
+impl<'a> Proxy<'a> {
+    pub fn consume_upstream_response(
+        &self,
+        input: ConsumeUpstreamResponse<'_>,
+    ) -> Result<UpstreamFlow, Error>;
+}
+```
+
+This authenticates the RelayState through the configured codec, rejects an
+expired context, and rejects an upstream descriptor that introduces signing
+certificates not pinned at bounce time. It then validates the Response against
+the tracker embedded in that exact context. On success, the required replay
+cache atomically reserves the namespaced proxy transaction using the same
+`input.now` clock used for validation and retains it through
+`context.expires_at`. A concurrent or later response for that transaction
+fails with `ProxyTransactionReplay`, even if the IdP uses a different assertion
+ID. The method returns the inseparable `UpstreamFlow { context, identity }`
+bound to the `Proxy` instance that made the trust decision.
+
+### 4.3 Relay to downstream
 
 ```rust
 pub struct RelayToDownstream<'a> {
@@ -272,17 +341,25 @@ impl<'a> Proxy<'a> {
 
 Internally:
 
-1. Look up the downstream SP descriptor by `context.downstream_sp_entity_id()`. (Caller-managed registry; the library does not maintain one.) For ergonomics, the caller can pass a closure for SP lookup via `ProxyConfig` (future addition).
+1. Verify that the by-value flow belongs to this `Proxy`, that the supplied SP
+   is the one bound into the context, that its encryption certificate set has
+   not changed, and that the full ACS endpoint remains registered. These checks
+   precede caller callbacks.
 2. **Select the class the response will advertise**, then **enforce AuthnContext non-downgrade** (§7) against *that* value using `flow.context().payload().requested_authn_context`. → `Error::AuthnContextDowngrade`. Where there is nothing to pass through, the emitted class is `Unspecified` rather than a synthesized `PasswordProtectedTransport`, which would claim more than upstream attested.
-3. Resolve the downstream NameID policy before callbacks. An unsupported
+3. Cap the downstream session, assertion and subject-confirmation deadlines at
+   the earliest of upstream Conditions `NotOnOrAfter`,
+   `SessionNotOnOrAfter`, and the selected `SubjectConfirmationData` expiry;
+   preflight all timestamp arithmetic before callbacks.
+4. Resolve the downstream NameID policy before callbacks. An unsupported
    explicit format fails without running either callback.
-4. Compute downstream NameID via `name_id_transform.transform(flow.identity().name_id(), flow.identity().attributes(), &downstream_sp)` and require the transform's declared format to equal the resolved policy; the proxy never relabels its result.
-5. Compute downstream attributes via `attribute_release.release(flow.identity().attributes(), &downstream_sp)`.
-6. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id()`).
-7. Call `self.idp.issue_response(...)` with the synthesized request and transformed identity.
-8. Cap every downstream deadline to the earlier of upstream Conditions
-   `NotOnOrAfter` and `SessionNotOnOrAfter`, then return the resulting
-   `Dispatch`.
+5. Compute downstream NameID via `name_id_transform.transform(flow.identity().name_id(), flow.identity().attributes(), downstream_sp)`. Require the transform's declared format to equal the resolved policy and reject a Persistent NameID whose present `SPNameQualifier` names another SP, all before attribute release.
+6. Compute downstream attributes via `attribute_release.release(flow.identity().attributes(), downstream_sp)`.
+7. Build a synthetic `ParsedAuthnRequest` from authenticated context provenance
+   and canonical downstream metadata.
+8. Call `self.idp.issue_response(...)` and return its POST dispatch. The current
+   proxy relay result has no slot for `ArtifactResolveTransaction`, so an
+   Artifact downstream ACS is refused with `ArtifactTransactionRequired`
+   before either callback runs.
 
 ---
 
@@ -307,8 +384,7 @@ pub struct ReleaseAllowList {
     pub names: Vec<String>,
 }
 
-/// Built-in: release all attributes. For development only; logs a warning if
-/// the `tracing` feature is enabled.
+/// Built-in: release all attributes. For development only.
 pub struct ReleaseAll;
 
 /// Built-in: per-SP allow-list. Different attribute sets for different downstream
@@ -391,7 +467,7 @@ pub struct StandardComparator;  // built-in: exact / minimum / maximum / better
 Explicitly punted to the caller:
 
 - **Session registry** mapping upstream → downstream sessions (for SLO chain propagation). The library exposes session indices and request IDs; the caller stores the graph.
-- **SLO chain orchestration loop**. Iterating through N downstream SPs via sequential browser redirects is a state-machine + UX problem, not a protocol problem. Library provides the primitives (`build LogoutRequest`, `parse LogoutResponse`) and a hook to drive the chain; the loop lives in the caller. Backchannel SOAP SLO is fully supported because it's just request/response.
+- **Session-graph selection for SLO**. The caller decides which downstream sessions belong to an upstream session. Once the caller supplies ordered targets, the `FrontChannelChain` helper drives sequential Redirect LogoutRequest/LogoutResponse round trips and records per-target outcomes; see RFC-007 §8.
 - **Discovery** (when the proxy fronts multiple upstream IdPs). The caller picks the IdP before calling `bounce_to_upstream`.
 - **Caching** of `IdpDescriptor` / `SpDescriptor` across requests. The library parses metadata XML on demand; whether the caller caches the parse result is up to them.
 - **SP / IdP registry lookup** by entity ID. The caller maintains the registry and looks up by `context.downstream_sp_entity_id()`.
@@ -402,7 +478,7 @@ Explicitly punted to the caller:
 
 ```rust
 // Upstream redirect binding ⇒ use OpaqueHandleCodec (80-byte RelayState ceiling).
-// For POST-bound upstreams, swap in Aes256GcmCodec for a fully stateless proxy.
+// For POST-bound upstreams, swap in Aes256GcmCodec to avoid a context store.
 let proxy = Proxy::new(
     &sp,
     &idp,
@@ -419,7 +495,8 @@ let parsed = idp.consume_authn_request(ConsumeAuthnRequest {
     sp: &downstream_sp,
     peer_crypto_policy: None,
     max_authn_request_age: None,   // use the IdP default
-    saml_request: &body.saml_request,
+    // Already decoded from the binding's base64 form value.
+    saml_request: &decoded_authn_request_xml,
     binding: Binding::HttpPost,
     relay_state: form.relay_state.as_deref(),
     detached_signature: None,
@@ -437,8 +514,8 @@ let bounce = proxy.bounce_to_upstream(BounceToUpstream {
     upstream_binding: Binding::HttpRedirect,
     now: SystemTime::now(),
 })?;
-// Dispatch to upstream IdP, with `bounce.upstream_relay_state` injected as the
-// RelayState query/form parameter. Carries downstream context across the round-trip.
+// Dispatch to the upstream IdP. `bounce.dispatch` already contains the proxy
+// RelayState; `upstream_relay_state` is exposed for correlation/logging only.
 
 // --- /saml/acs handler (upstream IdP → proxy) ---
 // One call: authenticate the RelayState blob through the configured codec and
@@ -451,7 +528,8 @@ let flow = proxy.consume_upstream_response(ConsumeUpstreamResponse {
     relay_state: &form.relay_state,
     upstream_idp: &upstream_idp_descriptor,
     peer_crypto_policy: None,
-    saml_response: &form.saml_response,
+    // Already decoded from the binding's base64 form value.
+    saml_response: &decoded_saml_response_xml,
     binding: SsoResponseBinding::HttpPost,
     expected_destination: "https://hub.example.com/saml/acs", // proxy ACS URL this handler serves
     now: SystemTime::now(),
@@ -463,7 +541,7 @@ let flow = proxy.consume_upstream_response(ConsumeUpstreamResponse {
 let dispatch = proxy.relay_to_downstream(RelayToDownstream {
     flow,
     // Required: the context must belong to this SP, or relay refuses.
-    downstream_sp: &downstream_sp_descriptor,
+    downstream_sp: &downstream_sp,
     attribute_release: &ReleaseAllowList {
         names: vec!["email".into(), "displayName".into(), "groups".into()],
     },
@@ -479,10 +557,9 @@ let dispatch = proxy.relay_to_downstream(RelayToDownstream {
 
 match dispatch {
     SsoResponseDispatch::Post(form) => render_autosubmit(form),  // back to downstream SP's ACS
-    SsoResponseDispatch::Artifact(art) => {
-        artifact_store.put(&art.artifact, &art.response_xml)?;
-        Redirect::to(art.redirect_to.as_str())
-    }
+    SsoResponseDispatch::Artifact(_) => unreachable!(
+        "Proxy relay refuses Artifact until its public result can carry the trust transaction"
+    ),
 }
 ```
 
@@ -499,6 +576,6 @@ match dispatch {
 | AuthnContext non-downgrade | Hard (Proxy enforces in `relay_to_downstream`) |
 | NameID scoped per downstream SP | Hard for Persistent NameIDs: a conflicting `SPNameQualifier` is rejected; caller still chooses the value transform (`PersistentPerSpHmac` recommended). |
 | Attribute release filtered | Soft — caller chooses policy (`ReleaseNone` is the default-safe built-in) |
-| ProxyContext authenticity | Hard via codec — AEAD for `Aes256GcmCodec`, authenticated lookup + TTL for `OpaqueHandleCodec`. |
-| ProxyContext max-age | Hard (codec rejects expired blobs / handles). |
-| Proxy-round-trip replay defense | `consume_upstream_response` atomically reserves a namespaced transaction tombstone after validation. Both codecs require the same replay cache, so a fresh assertion ID cannot redeem one transaction twice. |
+| ProxyContext authenticity | Hard via codec — AEAD for `Aes256GcmCodec`, authenticated lookup for `OpaqueHandleCodec`; a custom codec/store is itself a trust anchor. |
+| ProxyContext lifetime | Hard: universal ten-minute `expires_at`; AEAD also checks `max_age`; opaque handles require ≥128-bit entropy and store TTL is capped at the smaller of configured TTL and remaining context lifetime. |
+| Proxy-round-trip replay defense | Mandatory `ReplayCache`; after validation, `consume_upstream_response` atomically and linearly reserves the namespaced transaction tombstone through context expiry using the validation clock. The handle store is not the replay store, and a fresh assertion ID cannot redeem one transaction twice. |

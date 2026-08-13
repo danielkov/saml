@@ -64,6 +64,8 @@ pub enum ReplayNamespace {
     Assertion,
     /// A proxy login transaction.
     ProxyTransaction,
+    /// An authenticated IdP-side `<samlp:ArtifactResolve>/@ID`.
+    ArtifactResolve,
 }
 
 /// One namespaced replay tombstone to reserve atomically.
@@ -86,6 +88,15 @@ impl<'a> ReplayEntry<'a> {
     pub fn proxy_transaction(id: &'a str, expires_at: SystemTime) -> Self {
         Self {
             namespace: ReplayNamespace::ProxyTransaction,
+            id,
+            expires_at,
+        }
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub(crate) fn artifact_resolve(id: &'a str, expires_at: SystemTime) -> Self {
+        Self {
+            namespace: ReplayNamespace::ArtifactResolve,
             id,
             expires_at,
         }

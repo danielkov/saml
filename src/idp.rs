@@ -35,10 +35,21 @@
 
 use std::time::{Duration, SystemTime};
 
-#[cfg(feature = "slo")]
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+use aes_gcm::Aes256Gcm;
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+use aes_gcm::aead::{Aead as _, KeyInit as _, Payload as AeadPayload};
+#[cfg(any(
+    feature = "slo",
+    all(feature = "artifact-binding", feature = "weak-algos")
+))]
 use base64::Engine as _;
 #[cfg(feature = "slo")]
 use base64::engine::general_purpose::STANDARD as BASE64;
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+use rand::RngCore as _;
 
 use crate::attribute::Attribute;
 use crate::authn::request_parse::parse_authn_request;
@@ -47,6 +58,8 @@ use crate::authn_context::AuthnContextClassRef;
 #[cfg(any(feature = "slo", test))]
 use crate::binding::Dispatch;
 use crate::binding::{Binding, Endpoint, SsoResponseBinding, SsoResponseDispatch};
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+use crate::crypto::cert::certificate_fingerprint_set;
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
 use crate::dsig::algorithms::{
@@ -73,6 +86,8 @@ use crate::logout::{
 use crate::metadata::MetadataExtras;
 use crate::metadata::emit_idp::{IdpMetadataInputs, emit_idp_metadata};
 use crate::nameid::{NameId, NameIdFormat};
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+use crate::replay::{ReplayCache, ReplayEntry};
 use crate::response::issue::{
     IssueErrorResponseInputs, IssueResponseInputs, SamlStatusCode, issue_error_response,
     issue_response,
@@ -649,10 +664,39 @@ pub struct IssueErrorResponse<'a> {
     pub now: SystemTime,
 }
 
+fn artifact_issuance_without_transaction_error() -> Error {
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    {
+        Error::ArtifactTransactionRequired
+    }
+    #[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
+    {
+        Error::UnsupportedByPeer {
+            binding: Binding::HttpArtifact,
+        }
+    }
+}
+
 impl IdentityProvider {
     /// Mint and binding-encode a success `<samlp:Response>` for an SP.
-    /// See RFC-004 §3.1.
+    /// See RFC-004 §3.1. This compatibility API refuses HTTP-Artifact because
+    /// its return type cannot carry the trust transaction required by an
+    /// authenticated ArtifactResolutionService. Use
+    /// [`issue_response_with_artifact_transaction`](Self::issue_response_with_artifact_transaction)
+    /// for an Artifact-capable request.
     pub fn issue_response(&self, input: IssueResponse<'_>) -> Result<SsoResponseDispatch, Error> {
+        if input.in_response_to.validated_acs().binding == SsoResponseBinding::HttpArtifact {
+            return Err(artifact_issuance_without_transaction_error());
+        }
+        self.issue_response_dispatch(input)
+    }
+
+    /// Shared success-response implementation. Artifact-capable callers must
+    /// immediately bind any Artifact result to request-time provenance.
+    fn issue_response_dispatch(
+        &self,
+        input: IssueResponse<'_>,
+    ) -> Result<SsoResponseDispatch, Error> {
         ensure_request_belongs_to_sp(input.in_response_to, input.sp)?;
         match input.force_encrypt_assertion {
             Some(true) => ensure_sp_key_material_matches(input.in_response_to, input.sp)?,
@@ -720,6 +764,33 @@ impl IdentityProvider {
         issue_response(inputs)
     }
 
+    /// Issue an SSO response while preserving the trust transaction required
+    /// by authenticated HTTP-Artifact resolution.
+    ///
+    /// POST results contain only the form dispatch. Artifact results couple
+    /// the redirect and an opaque [`ArtifactResolveTransaction`] minted from
+    /// the same call's immutable AuthnRequest provenance. Use this API for
+    /// every Artifact-capable request; the compatibility
+    /// [`issue_response`](Self::issue_response) API refuses Artifact because it
+    /// cannot carry this transaction.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub fn issue_response_with_artifact_transaction(
+        &self,
+        input: IssueResponse<'_>,
+    ) -> Result<IssuedResponse, Error> {
+        let in_response_to = input.in_response_to;
+        match self.issue_response_dispatch(input)? {
+            SsoResponseDispatch::Post(form) => Ok(IssuedResponse::Post(form)),
+            SsoResponseDispatch::Artifact(redirect) => {
+                let transaction = self.bind_artifact(in_response_to, &redirect)?;
+                Ok(IssuedResponse::Artifact(IssuedArtifact {
+                    redirect,
+                    transaction,
+                }))
+            }
+        }
+    }
+
     /// Resolve NameID negotiation without issuing a response. The proxy uses
     /// this before caller callbacks so an unsupported downstream policy fails
     /// before attribute-release or pseudonym-generation side effects occur.
@@ -738,7 +809,21 @@ impl IdentityProvider {
     /// shape mirrors a success Response (same Issuer, Destination, ACS,
     /// signing rules) but carries `Status != Success` and no Assertion.
     /// See RFC-004 §4.
+    /// This compatibility API refuses HTTP-Artifact because its return type
+    /// cannot carry the required trust transaction. Use
+    /// [`issue_error_response_with_artifact_transaction`](Self::issue_error_response_with_artifact_transaction)
+    /// for an Artifact-capable request.
     pub fn issue_error_response(
+        &self,
+        input: IssueErrorResponse<'_>,
+    ) -> Result<SsoResponseDispatch, Error> {
+        if input.in_response_to.validated_acs().binding == SsoResponseBinding::HttpArtifact {
+            return Err(artifact_issuance_without_transaction_error());
+        }
+        self.issue_error_response_dispatch(input)
+    }
+
+    fn issue_error_response_dispatch(
         &self,
         input: IssueErrorResponse<'_>,
     ) -> Result<SsoResponseDispatch, Error> {
@@ -769,6 +854,26 @@ impl IdentityProvider {
         };
 
         issue_error_response(inputs)
+    }
+
+    /// Issue an error response while preserving the trust transaction needed
+    /// for authenticated HTTP-Artifact resolution.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub fn issue_error_response_with_artifact_transaction(
+        &self,
+        input: IssueErrorResponse<'_>,
+    ) -> Result<IssuedResponse, Error> {
+        let in_response_to = input.in_response_to;
+        match self.issue_error_response_dispatch(input)? {
+            SsoResponseDispatch::Post(form) => Ok(IssuedResponse::Post(form)),
+            SsoResponseDispatch::Artifact(redirect) => {
+                let transaction = self.bind_artifact(in_response_to, &redirect)?;
+                Ok(IssuedResponse::Artifact(IssuedArtifact {
+                    redirect,
+                    transaction,
+                }))
+            }
+        }
     }
 
     /// Select the IdP's canonical SOAP ArtifactResolutionService when the
@@ -803,15 +908,63 @@ impl IdentityProvider {
         Ok(Some(endpoint))
     }
 
+    /// Bind an issued Type-4 artifact to the immutable SP provenance of the
+    /// AuthnRequest transaction that produced it.
+    ///
+    /// Persist the returned opaque value beside `artifact.response_xml` under
+    /// the exact `artifact.artifact` key. The ArtifactResolutionService must
+    /// take that stored pair atomically, but only after
+    /// [`consume_artifact_resolve`](Self::consume_artifact_resolve) has
+    /// authenticated and replay-reserved the resolve request.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn bind_artifact(
+        &self,
+        in_response_to: &ParsedAuthnRequest,
+        artifact: &crate::binding::ArtifactRedirect,
+    ) -> Result<ArtifactResolveTransaction, Error> {
+        if in_response_to.validated_acs().binding != SsoResponseBinding::HttpArtifact {
+            return Err(Error::UnsupportedByPeer {
+                binding: Binding::HttpArtifact,
+            });
+        }
+        let ars = self
+            .artifact_resolution_service_for(SsoResponseBinding::HttpArtifact)?
+            .ok_or(Error::UnsupportedByPeer {
+                binding: Binding::HttpArtifact,
+            })?;
+        let ars_index = ars.index.ok_or(Error::InvalidConfiguration {
+            reason: "ArtifactResolutionService endpoint is missing its required index",
+        })?;
+        let parsed = crate::binding::artifact::parse_type4_artifact(&artifact.artifact)?;
+        if parsed.endpoint_index != ars_index
+            || parsed.source_id != crate::binding::artifact::source_id(&self.config.entity_id)
+        {
+            return Err(Error::MalformedArtifact {
+                reason: "artifact routing does not identify this IdP's selected ARS",
+            });
+        }
+
+        Ok(ArtifactResolveTransaction {
+            artifact: artifact.artifact.clone(),
+            sp_entity_id: in_response_to.validated_sp().to_owned(),
+            sp_signing_cert_fingerprints: in_response_to
+                .validated_signing_cert_fingerprints()
+                .to_vec(),
+        })
+    }
+
     /// Parse an inbound `<samlp:ArtifactResolve>` SOAP envelope received at
     /// this IdP's `ArtifactResolutionService` endpoint. The caller atomically
     /// takes the one-time artifact value from its store and constructs the response via
     /// [`IdentityProvider::build_artifact_response`].
     ///
     /// This compatibility API performs structural parsing and an issuer-text
-    /// comparison only. It does **not** authenticate the request. Use it only
-    /// when the SOAP transport already authenticates the SP with mutually
-    /// authenticated TLS. Otherwise use
+    /// comparison only. It does **not** authenticate the request. It may be
+    /// used as an untrusted lookup step to locate the transaction stored under
+    /// `request.artifact`, provided nothing is removed or disclosed before
+    /// [`consume_artifact_resolve`](Self::consume_artifact_resolve) succeeds.
+    /// Treating its result as authoritative is safe only when the SOAP
+    /// transport already authenticates the SP with mutual TLS. Otherwise use
     /// [`IdentityProvider::consume_artifact_resolve`] to verify the root XML
     /// signature, destination, and freshness.
     #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
@@ -846,17 +999,49 @@ impl IdentityProvider {
         let document = unwrapped.document_ref();
         let root = document.root();
 
-        if !self.config.artifact_resolution.iter().any(|endpoint| {
-            endpoint.binding == Binding::Soap && endpoint.url == input.expected_destination
-        }) {
+        let artifact_route =
+            crate::binding::artifact::parse_type4_artifact(&input.transaction.artifact)?;
+        if artifact_route.source_id != crate::binding::artifact::source_id(&self.config.entity_id) {
+            return Err(Error::MalformedArtifact {
+                reason: "artifact SourceID does not identify this IdP",
+            });
+        }
+        let Some(receiving_ars) = self
+            .config
+            .artifact_resolution
+            .iter()
+            .find(|endpoint| endpoint.index == Some(artifact_route.endpoint_index))
+        else {
+            return Err(Error::MalformedArtifact {
+                reason: "artifact endpoint index is not registered by this IdP",
+            });
+        };
+        if receiving_ars.binding != Binding::Soap || receiving_ars.url != input.expected_destination
+        {
             return Err(Error::InvalidConfiguration {
-                reason: "expected_destination is not a registered ArtifactResolutionService endpoint",
+                reason: "expected_destination is not the ArtifactResolutionService selected by the artifact",
+            });
+        }
+        if input.clock_skew.is_zero() {
+            return Err(Error::InvalidConfiguration {
+                reason: "ArtifactResolve clock_skew must be greater than zero",
             });
         }
         if request.issuer != input.sp.entity_id {
             return Err(Error::IssuerMismatch {
                 expected: input.sp.entity_id.clone(),
                 got: Some(request.issuer.clone()),
+            });
+        }
+        if request.issuer != input.transaction.sp_entity_id {
+            return Err(Error::IssuerMismatch {
+                expected: input.transaction.sp_entity_id.clone(),
+                got: Some(request.issuer.clone()),
+            });
+        }
+        if request.artifact != input.transaction.artifact {
+            return Err(Error::MalformedArtifact {
+                reason: "ArtifactResolve does not match the issued artifact transaction",
             });
         }
         if root.attribute(None, "Destination") != Some(input.expected_destination) {
@@ -882,6 +1067,23 @@ impl IdentityProvider {
         let signature = root.child_element(Some(DS_NS), "Signature");
         match signature {
             Some(signature) => {
+                // Metadata rotation may retire a root during the transaction,
+                // but it must never introduce signing authority that the
+                // AuthnRequest was not validated against. Empty fresh roots
+                // cannot authenticate an XML signature. The unsigned branch
+                // remains available only for explicitly mTLS-authenticated
+                // transports.
+                let current_sp_roots = certificate_fingerprint_set(&input.sp.signing_certs);
+                if current_sp_roots.is_empty()
+                    || !current_sp_roots.iter().all(|fingerprint| {
+                        input
+                            .transaction
+                            .sp_signing_cert_fingerprints
+                            .contains(fingerprint)
+                    })
+                {
+                    return Err(Error::ArtifactSpTrustRootMismatch);
+                }
                 let policy = input
                     .peer_crypto_policy
                     .unwrap_or(&self.config.default_peer_crypto_policy);
@@ -897,14 +1099,36 @@ impl IdentityProvider {
             None => {}
         }
 
+        // Reserve only after every structural, correlation, trust, freshness,
+        // and signature check. This prevents invalid traffic from poisoning
+        // the cache while ensuring the caller cannot take the artifact before
+        // a captured signed request loses its replay race.
+        // Freshness accepts both endpoints. ReplayCache expiry is exclusive
+        // (`expires_at <= now` is evicted), so retain the tombstone one tick
+        // beyond the inclusive upper endpoint.
+        let replay_expires_at = issue_instant
+            .checked_add(input.clock_skew)
+            .and_then(|expires_at| expires_at.checked_add(Duration::from_nanos(1)))
+            .ok_or_else(|| {
+                Error::XmlParse("ArtifactResolve replay expiry overflows SystemTime".to_owned())
+            })?;
+        let replay_id = format!("{}\0{}", input.transaction.sp_entity_id, request.request_id);
+        if !input.replay_cache.check_and_insert(
+            &[ReplayEntry::artifact_resolve(&replay_id, replay_expires_at)],
+            input.now,
+        )? {
+            return Err(Error::ArtifactResolveReplay);
+        }
+
         Ok(request)
     }
 
-    /// Build an outbound `<samlp:ArtifactResponse>` SOAP envelope wrapping
+    /// Build and sign an outbound `<samlp:ArtifactResponse>` SOAP envelope wrapping
     /// `payload_xml` (typically the previously-stashed `<samlp:Response>`
     /// atomically taken by `request.artifact`). `request` must be the
-    /// [`crate::binding::artifact::ArtifactResolveRequest`] returned from
-    /// [`IdentityProvider::parse_artifact_resolve`].
+    /// [`crate::binding::artifact::ArtifactResolveRequest`] returned from the
+    /// authenticated [`IdentityProvider::consume_artifact_resolve`] path (or
+    /// the mTLS-only [`IdentityProvider::parse_artifact_resolve`] path).
     ///
     /// The returned SOAP envelope is ready to be served as the HTTP response
     /// body with `Content-Type: text/xml`.
@@ -914,11 +1138,14 @@ impl IdentityProvider {
         request: &crate::binding::artifact::ArtifactResolveRequest,
         payload_xml: &str,
     ) -> Result<String, Error> {
-        crate::binding::artifact::build_artifact_response(
+        let unsigned = crate::binding::artifact::build_artifact_response(
             &self.config.entity_id,
             &request.request_id,
             payload_xml,
-        )
+        )?;
+        let body = crate::binding::soap::unwrap(unsigned.as_bytes())?;
+        let signed = self.maybe_sign_outbound(body.payload().clone(), true)?;
+        crate::binding::soap::wrap_element(signed)
     }
 }
 
@@ -926,15 +1153,157 @@ impl IdentityProvider {
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
 pub struct ConsumeArtifactResolve<'a> {
     pub sp: &'a SpDescriptor,
+    /// Opaque trust record stored with the exact one-time artifact at issue.
+    pub transaction: &'a ArtifactResolveTransaction,
+    /// Linearizable insert-if-absent store for authenticated request IDs.
+    pub replay_cache: &'a dyn ReplayCache,
     pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
     pub soap_envelope: &'a [u8],
     /// Exact IdP ArtifactResolutionService URL receiving this SOAP request.
     pub expected_destination: &'a str,
     pub now: SystemTime,
+    /// Positive freshness tolerance. Zero is rejected because SAML wire
+    /// timestamps are quantized and cannot reliably equal the receiver's
+    /// higher-precision clock.
     pub clock_skew: Duration,
     /// When true, reject an unsigned request. When false, a present signature
     /// is still verified rather than ignored.
     pub require_signed: bool,
+}
+
+/// SSO response issued with the artifact-resolution trust transaction intact.
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[derive(Debug)]
+pub enum IssuedResponse {
+    Post(crate::binding::SsoResponsePostForm),
+    Artifact(IssuedArtifact),
+}
+
+/// An Artifact redirect and the opaque transaction that must be persisted
+/// beside its response XML.
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[derive(Debug)]
+pub struct IssuedArtifact {
+    pub redirect: crate::binding::ArtifactRedirect,
+    pub transaction: ArtifactResolveTransaction,
+}
+
+/// Opaque trust and correlation record for one issued Type-4 artifact.
+///
+/// It has no public constructor, mutable fields, or unauthenticated
+/// deserialization path. The IdP role creates it only from a validated
+/// AuthnRequest and the exact issued artifact through
+/// [`IdentityProvider::issue_response_with_artifact_transaction`].
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[derive(Clone)]
+pub struct ArtifactResolveTransaction {
+    artifact: String,
+    sp_entity_id: String,
+    sp_signing_cert_fingerprints: Vec<[u8; 32]>,
+}
+
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArtifactResolveTransactionWire {
+    artifact: String,
+    sp_entity_id: String,
+    sp_signing_cert_fingerprints: Vec<[u8; 32]>,
+}
+
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+impl std::fmt::Debug for ArtifactResolveTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtifactResolveTransaction")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+impl ArtifactResolveTransaction {
+    /// Seal this transaction into authenticated opaque bytes suitable for a
+    /// database, cache, or another worker.
+    ///
+    /// The 32-byte key is the transaction-issuing trust root: anyone holding it
+    /// can produce a blob `open` will accept. Keep it server-side and separate
+    /// from untrusted artifact values.
+    pub fn seal(&self, key: &[u8; 32]) -> Result<String, Error> {
+        let wire = ArtifactResolveTransactionWire {
+            artifact: self.artifact.clone(),
+            sp_entity_id: self.sp_entity_id.clone(),
+            sp_signing_cert_fingerprints: self.sp_signing_cert_fingerprints.clone(),
+        };
+        let plaintext =
+            postcard::to_allocvec(&wire).map_err(|_err| Error::InvalidConfiguration {
+                reason: "artifact transaction serialize",
+            })?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|_err| Error::InvalidConfiguration {
+                reason: "AES-256-GCM key size mismatch",
+            })?;
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                aes_gcm::Nonce::from_slice(&nonce_bytes),
+                AeadPayload {
+                    msg: &plaintext,
+                    aad: b"saml-artifact-resolve-transaction-v1",
+                },
+            )
+            .map_err(|_err| Error::DecryptFailed {
+                reason: "artifact transaction",
+            })?;
+        let mut bytes = Vec::with_capacity(12usize.saturating_add(ciphertext.len()));
+        bytes.extend_from_slice(&nonce_bytes);
+        bytes.extend_from_slice(&ciphertext);
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    /// Authenticate and recover a transaction previously produced by
+    /// [`seal`](Self::seal).
+    pub fn open(blob: &str, key: &[u8; 32]) -> Result<Self, Error> {
+        let bytes =
+            URL_SAFE_NO_PAD
+                .decode(blob.as_bytes())
+                .map_err(|_err| Error::DecryptFailed {
+                    reason: "artifact transaction",
+                })?;
+        if bytes.len() < 12 + 16 {
+            return Err(Error::DecryptFailed {
+                reason: "artifact transaction",
+            });
+        }
+        let (nonce, ciphertext) = bytes.split_at(12);
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|_err| Error::InvalidConfiguration {
+                reason: "AES-256-GCM key size mismatch",
+            })?;
+        let plaintext = cipher
+            .decrypt(
+                aes_gcm::Nonce::from_slice(nonce),
+                AeadPayload {
+                    msg: ciphertext,
+                    aad: b"saml-artifact-resolve-transaction-v1",
+                },
+            )
+            .map_err(|_err| Error::DecryptFailed {
+                reason: "artifact transaction",
+            })?;
+        let wire: ArtifactResolveTransactionWire =
+            postcard::from_bytes(&plaintext).map_err(|_err| Error::DecryptFailed {
+                reason: "artifact transaction",
+            })?;
+        if wire.artifact.is_empty() || wire.sp_entity_id.is_empty() {
+            return Err(Error::DecryptFailed {
+                reason: "artifact transaction",
+            });
+        }
+        Ok(Self {
+            artifact: wire.artifact,
+            sp_entity_id: wire.sp_entity_id,
+            sp_signing_cert_fingerprints: wire.sp_signing_cert_fingerprints,
+        })
+    }
 }
 
 /// Confirm a validated `AuthnRequest` actually came from the SP the caller is
@@ -1876,10 +2245,17 @@ mod tests {
     #[cfg(feature = "slo")]
     use crate::logout::{LogoutOutcome, LogoutStatus, StartLogout};
     use crate::nameid::{NameId, NameIdFormat};
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    use crate::replay::InMemoryReplayCache;
     use crate::response::issue::SamlStatusCode;
     use crate::xml::emit::emit_document;
     use crate::xml::parse::Node;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    const SECOND_RSA_CERT_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.crt");
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    const SECOND_RSA_KEY_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.key");
 
     // -------------------------------------------------------------------------
     // Fixtures
@@ -1893,6 +2269,15 @@ mod tests {
 
     fn rsa_cert() -> X509Certificate {
         X509Certificate::from_pem(RSA_CERT_PEM).unwrap()
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn second_rsa_keypair_with_cert() -> KeyPair {
+        KeyPair::from_pkcs8_pem(SECOND_RSA_KEY_PEM)
+            .expect("second RSA key")
+            .with_certificate(
+                X509Certificate::from_pem(SECOND_RSA_CERT_PEM).expect("second RSA cert"),
+            )
     }
 
     fn idp_with(want_authn_requests_signed: bool, sign_responses: bool) -> IdentityProvider {
@@ -2065,13 +2450,14 @@ mod tests {
         signed: bool,
     ) -> Vec<u8> {
         let issue_instant = crate::time::format_xs_datetime(issue_instant).expect("format time");
+        let artifact = test_type4_artifact();
         let payload = format!(
             r#"<samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
                        xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
                        ID="_artifact-resolve-1" Version="2.0"
                        IssueInstant="{issue_instant}" Destination="{destination}">
   <saml:Issuer>{issuer}</saml:Issuer>
-  <samlp:Artifact>artifact-ok</samlp:Artifact>
+  <samlp:Artifact>{artifact}</samlp:Artifact>
 </samlp:ArtifactResolve>"#,
         );
 
@@ -2103,6 +2489,178 @@ mod tests {
     }
 
     #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn artifact_resolve_envelope_signed_with(
+        issuer: &str,
+        artifact: &str,
+        request_id: &str,
+        key: &KeyPair,
+    ) -> Vec<u8> {
+        let issue_instant =
+            crate::time::format_xs_datetime(fixed_now()).expect("format fixed time");
+        let payload = format!(
+            r#"<samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                       xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                       ID="{request_id}" Version="2.0"
+                       IssueInstant="{issue_instant}" Destination="https://idp.example.com/ars">
+  <saml:Issuer>{issuer}</saml:Issuer>
+  <samlp:Artifact>{artifact}</samlp:Artifact>
+</samlp:ArtifactResolve>"#,
+        );
+        let unsigned = Document::parse(payload.as_bytes()).expect("parse ArtifactResolve");
+        let signed = crate::dsig::sign::sign_element(
+            unsigned.root().clone(),
+            &unsigned,
+            crate::dsig::sign::SignOptions {
+                signing_key: key,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign ArtifactResolve");
+        let xml = emit_document(&Document::new(signed).expect("signed document"))
+            .expect("emit ArtifactResolve");
+        crate::binding::soap::wrap(&xml)
+            .expect("wrap ArtifactResolve")
+            .into_bytes()
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn artifact_transaction(sp: &SpDescriptor) -> ArtifactResolveTransaction {
+        ArtifactResolveTransaction {
+            artifact: test_type4_artifact(),
+            sp_entity_id: sp.entity_id.clone(),
+            sp_signing_cert_fingerprints: certificate_fingerprint_set(&sp.signing_certs),
+        }
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn test_type4_artifact() -> String {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+
+        let mut bytes = [0u8; 44];
+        bytes[..2].copy_from_slice(&0x0004u16.to_be_bytes());
+        bytes[2..4].copy_from_slice(&7u16.to_be_bytes());
+        bytes[4..24].copy_from_slice(&crate::binding::artifact::source_id(
+            "https://idp.example.com/saml",
+        ));
+        bytes[24..].fill(0x5a);
+        BASE64.encode(bytes)
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn artifact_authn_request(sp: &SpDescriptor) -> ParsedAuthnRequest {
+        ParsedAuthnRequest::for_proxy_reissue(
+            sp,
+            "_artifact-authn-request".to_owned(),
+            fixed_now(),
+            sp.assertion_consumer_services[0].clone(),
+            Some(NameIdFormat::EmailAddress),
+            None,
+            None,
+        )
+        .expect("fixture ACS is registered")
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn issue_artifact_with_transaction(
+        idp: &IdentityProvider,
+        sp: &SpDescriptor,
+    ) -> IssuedArtifact {
+        let request = artifact_authn_request(sp);
+        let issued = idp
+            .issue_response_with_artifact_transaction(IssueResponse {
+                sp,
+                in_response_to: &request,
+                name_id: NameId::email("alice@example.com"),
+                attributes: vec![],
+                authn_instant: fixed_now(),
+                session_index: "artifact-session".to_owned(),
+                session_not_on_or_after: None,
+                authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+                force_encrypt_assertion: Some(false),
+                now: fixed_now(),
+                assertion_lifetime: Duration::from_mins(10),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+                holder_of_key_cert: None,
+            })
+            .expect("issue artifact with trust transaction");
+        let IssuedResponse::Artifact(issued) = issued else {
+            panic!("fixture must issue Artifact")
+        };
+        issued
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    fn artifact_resolve_envelope_signed_over_artifact(issuer: &str, destination: &str) -> Vec<u8> {
+        let issue_instant =
+            crate::time::format_xs_datetime(fixed_now()).expect("format fixed time");
+        let payload = format!(
+            r#"<samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                       xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                       ID="_artifact-resolve-1" Version="2.0"
+                       IssueInstant="{issue_instant}" Destination="{destination}">
+  <saml:Issuer>{issuer}</saml:Issuer>
+  <samlp:Artifact ID="_signed-artifact">{}</samlp:Artifact>
+</samlp:ArtifactResolve>"#,
+            test_type4_artifact(),
+        );
+        let unsigned = Document::parse(payload.as_bytes()).expect("parse ArtifactResolve");
+        let mut artifact = unsigned
+            .root()
+            .child_element(Some(SAMLP_NS), "Artifact")
+            .expect("Artifact child")
+            .clone();
+        artifact
+            .namespaces_declared_here
+            .push((Some("samlp".to_owned()), SAMLP_NS.to_owned()));
+        let signed_artifact = crate::dsig::sign::sign_element(
+            artifact.clone(),
+            &unsigned,
+            crate::dsig::sign::SignOptions {
+                signing_key: &rsa_keypair_with_cert(),
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign Artifact child");
+        let signature = signed_artifact
+            .child_element(Some(DS_NS), "Signature")
+            .expect("generated Signature")
+            .clone();
+
+        // Put a cryptographically valid child-targeting signature where the
+        // role API expects the message signature. Verification must not treat
+        // that as authentication of the ArtifactResolve root.
+        let mut root = unsigned.root().clone();
+        let original_artifact = root
+            .children
+            .iter_mut()
+            .find_map(|node| match node {
+                Node::Element(element)
+                    if element.qname().namespace() == Some(SAMLP_NS)
+                        && element.qname().local() == "Artifact" =>
+                {
+                    Some(element)
+                }
+                _ => None,
+            })
+            .expect("Artifact child in cloned root");
+        *original_artifact = artifact;
+        root.children.insert(1, Node::Element(signature));
+        let xml = emit_document(&Document::new(root).expect("renumber signed request"))
+            .expect("emit child-signed ArtifactResolve");
+        crate::binding::soap::wrap(&xml)
+            .expect("wrap ArtifactResolve in SOAP")
+            .into_bytes()
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
     fn consume_artifact_resolve<'a>(
         idp: &IdentityProvider,
         sp: &'a SpDescriptor,
@@ -2110,8 +2668,12 @@ mod tests {
         destination: &'a str,
         require_signed: bool,
     ) -> Result<crate::binding::artifact::ArtifactResolveRequest, Error> {
+        let transaction = artifact_transaction(sp);
+        let replay_cache = InMemoryReplayCache::new(16);
         idp.consume_artifact_resolve(ConsumeArtifactResolve {
             sp,
+            transaction: &transaction,
+            replay_cache: &replay_cache,
             peer_crypto_policy: None,
             soap_envelope: envelope,
             expected_destination: destination,
@@ -2138,7 +2700,7 @@ mod tests {
                 .expect("valid signed request");
         assert_eq!(request.request_id, "_artifact-resolve-1");
         assert_eq!(request.issuer, sp.entity_id);
-        assert_eq!(request.artifact, "artifact-ok");
+        assert_eq!(request.artifact, test_type4_artifact());
     }
 
     #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
@@ -2227,7 +2789,7 @@ mod tests {
         );
         let tampered = String::from_utf8(envelope)
             .expect("SOAP envelope is UTF-8")
-            .replace("artifact-ok", "artifact-tampered")
+            .replace("_artifact-resolve-1", "_artifact-resolve-x")
             .into_bytes();
 
         let err =
@@ -2237,6 +2799,260 @@ mod tests {
             matches!(err, Error::SignatureVerification { .. }),
             "got {err:?}"
         );
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_accepts_optional_unsigned_at_registered_endpoint() {
+        let idp = artifact_idp();
+        let sp = sp_descriptor(false);
+        let envelope = artifact_resolve_envelope(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            fixed_now(),
+            false,
+        );
+
+        let request =
+            consume_artifact_resolve(&idp, &sp, &envelope, "https://idp.example.com/ars", false)
+                .expect("mTLS deployments may make the XML signature optional");
+        assert_eq!(request.artifact, test_type4_artifact());
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_rejects_unregistered_receiver_and_child_signature() {
+        let idp = artifact_idp();
+        let sp = sp_descriptor(false);
+        let envelope = artifact_resolve_envelope(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            fixed_now(),
+            false,
+        );
+        let err = consume_artifact_resolve(
+            &idp,
+            &sp,
+            &envelope,
+            "https://idp.example.com/unregistered-ars",
+            false,
+        )
+        .expect_err("the receiving endpoint must come from IdP metadata");
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+
+        let child_signed = artifact_resolve_envelope_signed_over_artifact(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+        );
+        let err = consume_artifact_resolve(
+            &idp,
+            &sp,
+            &child_signed,
+            "https://idp.example.com/ars",
+            true,
+        )
+        .expect_err("a signed child must not authenticate the message root");
+        assert!(matches!(err, Error::SignatureVerification { .. }));
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_binds_the_type4_index_to_the_receiving_ars() {
+        let mut idp = artifact_idp();
+        idp.config.artifact_resolution.push(Endpoint::soap(
+            "https://idp.example.com/ars-secondary",
+            Some(8),
+            false,
+        ));
+        let sp = sp_descriptor(false);
+        let envelope = artifact_resolve_envelope(
+            &sp.entity_id,
+            "https://idp.example.com/ars-secondary",
+            fixed_now(),
+            false,
+        );
+
+        let err = consume_artifact_resolve(
+            &idp,
+            &sp,
+            &envelope,
+            "https://idp.example.com/ars-secondary",
+            false,
+        )
+        .expect_err("an index-7 artifact cannot be resolved at the index-8 ARS");
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn idp_build_artifact_response_signs_the_outer_envelope() {
+        let idp = artifact_idp();
+        let request = crate::binding::artifact::ArtifactResolveRequest {
+            request_id: "_resolve-response-signing".to_owned(),
+            issuer: "https://sp.example.com/saml".to_owned(),
+            artifact: test_type4_artifact(),
+        };
+        let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
+        let envelope = idp
+            .build_artifact_response(&request, payload)
+            .expect("build signed ArtifactResponse");
+        let body = crate::binding::soap::unwrap(envelope.as_bytes()).expect("unwrap SOAP");
+        let response = body.payload();
+        let signature = response
+            .child_element(Some(DS_NS), "Signature")
+            .expect("outer ArtifactResponse signature");
+        let verified = verify_signature(
+            body.document_ref(),
+            signature,
+            &[rsa_cert()],
+            &PeerCryptoPolicy::strong_defaults(),
+        )
+        .expect("verify outer signature");
+        assert_eq!(verified.signed_element, response.id());
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_rejects_a_root_introduced_after_issuance() {
+        let idp = artifact_idp();
+        let mut original_sp = sp_descriptor(false);
+        original_sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs-artifact",
+            9,
+            true,
+        )];
+        let issued = issue_artifact_with_transaction(&idp, &original_sp);
+        let attacker_key = second_rsa_keypair_with_cert();
+        let mut substituted_sp = original_sp.clone();
+        substituted_sp.signing_certs = vec![
+            attacker_key
+                .certificate()
+                .expect("attacker test key carries cert")
+                .clone(),
+        ];
+        let envelope = artifact_resolve_envelope_signed_with(
+            &substituted_sp.entity_id,
+            &issued.redirect.artifact,
+            "_substituted-root",
+            &attacker_key,
+        );
+        let replay_cache = InMemoryReplayCache::new(16);
+
+        let err = idp
+            .consume_artifact_resolve(ConsumeArtifactResolve {
+                sp: &substituted_sp,
+                transaction: &issued.transaction,
+                replay_cache: &replay_cache,
+                peer_crypto_policy: None,
+                soap_envelope: &envelope,
+                expected_destination: "https://idp.example.com/ars",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(2),
+                require_signed: true,
+            })
+            .expect_err("fresh metadata cannot introduce artifact-resolution authority");
+        assert!(matches!(err, Error::ArtifactSpTrustRootMismatch));
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_atomically_reserves_request_id() {
+        let idp = artifact_idp();
+        let mut sp = sp_descriptor(false);
+        sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs-artifact",
+            9,
+            true,
+        )];
+        let issued = issue_artifact_with_transaction(&idp, &sp);
+        let envelope = artifact_resolve_envelope_signed_with(
+            &sp.entity_id,
+            &issued.redirect.artifact,
+            "_captured-resolve",
+            &rsa_keypair_with_cert(),
+        );
+        let replay_cache = InMemoryReplayCache::new(16);
+        let consume = || {
+            idp.consume_artifact_resolve(ConsumeArtifactResolve {
+                sp: &sp,
+                transaction: &issued.transaction,
+                replay_cache: &replay_cache,
+                peer_crypto_policy: None,
+                soap_envelope: &envelope,
+                expected_destination: "https://idp.example.com/ars",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(2),
+                require_signed: true,
+            })
+        };
+
+        consume().expect("first authenticated resolve reserves its ID");
+        let err = consume().expect_err("captured resolve ID must be single-use");
+        assert!(matches!(err, Error::ArtifactResolveReplay));
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_rejects_zero_skew_explicitly() {
+        let idp = artifact_idp();
+        let mut sp = sp_descriptor(false);
+        sp.signing_certs.clear();
+        let transaction = artifact_transaction(&sp);
+        let envelope = artifact_resolve_envelope(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            fixed_now(),
+            false,
+        );
+        let replay_cache = InMemoryReplayCache::new(16);
+        let err = idp
+            .consume_artifact_resolve(ConsumeArtifactResolve {
+                sp: &sp,
+                transaction: &transaction,
+                replay_cache: &replay_cache,
+                peer_crypto_policy: None,
+                soap_envelope: &envelope,
+                expected_destination: "https://idp.example.com/ars",
+                now: fixed_now(),
+                clock_skew: Duration::ZERO,
+                require_signed: false,
+            })
+            .expect_err("wire timestamp quantization makes zero skew unusable");
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_transaction_seal_round_trips_and_rejects_tampering() {
+        let mut sp = sp_descriptor(false);
+        sp.signing_certs.clear();
+        let transaction = artifact_transaction(&sp);
+        let key = [37u8; 32];
+        let sealed = transaction.seal(&key).expect("seal transaction");
+        let opened = ArtifactResolveTransaction::open(&sealed, &key).expect("open transaction");
+        assert_eq!(opened.artifact, transaction.artifact);
+        assert_eq!(opened.sp_entity_id, transaction.sp_entity_id);
+        assert_eq!(
+            opened.sp_signing_cert_fingerprints,
+            transaction.sp_signing_cert_fingerprints
+        );
+        assert!(
+            opened.sp_signing_cert_fingerprints.is_empty(),
+            "mTLS-only transactions legitimately have no XML signing roots"
+        );
+
+        let mut bytes = sealed.into_bytes();
+        let last = bytes.last_mut().expect("sealed transaction is nonempty");
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(bytes).expect("base64url is UTF-8");
+        assert!(matches!(
+            ArtifactResolveTransaction::open(&tampered, &key),
+            Err(Error::DecryptFailed { .. })
+        ));
+        assert!(matches!(
+            ArtifactResolveTransaction::open("short", &key),
+            Err(Error::DecryptFailed { .. })
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -2289,6 +3105,24 @@ mod tests {
             Endpoint::soap("https://idp.example.com/ars-b", Some(7), false),
         ];
         let err = IdentityProvider::new(cfg).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn artifact_dispatch_revalidates_mutated_service_shape() {
+        let mut idp = idp_with(false, false);
+        idp.config.artifact_resolution =
+            vec![Endpoint::post("https://idp.example.com/ars", 7, true)];
+        let err = idp
+            .artifact_resolution_service_for(SsoResponseBinding::HttpArtifact)
+            .expect_err("a non-SOAP service must never route artifact resolution");
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+
+        idp.config.artifact_resolution =
+            vec![Endpoint::soap("https://idp.example.com/ars", None, true)];
+        let err = idp
+            .artifact_resolution_service_for(SsoResponseBinding::HttpArtifact)
+            .expect_err("a Type-4 artifact cannot omit its ARS endpoint index");
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
@@ -2804,7 +3638,7 @@ mod tests {
             .validated_name_id_format()
             .cloned()
             .unwrap_or_else(|| idp.config.default_name_id_format.clone());
-        idp.issue_response(IssueResponse {
+        let input = IssueResponse {
             sp,
             in_response_to: req,
             name_id: NameId::new("alice@example.com", requested_format),
@@ -2818,7 +3652,19 @@ mod tests {
             assertion_lifetime: Duration::from_mins(10),
             subject_confirmation_lifetime: Duration::from_mins(5),
             holder_of_key_cert: None,
-        })
+        };
+        #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+        if req.validated_acs().binding == SsoResponseBinding::HttpArtifact {
+            return idp.issue_response_with_artifact_transaction(input).map(
+                |issued| match issued {
+                    IssuedResponse::Post(form) => SsoResponseDispatch::Post(form),
+                    IssuedResponse::Artifact(artifact) => {
+                        SsoResponseDispatch::Artifact(artifact.redirect)
+                    }
+                },
+            );
+        }
+        idp.issue_response(input)
     }
 
     #[test]
@@ -3007,6 +3853,60 @@ mod tests {
             })
             .expect_err("error responses correlate the same way");
         assert!(matches!(err, Error::IssuerMismatch { .. }));
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_issuance_requires_and_returns_a_trust_transaction() {
+        let idp = artifact_idp();
+        let mut sp = sp_descriptor(false);
+        sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs-artifact",
+            9,
+            true,
+        )];
+        let request = artifact_authn_request(&sp);
+        let success_input = || IssueResponse {
+            sp: &sp,
+            in_response_to: &request,
+            name_id: NameId::email("alice@example.com"),
+            attributes: vec![],
+            authn_instant: fixed_now(),
+            session_index: "artifact-session".to_owned(),
+            session_not_on_or_after: None,
+            authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+            force_encrypt_assertion: Some(false),
+            now: fixed_now(),
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
+        };
+        let error_input = || IssueErrorResponse {
+            sp: &sp,
+            in_response_to: &request,
+            status_code: SamlStatusCode::Responder,
+            second_level_status_code: None,
+            message: Some("denied".to_owned()),
+            now: fixed_now(),
+        };
+
+        assert!(matches!(
+            idp.issue_response(success_input()),
+            Err(Error::ArtifactTransactionRequired)
+        ));
+        assert!(matches!(
+            idp.issue_error_response(error_input()),
+            Err(Error::ArtifactTransactionRequired)
+        ));
+
+        let issued = idp
+            .issue_error_response_with_artifact_transaction(error_input())
+            .expect("the transaction-bearing error API supports Artifact");
+        let IssuedResponse::Artifact(issued) = issued else {
+            panic!("the Artifact ACS must receive an artifact dispatch")
+        };
+        assert_eq!(issued.transaction.artifact, issued.redirect.artifact);
+        assert_eq!(issued.transaction.sp_entity_id, sp.entity_id);
     }
 
     #[test]
@@ -3628,6 +4528,71 @@ mod tests {
             one_call.assertion_consumer_service.url,
             two_step.assertion_consumer_service.url
         );
+    }
+
+    #[test]
+    fn signed_redirect_rejects_xml_or_relay_state_not_covered_by_signature() {
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(false);
+        let signed_query = build_signed_redirect_authn_request_raw_query("_signed-request");
+        let decoded = crate::binding::decode_wire(
+            signed_query.as_bytes(),
+            Binding::HttpRedirect,
+            crate::binding::WireDirection::Request,
+        )
+        .expect("decode signed query");
+
+        let substituted_xml = build_unsigned_authn_request("_substituted-request", true);
+        let err = idp
+            .consume_authn_request(ConsumeAuthnRequest {
+                sp: &sp,
+                peer_crypto_policy: None,
+                saml_request: &substituted_xml,
+                binding: Binding::HttpRedirect,
+                relay_state: decoded.relay_state.as_deref(),
+                detached_signature: decoded.as_detached_signature(),
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect_err("a valid signature cannot be paired with different XML");
+        assert!(matches!(err, Error::SignatureVerification { .. }));
+
+        let err = idp
+            .consume_authn_request(ConsumeAuthnRequest {
+                sp: &sp,
+                peer_crypto_policy: None,
+                saml_request: &decoded.xml,
+                binding: Binding::HttpRedirect,
+                relay_state: Some("substituted-relay-state"),
+                detached_signature: decoded.as_detached_signature(),
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect_err("a valid signature cannot be paired with different RelayState");
+        assert!(matches!(err, Error::SignatureVerification { .. }));
+    }
+
+    #[test]
+    fn wire_redirect_rejects_a_conflicting_relay_state_override() {
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_authn_request_raw_query("_wire-relay-conflict");
+
+        let err = idp
+            .consume_authn_request_wire(ConsumeAuthnRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                relay_state: Some("different-state"),
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+            .expect_err("the decoded signed RelayState is authoritative");
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
     #[test]

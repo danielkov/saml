@@ -1044,6 +1044,12 @@ impl Proxy<'_> {
         let downstream_acs = SsoResponseEndpoint::try_from_endpoint(
             input.flow.context().payload().downstream_acs.clone(),
         )?;
+        // The public relay result cannot carry the opaque trust transaction an
+        // authenticated ArtifactResolutionService needs. Refuse before any
+        // caller callback rather than emit a transactionless bearer artifact.
+        if downstream_acs.binding == crate::binding::SsoResponseBinding::HttpArtifact {
+            return Err(Error::ArtifactTransactionRequired);
+        }
         if !input
             .downstream_sp
             .assertion_consumer_services
@@ -1174,6 +1180,7 @@ impl Proxy<'_> {
             input.downstream_sp,
         )?;
         ensure_transformed_name_id_format(&downstream_name_id, &chosen_name_id_format)?;
+        ensure_transformed_name_id_sp_qualifier(&downstream_name_id, input.downstream_sp)?;
 
         // 3. Attribute release.
         let attributes = input
@@ -1247,6 +1254,22 @@ fn ensure_transformed_name_id_format(
             got: name_id.format.as_uri().to_owned(),
         })
     }
+}
+
+fn ensure_transformed_name_id_sp_qualifier(
+    name_id: &NameId,
+    downstream_sp: &SpDescriptor,
+) -> Result<(), Error> {
+    if matches!(name_id.format, NameIdFormat::Persistent)
+        && let Some(qualifier) = name_id.sp_name_qualifier.as_deref()
+        && qualifier != downstream_sp.entity_id
+    {
+        return Err(Error::NameIdSpQualifierMismatch {
+            expected: downstream_sp.entity_id.clone(),
+            got: qualifier.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Replace the `RelayState` slot on a `Dispatch` with a freshly-encoded value.
@@ -2594,6 +2617,67 @@ mod tests {
         assert!(!release.called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    #[test]
+    fn relay_rejects_foreign_persistent_qualifier_before_attribute_release() {
+        struct ForeignPersistentNameId;
+
+        impl NameIdTransform for ForeignPersistentNameId {
+            fn transform(
+                &self,
+                _name_id: &NameId,
+                _attributes: &[Attribute],
+                _sp: &SpDescriptor,
+            ) -> Result<NameId, Error> {
+                Ok(NameId {
+                    value: "foreign-pseudonym".to_owned(),
+                    format: NameIdFormat::Persistent,
+                    name_qualifier: None,
+                    sp_name_qualifier: Some("https://other-sp.example.com".to_owned()),
+                    sp_provided_id: None,
+                })
+            }
+        }
+
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([17u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+        let release = SpyRelease::default();
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                // sample_context requests Persistent.
+                flow: flow(&proxy, sample_context(), identity),
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &ForeignPersistentNameId,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("a Persistent NameID scoped to another SP must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                Error::NameIdSpQualifierMismatch {
+                    ref expected,
+                    ref got,
+                } if expected == &downstream_sp.entity_id
+                    && got == "https://other-sp.example.com"
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            !release.called.load(std::sync::atomic::Ordering::SeqCst),
+            "attribute release ran before the foreign qualifier was rejected"
+        );
+    }
+
     /// At `now = UNIX_EPOCH` every addition succeeds, so an overflow-only
     /// preflight let both callbacks run — and issuance then failed on
     /// `Conditions/@NotBefore = now - 1 minute`.
@@ -3229,6 +3313,45 @@ mod tests {
             0,
             "NameID transform ran"
         );
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn relay_refuses_artifact_before_callbacks() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([13u8; 32])));
+        let mut downstream_sp = downstream_sp_descriptor();
+        downstream_sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://downstream-sp.example.com/acs-artifact",
+            4,
+            true,
+        )];
+        let mut context = sample_context();
+        context.downstream_acs = downstream_sp.assertion_consumer_services[0].as_endpoint();
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default();
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                flow: flow(
+                    &proxy,
+                    context,
+                    make_upstream_identity(AuthnContextClassRef::Password.as_uri()),
+                ),
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("the relay result cannot carry an Artifact trust transaction");
+
+        assert!(matches!(err, Error::ArtifactTransactionRequired));
+        assert!(!release.called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!transform.called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// An authentic context for SP-A must not be relayable to SP-B, even when

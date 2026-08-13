@@ -245,6 +245,8 @@ mod tests {
         assert_eq!(id.attributes.len(), 1);
         assert_eq!(id.name_id.format, NameIdFormat::EmailAddress);
         assert!(!id.is_one_time_use);
+        assert_eq!(id.assertion_id(), "_a1");
+        assert_eq!(id.verifying_cert_fingerprint(), [0u8; 32]);
     }
 
     #[test]

@@ -44,7 +44,7 @@ use crate::dsig::algorithms::{
 };
 use crate::error::Error;
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
-use crate::time::format_xs_datetime;
+use crate::time::{format_xs_datetime, parse_xs_datetime};
 use crate::xml::emit::emit_element;
 use crate::xml::parse::{Document, Element, Node, QName};
 
@@ -247,12 +247,16 @@ fn build_artifact_resolve_element(
 /// Validates that:
 ///
 /// 1. The envelope contains `soap:Envelope/soap:Body/samlp:ArtifactResponse`.
-/// 2. The `samlp:Status/samlp:StatusCode/@Value` equals the SAML 2.0
+/// 2. The mandatory `ID`, `Version`, and `IssueInstant` protocol attributes
+///    are present and valid. This low-level API has no request correlation or
+///    expected issuer/destination inputs; use [`BackchannelClient`] for those
+///    checks.
+/// 3. The `samlp:Status/samlp:StatusCode/@Value` equals the SAML 2.0
 ///    `urn:oasis:names:tc:SAML:2.0:status:Success` URI. A non-Success status
 ///    is surfaced as [`Error::StatusNotSuccess`] carrying the actual code (and
 ///    optional `StatusMessage`), so callers can branch precisely rather than
 ///    pattern-matching a stringly-typed `XmlParse`.
-/// 3. The `ArtifactResponse` contains exactly one payload protocol message.
+/// 4. The `ArtifactResponse` contains exactly one payload protocol message.
 ///    Duplicate/decoy payload siblings are rejected rather than selecting the
 ///    first. The whole subtree of that payload is serialized and returned.
 pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
@@ -266,6 +270,7 @@ pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
         ));
     }
 
+    validate_status_response_attributes(artifact_response)?;
     check_artifact_response_status(artifact_response)?;
     let payload = extract_artifact_response_payload(artifact_response)?;
     let serialized = emit_element(payload)?;
@@ -580,37 +585,61 @@ fn validate_artifact_response_protocol(
     expected_issuer: Option<&str>,
     expected_destination: Option<&str>,
 ) -> Result<(), Error> {
-    if response.attribute(None, "Version") != Some("2.0") {
-        return Err(Error::XmlParse(
-            "ArtifactResponse: Version must be 2.0".to_owned(),
-        ));
-    }
+    validate_status_response_attributes(response)?;
+
     if response.attribute(None, "InResponseTo") != Some(expected_in_response_to) {
         return Err(Error::InResponseToMismatch);
     }
 
     let issuer = response
         .child_element(Some(SAML_NS), "Issuer")
-        .ok_or_else(|| Error::XmlParse("ArtifactResponse: missing saml:Issuer".to_owned()))?
-        .text_content();
-    if issuer.is_empty() {
-        return Err(Error::XmlParse(
-            "ArtifactResponse: empty saml:Issuer".to_owned(),
-        ));
-    }
-    if let Some(expected) = expected_issuer
-        && issuer != expected
-    {
-        return Err(Error::IssuerMismatch {
-            expected: expected.to_owned(),
-            got: Some(issuer),
-        });
+        .map(Element::text_content);
+    if let Some(expected) = expected_issuer {
+        match issuer {
+            Some(issuer) if issuer == expected => {}
+            got => {
+                return Err(Error::IssuerMismatch {
+                    expected: expected.to_owned(),
+                    got,
+                });
+            }
+        }
     }
 
     if let Some(expected) = expected_destination
         && response.attribute(None, "Destination") != Some(expected)
     {
         return Err(Error::DestinationMismatch);
+    }
+    Ok(())
+}
+
+/// Validate the mandatory attributes inherited from SAML
+/// `StatusResponseType`, without imposing request-specific correlation.
+fn validate_status_response_attributes(response: &Element) -> Result<(), Error> {
+    let id = response
+        .attribute(None, "ID")
+        .ok_or_else(|| Error::XmlParse("ArtifactResponse: missing ID".to_owned()))?;
+    if id.is_empty() {
+        return Err(Error::XmlParse("ArtifactResponse: empty ID".to_owned()));
+    }
+    let issue_instant = response
+        .attribute(None, "IssueInstant")
+        .ok_or_else(|| Error::XmlParse("ArtifactResponse: missing IssueInstant".to_owned()))?;
+    parse_xs_datetime(issue_instant)?;
+
+    if response.attribute(None, "Version") != Some("2.0") {
+        return Err(Error::XmlParse(
+            "ArtifactResponse: Version must be 2.0".to_owned(),
+        ));
+    }
+    if response
+        .child_element(Some(SAML_NS), "Issuer")
+        .is_some_and(|issuer| issuer.text_content().is_empty())
+    {
+        return Err(Error::XmlParse(
+            "ArtifactResponse: empty saml:Issuer".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -728,16 +757,29 @@ fn parse_artifact_resolve_element(resolve: &Element) -> Result<ArtifactResolveRe
         .attribute(None, "ID")
         .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing @ID".to_string()))?
         .to_owned();
+    if request_id.is_empty() {
+        return Err(Error::XmlParse("ArtifactResolve: empty @ID".to_string()));
+    }
 
     let issuer = resolve
         .child_element(Some(SAML_NS), "Issuer")
         .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing saml:Issuer".to_string()))?
         .text_content();
+    if issuer.is_empty() {
+        return Err(Error::XmlParse(
+            "ArtifactResolve: empty saml:Issuer".to_string(),
+        ));
+    }
 
     let artifact = resolve
         .child_element(Some(SAMLP_NS), "Artifact")
         .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing samlp:Artifact".to_string()))?
         .text_content();
+    if artifact.is_empty() {
+        return Err(Error::XmlParse(
+            "ArtifactResolve: empty samlp:Artifact".to_string(),
+        ));
+    }
 
     Ok(ArtifactResolveRequest {
         request_id,
@@ -752,6 +794,10 @@ fn parse_artifact_resolve_element(resolve: &Element) -> Result<ArtifactResolveRe
 /// `idp_entity_id` is the IdP's entity ID (emitted as `saml:Issuer`).
 /// `in_response_to` is the `ArtifactResolve/@ID` from the incoming request.
 /// `payload_xml` is the inner SAML message XML (e.g. the stashed Response).
+/// This low-level helper emits an unsigned envelope. The IdP role's
+/// [`crate::IdentityProvider::build_artifact_response`] signs the outer
+/// `ArtifactResponse`; use this helper directly only when authenticated
+/// transport supplies the envelope's peer authentication.
 pub fn build_artifact_response(
     idp_entity_id: &str,
     in_response_to: &str,
@@ -983,6 +1029,41 @@ mod tests {
         assert_eq!(artifact_node.text_content(), "AAQAA...");
     }
 
+    #[test]
+    fn parse_artifact_resolve_rejects_empty_required_values() {
+        let valid = build_artifact_resolve(
+            "https://sp.example.com",
+            "https://idp.example.com/ars",
+            "artifact",
+        )
+        .expect("build fixture");
+        let document = Document::parse(valid.as_bytes()).expect("parse fixture");
+        let resolve = document
+            .root()
+            .child_element(Some(SOAP_NS), "Body")
+            .and_then(|body| body.child_element(Some(SAMLP_NS), "ArtifactResolve"))
+            .expect("ArtifactResolve fixture");
+        let id = resolve.attribute(None, "ID").expect("fixture ID");
+
+        for malformed in [
+            valid.replacen(&format!("ID=\"{id}\""), "ID=\"\"", 1),
+            valid.replacen(
+                ">https://sp.example.com</saml:Issuer>",
+                "></saml:Issuer>",
+                1,
+            ),
+            valid.replacen(">artifact</samlp:Artifact>", "></samlp:Artifact>", 1),
+        ] {
+            assert!(
+                matches!(
+                    parse_artifact_resolve(malformed.as_bytes()),
+                    Err(Error::XmlParse(_))
+                ),
+                "empty required value must be rejected"
+            );
+        }
+    }
+
     // --- parse_artifact_response -------------------------------------------
 
     fn success_envelope_xml_for(request_id: &str, payload_xml: &str) -> Vec<u8> {
@@ -1024,6 +1105,35 @@ mod tests {
         assert_eq!(inner_doc.root().qname().namespace(), Some(SAMLP_NS));
         assert_eq!(inner_doc.root().qname().local(), "Response");
         assert_eq!(inner_doc.root().attribute(None, "ID"), Some("_inner"));
+    }
+
+    #[test]
+    fn parse_artifact_response_requires_status_response_attributes() {
+        let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
+        let valid = String::from_utf8(success_envelope_xml(payload)).expect("UTF-8 fixture");
+        for malformed in [
+            valid.replacen(" ID=\"_resp1\"", "", 1),
+            valid.replacen(" ID=\"_resp1\"", " ID=\"\"", 1),
+            valid.replacen(" IssueInstant=\"2026-01-01T00:00:00Z\"", "", 1),
+            valid.replacen(
+                "IssueInstant=\"2026-01-01T00:00:00Z\"",
+                "IssueInstant=\"not-a-date\"",
+                1,
+            ),
+            valid.replacen(
+                "<saml:Issuer>https://idp.example.com</saml:Issuer>",
+                "<saml:Issuer/>",
+                1,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_artifact_response(malformed.as_bytes()),
+                    Err(Error::XmlParse(_))
+                ),
+                "mandatory StatusResponseType attributes must be checked"
+            );
+        }
     }
 
     #[test]
@@ -1315,6 +1425,72 @@ mod tests {
         let err = validate_artifact_response_protocol(body.payload(), "_req", None, None)
             .expect_err("wrong version");
         assert!(matches!(err, Error::XmlParse(_)));
+    }
+
+    #[test]
+    fn artifact_response_protocol_requires_id_and_valid_issue_instant() {
+        let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
+        let envelope =
+            String::from_utf8(success_envelope_xml_for("_req", payload)).expect("UTF-8 envelope");
+
+        for (invalid, expected_message) in [
+            (
+                envelope.replacen(" ID=\"_resp1\"", "", 1),
+                "ArtifactResponse: missing ID",
+            ),
+            (
+                envelope.replacen(" IssueInstant=\"2026-01-01T00:00:00Z\"", "", 1),
+                "ArtifactResponse: missing IssueInstant",
+            ),
+        ] {
+            let body = soap::unwrap(invalid.as_bytes()).expect("unwrap invalid envelope");
+            let err = validate_artifact_response_protocol(body.payload(), "_req", None, None)
+                .expect_err("mandatory protocol attribute is absent");
+            assert!(
+                matches!(err, Error::XmlParse(ref message) if message == expected_message),
+                "got {err:?}"
+            );
+        }
+
+        let malformed = envelope.replacen(
+            "IssueInstant=\"2026-01-01T00:00:00Z\"",
+            "IssueInstant=\"not-a-date\"",
+            1,
+        );
+        let body = soap::unwrap(malformed.as_bytes()).expect("unwrap invalid envelope");
+        let err = validate_artifact_response_protocol(body.payload(), "_req", None, None)
+            .expect_err("IssueInstant must be an xs:dateTime");
+        assert!(
+            matches!(err, Error::XmlParse(ref message) if message.starts_with("invalid xs:dateTime:")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_response_issuer_is_required_only_when_expected() {
+        let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
+        let envelope = String::from_utf8(success_envelope_xml_for("_req", payload))
+            .expect("UTF-8 envelope")
+            .replace("<saml:Issuer>https://idp.example.com</saml:Issuer>", "");
+        let body = soap::unwrap(envelope.as_bytes()).expect("unwrap envelope");
+
+        validate_artifact_response_protocol(body.payload(), "_req", None, None)
+            .expect("Issuer is optional when the transport authenticates the peer");
+
+        let err = validate_artifact_response_protocol(
+            body.payload(),
+            "_req",
+            Some("https://idp.example.com"),
+            None,
+        )
+        .expect_err("a pinned issuer must be present");
+        assert!(matches!(
+            err,
+            Error::IssuerMismatch {
+                ref expected,
+                got: None
+            } if expected == "https://idp.example.com"
+        ));
     }
 
     // --- BackchannelClient: signing + verification --------------------------

@@ -3,13 +3,12 @@
 //! Wires the artifact flow through the role layers:
 //! - SP issues an AuthnRequest with `ProtocolBinding=Artifact` and an ACS
 //!   endpoint registered as `HttpArtifact`.
-//! - IdP's `issue_response` returns `SsoResponseDispatch::Artifact(...)`
-//!   carrying the redirect URL, the artifact value, and the stashed Response
-//!   XML the IdP must serve from its ArtifactResolutionService.
-//! - We stash the Response XML in a `HashMap<artifact, response_xml>` and
-//!   atomically remove it on resolution.
+//! - IdP's transaction-bearing issuance returns an `IssuedArtifact` carrying
+//!   the redirect plus request-time SP trust provenance.
+//! - We stash the Response XML and transaction together and atomically remove
+//!   them only after authenticating and replay-reserving ArtifactResolve.
 //! - A mock `HttpClient` simulates the IdP's ARS: on POST, it calls
-//!   `idp.parse_artifact_resolve(...)`, takes the artifact from the stash,
+//!   `idp.consume_artifact_resolve(...)`, takes the artifact from the stash,
 //!   and emits a `<samlp:ArtifactResponse>` SOAP envelope via
 //!   `idp.build_artifact_response(...)`.
 //! - SP calls `consume_response_artifact(http, ...)` which fetches via SOAP
@@ -31,18 +30,22 @@ use std::time::Duration;
 
 use saml::attribute::Attribute;
 use saml::authn_context::AuthnContextClassRef;
-use saml::binding::{
-    Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint,
-};
+use saml::binding::{Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseEndpoint};
 use saml::descriptor::{IdpDescriptor, SpDescriptor};
 use saml::dsig::algorithms::{
     C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
 };
 use saml::http::{HttpClient, HttpRequest, HttpResponse};
-use saml::idp::{ConsumeAuthnRequest, IdentityProvider, IdentityProviderConfig, IssueResponse};
+use saml::idp::{
+    ArtifactResolveTransaction, ConsumeArtifactResolve, ConsumeAuthnRequest, IdentityProvider,
+    IdentityProviderConfig, IssueResponse, IssuedResponse,
+};
 use saml::nameid::{NameId, NameIdFormat};
-use saml::replay::ReplayMode;
-use saml::sp::{ConsumeArtifactResponse, ServiceProvider, ServiceProviderConfig, StartLogin};
+use saml::replay::{InMemoryReplayCache, ReplayMode};
+use saml::sp::{
+    ArtifactBackchannel, ConsumeArtifactResponse, ServiceProvider, ServiceProviderConfig,
+    StartLogin,
+};
 use saml::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
 
 const SP_ENTITY_ID: &str = "https://sp.example.com/artifact";
@@ -93,7 +96,7 @@ fn make_artifact_sp() -> common::TestResult<ServiceProvider> {
         acs: vec![SsoResponseEndpoint::artifact(SP_ACS_URL, 0, true)],
         slo: vec![],
         name_id_formats: vec![NameIdFormat::EmailAddress, NameIdFormat::Persistent],
-        signing_key: None,
+        signing_key: Some(common::rsa_keypair_with_cert()?),
         decryption_key: None,
         sign_authn_requests: false,
         want_signed: saml::SpWantSigned {
@@ -119,7 +122,13 @@ fn make_artifact_sp() -> common::TestResult<ServiceProvider> {
 struct ArtifactResolutionService<'a> {
     idp: &'a IdentityProvider,
     sp_descriptor: &'a SpDescriptor,
-    stash: Arc<Mutex<HashMap<String, String>>>,
+    replay_cache: &'a InMemoryReplayCache,
+    stash: Arc<Mutex<HashMap<String, StashedArtifact>>>,
+}
+
+struct StashedArtifact {
+    response_xml: String,
+    transaction: ArtifactResolveTransaction,
 }
 
 impl HttpClient for ArtifactResolutionService<'_> {
@@ -128,21 +137,40 @@ impl HttpClient for ArtifactResolutionService<'_> {
         request: HttpRequest,
     ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
     {
-        let parsed = self
+        // Parse only to select the untrusted artifact key. No payload is
+        // removed and no parsed field is trusted until the authenticated API
+        // below succeeds.
+        let selected = self
             .idp
             .parse_artifact_resolve(self.sp_descriptor, &request.body)
             .map_err(|e| format!("parse_artifact_resolve: {e:?}"));
         let stash = self.stash.clone();
-        let idp_response = parsed.and_then(|req| {
+        let idp_response = selected.and_then(|selected| {
             let mut guard = stash
                 .lock()
                 .map_err(|_poison| "stash poisoned".to_string())?;
-            let response_xml = guard
+            let entry = guard
+                .get(&selected.artifact)
+                .ok_or_else(|| format!("artifact not in stash: {}", selected.artifact))?;
+            let req = self
+                .idp
+                .consume_artifact_resolve(ConsumeArtifactResolve {
+                    sp: self.sp_descriptor,
+                    transaction: &entry.transaction,
+                    replay_cache: self.replay_cache,
+                    peer_crypto_policy: None,
+                    soap_envelope: &request.body,
+                    expected_destination: IDP_ARS_URL,
+                    now: std::time::SystemTime::now(),
+                    clock_skew: Duration::from_mins(2),
+                    require_signed: true,
+                })
+                .map_err(|e| format!("consume_artifact_resolve: {e:?}"))?;
+            let entry = guard
                 .remove(&req.artifact)
                 .ok_or_else(|| format!("artifact not in stash: {}", req.artifact))?;
-            drop(guard);
             self.idp
-                .build_artifact_response(&req, &response_xml)
+                .build_artifact_response(&req, &entry.response_xml)
                 .map_err(|e| format!("build_artifact_response: {e:?}"))
         });
 
@@ -219,10 +247,9 @@ async fn artifact_flow_end_to_end() {
         SsoResponseBinding::HttpArtifact
     );
 
-    // 4. IdP issues the Response. Because the resolved ACS is Artifact,
-    //    issue_response returns SsoResponseDispatch::Artifact(...).
-    let dispatch = idp
-        .issue_response(IssueResponse {
+    // 4. IdP issues the Response and its request-time trust transaction.
+    let issued = idp
+        .issue_response_with_artifact_transaction(IssueResponse {
             sp: &sp_descriptor,
             in_response_to: &parsed,
             name_id: NameId::email(USER_EMAIL),
@@ -242,18 +269,22 @@ async fn artifact_flow_end_to_end() {
         })
         .expect("idp issue_response");
 
-    let SsoResponseDispatch::Artifact(redirect) = dispatch else {
-        panic!("expected SsoResponseDispatch::Artifact, got {dispatch:?}");
+    let IssuedResponse::Artifact(issued) = issued else {
+        panic!("expected IssuedResponse::Artifact");
     };
+    let redirect = &issued.redirect;
 
     // 5. Caller stashes response_xml keyed by artifact. In a real deployment
     //    this is a persistent store keyed by the artifact's MessageHandle
     //    with an atomic take/delete operation.
-    let stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    stash
-        .lock()
-        .expect("stash lock")
-        .insert(redirect.artifact.clone(), redirect.response_xml.clone());
+    let stash: Arc<Mutex<HashMap<String, StashedArtifact>>> = Arc::new(Mutex::new(HashMap::new()));
+    stash.lock().expect("stash lock").insert(
+        redirect.artifact.clone(),
+        StashedArtifact {
+            response_xml: redirect.response_xml.clone(),
+            transaction: issued.transaction,
+        },
+    );
 
     // 6. Confirm the redirect URL carries ?SAMLart=... and RelayState=...
     let query_pairs: HashMap<String, String> = redirect
@@ -273,11 +304,18 @@ async fn artifact_flow_end_to_end() {
     // 7. Browser hits the SP's ACS with `?SAMLart=...`. SP resolves the
     //    artifact against the IdP via SOAP and validates the recovered
     //    Response.
+    let artifact_resolve_replay = InMemoryReplayCache::new(16);
     let ars = ArtifactResolutionService {
         idp: &idp,
         sp_descriptor: &sp_descriptor,
+        replay_cache: &artifact_resolve_replay,
         stash: stash.clone(),
     };
+    let sp_signing_key = sp
+        .config()
+        .signing_key
+        .as_ref()
+        .expect("artifact SP signing key");
 
     let identity = sp
         .consume_response_artifact(
@@ -294,7 +332,15 @@ async fn artifact_flow_end_to_end() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(saml::binding::artifact::SignConfig {
+                        key: sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
@@ -344,10 +390,13 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     let unknown_artifact =
         saml::binding::artifact::make_artifact(IDP_ENTITY_ID, 7).expect("valid unknown artifact");
 
-    let empty_stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let empty_stash: Arc<Mutex<HashMap<String, StashedArtifact>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let artifact_resolve_replay = InMemoryReplayCache::new(16);
     let ars = ArtifactResolutionService {
         idp: &idp,
         sp_descriptor: &sp_descriptor,
+        replay_cache: &artifact_resolve_replay,
         stash: empty_stash,
     };
 
