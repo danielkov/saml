@@ -347,7 +347,9 @@ pub mod sp;
 
 pub use crate::error::Error;
 pub use crate::http::{HttpClient, HttpRequest, HttpResponse};
-pub use crate::replay::{InMemoryReplayCache, ReplayCache, ReplayMode};
+pub use crate::replay::{
+    InMemoryReplayCache, ReplayCache, ReplayEntry, ReplayMode, ReplayNamespace,
+};
 pub use crate::time::{format_xs_datetime, parse_xs_datetime};
 
 pub use crate::attribute::Attribute;
@@ -409,6 +411,8 @@ pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};
 
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
 pub use crate::binding::artifact::ArtifactResolveRequest;
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+pub use crate::idp::ConsumeArtifactResolve;
 
 #[cfg(feature = "ecp")]
 pub use crate::binding::ecp::{

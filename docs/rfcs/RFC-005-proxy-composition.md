@@ -88,10 +88,9 @@ pub trait ProxyContextStore: Send + Sync {
     /// owns the store, so a `put` accepting a payload would let them insert an
     /// invented context under a handle of their choosing and redeem it.
     fn put(&self, handle: &str, grant: &SealingGrant<'_>, ttl: Duration) -> Result<(), Error>;
-    /// Must be atomic and one-shot. Whatever this returns is what
-    /// `decode_context` attests and relay signs from, so a custom store is a
-    /// trust anchor in the same way a custom codec is.
-    fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
+    /// Read without consuming. The authenticated proxy transaction is
+    /// atomically redeemed only after response validation succeeds.
+    fn get(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
 
 pub struct OpaqueHandleCodec<S: ProxyContextStore> {
@@ -113,14 +112,14 @@ impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
     }
 
     fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error> {
-        self.store.take(blob)?.ok_or(Error::InvalidConfiguration {
+        self.store.get(blob)?.ok_or(Error::InvalidConfiguration {
             reason: "proxy context not found (expired or replay)",
         })
     }
 }
 ```
 
-This trades the "fully stateless" promise for spec-compliant `RelayState` size. The trade is localized: only the proxy uses the store; SP and IdP roles remain stateless. Typical `ProxyContextStore` implementations are a Redis hash with `EXPIRE`, a database table with `expires_at`, or an in-memory `Mutex<HashMap>` for single-instance deployments. `take` semantics (one-shot consumption) double as replay defense for the proxy round-trip.
+This trades the "fully stateless" promise for spec-compliant `RelayState` size. The trade is localized: only the proxy uses the store; SP and IdP roles remain stateless. Typical `ProxyContextStore` implementations are a Redis hash with `EXPIRE`, a database table with `expires_at`, or an in-memory `Mutex<HashMap>` for single-instance deployments. Transaction redemption is separate and happens after response validation through the mandatory atomic replay cache, so an invalid Response cannot consume a valid handle.
 
 | Outbound upstream binding | Recommended codec | Notes |
 | --- | --- | --- |
@@ -164,12 +163,17 @@ pub struct ProxyContextPayload {
     /// What the downstream requested. Preserved for non-downgrade enforcement.
     pub requested_authn_context: Option<RequestedAuthnContext>,
     pub requested_name_id_format: Option<NameIdFormat>,
-    /// Upstream LoginTracker, stashed inside the context to avoid
+    /// Transparent upstream tracker payload, stashed inside the authenticated
+    /// proxy context to avoid
     /// requiring `allow_unsolicited` on the SP side.
-    pub upstream_tracker: LoginTracker,
+    pub upstream_tracker: LoginTrackerPayload,
     /// Issued-at timestamp. Used for context-blob age-limit enforcement
     /// by `ProxyContextCodec::decode`.
     pub issued_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub transaction_id: [u8; 16],
+    pub downstream_encryption_cert_fingerprints: Vec<[u8; 32]>,
+    pub upstream_signing_cert_fingerprints: Vec<[u8; 32]>,
 }
 ```
 
@@ -227,7 +231,8 @@ Internally:
 
 1. Build a `StartLogin` for the upstream IdP, propagating flags per `input`.
 2. Call `self.sp.start_login(input.upstream_idp, ...)`.
-3. Stash the returned `LoginTracker` inside `ProxyContext`.
+3. Stash the returned tracker's transparent payload inside the authenticated
+   `ProxyContextPayload`.
 4. Encode the `ProxyContext` via the codec → `upstream_relay_state`.
 5. Return `BounceResult { dispatch, upstream_relay_state }`.
 
@@ -238,7 +243,7 @@ pub struct RelayToDownstream<'a> {
     /// From `Proxy::consume_upstream_response` — the only source of one.
     /// Carries the context, the identity validated under it, and the `Proxy`
     /// instance that produced both.
-    pub flow: &'a UpstreamFlow,
+    pub flow: UpstreamFlow,
     /// Downstream SP descriptor. The context must belong to it; relay refuses
     /// the pairing otherwise.
     pub downstream_sp: &'a SpDescriptor,
@@ -269,11 +274,15 @@ Internally:
 
 1. Look up the downstream SP descriptor by `context.downstream_sp_entity_id()`. (Caller-managed registry; the library does not maintain one.) For ergonomics, the caller can pass a closure for SP lookup via `ProxyConfig` (future addition).
 2. **Select the class the response will advertise**, then **enforce AuthnContext non-downgrade** (§7) against *that* value using `flow.context().payload().requested_authn_context`. → `Error::AuthnContextDowngrade`. Where there is nothing to pass through, the emitted class is `Unspecified` rather than a synthesized `PasswordProtectedTransport`, which would claim more than upstream attested.
-3. Compute downstream attributes via `attribute_release.release(flow.identity().attributes(), &downstream_sp)`.
-4. Compute downstream NameID via `name_id_transform.transform(flow.identity().name_id(), flow.identity().attributes(), &downstream_sp)`.
-5. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id()`).
-6. Call `self.idp.issue_response(...)` with the synthesized request and transformed identity.
-7. Return the resulting `Dispatch`.
+3. Resolve the downstream NameID policy before callbacks. An unsupported
+   explicit format fails without running either callback.
+4. Compute downstream NameID via `name_id_transform.transform(flow.identity().name_id(), flow.identity().attributes(), &downstream_sp)` and require the transform's declared format to equal the resolved policy; the proxy never relabels its result.
+5. Compute downstream attributes via `attribute_release.release(flow.identity().attributes(), &downstream_sp)`.
+6. Build a synthetic `ParsedAuthnRequest` from `context` (with `in_response_to: context.downstream_request_id()`).
+7. Call `self.idp.issue_response(...)` with the synthesized request and transformed identity.
+8. Cap every downstream deadline to the earlier of upstream Conditions
+   `NotOnOrAfter` and `SessionNotOnOrAfter`, then return the resulting
+   `Dispatch`.
 
 ---
 
@@ -348,8 +357,8 @@ pub struct NameIdFromAttribute {
     pub format: NameIdFormat,
 }
 
-/// Built-in: per-SP format selection. Different downstream SPs get different
-/// NameID formats based on their declared `supported_name_id_formats`.
+/// Compatibility wrapper. Delegates to `inner`; the inner transform chooses
+/// the value and format.
 pub struct PerSpFormat {
     pub inner: Box<dyn NameIdTransform>,
 }
@@ -361,7 +370,7 @@ pub struct PerSpFormat {
 
 If `context.payload().requested_authn_context` requested `MultiFactorAuth` and the response would advertise `PasswordProtectedTransport`, the proxy must reject — silently downgrading authentication strength is a transitive trust violation.
 
-`relay_to_downstream` selects the class the downstream response will advertise **first**, then evaluates that exact class against the downstream request. The order matters: validating the upstream class and then emitting a different one (which `passthrough_authn_context: false` does, substituting `PasswordProtectedTransport`) proves nothing about what the downstream SP receives.
+`relay_to_downstream` selects the class the downstream response will advertise **first**, then evaluates that exact class against the downstream request. The order matters: validating the upstream class and then emitting a different one proves nothing about what the downstream SP receives. With passthrough disabled it emits truthful `Unspecified`, not a fabricated stronger class.
 
 Comparison rules per SAML 2.0 §3.3.2.2.1 (`Comparison` attribute: `exact` / `minimum` / `maximum` / `better`). Default is `exact`. `relay_to_downstream` applies `StandardComparator` unconditionally — the `AuthnContextComparator` trait is public, but there is no override plumbed through `RelayToDownstream`, so a deployment with a custom AuthnContext hierarchy cannot substitute its own today. Both `NotSatisfied` and `NotComparable` collapse to `Error::AuthnContextDowngrade`, i.e. fail closed.
 
@@ -446,13 +455,12 @@ let flow = proxy.consume_upstream_response(ConsumeUpstreamResponse {
     expected_destination: "https://hub.example.com/saml/acs", // proxy ACS URL this handler serves
     now: SystemTime::now(),
     clock_skew: Duration::from_secs(60),
-    replay_cache: None,
-    replay_mode: ReplayMode::All,
+    replay_cache: &replay_cache,
     holder_of_key_cert: None,
 })?;
 
 let dispatch = proxy.relay_to_downstream(RelayToDownstream {
-    flow: &flow,
+    flow,
     // Required: the context must belong to this SP, or relay refuses.
     downstream_sp: &downstream_sp_descriptor,
     attribute_release: &ReleaseAllowList {
@@ -488,8 +496,8 @@ match dispatch {
 | Upstream `Destination` / `Issuer` / `InResponseTo` checks | Hard (via SP role) |
 | Upstream signature verified | Hard (via SP role) |
 | AuthnContext non-downgrade | Hard (Proxy enforces in `relay_to_downstream`) |
-| NameID scoped per downstream SP | Soft — caller chooses transform (`PersistentPerSpHmac` is the recommended built-in) |
+| NameID scoped per downstream SP | Hard for Persistent NameIDs: a conflicting `SPNameQualifier` is rejected; caller still chooses the value transform (`PersistentPerSpHmac` recommended). |
 | Attribute release filtered | Soft — caller chooses policy (`ReleaseNone` is the default-safe built-in) |
-| ProxyContext authenticity | Hard via codec — AEAD for `Aes256GcmCodec`, one-shot lookup + TTL for `OpaqueHandleCodec`. |
+| ProxyContext authenticity | Hard via codec — AEAD for `Aes256GcmCodec`, authenticated lookup + TTL for `OpaqueHandleCodec`. |
 | ProxyContext max-age | Hard (codec rejects expired blobs / handles). |
-| Proxy-round-trip replay defense | `OpaqueHandleCodec.take` is one-shot; `Aes256GcmCodec` relies on `max_age` (caller can layer an external replay store if a shorter window is needed). |
+| Proxy-round-trip replay defense | `consume_upstream_response` atomically reserves a namespaced transaction tombstone after validation. Both codecs require the same replay cache, so a fresh assertion ID cannot redeem one transaction twice. |

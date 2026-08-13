@@ -26,12 +26,14 @@ pub use crate::authn_context::StandardComparator;
 use crate::binding::{
     Binding, Dispatch, Endpoint, PostForm, SsoResponseDispatch, SsoResponseEndpoint,
 };
+use crate::crypto::cert::certificate_fingerprint_set;
 use crate::descriptor::{IdpDescriptor, SpDescriptor};
 use crate::error::Error;
 use crate::idp::{IdentityProvider, IssueResponse};
 #[cfg(feature = "slo")]
 use crate::logout::{ConsumeLogoutResponse, LogoutOutcome, LogoutTracker, StartLogout};
 use crate::nameid::{NameId, NameIdFormat};
+use crate::replay::ReplayEntry;
 use crate::response::Identity;
 use crate::sp::{LoginTracker, ServiceProvider, StartLogin};
 
@@ -219,6 +221,12 @@ pub struct ProxyContextPayload {
     pub upstream_tracker: crate::sp::LoginTrackerPayload,
     /// Issued-at timestamp. Codec rejects blobs older than its `max_age`.
     pub issued_at: SystemTime,
+    /// Hard expiry enforced for every codec, and replay-tombstone deadline.
+    pub expires_at: SystemTime,
+    /// Random transaction identifier atomically consumed after response
+    /// validation. Assertion IDs alone do not make a transaction one-shot: an
+    /// IdP can issue two valid Responses with distinct assertion IDs.
+    pub transaction_id: [u8; 16],
     /// SHA-256 fingerprints of the *downstream* SP's encryption certificates
     /// as seen when its AuthnRequest was validated.
     ///
@@ -327,6 +335,8 @@ impl ProxyContext {
 /// this is a caller stamping a future date to evade `max_age`, since
 /// `BounceToUpstream::now` is caller-supplied.
 const MAX_CONTEXT_CLOCK_SKEW: Duration = Duration::from_mins(5);
+/// Universal proxy-context lifetime, independent of the selected codec.
+const PROXY_CONTEXT_LIFETIME: Duration = Duration::from_mins(10);
 
 /// Stateless AEAD codec: postcard-serialized `ProxyContextPayload` sealed with
 /// AES-256-GCM, base64url-encoded for `RelayState`.
@@ -457,7 +467,7 @@ impl ProxyContextCodec for Aes256GcmCodec {
 // Opaque-handle codec for Redirect binding (RFC-005 §2.1)
 // =============================================================================
 
-/// Caller-supplied storage for the opaque-handle codec. `take` is one-shot.
+/// Caller-supplied storage for the opaque-handle codec.
 pub trait ProxyContextStore: Send + Sync {
     /// Store the granted payload under `handle`.
     ///
@@ -476,16 +486,15 @@ pub trait ProxyContextStore: Send + Sync {
     ///   which a leaked `RelayState` is redeemable. [`Aes256GcmCodec`]
     ///   enforces its age limit itself; here the store is the only thing that
     ///   can.
-    /// - **Make [`take`](Self::take) atomic and one-shot.** Returning the same
-    ///   handle twice makes the proxy round-trip replayable. A check-then-
-    ///   delete that is not atomic is a race, not a one-shot.
     ///
-    /// Neither property is checkable from inside this crate, which is why they
-    /// are stated as obligations rather than assumed.
+    /// This property is not checkable from inside this crate, which is why it
+    /// is stated as an obligation rather than assumed.
     fn put(&self, handle: &str, grant: &SealingGrant<'_>, ttl: Duration) -> Result<(), Error>;
-    /// Remove and return the payload stored under `handle`, if any.
+    /// Return the payload stored under `handle`, if any, without consuming it.
     ///
-    /// Must be atomic and one-shot — see the contract on [`put`](Self::put).
+    /// Consumption happens only after the upstream Response validates, via
+    /// the mandatory atomic replay cache. Deleting here lets anyone who learns
+    /// a handle destroy a legitimate login merely by pairing it with garbage.
     ///
     /// Whatever this returns is what [`Proxy::decode_context`] attests and
     /// [`Proxy::relay_to_downstream`] then signs a downstream assertion from.
@@ -495,7 +504,7 @@ pub trait ProxyContextStore: Send + Sync {
     /// your implementation chooses to return. An implementation that returns a
     /// payload it was never given — or one belonging to a different handle —
     /// forges a context, and nothing downstream can tell.
-    fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
+    fn get(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error>;
 }
 
 /// Minimum handle entropy, in bytes. 128 bits — the handle is a bearer
@@ -523,18 +532,31 @@ impl<S: ProxyContextStore> ProxyContextCodec for OpaqueHandleCodec<S> {
                 reason: "OpaqueHandleCodec.handle_byte_len must be at least 16 bytes",
             });
         }
+        if self.ttl > PROXY_CONTEXT_LIFETIME {
+            return Err(Error::InvalidConfiguration {
+                reason: "OpaqueHandleCodec.ttl must not exceed the proxy context lifetime",
+            });
+        }
+        let remaining_lifetime = grant
+            .payload()
+            .expires_at
+            .duration_since(SystemTime::now())
+            .map_err(|_elapsed| Error::InvalidConfiguration {
+                reason: "cannot store an already-expired proxy context",
+            })?;
+        let effective_ttl = self.ttl.min(remaining_lifetime);
         let mut bytes = vec![0u8; self.handle_byte_len];
         rand::rng().fill_bytes(&mut bytes);
         let handle = URL_SAFE_NO_PAD.encode(&bytes);
         // Forward the grant rather than the payload: `put` is public, so a
         // caller who could call it with a bare payload would not need this
         // codec at all.
-        self.store.put(&handle, grant, self.ttl)?;
+        self.store.put(&handle, grant, effective_ttl)?;
         Ok(handle)
     }
 
     fn decode(&self, blob: &str) -> Result<ProxyContextPayload, Error> {
-        let ctx = self.store.take(blob)?.ok_or(Error::InvalidConfiguration {
+        let ctx = self.store.get(blob)?.ok_or(Error::InvalidConfiguration {
             reason: "proxy context not found (expired or replay)",
         })?;
         Ok(ctx)
@@ -731,6 +753,16 @@ impl Proxy<'_> {
             },
         )?;
 
+        let expires_at =
+            input
+                .now
+                .checked_add(PROXY_CONTEXT_LIFETIME)
+                .ok_or(Error::InvalidConfiguration {
+                    reason: "proxy context expiry overflow",
+                })?;
+        let mut transaction_id = [0u8; 16];
+        rand::rng().fill_bytes(&mut transaction_id);
+
         // 2. Build the ProxyContextPayload from the parsed downstream request.
         // Seal the provenance the validator established, not the `pub`
         // wire-derived copies. Those are caller-mutable: validate against
@@ -749,28 +781,23 @@ impl Proxy<'_> {
             requested_name_id_format: downstream.validated_name_id_format().cloned(),
             upstream_tracker: result.tracker.to_payload(),
             issued_at: input.now,
+            expires_at,
+            transaction_id,
             downstream_encryption_cert_fingerprints: downstream
                 .validated_encryption_cert_fingerprints()
                 .to_vec(),
-            upstream_signing_cert_fingerprints: input
-                .upstream_idp
-                .signing_certs
-                .iter()
-                .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
-                .collect(),
+            upstream_signing_cert_fingerprints: certificate_fingerprint_set(
+                &input.upstream_idp.signing_certs,
+            ),
         };
 
         // 3. Encode the context for the wire.
         let upstream_relay_state = self.context_codec.encode(&SealingGrant::issue(&context))?;
 
         // 4. Inject the encoded RelayState into the dispatch. For POST we set
-        //    the form field; for Redirect we append to the URL query. NOTE
-        //    (RFC-005 §2.1): for *signed* Redirect outbound the appended
-        //    RelayState falls outside the signature. v0.1 ships this and
-        //    documents the constraint; production proxies should pair Redirect
-        //    upstream with `OpaqueHandleCodec` (small handle) and a signed
-        //    binding that re-signs the canonical query string at the wire
-        //    layer.
+        //    the form field; for unsigned Redirect we append it to the URL.
+        //    Signed Redirect was rejected above because the tracker-dependent
+        //    RelayState does not exist until after `start_login` has signed.
         let dispatch = inject_relay_state(result.dispatch, &upstream_relay_state);
 
         Ok(BounceResult {
@@ -798,6 +825,9 @@ impl Proxy<'_> {
         input: ConsumeUpstreamResponse<'_>,
     ) -> Result<UpstreamFlow, Error> {
         let context = self.decode_context(input.relay_state)?;
+        if context.payload().expires_at <= input.now {
+            return Err(Error::Expired);
+        }
 
         // The descriptor validating this response must be the trust root the
         // login was started against. The tracker correlates on entity ID only,
@@ -808,35 +838,42 @@ impl Proxy<'_> {
         // Subset rather than equality: retiring a key mid-flow is ordinary
         // rotation, introducing one is the attack.
         let sealed = &context.payload().upstream_signing_cert_fingerprints;
-        if !input
-            .upstream_idp
-            .signing_certs
-            .iter()
-            .all(|cert| sealed.contains(&cert.fingerprint_sha256()))
+        let current = certificate_fingerprint_set(&input.upstream_idp.signing_certs);
+        if current.is_empty()
+            || !current
+                .iter()
+                .all(|fingerprint| sealed.contains(fingerprint))
         {
             return Err(Error::UpstreamTrustRootMismatch);
         }
 
-        let identity = self.sp.consume_response(crate::sp::ConsumeResponse {
-            idp: input.upstream_idp,
-            peer_crypto_policy: input.peer_crypto_policy,
-            saml_response: input.saml_response,
-            binding: input.binding,
-            relay_state: Some(input.relay_state),
-            // From the context, never from the caller — this is the coupling.
-            tracker: Some(&LoginTracker::from_payload(
-                context.payload().upstream_tracker.clone(),
-            )),
-            expected_destination: input.expected_destination,
-            now: input.now,
-            clock_skew: input.clock_skew,
-            replay_cache: Some(input.replay_cache),
-            // `All`, not the caller's choice: a relaxed mode would let the
-            // upstream assertion be redeemed twice, which is the whole point
-            // of requiring a cache here.
-            replay_mode: crate::replay::ReplayMode::All,
-            holder_of_key_cert: input.holder_of_key_cert,
-        })?;
+        let transaction_id = URL_SAFE_NO_PAD.encode(context.payload().transaction_id);
+        let transaction_entry =
+            ReplayEntry::proxy_transaction(&transaction_id, context.payload().expires_at);
+        let identity = self.sp.consume_response_with_replay(
+            crate::sp::ConsumeResponse {
+                idp: input.upstream_idp,
+                peer_crypto_policy: input.peer_crypto_policy,
+                saml_response: input.saml_response,
+                binding: input.binding,
+                relay_state: Some(input.relay_state),
+                // From the context, never from the caller — this is the coupling.
+                tracker: Some(&LoginTracker::from_payload(
+                    context.payload().upstream_tracker.clone(),
+                )),
+                expected_destination: input.expected_destination,
+                now: input.now,
+                clock_skew: input.clock_skew,
+                replay_cache: Some(input.replay_cache),
+                // `All`, not the caller's choice: a relaxed mode would let the
+                // upstream assertion be redeemed twice, which is the whole point
+                // of requiring a cache here.
+                replay_mode: crate::replay::ReplayMode::All,
+                holder_of_key_cert: input.holder_of_key_cert,
+            },
+            Some(transaction_entry),
+            Error::ProxyTransactionReplay,
+        )?;
         Ok(UpstreamFlow {
             context,
             identity,
@@ -907,6 +944,15 @@ impl Proxy<'_> {
     /// scope, use [`OpaqueHandleCodec`].
     pub fn decode_context(&self, blob: &str) -> Result<ProxyContext, Error> {
         let payload = self.context_codec.decode(blob)?;
+        if payload
+            .expires_at
+            .duration_since(payload.issued_at)
+            .map_or(true, |lifetime| lifetime > PROXY_CONTEXT_LIFETIME)
+        {
+            return Err(Error::InvalidConfiguration {
+                reason: "proxy context lifetime exceeds the allowed maximum",
+            });
+        }
         Ok(ProxyContext::attested(payload))
     }
 
@@ -936,8 +982,8 @@ impl Proxy<'_> {
             return Err(Error::ForeignProxyFlow);
         }
 
-        // 0aa. The downstream SP's key material must be the one whose request
-        //      we sealed.
+        // 0aa. When this issuance will be encrypted, the downstream SP's key
+        //      material must be the one whose request we sealed.
         //
         //      Issuance re-checks this, but from a synthetic request built out
         //      of the descriptor passed here — so that comparison is against
@@ -945,7 +991,9 @@ impl Proxy<'_> {
         //      downstream SP actually sent, which is the only non-circular
         //      reference available at relay time. Compared as a set, since
         //      metadata ordering carries no meaning.
-        {
+        //      Plaintext issuance does not consume encryption-key provenance;
+        //      ordinary metadata rotation must not break it.
+        if self.idp.config().encrypt_assertions_when_possible {
             let mut sealed = input
                 .flow
                 .context()
@@ -1075,10 +1123,12 @@ impl Proxy<'_> {
         // the assertion; `session_not_on_or_after` bounds the authenticated
         // session, and can be sooner — capping only on the former let a
         // downstream session outlive the upstream session it represents.
-        let upstream_expiry = match input.flow.identity().session_not_on_or_after() {
+        let assertion_and_session_expiry = match input.flow.identity().session_not_on_or_after() {
             Some(session_end) => input.flow.identity().not_on_or_after().min(session_end),
             None => input.flow.identity().not_on_or_after(),
         };
+        let upstream_expiry = assertion_and_session_expiry
+            .min(input.flow.identity().subject_confirmation_not_on_or_after());
         if upstream_expiry <= input.now {
             return Err(Error::Expired);
         }
@@ -1103,17 +1153,32 @@ impl Proxy<'_> {
             Some(session_not_on_or_after),
         )?;
 
-        // 2. Attribute release.
-        let attributes = input
-            .attribute_release
-            .release(input.flow.identity().attributes(), input.downstream_sp);
+        // NameID policy negotiation is independent of both callbacks. Resolve
+        // it first so an unsupported explicit request cannot run attribute
+        // release or pseudonym-store logic and only then fail in IdP issuance.
+        let chosen_name_id_format = self.idp.resolve_name_id_format(
+            input
+                .flow
+                .context()
+                .payload()
+                .requested_name_id_format
+                .as_ref(),
+        )?;
 
-        // 3. NameID transformation.
+        // 2. NameID transformation. Validate its semantic format before the
+        // attribute-release callback runs; the IdP repeats this at its public
+        // issuance boundary.
         let downstream_name_id = input.name_id_transform.transform(
             input.flow.identity().name_id(),
             input.flow.identity().attributes(),
             input.downstream_sp,
         )?;
+        ensure_transformed_name_id_format(&downstream_name_id, &chosen_name_id_format)?;
+
+        // 3. Attribute release.
+        let attributes = input
+            .attribute_release
+            .release(input.flow.identity().attributes(), input.downstream_sp);
 
         // 5. Build a synthetic ParsedAuthnRequest from the proxy context.
         //    The `assertion_consumer_service` field is type-narrowed to
@@ -1166,6 +1231,20 @@ impl Proxy<'_> {
             assertion_lifetime: effective_session_lifetime,
             subject_confirmation_lifetime: effective_subject_confirmation_lifetime,
             holder_of_key_cert: None,
+        })
+    }
+}
+
+fn ensure_transformed_name_id_format(
+    name_id: &NameId,
+    expected: &NameIdFormat,
+) -> Result<(), Error> {
+    if &name_id.format == expected {
+        Ok(())
+    } else {
+        Err(Error::NameIdFormatMismatch {
+            expected: expected.as_uri().to_owned(),
+            got: name_id.format.as_uri().to_owned(),
         })
     }
 }
@@ -1768,8 +1847,14 @@ mod tests {
                 acs_endpoint: SsoResponseEndpoint::post("https://proxy.example.com/acs", 0, true),
                 requested_authn_context: None,
                 requested_name_id_format: None,
+                idp_signing_cert_fingerprints: vec![],
+                idp_artifact_resolution_services: vec![],
             },
             issued_at: SystemTime::now(),
+            expires_at: SystemTime::now()
+                .checked_add(PROXY_CONTEXT_LIFETIME)
+                .expect("context expiry fits"),
+            transaction_id: [1u8; 16],
         }
     }
 
@@ -1870,22 +1955,22 @@ mod tests {
             Ok(())
         }
 
-        fn take(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error> {
-            let mut guard = self
+        fn get(&self, handle: &str) -> Result<Option<ProxyContextPayload>, Error> {
+            let guard = self
                 .inner
                 .lock()
                 .map_err(|_err| Error::InvalidConfiguration {
                     reason: "InMemoryStore: lock poisoned",
                 })?;
-            match guard.remove(handle) {
-                Some((ctx, expires_at)) if expires_at > SystemTime::now() => Ok(Some(ctx)),
-                Some(_) | None => Ok(None), // expired or absent
+            match guard.get(handle) {
+                Some((ctx, expires_at)) if *expires_at > SystemTime::now() => Ok(Some(ctx.clone())),
+                Some(_) | None => Ok(None),
             }
         }
     }
 
     #[test]
-    fn opaque_handle_codec_round_trip_and_one_shot() {
+    fn opaque_handle_codec_decode_is_non_destructive() {
         let codec = OpaqueHandleCodec {
             store: InMemoryStore::new(),
             handle_byte_len: 24,
@@ -1898,9 +1983,8 @@ mod tests {
         let decoded = codec.decode(&handle).unwrap();
         assert_eq!(decoded.downstream_request_id, context.downstream_request_id);
 
-        // Second decode: one-shot consumption returns None.
-        let err = codec.decode(&handle).unwrap_err();
-        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+        let decoded_again = codec.decode(&handle).unwrap();
+        assert_eq!(decoded_again.transaction_id, context.transaction_id);
     }
 
     #[test]
@@ -1914,6 +1998,21 @@ mod tests {
         let handle = codec.encode(&SealingGrant::issue(&context)).unwrap();
         std::thread::sleep(Duration::from_millis(10));
         let err = codec.decode(&handle).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn opaque_handle_codec_rejects_ttl_beyond_context_lifetime() {
+        let codec = OpaqueHandleCodec {
+            store: InMemoryStore::new(),
+            handle_byte_len: 24,
+            ttl: PROXY_CONTEXT_LIFETIME + Duration::from_secs(1),
+        };
+        let context = sample_context();
+
+        let err = codec
+            .encode(&SealingGrant::issue(&context))
+            .expect_err("store lifetime must not outlive the context");
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
@@ -2058,7 +2157,10 @@ mod tests {
                 flow: flow(&proxy, context, identity),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
-                name_id_transform: &PassThroughNameId,
+                name_id_transform: &PersistentPerSpHmac {
+                    key: [12u8; 32],
+                    format: NameIdFormat::Persistent,
+                },
                 passthrough_authn_context: false,
                 now: SystemTime::now(),
                 session_lifetime: Duration::from_hours(1),
@@ -2174,7 +2276,10 @@ mod tests {
                 flow: flow(&proxy, context, identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
-                name_id_transform: &PassThroughNameId,
+                name_id_transform: &PersistentPerSpHmac {
+                    key: [12u8; 32],
+                    format: NameIdFormat::Persistent,
+                },
                 passthrough_authn_context: true,
                 now: SystemTime::now(),
                 session_lifetime: Duration::from_hours(1),
@@ -2319,6 +2424,7 @@ mod tests {
             Some("upstream-sess-1".into()),
             now,
             Some(session_not_on_or_after),
+            not_on_or_after,
             Some(class_ref_uri.to_string()),
             vec![
                 Attribute::email("alice@example.com"),
@@ -2330,6 +2436,16 @@ mod tests {
             [0u8; 32],
             false,
         )
+    }
+
+    fn make_upstream_identity_with_confirmation_expiry(
+        class_ref_uri: &str,
+        anchor: SystemTime,
+        confirmation_expiry: SystemTime,
+    ) -> Identity {
+        let mut identity = make_upstream_identity_expiring(class_ref_uri, anchor);
+        identity.subject_confirmation_not_on_or_after = confirmation_expiry;
+        identity
     }
 
     /// Attribute release and NameID transformation are caller-supplied and
@@ -2406,6 +2522,75 @@ mod tests {
             !transform.called.load(std::sync::atomic::Ordering::SeqCst),
             "NameID transformation ran despite an unsatisfiable time bound"
         );
+    }
+
+    #[test]
+    fn relay_rejects_unsupported_name_id_policy_before_callbacks() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([15u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let mut context = sample_context();
+        context.requested_name_id_format = Some(NameIdFormat::Transient);
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default();
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                flow: flow(&proxy, context, identity),
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("the proxy IdP cannot produce Transient NameIDs");
+
+        assert!(
+            matches!(err, Error::UnsupportedNameIdPolicy { .. }),
+            "got {err:?}"
+        );
+        assert!(!release.called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!transform.called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn relay_rejects_transform_format_mismatch_before_attribute_release() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([16u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let identity = make_upstream_identity(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        );
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default(); // returns upstream EmailAddress
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                // sample_context requests Persistent.
+                flow: flow(&proxy, sample_context(), identity),
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now: SystemTime::now(),
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("EmailAddress transform cannot satisfy Persistent policy");
+
+        assert!(
+            matches!(err, Error::NameIdFormatMismatch { .. }),
+            "got {err:?}"
+        );
+        assert!(transform.called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!release.called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// At `now = UNIX_EPOCH` every addition succeeds, so an overflow-only
@@ -2566,6 +2751,40 @@ mod tests {
             !transform.called.load(std::sync::atomic::Ordering::SeqCst),
             "NameID transformation ran for an expired upstream"
         );
+    }
+
+    #[test]
+    fn relay_refuses_an_expired_selected_confirmation_before_callbacks() {
+        let sp = proxy_sp();
+        let idp = proxy_idp();
+        let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([14u8; 32])));
+        let downstream_sp = downstream_sp_descriptor();
+        let release = SpyRelease::default();
+        let transform = SpyNameId::default();
+        let now = SystemTime::now();
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap();
+        let identity = make_upstream_identity_with_confirmation_expiry(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+            now,
+            expired,
+        );
+
+        let err = proxy
+            .relay_to_downstream(RelayToDownstream {
+                flow: flow(&proxy, sample_context(), identity),
+                downstream_sp: &downstream_sp,
+                attribute_release: &release,
+                name_id_transform: &transform,
+                passthrough_authn_context: true,
+                now,
+                session_lifetime: Duration::from_hours(1),
+                subject_confirmation_lifetime: Duration::from_mins(5),
+            })
+            .expect_err("the selected confirmation no longer authorizes relay");
+
+        assert!(matches!(err, Error::Expired), "got {err:?}");
+        assert!(!release.called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!transform.called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -2878,7 +3097,10 @@ mod tests {
                 flow: flow(&proxy, context.clone(), identity.clone()),
                 downstream_sp: &downstream_sp,
                 attribute_release: &ReleaseAll,
-                name_id_transform: &PassThroughNameId,
+                name_id_transform: &PersistentPerSpHmac {
+                    key: [12u8; 32],
+                    format: NameIdFormat::Persistent,
+                },
                 passthrough_authn_context: true,
                 now: SystemTime::now(),
                 session_lifetime: Duration::from_hours(1),

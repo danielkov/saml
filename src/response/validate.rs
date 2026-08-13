@@ -256,7 +256,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // bearer confirmation satisfies on its SubjectConfirmationData constraints
     // alone; a Holder-of-Key confirmation additionally requires the presenter
     // key to match its `<ds:KeyInfo>` (SAML V2.0 HoK SSO Profile).
-    find_valid_subject_confirmation(
+    let selected_confirmation = find_valid_subject_confirmation(
         &assertion,
         expected_destination,
         tracker_request_id,
@@ -264,6 +264,9 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         clock_skew,
         holder_of_key_cert,
     )?;
+    let subject_confirmation_not_on_or_after = selected_confirmation
+        .not_on_or_after
+        .ok_or(Error::Expired)?;
 
     // --- Step 17: AuthnContext non-downgrade ---------------------------------
     if let Some(req) = requested_authn_context {
@@ -311,6 +314,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         session_index,
         authn_instant,
         session_not_on_or_after,
+        subject_confirmation_not_on_or_after,
         authn_context_class_ref,
         assertion.attributes,
         assertion.id,
@@ -1312,6 +1316,11 @@ mod tests {
         assert_eq!(identity.name_id.value, "alice@example.com");
         assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
         assert_eq!(identity.session_index.as_deref(), Some("sess-1"));
+        assert_eq!(
+            identity.subject_confirmation_not_on_or_after(),
+            UNIX_EPOCH + Duration::from_mins(29_663_285),
+            "the selected confirmation's 12:05 expiry is preserved"
+        );
         assert_eq!(
             identity.authn_context_class_ref.as_deref(),
             Some("urn:oasis:names:tc:SAML:2.0:ac:classes:Password")
