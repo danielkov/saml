@@ -537,6 +537,48 @@ mod tests {
     }
 
     #[test]
+    fn pkcs8_der_and_pkcs1_pem_parse_supported_rsa_key() {
+        use rsa::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+
+        let pem = std::str::from_utf8(RSA_KEY_PKCS8_PEM).expect("ASCII PEM");
+        let rsa = RsaPrivateKey::from_pkcs8_pem(pem).expect("parse fixture");
+        let pkcs8_der = rsa.to_pkcs8_der().expect("encode PKCS#8");
+        assert_eq!(
+            KeyPair::from_pkcs8_der(pkcs8_der.as_bytes())
+                .expect("parse PKCS#8 DER")
+                .algorithm_family(),
+            PublicKeyAlgorithm::Rsa
+        );
+
+        use rsa::pkcs1::EncodeRsaPrivateKey as _;
+        let pkcs1_pem = rsa
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .expect("encode PKCS#1 PEM");
+        assert_eq!(
+            KeyPair::from_pkcs1_pem(pkcs1_pem.as_bytes())
+                .expect("parse PKCS#1 PEM")
+                .algorithm_family(),
+            PublicKeyAlgorithm::Rsa
+        );
+    }
+
+    #[test]
+    fn key_parsers_reject_invalid_utf8_and_der() {
+        assert!(matches!(
+            KeyPair::from_pkcs8_pem(&[0xff]),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            KeyPair::from_pkcs1_pem(&[0xff]),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            KeyPair::from_pkcs8_der(b"not a private key"),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+    }
+
+    #[test]
     fn with_certificate_attaches_cert() {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
@@ -571,6 +613,19 @@ mod tests {
     }
 
     #[test]
+    fn rsa_sign_verify_round_trip_sha384() {
+        let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("parse key");
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("parse cert");
+        let payload = b"sha384 payload";
+        let signature = kp
+            .sign(SignatureAlgorithm::RsaSha384, payload)
+            .expect("sign");
+        cert.public_key()
+            .verify_signature(SignatureAlgorithm::RsaSha384, payload, &signature)
+            .expect("verify");
+    }
+
+    #[test]
     fn ecdsa_p256_sign_verify_round_trip() {
         let kp = KeyPair::from_pkcs8_pem(EC_P256_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(EC_P256_CERT_PEM).unwrap();
@@ -601,6 +656,16 @@ mod tests {
             .sign(SignatureAlgorithm::EcdsaSha384, b"x")
             .expect_err("P-256 with SHA-384 is not a supported pairing");
         assert!(matches!(err, Error::DisallowedAlgorithm { .. }));
+    }
+
+    #[test]
+    fn debug_reports_shape_without_private_material() {
+        let key = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("parse key");
+        let debug = format!("{key:?}");
+        assert!(debug.contains("KeyPair"));
+        assert!(debug.contains("algorithm_family"));
+        assert!(debug.contains("has_certificate"));
+        assert!(!debug.contains("PRIVATE KEY"));
     }
 
     #[test]

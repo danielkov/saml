@@ -87,6 +87,12 @@ struct ValidatedBinding {
     /// with the certificate removed silently downgrades opportunistic
     /// encryption to plaintext.
     encryption_cert_fingerprints: Vec<[u8; 32]>,
+    /// SHA-256 fingerprints of the SP signing certificates trusted while the
+    /// request was validated. Artifact issuance carries these into its
+    /// one-time transaction record so a later ArtifactResolve cannot replace
+    /// the transaction's trust roots through fresh metadata.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    signing_cert_fingerprints: Vec<[u8; 32]>,
     /// RelayState as the role layer sealed it, straight from the binding.
     ///
     /// The `pub` copy is caller-mutable and rewriting it cross-wires
@@ -118,6 +124,14 @@ impl ParsedAuthnRequest {
     #[must_use]
     pub fn validated_encryption_cert_fingerprints(&self) -> &[[u8; 32]] {
         &self.validated.encryption_cert_fingerprints
+    }
+
+    /// Canonical signing-root fingerprints seen while validating the request.
+    /// Crate-internal because callers consume these only through the opaque
+    /// artifact transaction created by the IdP role.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub(crate) fn validated_signing_cert_fingerprints(&self) -> &[[u8; 32]] {
+        &self.validated.signing_cert_fingerprints
     }
 
     /// RelayState as the role layer sealed it from the binding.
@@ -254,6 +268,10 @@ impl ParsedAuthnRequest {
                     .iter()
                     .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
                     .collect(),
+                #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+                signing_cert_fingerprints: crate::crypto::cert::certificate_fingerprint_set(
+                    &sp.signing_certs,
+                ),
                 relay_state: relay_state.clone(),
                 requested_authn_context: requested_authn_context.clone(),
                 requested_name_id_format: requested_name_id_format.clone(),
@@ -388,6 +406,10 @@ pub(crate) fn validate_authn_request(
                 .iter()
                 .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
                 .collect(),
+            #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+            signing_cert_fingerprints: crate::crypto::cert::certificate_fingerprint_set(
+                &sp.signing_certs,
+            ),
             requested_authn_context: raw.requested_authn_context.clone(),
             requested_name_id_format: raw.requested_name_id_format.clone(),
             // The role layer seals this immediately after validate.
@@ -815,5 +837,21 @@ mod tests {
                 "canonical lookup must not collapse endpoints that differ only by index"
             );
         }
+    }
+
+    #[test]
+    fn proxy_reissue_rejects_an_unregistered_acs() {
+        let sp = default_sp();
+        let err = ParsedAuthnRequest::for_proxy_reissue(
+            &sp,
+            "_req".into(),
+            SystemTime::UNIX_EPOCH,
+            SsoResponseEndpoint::post("https://attacker.example.com/acs", 99, false),
+            None,
+            None,
+            None,
+        )
+        .expect_err("the proxy cannot mint provenance for an unregistered endpoint");
+        assert!(matches!(err, Error::UnregisteredAcs { .. }));
     }
 }

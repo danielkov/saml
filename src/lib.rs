@@ -422,7 +422,9 @@ pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};
 #[cfg(feature = "artifact-binding")]
 pub use crate::binding::artifact::ArtifactResolveRequest;
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
-pub use crate::idp::ConsumeArtifactResolve;
+pub use crate::idp::{
+    ArtifactResolveTransaction, ConsumeArtifactResolve, IssuedArtifact, IssuedResponse,
+};
 
 #[cfg(feature = "ecp")]
 pub use crate::binding::ecp::{

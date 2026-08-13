@@ -255,6 +255,15 @@ pub enum Error {
     /// plaintext.
     #[error("SP encryption certificates differ from those seen at validation")]
     SpKeyMaterialMismatch,
+    /// Artifact resolution supplied a fresh SP descriptor whose signing roots
+    /// were not trusted by the AuthnRequest transaction that minted it.
+    #[error("SP signing certificates differ from those pinned for this artifact")]
+    ArtifactSpTrustRootMismatch,
+    /// An IdP issuance API that returns only [`SsoResponseDispatch`](crate::SsoResponseDispatch)
+    /// was asked to emit an HTTP-Artifact response. Such a result cannot carry
+    /// the trust transaction needed to authenticate its later resolution.
+    #[error("HTTP-Artifact issuance requires a transaction-bearing issuance API")]
+    ArtifactTransactionRequired,
     /// The assertion carries `<saml:OneTimeUse>` but no replay cache was
     /// supplied, or [`ReplayMode::Off`](crate::ReplayMode) disabled the check.
     ///
@@ -268,6 +277,9 @@ pub enum Error {
     /// valid upstream Response.
     #[error("proxy transaction was already redeemed")]
     ProxyTransactionReplay,
+    /// An authenticated ArtifactResolve request ID was already reserved.
+    #[error("ArtifactResolve request was already redeemed")]
+    ArtifactResolveReplay,
     /// The SP's `<samlp:NameIDPolicy>/@Format` names a format this IdP cannot
     /// produce.
     ///

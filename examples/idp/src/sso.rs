@@ -29,12 +29,16 @@ use axum::{
 use serde::Deserialize;
 use tracing::{info, warn};
 
+#[cfg(not(feature = "artifact-binding"))]
+use saml::SsoResponseDispatch;
 use saml::{
     Attribute, AuthnContextClassRef, Binding, ConsumeAuthnRequest, ConsumeLogoutRequest,
     ConsumeLogoutResponse, DetachedSignature, Dispatch, IssueResponse, LogoutDispatch,
-    LogoutOutcome, LogoutStatus, NameId, NameIdFormat, ParsedAuthnRequest, SsoResponseDispatch,
-    StartLogout, WireDirection, decode_wire,
+    LogoutOutcome, LogoutStatus, NameId, NameIdFormat, ParsedAuthnRequest, StartLogout,
+    WireDirection, decode_wire,
 };
+#[cfg(feature = "artifact-binding")]
+use saml::{ConsumeArtifactResolve, IssuedArtifact, IssuedResponse};
 
 use crate::auth::StoredUser;
 use crate::session::{self, Session};
@@ -461,7 +465,7 @@ fn finalize_login(
         .checked_add(Duration::from_secs(session.authn_instant_unix))
         .unwrap_or(now);
 
-    let dispatch = match state.idp.issue_response(IssueResponse {
+    let issue = IssueResponse {
         sp: &entry.sp,
         in_response_to: parsed,
         name_id: NameId::new(user.email.clone(), NameIdFormat::EmailAddress),
@@ -475,7 +479,21 @@ fn finalize_login(
         assertion_lifetime: Duration::from_mins(5),
         subject_confirmation_lifetime: Duration::from_mins(5),
         holder_of_key_cert: None,
-    }) {
+    };
+    #[cfg(feature = "artifact-binding")]
+    let issued = state.idp.issue_response_with_artifact_transaction(issue);
+    #[cfg(not(feature = "artifact-binding"))]
+    let issued = state
+        .idp
+        .issue_response(issue)
+        .map(|dispatch| match dispatch {
+            SsoResponseDispatch::Post(form) => IssuedForExample::Post(form),
+            SsoResponseDispatch::Artifact(_) => unreachable!(
+                "the non-artifact example cannot validate an Artifact ACS from metadata"
+            ),
+        });
+
+    let dispatch = match issued {
         Ok(d) => d,
         Err(e) => {
             warn!(error = %e, "/saml/sso/continue: issue_response failed");
@@ -487,6 +505,11 @@ fn finalize_login(
     };
 
     finalize_sso_dispatch(state, &entry.sp.entity_id, dispatch, entry.label())
+}
+
+#[cfg(not(feature = "artifact-binding"))]
+enum IssuedForExample {
+    Post(saml::SsoResponsePostForm),
 }
 
 fn build_attributes(user: &StoredUser) -> Vec<Attribute> {
@@ -1011,12 +1034,51 @@ pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::By
         );
     };
 
-    let resolve = match state.idp.parse_artifact_resolve(&entry.sp, &body) {
+    // Parse without trusting or consuming anything so the artifact can select
+    // its stored transaction. Authentication happens below before the take.
+    let selected = match state.idp.parse_artifact_resolve(&entry.sp, &body) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, sp = %entry.sp.entity_id, "/saml/artifact: parse_artifact_resolve failed");
             return error_page(
                 StatusCode::BAD_REQUEST,
+                &format!("ArtifactResolve rejected: {e}"),
+            );
+        }
+    };
+
+    let Some(peeked) = (match state.peek_artifact(&selected.artifact) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(error = %e, "/saml/artifact: artifact store unavailable");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact store unavailable",
+            );
+        }
+    }) else {
+        return error_page(
+            StatusCode::NOT_FOUND,
+            "The requested artifact is unknown or has already been resolved.",
+        );
+    };
+
+    let resolve = match state.idp.consume_artifact_resolve(ConsumeArtifactResolve {
+        sp: &entry.sp,
+        transaction: &peeked.transaction,
+        replay_cache: state.artifact_resolve_replay.as_ref(),
+        peer_crypto_policy: None,
+        soap_envelope: &body,
+        expected_destination: &format!("{}/saml/artifact", state.config.idp_base_url),
+        now: SystemTime::now(),
+        clock_skew: Duration::from_mins(2),
+        require_signed: true,
+    }) {
+        Ok(resolve) => resolve,
+        Err(e) => {
+            warn!(error = %e, sp = %entry.sp.entity_id, "/saml/artifact: authenticated consume failed");
+            return error_page(
+                StatusCode::UNAUTHORIZED,
                 &format!("ArtifactResolve rejected: {e}"),
             );
         }
@@ -1106,13 +1168,14 @@ fn redirect_with_cleared_cookie(target: &str) -> Response {
 fn finalize_sso_dispatch(
     state: &AppState,
     sp_entity_id: &str,
-    dispatch: SsoResponseDispatch,
+    dispatch: impl IntoExampleIssued,
     sp_label: &str,
 ) -> Response {
+    let dispatch = dispatch.into_example_issued();
     // `sp_entity_id` is only consumed by the artifact arm below.
     let _ = (state, sp_entity_id);
     match dispatch {
-        SsoResponseDispatch::Post(form) => Html(templates::render_post_dispatch(
+        ExampleIssued::Post(form) => Html(templates::render_post_dispatch(
             form.action.as_str(),
             None,
             Some(form.saml_response.as_str()),
@@ -1121,14 +1184,38 @@ fn finalize_sso_dispatch(
         ))
         .into_response(),
         #[cfg(feature = "artifact-binding")]
-        SsoResponseDispatch::Artifact(redirect) => {
-            finalize_artifact_dispatch(state, sp_entity_id, redirect)
+        ExampleIssued::Artifact(artifact) => {
+            finalize_artifact_dispatch(state, sp_entity_id, artifact)
         }
-        #[cfg(not(feature = "artifact-binding"))]
-        SsoResponseDispatch::Artifact(_) => error_page(
-            StatusCode::NOT_IMPLEMENTED,
-            "Artifact-binding response dispatch is not implemented in this example.",
-        ),
+    }
+}
+
+enum ExampleIssued {
+    Post(saml::SsoResponsePostForm),
+    #[cfg(feature = "artifact-binding")]
+    Artifact(IssuedArtifact),
+}
+
+trait IntoExampleIssued {
+    fn into_example_issued(self) -> ExampleIssued;
+}
+
+#[cfg(feature = "artifact-binding")]
+impl IntoExampleIssued for IssuedResponse {
+    fn into_example_issued(self) -> ExampleIssued {
+        match self {
+            IssuedResponse::Post(form) => ExampleIssued::Post(form),
+            IssuedResponse::Artifact(artifact) => ExampleIssued::Artifact(artifact),
+        }
+    }
+}
+
+#[cfg(not(feature = "artifact-binding"))]
+impl IntoExampleIssued for IssuedForExample {
+    fn into_example_issued(self) -> ExampleIssued {
+        match self {
+            IssuedForExample::Post(form) => ExampleIssued::Post(form),
+        }
     }
 }
 
@@ -1139,9 +1226,14 @@ fn finalize_sso_dispatch(
 fn finalize_artifact_dispatch(
     state: &AppState,
     sp_entity_id: &str,
-    redirect: saml::ArtifactRedirect,
+    artifact: IssuedArtifact,
 ) -> Response {
-    let entry = crate::StashedArtifact::new(redirect.response_xml, sp_entity_id.to_owned());
+    let redirect = artifact.redirect;
+    let entry = crate::StashedArtifact::new(
+        redirect.response_xml,
+        sp_entity_id.to_owned(),
+        artifact.transaction,
+    );
     if let Err(e) = state.stash_artifact(redirect.artifact.clone(), entry) {
         warn!(error = %e, "/saml/sso: artifact store unavailable");
         return error_page(

@@ -566,4 +566,49 @@ mod tests {
         // silently round to a wrong date via downstream arithmetic.
         parse_xs_datetime("100000-01-01T00:00:00Z").unwrap_err();
     }
+
+    #[test]
+    fn rejects_invalid_time_and_offset_components() {
+        for value in [
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:61Z",
+            "2026-01-01T00:00:00.badZ",
+            "2026-01-01T00:00:00+15:00",
+            "2026-01-01T00:00:00+01:60",
+            "2026-01-01T00:00:00+aa:00",
+        ] {
+            assert!(parse_xs_datetime(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn accepts_leap_second_and_truncates_long_fraction() {
+        assert_eq!(
+            parse_xs_datetime("2026-01-01T00:00:60Z").expect("leap second"),
+            parse_xs_datetime("2026-01-01T00:00:59Z").expect("ordinary second")
+        );
+        let parsed = parse_xs_datetime("2026-01-01T00:00:00.123456789999Z")
+            .expect("long fractional precision");
+        assert_eq!(
+            parsed
+                .duration_since(UNIX_EPOCH)
+                .expect("post epoch")
+                .subsec_nanos(),
+            123_456_789
+        );
+    }
+
+    #[test]
+    fn format_rejects_pre_epoch_and_unrepresentable_civil_date() {
+        assert!(
+            format_xs_datetime(UNIX_EPOCH - Duration::from_secs(1)).is_err(),
+            "pre-epoch time must fail closed"
+        );
+        if let Some(far_future) = UNIX_EPOCH.checked_add(Duration::from_secs(u64::MAX)) {
+            assert!(
+                format_xs_datetime(far_future).is_err(),
+                "a civil date outside the supported range must fail closed"
+            );
+        }
+    }
 }

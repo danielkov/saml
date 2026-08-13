@@ -633,6 +633,29 @@ mod tests {
     }
 
     #[test]
+    fn debug_and_public_key_comparison_do_not_expose_or_confuse_key_material() {
+        let rsa = X509Certificate::from_pem(RSA_CERT_PEM).expect("RSA cert");
+        let same_rsa = X509Certificate::from_der(rsa.to_der()).expect("same cert from DER");
+        let ec = X509Certificate::from_pem(EC_P256_CERT_PEM).expect("EC cert");
+
+        assert!(rsa.same_public_key_as(&same_rsa));
+        assert!(!rsa.same_public_key_as(&ec));
+        let debug = format!("{rsa:?}");
+        assert!(debug.contains("X509Certificate"));
+        assert!(debug.contains("der_len"));
+        assert!(!debug.contains("fingerprint"));
+    }
+
+    #[test]
+    fn fingerprint_set_is_sorted_and_deduplicated() {
+        let rsa = X509Certificate::from_pem(RSA_CERT_PEM).expect("RSA cert");
+        let ec = X509Certificate::from_pem(EC_P256_CERT_PEM).expect("EC cert");
+        let fingerprints = certificate_fingerprint_set(&[rsa.clone(), ec, rsa]);
+        assert_eq!(fingerprints.len(), 2);
+        assert!(fingerprints.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
     fn malformed_input_is_rejected() {
         let r = X509Certificate::from_der(b"not actually a certificate");
         assert!(matches!(r, Err(Error::X509Parse)));

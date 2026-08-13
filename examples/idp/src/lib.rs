@@ -50,6 +50,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use saml::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy};
+#[cfg(feature = "artifact-binding")]
+use saml::{ArtifactResolveTransaction, InMemoryReplayCache};
 use saml::{
     DataEncryptionAlgorithm, Endpoint, IdentityProvider, IdentityProviderConfig,
     IdpAssertionSigning, IdpLogoutSigning, IdpLogoutWantSigned, KeyPair, KeyTransportAlgorithm,
@@ -339,16 +341,22 @@ impl LogoutTrackerStore {
 pub struct StashedArtifact {
     pub response_xml: String,
     pub sp_entity_id: String,
+    pub transaction: ArtifactResolveTransaction,
     created_at: SystemTime,
 }
 
 #[cfg(feature = "artifact-binding")]
 impl StashedArtifact {
     #[must_use]
-    pub fn new(response_xml: String, sp_entity_id: String) -> Self {
+    pub fn new(
+        response_xml: String,
+        sp_entity_id: String,
+        transaction: ArtifactResolveTransaction,
+    ) -> Self {
         Self {
             response_xml,
             sp_entity_id,
+            transaction,
             created_at: SystemTime::now(),
         }
     }
@@ -430,6 +438,9 @@ pub struct AppState {
     /// by the opaque `SAMLart` value and served back from `/saml/artifact`.
     #[cfg(feature = "artifact-binding")]
     pub artifacts: Arc<Mutex<ArtifactStore>>,
+    /// Atomic replay reservation for authenticated `ArtifactResolve/@ID`.
+    #[cfg(feature = "artifact-binding")]
+    pub artifact_resolve_replay: Arc<InMemoryReplayCache>,
 }
 
 impl AppState {
@@ -454,6 +465,8 @@ impl AppState {
             logout_trackers: Arc::new(Mutex::new(LogoutTrackerStore::default())),
             #[cfg(feature = "artifact-binding")]
             artifacts: Arc::new(Mutex::new(ArtifactStore::default())),
+            #[cfg(feature = "artifact-binding")]
+            artifact_resolve_replay: Arc::new(InMemoryReplayCache::default()),
         }
     }
 
@@ -546,6 +559,17 @@ impl AppState {
             .lock()
             .map_err(|e| format!("artifact store poisoned: {e}"))?;
         Ok(store.take(artifact))
+    }
+
+    /// Borrow-by-clone for authentication before the one-time take. The SOAP
+    /// body supplies only an untrusted lookup key at this stage.
+    #[cfg(feature = "artifact-binding")]
+    pub fn peek_artifact(&self, artifact: &str) -> Result<Option<StashedArtifact>, String> {
+        let store = self
+            .artifacts
+            .lock()
+            .map_err(|e| format!("artifact store poisoned: {e}"))?;
+        Ok(store.map.get(artifact).cloned())
     }
 }
 
