@@ -587,6 +587,12 @@ mod tests {
             parse_xs_datetime("2026-01-01T00:00:60Z").expect("leap second"),
             parse_xs_datetime("2026-01-01T00:00:59Z").expect("ordinary second")
         );
+        // The fraction ends in `00` on purpose. Windows models `SystemTime` as
+        // a `FILETIME`, whose resolution is 100ns, so a value like
+        // `...789` is not representable there and comes back as `...700` —
+        // the assertion below would fail on that platform alone. What this
+        // test is about is that digits beyond the ninth are *truncated* rather
+        // than rounded, which the trailing `999` still exercises.
         let parsed = parse_xs_datetime("2026-01-01T00:00:00.123456700999Z")
             .expect("long fractional precision");
         assert_eq!(

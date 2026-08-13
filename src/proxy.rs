@@ -1175,6 +1175,13 @@ impl Proxy<'_> {
         // attribute-release callback runs; the IdP repeats this at its public
         // issuance boundary.
         let downstream_name_id = input.name_id_transform.transform(
+            input
+                .flow
+                .context()
+                .payload()
+                .upstream_tracker
+                .idp_entity_id
+                .as_str(),
             input.flow.identity().name_id(),
             input.flow.identity().attributes(),
             input.downstream_sp,
@@ -1389,22 +1396,28 @@ impl AttributeReleasePolicy for ReleasePerSp {
 // NameID transformation (RFC-005 §6)
 // =============================================================================
 
-/// Mint a downstream NameID from the upstream subject + attribute bag.
+/// Mint a downstream NameID from the authenticated upstream IdP, subject, and
+/// attribute bag.
 ///
-/// The attribute bag is passed alongside the subject so transforms can lift
-/// values out of `upstream_identity.attributes` (see
-/// [`NameIdFromAttribute`]).
+/// `upstream_idp_entity_id` comes from the tracker authenticated as part of the
+/// upstream flow, not from caller-supplied metadata. The attribute bag is
+/// passed alongside the subject so transforms can lift values out of
+/// `upstream_identity.attributes` (see [`NameIdFromAttribute`]).
 pub trait NameIdTransform: Send + Sync {
     fn transform(
         &self,
+        upstream_idp_entity_id: &str,
         upstream_subject: &NameId,
         upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
     ) -> Result<NameId, Error>;
 }
 
-/// HMAC-SHA256(upstream_value || downstream_sp_entity_id), base64url-encoded.
-/// Produces an SP-scoped persistent ID that downstream SPs cannot correlate.
+/// HMAC-SHA256 over the authenticated upstream IdP, upstream subject, and
+/// downstream SP, base64url-encoded. The input uses a versioned domain
+/// separator and fixed-width length prefixes so distinct tuples cannot alias.
+/// Produces an IdP- and SP-scoped persistent ID that downstream SPs cannot
+/// correlate.
 pub struct PersistentPerSpHmac {
     pub key: [u8; 32],
     pub format: NameIdFormat,
@@ -1413,6 +1426,7 @@ pub struct PersistentPerSpHmac {
 impl NameIdTransform for PersistentPerSpHmac {
     fn transform(
         &self,
+        upstream_idp_entity_id: &str,
         upstream_subject: &NameId,
         _upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
@@ -1422,8 +1436,18 @@ impl NameIdTransform for PersistentPerSpHmac {
                 reason: "HMAC-SHA256 key size mismatch",
             }
         })?;
-        mac.update(upstream_subject.value.as_bytes());
-        mac.update(downstream_sp.entity_id.as_bytes());
+        mac.update(b"saml-proxy-persistent-nameid-v1\0");
+        for field in [
+            upstream_idp_entity_id,
+            upstream_subject.value.as_str(),
+            downstream_sp.entity_id.as_str(),
+        ] {
+            let len = u64::try_from(field.len()).map_err(|_err| Error::InvalidConfiguration {
+                reason: "PersistentPerSpHmac input exceeds u64 length",
+            })?;
+            mac.update(&len.to_be_bytes());
+            mac.update(field.as_bytes());
+        }
         let digest = mac.finalize().into_bytes();
         let value = URL_SAFE_NO_PAD.encode(digest);
         Ok(NameId {
@@ -1443,6 +1467,7 @@ pub struct PassThroughNameId;
 impl NameIdTransform for PassThroughNameId {
     fn transform(
         &self,
+        _upstream_idp_entity_id: &str,
         upstream_subject: &NameId,
         _upstream_attributes: &[Attribute],
         _downstream_sp: &SpDescriptor,
@@ -1461,6 +1486,7 @@ pub struct NameIdFromAttribute {
 impl NameIdTransform for NameIdFromAttribute {
     fn transform(
         &self,
+        _upstream_idp_entity_id: &str,
         _upstream_subject: &NameId,
         upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
@@ -1498,12 +1524,17 @@ pub struct PerSpFormat {
 impl NameIdTransform for PerSpFormat {
     fn transform(
         &self,
+        upstream_idp_entity_id: &str,
         upstream_subject: &NameId,
         upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
     ) -> Result<NameId, Error> {
-        self.inner
-            .transform(upstream_subject, upstream_attributes, downstream_sp)
+        self.inner.transform(
+            upstream_idp_entity_id,
+            upstream_subject,
+            upstream_attributes,
+            downstream_sp,
+        )
     }
 }
 
@@ -1720,6 +1751,7 @@ mod tests {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching test certificate")
     }
 
     fn rsa_cert() -> X509Certificate {
@@ -2494,6 +2526,7 @@ mod tests {
     impl NameIdTransform for SpyNameId {
         fn transform(
             &self,
+            _upstream_idp_entity_id: &str,
             name_id: &NameId,
             _attributes: &[Attribute],
             _sp: &SpDescriptor,
@@ -2623,6 +2656,7 @@ mod tests {
         impl NameIdTransform for ForeignPersistentNameId {
             fn transform(
                 &self,
+                _upstream_idp_entity_id: &str,
                 _name_id: &NameId,
                 _attributes: &[Attribute],
                 _sp: &SpDescriptor,
@@ -3028,6 +3062,7 @@ mod tests {
 
     #[test]
     fn persistent_per_sp_hmac_is_stable_and_sp_scoped() {
+        let idp = "https://upstream-idp.example.com";
         let upstream = NameId::email("alice@example.com");
         let sp_a = downstream_sp_descriptor();
         let mut sp_b = downstream_sp_descriptor();
@@ -3038,9 +3073,9 @@ mod tests {
             format: NameIdFormat::Persistent,
         };
 
-        let a1 = transform.transform(&upstream, &[], &sp_a).unwrap();
-        let a2 = transform.transform(&upstream, &[], &sp_a).unwrap();
-        let b1 = transform.transform(&upstream, &[], &sp_b).unwrap();
+        let a1 = transform.transform(idp, &upstream, &[], &sp_a).unwrap();
+        let a2 = transform.transform(idp, &upstream, &[], &sp_a).unwrap();
+        let b1 = transform.transform(idp, &upstream, &[], &sp_b).unwrap();
 
         // Stable across calls for the same (subject, SP).
         assert_eq!(a1.value, a2.value);
@@ -3056,10 +3091,51 @@ mod tests {
     }
 
     #[test]
+    fn persistent_per_sp_hmac_is_scoped_to_authenticated_upstream_idp() {
+        let upstream = NameId::new("shared-local-subject", NameIdFormat::Persistent);
+        let sp = downstream_sp_descriptor();
+        let transform = PersistentPerSpHmac {
+            key: [11u8; 32],
+            format: NameIdFormat::Persistent,
+        };
+
+        let from_idp_a = transform
+            .transform("https://idp-a.example.com", &upstream, &[], &sp)
+            .unwrap();
+        let from_idp_b = transform
+            .transform("https://idp-b.example.com", &upstream, &[], &sp)
+            .unwrap();
+
+        assert_ne!(from_idp_a.value, from_idp_b.value);
+    }
+
+    #[test]
+    fn persistent_per_sp_hmac_uses_unambiguous_framing() {
+        let sp = downstream_sp_descriptor();
+        let transform = PersistentPerSpHmac {
+            key: [11u8; 32],
+            format: NameIdFormat::Persistent,
+        };
+
+        // Both tuples have the same raw concatenation before the SP ID:
+        // ("a", "bc") and ("ab", "c"). Length-prefixing keeps them apart.
+        let first = transform
+            .transform("a", &NameId::new("bc", NameIdFormat::Persistent), &[], &sp)
+            .unwrap();
+        let second = transform
+            .transform("ab", &NameId::new("c", NameIdFormat::Persistent), &[], &sp)
+            .unwrap();
+
+        assert_ne!(first.value, second.value);
+    }
+
+    #[test]
     fn passthrough_name_id_clones_upstream() {
         let upstream = NameId::email("alice@example.com");
         let sp = downstream_sp_descriptor();
-        let out = PassThroughNameId.transform(&upstream, &[], &sp).unwrap();
+        let out = PassThroughNameId
+            .transform("https://idp.example.com", &upstream, &[], &sp)
+            .unwrap();
         assert_eq!(out, upstream);
     }
 
@@ -3072,7 +3148,9 @@ mod tests {
             attribute_name: "urn:oid:0.9.2342.19200300.100.1.3".into(),
             format: NameIdFormat::EmailAddress,
         };
-        let out = transform.transform(&upstream, &attrs, &sp).unwrap();
+        let out = transform
+            .transform("https://idp.example.com", &upstream, &attrs, &sp)
+            .unwrap();
         assert_eq!(out.value, "alice@example.com");
         assert_eq!(out.format, NameIdFormat::EmailAddress);
     }
@@ -3085,7 +3163,9 @@ mod tests {
             attribute_name: "nope".into(),
             format: NameIdFormat::EmailAddress,
         };
-        let err = transform.transform(&upstream, &[], &sp).unwrap_err();
+        let err = transform
+            .transform("https://idp.example.com", &upstream, &[], &sp)
+            .unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
@@ -3268,6 +3348,7 @@ mod tests {
         impl NameIdTransform for SpyTransform {
             fn transform(
                 &self,
+                _upstream_idp_entity_id: &str,
                 upstream_subject: &NameId,
                 _upstream_attributes: &[Attribute],
                 _downstream_sp: &SpDescriptor,

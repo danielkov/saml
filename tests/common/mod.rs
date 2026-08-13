@@ -113,7 +113,7 @@ pub fn fixed_now() -> TestResult<SystemTime> {
 pub fn rsa_keypair_with_cert() -> TestResult<KeyPair> {
     let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM)?;
     let cert = X509Certificate::from_pem(RSA_CERT_PEM)?;
-    Ok(kp.with_certificate(cert))
+    Ok(kp.with_certificate(cert)?)
 }
 
 /// Build a fresh `X509Certificate` from the static PEM bundle.

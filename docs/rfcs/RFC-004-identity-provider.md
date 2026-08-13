@@ -416,7 +416,8 @@ let idp = IdentityProvider::new(IdentityProviderConfig {
     )],
     supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
     default_name_id_format: NameIdFormat::Persistent,
-    signing_key: KeyPair::from_pkcs8_pem(IDP_PRIV)?,
+    signing_key: KeyPair::from_pkcs8_pem(IDP_PRIV)?
+        .with_certificate(X509Certificate::from_pem(IDP_CERT)?)?,
     decryption_key: None,
     want_authn_requests_signed: true,
     assertion_signing: IdpAssertionSigning {

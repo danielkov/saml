@@ -352,7 +352,7 @@ Internally:
    preflight all timestamp arithmetic before callbacks.
 4. Resolve the downstream NameID policy before callbacks. An unsupported
    explicit format fails without running either callback.
-5. Compute downstream NameID via `name_id_transform.transform(flow.identity().name_id(), flow.identity().attributes(), downstream_sp)`. Require the transform's declared format to equal the resolved policy and reject a Persistent NameID whose present `SPNameQualifier` names another SP, all before attribute release.
+5. Compute downstream NameID via `name_id_transform.transform(flow.context().payload().upstream_tracker.idp_entity_id.as_str(), flow.identity().name_id(), flow.identity().attributes(), downstream_sp)`. The upstream IdP entity ID comes from the authenticated flow, never caller-supplied metadata. Require the transform's declared format to equal the resolved policy and reject a Persistent NameID whose present `SPNameQualifier` names another SP, all before attribute release.
 6. Compute downstream attributes via `attribute_release.release(flow.identity().attributes(), downstream_sp)`.
 7. Build a synthetic `ParsedAuthnRequest` from authenticated context provenance
    and canonical downstream metadata.
@@ -405,6 +405,8 @@ Custom policies — for example, attribute renaming per downstream SP, or eduPer
 pub trait NameIdTransform: Send + Sync {
     fn transform(
         &self,
+        /// Authenticated issuer provenance from the upstream login tracker.
+        upstream_idp_entity_id: &str,
         upstream_subject: &NameId,
         /// Upstream attributes, so a transform can derive the downstream
         /// NameID from one (e.g. a directory UUID) rather than the subject.
@@ -413,9 +415,12 @@ pub trait NameIdTransform: Send + Sync {
     ) -> Result<NameId, Error>;
 }
 
-/// Built-in: HMAC-SHA256 of (upstream_subject_value || downstream_sp_entity_id),
-/// base64url-encoded. Produces an SP-scoped persistent ID that the downstream SP
-/// cannot correlate with other SPs.
+/// Built-in: HMAC-SHA256 over a versioned domain separator followed by
+/// fixed-width-length-prefixed upstream IdP entity ID, upstream subject value,
+/// and downstream SP entity ID. It is base64url-encoded and produces an IdP-
+/// and SP-scoped persistent ID. Framing prevents distinct input tuples from
+/// aliasing, and users at different upstream IdPs cannot collide merely because
+/// their IdPs chose the same local subject value.
 pub struct PersistentPerSpHmac {
     pub key: [u8; 32],
     pub format: NameIdFormat,  // typically Persistent

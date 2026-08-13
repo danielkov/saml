@@ -625,7 +625,7 @@ fn read_config_or_default(
 pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, saml::Error> {
     let kp = KeyPair::from_pkcs8_pem(IDP_KEY_PEM)?;
     let cert = saml::X509Certificate::from_pem(IDP_CERT_PEM)?;
-    let signing_key = kp.with_certificate(cert);
+    let signing_key = kp.with_certificate(cert)?;
 
     let sso_endpoint_url = format!("{}/saml/sso", config.idp_base_url);
     let logout_endpoint_url = format!("{}/saml/slo", config.idp_base_url);
@@ -980,7 +980,8 @@ mod tests {
             signing_key: Some(
                 saml::KeyPair::from_pkcs8_pem(IDP_KEY_PEM)
                     .expect("key")
-                    .with_certificate(saml::X509Certificate::from_pem(IDP_CERT_PEM).expect("cert")),
+                    .with_certificate(saml::X509Certificate::from_pem(IDP_CERT_PEM).expect("cert"))
+                    .expect("matching test certificate"),
             ),
             decryption_key: None,
             sign_authn_requests: true,

@@ -53,7 +53,9 @@ const USER_EMAIL: &str = "alice@example.com";
 fn make_artifact_sp() -> ServiceProvider {
     let kp = saml::KeyPair::from_pkcs8_pem(idp::IDP_KEY_PEM).expect("sp keypair");
     let cert = X509Certificate::from_pem(idp::IDP_CERT_PEM).expect("sp cert");
-    let signing_key = kp.with_certificate(cert);
+    let signing_key = kp
+        .with_certificate(cert)
+        .expect("matching SP signing certificate");
 
     ServiceProvider::new(ServiceProviderConfig {
         entity_id: SP_ENTITY_ID.to_owned(),
