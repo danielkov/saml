@@ -1082,11 +1082,13 @@ impl ServiceProvider {
 
         // Route through the first-class BackchannelClient so callers can opt
         // into signing the outbound resolve and/or verifying the inbound
-        // envelope signature. With no `backchannel` config this is byte-for-
-        // byte the old `resolve_artifact` behavior (unsigned, unverified) —
-        // the recovered inner Response is still independently verified below.
-        let mut client = crate::binding::artifact::BackchannelClient::new(http)
-            .expect_response_issuer(tracker.idp_entity_id());
+        // envelope signature. ArtifactResponse/Issuer is optional, so the
+        // high-level path does not require it: the envelope is authenticated
+        // by pinned signing roots or the caller's mutually-authenticated
+        // transport, and the embedded Response is independently validated
+        // against the tracked IdP below. Low-level callers that require an
+        // exact outer Issuer can opt into `expect_response_issuer` directly.
+        let mut client = crate::binding::artifact::BackchannelClient::new(http);
         if let Some(bc) = input.backchannel {
             if let Some(sign) = bc.sign {
                 client = client.sign_with(sign);
@@ -1871,6 +1873,7 @@ mod tests {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching test certificate")
     }
 
     fn fixture_idp() -> IdpDescriptor {
@@ -4092,6 +4095,61 @@ mod tests {
             }
         }
 
+        /// Models a SOAP channel authenticated by mutual TLS: the outer
+        /// ArtifactResponse needs no XML signature and deliberately omits its
+        /// optional Issuer, while the embedded Response remains signed.
+        struct IssuerlessMockClient {
+            inner_xml: Vec<u8>,
+        }
+
+        impl HttpClient for IssuerlessMockClient {
+            fn send(
+                &self,
+                request: HttpRequest,
+            ) -> impl Future<
+                Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send {
+                assert_eq!(request.url, ARS_URL);
+                let resolve_document = Document::parse(&request.body).expect("resolve parses");
+                let request_id = resolve_document
+                    .find_first(Some(SAMLP_NS), "ArtifactResolve")
+                    .expect("ArtifactResolve")
+                    .attribute(None, "ID")
+                    .expect("resolve ID");
+                let inner_document =
+                    Document::parse(&self.inner_xml).expect("inner Response parses");
+
+                let status_code =
+                    Element::build(QName::new(Some(SAMLP_NS.to_owned()), "StatusCode"))
+                        .with_attribute(QName::new(None, "Value"), STATUS_SUCCESS.to_owned())
+                        .finish();
+                let status = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "Status"))
+                    .with_child(Node::Element(status_code))
+                    .finish();
+                let artifact_response =
+                    Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResponse"))
+                        .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
+                        .with_attribute(QName::new(None, "ID"), "_issuerless-art-resp")
+                        .with_attribute(QName::new(None, "Version"), "2.0")
+                        .with_attribute(QName::new(None, "IssueInstant"), "2026-05-26T12:00:00Z")
+                        .with_attribute(QName::new(None, "InResponseTo"), request_id.to_owned())
+                        .with_child(Node::Element(status))
+                        .with_child(Node::Element(inner_document.root().clone()))
+                        .finish();
+                let body = soap::wrap_element(artifact_response)
+                    .expect("wrap issuer-less ArtifactResponse")
+                    .into_bytes();
+
+                async move {
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![("Content-Type".to_owned(), "text/xml".to_owned())],
+                        body,
+                    })
+                }
+            }
+        }
+
         /// IdP descriptor advertising an `ArtifactResolutionService` so the SP
         /// artifact path resolves an ARS endpoint.
         fn artifact_idp() -> IdpDescriptor {
@@ -4539,6 +4597,51 @@ mod tests {
                 !matches!(err, Error::SignatureMissing),
                 "default path must not require an envelope signature; got {err:?}"
             );
+        }
+
+        /// SAML Core makes StatusResponseType/Issuer optional. On a mutually
+        /// authenticated SOAP channel, an unsigned, issuer-less outer
+        /// ArtifactResponse is conforming; trust in the embedded Response is
+        /// still established by its own IdP signature and normal SP checks.
+        #[tokio::test]
+        async fn sp_accepts_issuerless_artifact_response_over_authenticated_transport() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let (tracker, artifact) = tracked_artifact(&sp, &idp);
+            let client = IssuerlessMockClient {
+                inner_xml: build_signed_response_xml(
+                    &rsa_signing_key(),
+                    Some("_req1"),
+                    "https://sp.example.com/acs",
+                    "https://sp.example.com",
+                    "2026-05-26T11:59:00Z",
+                    "2026-05-26T12:10:00Z",
+                ),
+            };
+
+            let identity = sp
+                .consume_response_artifact(
+                    &client,
+                    ConsumeArtifactResponse {
+                        idp: &idp,
+                        peer_crypto_policy: None,
+                        artifact: &artifact,
+                        relay_state: None,
+                        tracker: Some(&tracker),
+                        expected_destination: "https://sp.example.com/acs",
+                        now: fixed_now(),
+                        clock_skew: Duration::from_secs(30),
+                        replay_cache: None,
+                        replay_mode: ReplayMode::All,
+                        holder_of_key_cert: None,
+                        backchannel: None,
+                    },
+                )
+                .await
+                .expect("issuer-less ArtifactResponse is conforming");
+
+            assert_eq!(identity.assertion_id, "_a1");
+            assert_eq!(identity.name_id.value, "alice@example.com");
         }
     }
 }

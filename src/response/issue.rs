@@ -778,6 +778,7 @@ mod tests {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching test certificate")
     }
 
     fn sp_descriptor(with_encryption_cert: bool) -> SpDescriptor {

@@ -286,16 +286,39 @@ impl KeyPair {
         })
     }
 
-    /// Attach a certificate to this keypair (consuming builder form). The cert
-    /// is what `<ds:KeyInfo>/<ds:X509Data>` emits when outbound signing is
-    /// configured to publish the signer's certificate. The library does NOT
-    /// verify that the certificate's public key matches the private key —
-    /// callers who care can compare `cert.public_key()` against
-    /// `keypair.public_key()` themselves; v0.1's posture is that configuration
-    /// is the caller's responsibility.
-    pub fn with_certificate(mut self, cert: X509Certificate) -> Self {
+    /// Attach a certificate to this keypair (consuming builder form).
+    ///
+    /// The certificate is what `<ds:KeyInfo>/<ds:X509Data>` emits when
+    /// outbound signing publishes the signer's identity. Attaching a
+    /// certificate for another key would produce signatures that no peer can
+    /// verify with the embedded certificate, so this method proves exact key
+    /// correspondence before accepting it: the private key signs a
+    /// domain-separated challenge and the certificate's public key verifies
+    /// that signature. Checking only the algorithm family is insufficient —
+    /// two unrelated RSA keys, for example, have the same family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] when the certificate does not
+    /// carry the public key corresponding to this private key.
+    pub fn with_certificate(mut self, cert: X509Certificate) -> Result<Self, Error> {
+        const KEY_BINDING_CHALLENGE: &[u8] = b"saml-rs:keypair-certificate-binding:v1";
+        let algorithm = match self.algorithm_family() {
+            PublicKeyAlgorithm::Rsa => SignatureAlgorithm::RsaSha256,
+            PublicKeyAlgorithm::EcdsaP256 => SignatureAlgorithm::EcdsaSha256,
+            PublicKeyAlgorithm::EcdsaP384 => SignatureAlgorithm::EcdsaSha384,
+        };
+        let mismatch = || Error::InvalidConfiguration {
+            reason: "certificate public key does not match private key",
+        };
+        let signature = self
+            .sign(algorithm, KEY_BINDING_CHALLENGE)
+            .map_err(|_err| mismatch())?;
+        cert.public_key()
+            .verify_signature(algorithm, KEY_BINDING_CHALLENGE, &signature)
+            .map_err(|_err| mismatch())?;
         self.cert = Some(cert);
-        self
+        Ok(self)
     }
 
     /// Borrow the attached certificate, if any.
@@ -582,8 +605,24 @@ mod tests {
     fn with_certificate_attaches_cert() {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
-        let kp_with_cert = kp.with_certificate(cert.clone());
+        let kp_with_cert = kp
+            .with_certificate(cert.clone())
+            .expect("matching certificate");
         assert_eq!(kp_with_cert.certificate(), Some(&cert));
+    }
+
+    #[test]
+    fn with_certificate_rejects_same_family_mismatched_key() {
+        use rsa::rand_core::OsRng;
+
+        let unrelated = RsaPrivateKey::new(&mut OsRng, 1024).expect("generate unrelated RSA key");
+        let kp = KeyPair::from_rsa_private_key(unrelated).expect("wrap unrelated RSA key");
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("parse RSA certificate");
+
+        let err = kp
+            .with_certificate(cert)
+            .expect_err("same algorithm family must not imply the same key");
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
     #[test]

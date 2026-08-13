@@ -146,6 +146,7 @@ mod tests {
         KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM)
             .unwrap()
             .with_certificate(rsa_cert())
+            .expect("matching test certificate")
     }
 
     fn idp_member<'a>(

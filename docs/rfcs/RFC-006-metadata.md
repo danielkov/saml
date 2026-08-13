@@ -207,7 +207,7 @@ Produces `<md:EntityDescriptor>` containing `<md:SPSSODescriptor>` with:
 
 - `protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"`.
 - `AuthnRequestsSigned` if `config.sign_authn_requests`.
-- `WantAssertionsSigned` if `config.want_assertions_signed`.
+- `WantAssertionsSigned` if `config.want_signed.assertions`.
 - `<md:KeyDescriptor use="signing">` with the SP signing cert (derived from `config.signing_key`).
 - `<md:KeyDescriptor use="encryption">` with the SP encryption cert (derived from `config.decryption_key`), including `<xenc:EncryptionMethod>` declarations for the supported data-encryption algorithms.
 - `<md:NameIDFormat>` entries from `config.name_id_formats`.

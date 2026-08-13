@@ -107,7 +107,7 @@ struct Fixture {
 
 fn build_fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     let keypair = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM)?
-        .with_certificate(saml::crypto::cert::X509Certificate::from_pem(RSA_CERT_PEM)?);
+        .with_certificate(saml::crypto::cert::X509Certificate::from_pem(RSA_CERT_PEM)?)?;
 
     // The IdP fixture only exists to emit a metadata document containing the
     // signing cert + SSO endpoint; we then re-parse that document into an
