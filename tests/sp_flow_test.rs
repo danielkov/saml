@@ -130,19 +130,19 @@ fn sp_consumes_real_idp_response() {
         .expect("sp consume_response");
 
     // 7. Assertions on the recovered Identity.
-    assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
-    assert_eq!(identity.name_id.value, USER_EMAIL);
-    assert_eq!(identity.session_index.as_deref(), Some("sess-sp-flow-1"));
+    assert_eq!(identity.name_id().format, NameIdFormat::EmailAddress);
+    assert_eq!(identity.name_id().value, USER_EMAIL);
+    assert_eq!(identity.session_index(), Some("sess-sp-flow-1"));
 
     let email_attr = identity
-        .attributes
+        .attributes()
         .iter()
         .find(|a| a.friendly_name.as_deref() == Some("mail"))
         .expect("mail attribute present");
     assert_eq!(email_attr.values, vec![USER_EMAIL.to_owned()]);
 
     let display_attr = identity
-        .attributes
+        .attributes()
         .iter()
         .find(|a| a.friendly_name.as_deref() == Some("displayName"))
         .expect("displayName attribute present");

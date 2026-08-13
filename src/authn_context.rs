@@ -225,9 +225,24 @@ impl StandardComparator {
         let Some(actual_strength) = class_ref_strength(&actual) else {
             return ComparatorOutcome::NotComparable;
         };
-        // All requested refs that are rankable.
-        let mut requested_strengths = requested.class_refs.iter().filter_map(class_ref_strength);
-        // If every requested ref is Custom/non-rankable, we cannot order at all.
+        // Every requested ref must be rankable, not merely some of them.
+        //
+        // Dropping the unrankable ones silently answered a different question
+        // than the caller asked: `Better([Custom, Password])` against an MFA
+        // actual compared only against Password, reported Satisfied, and never
+        // established that MFA is stronger than the custom class — which is
+        // exactly what `Better` claims. The same reasoning applies to
+        // `Minimum` and `Maximum`: an unrankable member leaves the bound
+        // undetermined, and this API promises to fail closed rather than guess.
+        let mut requested_strengths = Vec::with_capacity(requested.class_refs.len());
+        for class_ref in &requested.class_refs {
+            let Some(strength) = class_ref_strength(class_ref) else {
+                return ComparatorOutcome::NotComparable;
+            };
+            requested_strengths.push(strength);
+        }
+        let mut requested_strengths = requested_strengths.into_iter();
+        // An empty requested set cannot order anything either.
         let Some(first) = requested_strengths.next() else {
             return ComparatorOutcome::NotComparable;
         };
@@ -634,16 +649,68 @@ mod tests {
         );
     }
 
+    /// An unrankable class among the requested set makes an ordered
+    /// comparison undecidable, so it fails closed.
+    ///
+    /// This previously reported `Satisfied` by dropping the custom class and
+    /// comparing against the rest — answering a question the caller did not
+    /// ask. Nothing establishes where a vendor-defined class sits in the
+    /// standard hierarchy, so no ordered verdict against it is sound.
     #[test]
-    fn ordered_comparison_skips_custom_among_known_requested() {
-        // Mix of {Custom(unranked), Password(2)} under Minimum: the Custom is
-        // skipped (filter_map drops it), the floor is Password(2). Actual
-        // PPT(3) ≥ 2 → Satisfied.
+    fn ordered_comparison_rejects_unrankable_among_requested() {
+        let c = StandardComparator;
+        for comparison in [
+            AuthnContextComparison::Minimum,
+            AuthnContextComparison::Maximum,
+            AuthnContextComparison::Better,
+        ] {
+            let req = requested(
+                comparison.clone(),
+                &[
+                    AuthnContextClassRef::Custom("urn:example:vendor:weak".into()),
+                    AuthnContextClassRef::Password,
+                ],
+            );
+            assert_eq!(
+                c.evaluate(
+                    &req,
+                    AuthnContextClassRef::PasswordProtectedTransport.as_uri()
+                ),
+                ComparatorOutcome::NotComparable,
+                "{comparison:?} with an unrankable requested class must not decide"
+            );
+        }
+    }
+
+    /// `Better` is the case where dropping an unrankable class was most
+    /// clearly wrong: it claims the actual exceeds *every* requested class.
+    #[test]
+    fn better_rejects_unrankable_rather_than_comparing_the_rest() {
+        let req = requested(
+            AuthnContextComparison::Better,
+            &[
+                AuthnContextClassRef::Custom("urn:example:vendor:custom".into()),
+                AuthnContextClassRef::Password,
+            ],
+        );
+        let c = StandardComparator;
+        // MFA does outrank Password, which is what the old filter_map compared
+        // against — but nothing places it relative to the custom class.
+        assert_eq!(
+            c.evaluate(&req, AuthnContextClassRef::MultiFactorAuth.as_uri()),
+            ComparatorOutcome::NotComparable,
+        );
+    }
+
+    /// The all-rankable path still decides normally, so the guard above is not
+    /// simply refusing everything.
+    #[test]
+    fn ordered_comparison_still_decides_when_all_requested_are_rankable() {
         let req = requested(
             AuthnContextComparison::Minimum,
             &[
-                AuthnContextClassRef::Custom("urn:example:vendor:weak".into()),
                 AuthnContextClassRef::Password,
+                AuthnContextClassRef::PasswordProtectedTransport,
             ],
         );
         let c = StandardComparator;

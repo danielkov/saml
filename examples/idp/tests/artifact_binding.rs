@@ -5,8 +5,8 @@
 //!
 //!   1. A real `ServiceProvider` (artifact ACS) starts login.
 //!   2. The IdP example consumes the AuthnRequest and issues the Response.
-//!      Because the resolved ACS binding is HTTP-Artifact, `issue_response`
-//!      returns `SsoResponseDispatch::Artifact(...)`.
+//!      Because the resolved ACS binding is HTTP-Artifact, transaction-bearing
+//!      issuance returns `IssuedResponse::Artifact(...)`.
 //!   3. We stash the Response XML keyed by the minted artifact via the same
 //!      `AppState::stash_artifact` call the dispatch path makes, and confirm
 //!      the redirect URL carries `?SAMLart=...`.
@@ -27,12 +27,14 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt as _;
 
-use saml::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
+use saml::dsig::algorithms::{
+    C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
+};
 use saml::http::{HttpClient, HttpRequest, HttpResponse};
 use saml::{
-    Attribute, AuthnContextClassRef, Binding, ConsumeArtifactResponse, ConsumeAuthnRequest,
-    Dispatch, IdpDescriptor, IssueResponse, NameId, NameIdFormat, ReplayMode, ServiceProvider,
-    ServiceProviderConfig, SpDescriptor, SpWantSigned, SsoResponseBinding, SsoResponseDispatch,
+    ArtifactBackchannel, Attribute, AuthnContextClassRef, Binding, ConsumeArtifactResponse,
+    ConsumeAuthnRequest, Dispatch, IdpDescriptor, IssueResponse, NameId, NameIdFormat, ReplayMode,
+    ServiceProvider, ServiceProviderConfig, SpDescriptor, SpWantSigned, SsoResponseBinding,
     SsoResponseEndpoint, StartLogin, X509Certificate,
 };
 
@@ -51,7 +53,9 @@ const USER_EMAIL: &str = "alice@example.com";
 fn make_artifact_sp() -> ServiceProvider {
     let kp = saml::KeyPair::from_pkcs8_pem(idp::IDP_KEY_PEM).expect("sp keypair");
     let cert = X509Certificate::from_pem(idp::IDP_CERT_PEM).expect("sp cert");
-    let signing_key = kp.with_certificate(cert);
+    let signing_key = kp
+        .with_certificate(cert)
+        .expect("matching SP signing certificate");
 
     ServiceProvider::new(ServiceProviderConfig {
         entity_id: SP_ENTITY_ID.to_owned(),
@@ -224,9 +228,9 @@ async fn artifact_round_trip_through_example_handlers() {
     );
 
     // 3. IdP issues the Response — resolves to Artifact dispatch.
-    let dispatch = state
+    let issued = state
         .idp
-        .issue_response(IssueResponse {
+        .issue_response_with_artifact_transaction(IssueResponse {
             sp: &sp_descriptor,
             in_response_to: &parsed,
             name_id: NameId::email(USER_EMAIL),
@@ -243,16 +247,21 @@ async fn artifact_round_trip_through_example_handlers() {
         })
         .expect("issue_response");
 
-    let SsoResponseDispatch::Artifact(redirect) = dispatch else {
+    let saml::IssuedResponse::Artifact(issued) = issued else {
         panic!("expected Artifact dispatch");
     };
+    let redirect = &issued.redirect;
 
     // 4. Stash exactly as the example's finalize_artifact_dispatch does, and
     //    confirm the redirect carries SAMLart + RelayState.
     state
         .stash_artifact(
             redirect.artifact.clone(),
-            StashedArtifact::new(redirect.response_xml.clone(), SP_ENTITY_ID.to_owned()),
+            StashedArtifact::new(
+                redirect.response_xml.clone(),
+                SP_ENTITY_ID.to_owned(),
+                issued.transaction,
+            ),
         )
         .expect("stash");
 
@@ -274,6 +283,11 @@ async fn artifact_round_trip_through_example_handlers() {
     let client = RouterClient {
         state: state.clone(),
     };
+    let signing_key = sp
+        .config()
+        .signing_key
+        .as_ref()
+        .expect("artifact SP signing key");
     let identity = sp
         .consume_response_artifact(
             &client,
@@ -289,15 +303,23 @@ async fn artifact_round_trip_through_example_handlers() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(saml::binding::artifact::SignConfig {
+                        key: signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
         .expect("consume_response_artifact");
 
-    assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
-    assert_eq!(identity.name_id.value, USER_EMAIL);
-    assert_eq!(identity.session_index.as_deref(), Some("sess-artifact-1"));
+    assert_eq!(identity.name_id().format, NameIdFormat::EmailAddress);
+    assert_eq!(identity.name_id().value, USER_EMAIL);
+    assert_eq!(identity.session_index(), Some("sess-artifact-1"));
 
     // 6. The artifact is single-use. A second resolve hits the now-empty
     //    store: handle_artifact returns a 404 error page instead of a SOAP

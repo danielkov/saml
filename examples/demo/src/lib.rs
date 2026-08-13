@@ -167,7 +167,7 @@ impl TrackerStore {
     fn insert(&mut self, tracker: LoginTracker) {
         let now = SystemTime::now();
         self.map.retain(|_, t| {
-            now.duration_since(t.issued_at)
+            now.duration_since(t.issued_at())
                 .map_or(true, |age| age < Self::STALE_AFTER)
         });
 
@@ -175,12 +175,12 @@ impl TrackerStore {
             && let Some(oldest) = self
                 .map
                 .iter()
-                .min_by_key(|(_, t)| t.issued_at)
+                .min_by_key(|(_, t)| t.issued_at())
                 .map(|(k, _)| k.clone())
         {
             self.map.remove(&oldest);
         }
-        self.map.insert(tracker.request_id.clone(), tracker);
+        self.map.insert(tracker.request_id().to_owned(), tracker);
     }
 
     fn take(&mut self, request_id: &str) -> Option<LoginTracker> {
@@ -321,7 +321,7 @@ impl AppState {
 pub fn build_service_provider(config: &AppConfig) -> Result<ServiceProvider, saml::Error> {
     let kp = KeyPair::from_pkcs8_pem(SP_KEY_PEM)?;
     let cert = saml::X509Certificate::from_pem(SP_CERT_PEM)?;
-    let signing_key = kp.with_certificate(cert);
+    let signing_key = kp.with_certificate(cert)?;
 
     let acs_url = format!("{}/saml/acs", config.sp_base_url);
     let slo_url = format!("{}/saml/slo", config.sp_base_url);
@@ -676,20 +676,20 @@ async fn handle_acs(State(state): State<AppState>, Form(form): Form<AcsForm>) ->
 
     let now_unix = unix_now();
     let authn_instant_unix = identity
-        .authn_instant
+        .authn_instant()
         .duration_since(UNIX_EPOCH)
         .map_or(now_unix, |d| d.as_secs());
 
     let session = Session {
-        name_id_value: identity.name_id.value.clone(),
-        name_id_format: identity.name_id.format.as_uri().to_owned(),
-        session_index: identity.session_index.clone(),
+        name_id_value: identity.name_id().value.clone(),
+        name_id_format: identity.name_id().format.as_uri().to_owned(),
+        session_index: identity.session_index().map(str::to_owned),
         authn_instant_unix,
         issued_at_unix: now_unix,
         idp_entity_id: entry.idp.entity_id.clone(),
         provider_id: entry.config.id.clone(),
         attributes: identity
-            .attributes
+            .attributes()
             .iter()
             .map(attribute_to_session)
             .collect(),
@@ -718,8 +718,8 @@ async fn handle_acs(State(state): State<AppState>, Form(form): Form<AcsForm>) ->
 
     info!(
         provider = %entry.config.id,
-        name_id = %identity.name_id.value,
-        attributes = identity.attributes.len(),
+        name_id = %identity.name_id().value,
+        attributes = identity.attributes().len(),
         "ACS: session established"
     );
 

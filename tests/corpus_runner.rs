@@ -42,8 +42,45 @@ use saml::error::Error;
 use saml::nameid::NameIdFormat;
 use saml::replay::ReplayMode;
 use saml::sp::{
-    ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
+    ConsumeResponse, LoginTracker, LoginTrackerPayload, ServiceProvider, ServiceProviderConfig,
+    SpWantSigned,
 };
+
+/// Fixture key for sealing corpus trackers. The corpus replays canned
+/// responses, so there is no `start_login` to obtain a tracker from.
+const TRACKER_KEY: [u8; 32] = [0x5a; 32];
+
+/// Build a corpus tracker the only way one can now exist: seal a payload and
+/// open it, which is the round trip an application makes through its own
+/// session store. The corpus replays canned responses, so there is no
+/// `start_login` to obtain a tracker from.
+fn seal_and_open_tracker(
+    in_response_to: &str,
+    meta: &Extracted,
+    acs_url: &str,
+    idp_cert: &X509Certificate,
+) -> Result<LoginTracker, String> {
+    let payload = LoginTrackerPayload {
+        request_id: in_response_to.to_owned(),
+        issued_at: meta.issue_instant,
+        idp_entity_id: meta.issuer.clone(),
+        acs_endpoint: SsoResponseEndpoint::post(acs_url, 0, true),
+        requested_authn_context: None,
+        requested_name_id_format: None,
+        idp_signing_cert_fingerprints: vec![idp_cert.fingerprint_sha256()],
+        idp_artifact_resolution_services: vec![],
+    };
+    let sealed = payload
+        .seal(&TRACKER_KEY)
+        .map_err(|e| format!("seal tracker: {e:?}"))?;
+    LoginTracker::open(
+        &sealed,
+        &TRACKER_KEY,
+        meta.issue_instant,
+        Duration::from_hours(24),
+    )
+    .map_err(|e| format!("open tracker: {e:?}"))
+}
 use saml::time::parse_xs_datetime;
 
 // =============================================================================
@@ -148,6 +185,7 @@ impl Fixture {
         self
     }
 
+    #[cfg(feature = "xmlenc")]
     const fn with_acs(mut self, url: &'static str) -> Self {
         self.acs_url_override = Some(url);
         self
@@ -725,14 +763,14 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
     let tracker_owned = meta
         .in_response_to
         .as_deref()
-        .map(|in_response_to| LoginTracker {
-            request_id: in_response_to.to_owned(),
-            issued_at: meta.issue_instant,
-            idp_entity_id: meta.issuer.clone(),
-            acs_endpoint: SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
-            requested_authn_context: None,
-            requested_name_id_format: None,
-        });
+        .map(|in_response_to| {
+            let signing_cert = idp
+                .signing_certs
+                .first()
+                .ok_or_else(|| "fixture IdP has no signing certificate".to_string())?;
+            seal_and_open_tracker(in_response_to, &meta, acs_url.as_str(), signing_cert)
+        })
+        .transpose()?;
 
     sp.consume_response(ConsumeResponse {
         idp: &idp,
@@ -949,14 +987,16 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
     let tracker_owned = meta
         .in_response_to
         .as_deref()
-        .map(|in_response_to| LoginTracker {
-            request_id: in_response_to.to_owned(),
-            issued_at: meta.issue_instant,
-            idp_entity_id: meta.issuer.clone(),
-            acs_endpoint: SsoResponseEndpoint::post(acs_url.as_str(), 0, true),
-            requested_authn_context: None,
-            requested_name_id_format: None,
-        });
+        .map(|in_response_to| {
+            seal_and_open_tracker(
+                in_response_to,
+                &meta,
+                acs_url.as_str(),
+                &idp.signing_certs[0],
+            )
+        })
+        .transpose()
+        .unwrap_or_else(|e| panic!("tracker: {e}"));
 
     let result = sp.consume_response(ConsumeResponse {
         idp: &idp,

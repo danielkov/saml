@@ -22,8 +22,8 @@ use saml::binding::{Binding, Dispatch, SsoResponseBinding, SsoResponseDispatch};
 use saml::idp::{ConsumeAuthnRequest, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
 use saml::proxy::{
-    Aes256GcmCodec, BounceToUpstream, PersistentPerSpHmac, Proxy, ProxyContext, RelayToDownstream,
-    ReleaseAllowList,
+    Aes256GcmCodec, BounceToUpstream, ConsumeUpstreamResponse, PersistentPerSpHmac, Proxy,
+    RelayToDownstream, ReleaseAllowList, UpstreamFlow,
 };
 use saml::replay::ReplayMode;
 use saml::sp::{ConsumeResponse, StartLogin};
@@ -70,7 +70,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     // Proxy composes the proxy_sp + proxy_idp roles. Use the in-memory
     // AEAD codec so the test has no extra storage dependency. The codec's
     // `decode` enforces `max_age` against `SystemTime::now()` (real wall
-    // clock); our test mints `ProxyContext.issued_at` from `fixed_now()`
+    // clock); our test mints `ProxyContextPayload.issued_at` from `fixed_now()`
     // which is pinned, so widen the window to swallow that delta — a
     // century is more than enough.
     let codec =
@@ -151,7 +151,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
     };
     assert_eq!(
         upstream_relay_state, bounce.upstream_relay_state,
-        "bounce dispatch RelayState matches the encoded ProxyContext blob",
+        "bounce dispatch RelayState matches the encoded ProxyContextPayload blob",
     );
 
     // ---- 4. Upstream IdP consumes the AuthnRequest. ---------------------
@@ -206,31 +206,88 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
         SsoResponseDispatch::Artifact(_) => panic!("expected POST"),
     };
 
-    // ---- 6. Proxy (SP face) consumes the upstream Response. -------------
-    let proxy_context: ProxyContext = proxy
-        .context_codec()
-        .decode(&upstream_relay_state)
-        .expect("proxy context decodes");
+    // A second, separately issued Response has a fresh assertion ID but
+    // answers the same upstream AuthnRequest. The proxy transaction, rather
+    // than merely one assertion ID, must be the one-shot credential.
+    let second_upstream_dispatch = upstream_idp
+        .issue_response(IssueResponse {
+            sp: &proxy_sp_descriptor,
+            in_response_to: &parsed_upstream_request,
+            name_id: NameId::persistent_for_sp("upstream-uid-7", PROXY_SP_ENTITY_ID),
+            attributes: vec![Attribute::email(USER_EMAIL)],
+            authn_instant: now,
+            session_index: "sess-upstream-2".to_owned(),
+            session_not_on_or_after: Some(
+                now.checked_add(Duration::from_hours(1))
+                    .expect("session_not_on_or_after fits"),
+            ),
+            authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+            force_encrypt_assertion: None,
+            now,
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
+        })
+        .expect("second upstream response");
+    let second_upstream_response_xml = match second_upstream_dispatch {
+        SsoResponseDispatch::Post(form) => BASE64
+            .decode(form.saml_response.as_bytes())
+            .expect("base64"),
+        SsoResponseDispatch::Artifact(_) => panic!("expected POST"),
+    };
 
-    let upstream_identity = proxy_sp
-        .consume_response(ConsumeResponse {
-            idp: &upstream_idp_descriptor,
+    // One transaction tombstone is sufficient; a capacity-one cache must not
+    // need a separate assertion-ID slot and partially burn the login.
+    let replay_cache = saml::InMemoryReplayCache::new(1);
+
+    // ---- 6. Proxy (SP face) consumes the upstream Response. -------------
+    // One call authenticates the RelayState blob and validates the Response
+    // against *that* context's tracker. The two arrive coupled, so relay
+    // cannot be handed an identity validated under a different context.
+    let flow: UpstreamFlow = proxy
+        .consume_upstream_response(ConsumeUpstreamResponse {
+            relay_state: &upstream_relay_state,
+            upstream_idp: &upstream_idp_descriptor,
             peer_crypto_policy: None,
             saml_response: &upstream_response_xml,
             binding: SsoResponseBinding::HttpPost,
-            relay_state: Some(&upstream_relay_state),
-            tracker: Some(&proxy_context.upstream_tracker),
             expected_destination: PROXY_SP_ACS_URL,
             now,
             clock_skew: Duration::from_mins(2),
-            replay_cache: None,
-            replay_mode: ReplayMode::All,
+            // Required on the proxy path: without consuming the upstream
+            // assertion, replaying {RelayState, Response} mints another flow.
+            replay_cache: &replay_cache,
             holder_of_key_cert: None,
         })
-        .expect("proxy sp consume_response");
+        .expect("proxy consumes the upstream response under its own context");
+
+    let Err(replay_err) = proxy.consume_upstream_response(ConsumeUpstreamResponse {
+        relay_state: &upstream_relay_state,
+        upstream_idp: &upstream_idp_descriptor,
+        peer_crypto_policy: None,
+        saml_response: &second_upstream_response_xml,
+        binding: SsoResponseBinding::HttpPost,
+        expected_destination: PROXY_SP_ACS_URL,
+        now,
+        clock_skew: Duration::from_mins(2),
+        replay_cache: &replay_cache,
+        holder_of_key_cert: None,
+    }) else {
+        panic!("a fresh assertion ID cannot redeem one proxy transaction twice");
+    };
+    assert!(matches!(replay_err, saml::Error::ProxyTransactionReplay));
+    let upstream_identity = flow.identity();
+
+    // The coupled context is the one `bounce_to_upstream` sealed: the identity
+    // above was correlated against *its* tracker, not one the test supplied.
+    assert_eq!(
+        flow.context().downstream_request_id(),
+        parsed_downstream_request.id,
+        "flow must carry the context the upstream response was validated under"
+    );
 
     // The proxy saw all four upstream attributes.
-    assert_eq!(upstream_identity.attributes.len(), 4);
+    assert_eq!(upstream_identity.attributes().len(), 4);
 
     // ---- 7. Proxy relays the identity downstream. -----------------------
     let release_policy = ReleaseAllowList {
@@ -249,8 +306,7 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
 
     let downstream_dispatch = proxy
         .relay_to_downstream(RelayToDownstream {
-            context: &proxy_context,
-            upstream_identity: &upstream_identity,
+            flow,
             downstream_sp: &downstream_sp_descriptor,
             attribute_release: &release_policy,
             name_id_transform: &name_id_transform,
@@ -297,40 +353,44 @@ fn proxy_round_trip_releases_attributes_and_scopes_name_id() {
 
     // ---- Assertions: attribute release worked. --------------------------
     assert_eq!(
-        downstream_identity.attributes.len(),
+        downstream_identity.attributes().len(),
         3,
         "internalSecret was filtered by the allow-list (4 upstream → 3 downstream)",
     );
     assert!(
         downstream_identity
-            .attributes
+            .attributes()
             .iter()
             .all(|a| a.name != "internalSecret"),
         "internalSecret never reaches the downstream SP",
     );
     let email_attr = downstream_identity
-        .attributes
+        .attributes()
         .iter()
         .find(|a| a.friendly_name.as_deref() == Some("mail"))
         .expect("mail attribute released");
     assert_eq!(email_attr.values, vec![USER_EMAIL.to_owned()]);
 
     // ---- Assertions: NameID is scoped to the downstream SP. -------------
-    assert_eq!(downstream_identity.name_id.format, NameIdFormat::Persistent,);
     assert_eq!(
-        downstream_identity.name_id.sp_name_qualifier.as_deref(),
+        downstream_identity.name_id().format,
+        NameIdFormat::Persistent,
+    );
+    assert_eq!(
+        downstream_identity.name_id().sp_name_qualifier.as_deref(),
         Some(DOWN_SP_ENTITY_ID),
         "downstream NameID carries SPNameQualifier = downstream SP entityID",
     );
     // Re-minted: HMAC output, not the verbatim upstream value.
     assert_ne!(
-        downstream_identity.name_id.value, "upstream-uid-7",
+        downstream_identity.name_id().value,
+        "upstream-uid-7",
         "proxy must NOT pass the upstream subject through verbatim",
     );
 
     // The downstream identity carries the upstream authn context (passthrough).
     assert_eq!(
-        downstream_identity.authn_context_class_ref.as_deref(),
+        downstream_identity.authn_context_class_ref(),
         Some(AuthnContextClassRef::PasswordProtectedTransport.as_uri()),
     );
 }

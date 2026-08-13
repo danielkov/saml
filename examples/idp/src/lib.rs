@@ -50,6 +50,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use saml::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy};
+#[cfg(feature = "artifact-binding")]
+use saml::{ArtifactResolveTransaction, InMemoryReplayCache};
 use saml::{
     DataEncryptionAlgorithm, Endpoint, IdentityProvider, IdentityProviderConfig,
     IdpAssertionSigning, IdpLogoutSigning, IdpLogoutWantSigned, KeyPair, KeyTransportAlgorithm,
@@ -339,16 +341,22 @@ impl LogoutTrackerStore {
 pub struct StashedArtifact {
     pub response_xml: String,
     pub sp_entity_id: String,
+    pub transaction: ArtifactResolveTransaction,
     created_at: SystemTime,
 }
 
 #[cfg(feature = "artifact-binding")]
 impl StashedArtifact {
     #[must_use]
-    pub fn new(response_xml: String, sp_entity_id: String) -> Self {
+    pub fn new(
+        response_xml: String,
+        sp_entity_id: String,
+        transaction: ArtifactResolveTransaction,
+    ) -> Self {
         Self {
             response_xml,
             sp_entity_id,
+            transaction,
             created_at: SystemTime::now(),
         }
     }
@@ -430,6 +438,9 @@ pub struct AppState {
     /// by the opaque `SAMLart` value and served back from `/saml/artifact`.
     #[cfg(feature = "artifact-binding")]
     pub artifacts: Arc<Mutex<ArtifactStore>>,
+    /// Atomic replay reservation for authenticated `ArtifactResolve/@ID`.
+    #[cfg(feature = "artifact-binding")]
+    pub artifact_resolve_replay: Arc<InMemoryReplayCache>,
 }
 
 impl AppState {
@@ -454,6 +465,8 @@ impl AppState {
             logout_trackers: Arc::new(Mutex::new(LogoutTrackerStore::default())),
             #[cfg(feature = "artifact-binding")]
             artifacts: Arc::new(Mutex::new(ArtifactStore::default())),
+            #[cfg(feature = "artifact-binding")]
+            artifact_resolve_replay: Arc::new(InMemoryReplayCache::default()),
         }
     }
 
@@ -547,6 +560,17 @@ impl AppState {
             .map_err(|e| format!("artifact store poisoned: {e}"))?;
         Ok(store.take(artifact))
     }
+
+    /// Borrow-by-clone for authentication before the one-time take. The SOAP
+    /// body supplies only an untrusted lookup key at this stage.
+    #[cfg(feature = "artifact-binding")]
+    pub fn peek_artifact(&self, artifact: &str) -> Result<Option<StashedArtifact>, String> {
+        let store = self
+            .artifacts
+            .lock()
+            .map_err(|e| format!("artifact store poisoned: {e}"))?;
+        Ok(store.map.get(artifact).cloned())
+    }
 }
 
 // =============================================================================
@@ -601,7 +625,7 @@ fn read_config_or_default(
 pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, saml::Error> {
     let kp = KeyPair::from_pkcs8_pem(IDP_KEY_PEM)?;
     let cert = saml::X509Certificate::from_pem(IDP_CERT_PEM)?;
-    let signing_key = kp.with_certificate(cert);
+    let signing_key = kp.with_certificate(cert)?;
 
     let sso_endpoint_url = format!("{}/saml/sso", config.idp_base_url);
     let logout_endpoint_url = format!("{}/saml/slo", config.idp_base_url);
@@ -925,21 +949,99 @@ mod tests {
         assert!(store.take("_req-1").is_none());
     }
 
+    /// A `ParsedAuthnRequest` obtained the only way an external crate can:
+    /// by running a real `AuthnRequest` through the validator.
+    ///
+    /// The provenance binding is crate-internal to `saml`, so there is no
+    /// constructor to call here — which is the point. Nothing outside the
+    /// library can mint a request that claims an SP it was never checked
+    /// against.
     fn synthetic_parsed_authn_request() -> ParsedAuthnRequest {
-        use saml::{AcsSelection, SsoResponseEndpoint};
-        ParsedAuthnRequest {
-            id: "_req-1".into(),
-            issuer: "sp".into(),
-            destination: Some("http://test/saml/sso".into()),
-            issue_instant: SystemTime::UNIX_EPOCH,
-            force_authn: false,
-            is_passive: false,
-            requested_name_id_format: None,
-            requested_authn_context: None,
-            assertion_consumer_service: SsoResponseEndpoint::post("http://sp/acs", 0, true),
-            assertion_consumer_service_selection: AcsSelection::Default,
+        use saml::{
+            Binding, Dispatch, ServiceProvider, ServiceProviderConfig, SpDescriptor,
+            SsoResponseEndpoint, StartLogin,
+        };
+
+        let cfg = AppConfig {
+            bind_addr: "127.0.0.1:3001".parse().unwrap(),
+            idp_entity_id: "http://test/idp".into(),
+            idp_base_url: "http://test".into(),
+            session_signing_key: [0u8; 32],
+            users_toml_path: None,
+            sps_toml_path: None,
+        };
+        let idp = build_identity_provider(&cfg).expect("idp builds");
+
+        let sp = ServiceProvider::new(ServiceProviderConfig {
+            entity_id: "sp".into(),
+            acs: vec![SsoResponseEndpoint::post("http://sp/acs", 0, true)],
+            slo: vec![],
+            name_id_formats: vec![saml::NameIdFormat::EmailAddress],
+            signing_key: Some(
+                saml::KeyPair::from_pkcs8_pem(IDP_KEY_PEM)
+                    .expect("key")
+                    .with_certificate(saml::X509Certificate::from_pem(IDP_CERT_PEM).expect("cert"))
+                    .expect("matching test certificate"),
+            ),
+            decryption_key: None,
+            sign_authn_requests: true,
+            want_signed: saml::SpWantSigned {
+                response: false,
+                assertions: true,
+            },
+            allow_unsolicited: false,
+            logout_signing: saml::SpLogoutSigning::default(),
+            logout_want_signed: saml::SpLogoutWantSigned::default(),
+            default_peer_crypto_policy: saml::PeerCryptoPolicy::strong_defaults(),
+            outbound_signature_algorithm: saml::SignatureAlgorithm::RsaSha256,
+            outbound_digest_algorithm: saml::DigestAlgorithm::Sha256,
+        })
+        .expect("sp builds");
+
+        let idp_descriptor = saml::IdpDescriptor::from_metadata_xml(
+            idp.metadata_xml(false).expect("idp metadata").as_bytes(),
+        )
+        .expect("idp descriptor");
+
+        let start = sp
+            .start_login(
+                &idp_descriptor,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpPost,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start_login");
+        let Dispatch::Post(form) = start.dispatch else {
+            unreachable!("HttpPost dispatch");
+        };
+
+        let sp_descriptor = SpDescriptor::from_metadata_xml(
+            sp.metadata_xml(false).expect("sp metadata").as_bytes(),
+        )
+        .expect("sp descriptor");
+
+        idp.consume_authn_request_wire(saml::ConsumeAuthnRequestWire {
+            sp: &sp_descriptor,
+            peer_crypto_policy: None,
+            wire_body: form
+                .saml_request
+                .as_deref()
+                .expect("POST dispatch carries SAMLRequest")
+                .as_bytes(),
+            binding: Binding::HttpPost,
             relay_state: None,
-            protocol_binding: None,
-        }
+            expected_destination: "http://test/saml/sso",
+            now: SystemTime::now(),
+            clock_skew: Duration::from_mins(1),
+        })
+        .expect("the validator produces the provenance binding")
     }
 }

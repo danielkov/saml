@@ -256,7 +256,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // bearer confirmation satisfies on its SubjectConfirmationData constraints
     // alone; a Holder-of-Key confirmation additionally requires the presenter
     // key to match its `<ds:KeyInfo>` (SAML V2.0 HoK SSO Profile).
-    find_valid_subject_confirmation(
+    let selected_confirmation = find_valid_subject_confirmation(
         &assertion,
         expected_destination,
         tracker_request_id,
@@ -264,6 +264,9 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         clock_skew,
         holder_of_key_cert,
     )?;
+    let subject_confirmation_not_on_or_after = selected_confirmation
+        .not_on_or_after
+        .ok_or(Error::Expired)?;
 
     // --- Step 17: AuthnContext non-downgrade ---------------------------------
     if let Some(req) = requested_authn_context {
@@ -290,23 +293,35 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
             None => (None, assertion.issue_instant, None, None),
         };
 
+    // An expired `SessionNotOnOrAfter` means the authenticated session is
+    // already over, whatever the assertion's own window says. Surfacing it
+    // unchecked let a caller build a live application session on top of a dead
+    // upstream one — and the proxy caps its downstream deadlines on this
+    // value, so an expired one there is worse than useless.
+    if let Some(session_end) = session_not_on_or_after
+        && session_end <= now.checked_sub(clock_skew).unwrap_or(now)
+    {
+        return Err(Error::Expired);
+    }
+
     // `<saml:OneTimeUse>` (SAML 2.0 Core §2.5.1.5) is a deduplication
     // directive, not a time bound — distinct from `NotOnOrAfter`. The library
     // surfaces the parsed flag here and leaves enforcement (replay cache
     // keyed on `assertion_id`) to the caller. See `Identity::is_one_time_use`
     // for the contract.
-    Ok(Identity {
-        name_id: assertion.subject_name_id,
+    Ok(Identity::new(
+        assertion.subject_name_id,
         session_index,
         authn_instant,
         session_not_on_or_after,
+        subject_confirmation_not_on_or_after,
         authn_context_class_ref,
-        attributes: assertion.attributes,
-        assertion_id: assertion.id,
-        not_on_or_after: conditions_not_on_or_after,
-        verifying_cert_fingerprint: verified_cert_fingerprint,
-        is_one_time_use: assertion.conditions.one_time_use,
-    })
+        assertion.attributes,
+        assertion.id,
+        conditions_not_on_or_after,
+        verified_cert_fingerprint,
+        assertion.conditions.one_time_use,
+    ))
 }
 
 // =============================================================================
@@ -767,6 +782,7 @@ mod tests {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching test certificate")
     }
 
     fn strong_policy() -> PeerCryptoPolicy {
@@ -1301,6 +1317,11 @@ mod tests {
         assert_eq!(identity.name_id.value, "alice@example.com");
         assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
         assert_eq!(identity.session_index.as_deref(), Some("sess-1"));
+        assert_eq!(
+            identity.subject_confirmation_not_on_or_after(),
+            UNIX_EPOCH + Duration::from_mins(29_663_285),
+            "the selected confirmation's 12:05 expiry is preserved"
+        );
         assert_eq!(
             identity.authn_context_class_ref.as_deref(),
             Some("urn:oasis:names:tc:SAML:2.0:ac:classes:Password")
