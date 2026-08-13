@@ -185,6 +185,7 @@ impl Fixture {
         self
     }
 
+    #[cfg(feature = "xmlenc")]
     const fn with_acs(mut self, url: &'static str) -> Self {
         self.acs_url_override = Some(url);
         self

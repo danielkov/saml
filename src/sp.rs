@@ -887,14 +887,15 @@ impl ServiceProvider {
                 received: binding.as_binding(),
             });
         }
-        let current_roots = certificate_fingerprint_set(&idp.signing_certs);
-        if current_roots.is_empty()
-            || !current_roots.iter().all(|fingerprint| {
-                tracker
-                    .idp_signing_cert_fingerprints()
-                    .contains(fingerprint)
-            })
-        {
+        // Requiring every current certificate to be pinned broke additive
+        // rotation. This preflight establishes that a current-and-pinned
+        // verification root remains; response validation below receives only
+        // that intersection, so newly introduced roots are never candidates.
+        if !idp.signing_certs.iter().any(|cert| {
+            tracker
+                .idp_signing_cert_fingerprints()
+                .contains(&cert.fingerprint_sha256())
+        }) {
             return Err(Error::IdpTrustRootMismatch);
         }
         Ok(())
@@ -946,10 +947,28 @@ impl ServiceProvider {
             .map(|k| vec![k])
             .unwrap_or_default();
 
+        // For a solicited response, verification candidates are exactly the
+        // intersection of the IdP's current metadata and the roots pinned when
+        // the login began. This permits ordinary additive rotation
+        // (`[old] -> [old, new]`) without allowing `new` to authenticate any
+        // part of this in-flight response. Filtering before validation matters
+        // for responses that require both Response and Assertion signatures:
+        // a single post-validation fingerprint cannot describe both keys.
+        let pinned_idp = input.tracker.map(|tracker| {
+            let mut idp = input.idp.clone();
+            idp.signing_certs.retain(|cert| {
+                tracker
+                    .idp_signing_cert_fingerprints()
+                    .contains(&cert.fingerprint_sha256())
+            });
+            idp
+        });
+        let validation_idp = pinned_idp.as_ref().unwrap_or(input.idp);
+
         let identity = validate_response(ValidateResponse {
             document: &document,
             parsed,
-            idp: input.idp,
+            idp: validation_idp,
             peer_crypto_policy: policy,
             #[cfg(feature = "xmlenc")]
             decryption_keys: &decryption_keys_owned,
@@ -1080,6 +1099,32 @@ impl ServiceProvider {
                 index: parsed.endpoint_index,
             })?;
 
+        // Intersection of the caller's verification certificates with those
+        // pinned when the login began. Hoisted here so it outlives the
+        // borrow the client holds.
+        //
+        // Equality would break additive rotation: an IdP mid-rotation offers
+        // `[old, new]` while only `old` was pinned, and refusing that takes
+        // the transaction down for no security gain. Verifying against the
+        // intersection accepts `old` and never offers `new`.
+        let pinned_certs: Vec<_> = input
+            .backchannel
+            .as_ref()
+            .and_then(|bc| bc.verify.as_ref())
+            .map(|verify| {
+                verify
+                    .certs
+                    .iter()
+                    .filter(|cert| {
+                        tracker
+                            .idp_signing_cert_fingerprints()
+                            .contains(&cert.fingerprint_sha256())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         // Route through the first-class BackchannelClient so callers can opt
         // into signing the outbound resolve and/or verifying the inbound
         // envelope signature. ArtifactResponse/Issuer is optional, so the
@@ -1094,17 +1139,13 @@ impl ServiceProvider {
                 client = client.sign_with(sign);
             }
             if let Some(verify) = bc.verify {
-                let verify_roots = certificate_fingerprint_set(verify.certs);
-                if verify_roots.is_empty()
-                    || !verify_roots.iter().all(|fingerprint| {
-                        tracker
-                            .idp_signing_cert_fingerprints()
-                            .contains(fingerprint)
-                    })
-                {
+                if pinned_certs.is_empty() {
                     return Err(Error::IdpTrustRootMismatch);
                 }
-                client = client.verify_with(verify);
+                client = client.verify_with(crate::binding::artifact::VerifyConfig {
+                    certs: &pinned_certs,
+                    ..verify
+                });
             }
         }
         let inner_xml = client
@@ -1867,6 +1908,9 @@ mod tests {
     use crate::xml::parse::{Document, Element, Node, QName};
     use std::time::{Duration, UNIX_EPOCH};
 
+    const SECOND_RSA_CERT_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.crt");
+    const SECOND_RSA_KEY_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.key");
+
     // ---------- Fixtures ----------
 
     fn rsa_signing_key() -> KeyPair {
@@ -1874,6 +1918,15 @@ mod tests {
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
             .expect("matching test certificate")
+    }
+
+    fn second_rsa_signing_key() -> KeyPair {
+        KeyPair::from_pkcs8_pem(SECOND_RSA_KEY_PEM)
+            .expect("second RSA key")
+            .with_certificate(
+                X509Certificate::from_pem(SECOND_RSA_CERT_PEM).expect("second RSA cert"),
+            )
+            .expect("matching second RSA certificate")
     }
 
     fn fixture_idp() -> IdpDescriptor {
@@ -2885,6 +2938,145 @@ mod tests {
             .expect_err("a fresh same-entity signing root must not be trusted");
 
         assert!(matches!(err, Error::IdpTrustRootMismatch), "got {err:?}");
+    }
+
+    #[test]
+    fn consume_response_accepts_the_pinned_key_during_additive_rotation() {
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let trusted = fixture_idp();
+        let tracker = sp
+            .start_login(
+                &trusted,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login")
+            .tracker;
+        let mut rotating = trusted.clone();
+        rotating.signing_certs.push(
+            second_rsa_signing_key()
+                .certificate()
+                .expect("second key carries cert")
+                .clone(),
+        );
+        let xml = build_signed_response_xml(
+            &rsa_signing_key(),
+            Some(tracker.request_id()),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+
+        sp.consume_response(ConsumeResponse {
+            idp: &rotating,
+            peer_crypto_policy: None,
+            saml_response: &xml,
+            binding: SsoResponseBinding::HttpPost,
+            relay_state: None,
+            tracker: Some(&tracker),
+            expected_destination: "https://sp.example.com/acs",
+            now: fixed_now(),
+            clock_skew: Duration::from_secs(30),
+            replay_cache: None,
+            replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
+        })
+        .expect("the pinned key remains valid while a new key overlaps");
+    }
+
+    #[test]
+    fn consume_response_never_uses_the_new_key_in_a_double_signed_response() {
+        let mut cfg = fixture_sp_config(None, false, false);
+        cfg.want_signed.response = true;
+        cfg.want_signed.assertions = true;
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let trusted = fixture_idp();
+        let tracker = sp
+            .start_login(
+                &trusted,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login")
+            .tracker;
+        let new_key = second_rsa_signing_key();
+        let mut rotating = trusted.clone();
+        rotating.signing_certs.push(
+            new_key
+                .certificate()
+                .expect("second key carries cert")
+                .clone(),
+        );
+
+        // The Assertion is signed by the old, pinned key. Add a required
+        // Response signature made with the newly introduced key. A singular
+        // post-validation fingerprint sees only the Assertion key, so this is
+        // the regression that requires filtering verification roots up front.
+        let assertion_signed = build_signed_response_xml(
+            &rsa_signing_key(),
+            Some(tracker.request_id()),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+        let document = Document::parse(&assertion_signed).expect("response parses");
+        let double_signed = sign_element(
+            document.root().clone(),
+            &document,
+            SignOptions {
+                signing_key: &new_key,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign Response with new key");
+        let double_signed = emit_document(&Document::new(double_signed).expect("document"))
+            .expect("emit")
+            .into_bytes();
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &rotating,
+                peer_crypto_policy: None,
+                saml_response: &double_signed,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("a newly introduced key cannot satisfy any required signature");
+        assert!(
+            matches!(err, Error::SignatureVerification { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -4174,7 +4366,10 @@ mod tests {
         /// When `tamper` is set, an attribute is mutated after signing so the
         /// envelope signature no longer verifies.
         fn signed_envelope(request_id: &str, tamper: bool) -> Vec<u8> {
-            let kp = rsa_signing_key();
+            signed_envelope_with(request_id, tamper, &rsa_signing_key())
+        }
+
+        fn signed_envelope_with(request_id: &str, tamper: bool, kp: &KeyPair) -> Vec<u8> {
             let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
             let inner_doc = Document::parse(inner.as_bytes()).expect("inner parse");
             let inner_elem = inner_doc.root().clone();
@@ -4205,7 +4400,7 @@ mod tests {
                 stash.root().clone(),
                 &stash,
                 SignOptions {
-                    signing_key: &kp,
+                    signing_key: kp,
                     sig_alg: SignatureAlgorithm::RsaSha256,
                     digest_alg: DigestAlgorithm::Sha256,
                     c14n_alg: C14nAlgorithm::ExclusiveCanonical,
@@ -4504,6 +4699,93 @@ mod tests {
                 ),
                 "envelope signature must have verified; got {err:?}"
             );
+        }
+
+        /// Envelope verification uses only current roots pinned when the
+        /// transaction began: an overlapping new root neither breaks the old
+        /// key nor gains authority itself.
+        #[tokio::test]
+        async fn sp_filters_artifact_envelope_roots_during_additive_rotation() {
+            struct RotatingClient {
+                key: KeyPair,
+            }
+
+            impl HttpClient for RotatingClient {
+                fn send(
+                    &self,
+                    request: HttpRequest,
+                ) -> impl Future<
+                    Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send {
+                    let document = Document::parse(&request.body).expect("resolve parses");
+                    let request_id = document
+                        .find_first(Some(SAMLP_NS), "ArtifactResolve")
+                        .expect("ArtifactResolve")
+                        .attribute(None, "ID")
+                        .expect("resolve ID");
+                    let body = signed_envelope_with(request_id, false, &self.key);
+                    async move {
+                        Ok(HttpResponse {
+                            status: 200,
+                            headers: vec![("Content-Type".to_owned(), "text/xml".to_owned())],
+                            body,
+                        })
+                    }
+                }
+            }
+
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let new_key = second_rsa_signing_key();
+            let mut rotating_certs = idp.signing_certs.clone();
+            rotating_certs.push(
+                new_key
+                    .certificate()
+                    .expect("second key carries cert")
+                    .clone(),
+            );
+            let policy = PeerCryptoPolicy::strong_defaults();
+
+            for (client, old_key_should_verify) in [
+                (
+                    RotatingClient {
+                        key: rsa_signing_key(),
+                    },
+                    true,
+                ),
+                (RotatingClient { key: new_key }, false),
+            ] {
+                let (tracker, artifact) = tracked_artifact(&sp, &idp);
+                let bc = ArtifactBackchannel {
+                    sign: None,
+                    verify: Some(VerifyConfig {
+                        certs: &rotating_certs,
+                        policy: &policy,
+                        require_signed: true,
+                    }),
+                };
+                let result = sp
+                    .consume_response_artifact(
+                        &client,
+                        consume_input(&idp, &tracker, &artifact, Some(bc)),
+                    )
+                    .await;
+                if old_key_should_verify {
+                    let err = result.expect_err("minimal inner Response remains invalid");
+                    assert!(
+                        !matches!(
+                            err,
+                            Error::SignatureMissing | Error::SignatureVerification { .. }
+                        ),
+                        "old pinned envelope key must verify; got {err:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::SignatureVerification { .. })),
+                        "new envelope key must be ignored; got {result:?}"
+                    );
+                }
+            }
         }
 
         /// A tampered envelope signature is rejected by the SP artifact path

@@ -58,7 +58,7 @@ use crate::authn_context::AuthnContextClassRef;
 #[cfg(any(feature = "slo", test))]
 use crate::binding::Dispatch;
 use crate::binding::{Binding, Endpoint, SsoResponseBinding, SsoResponseDispatch};
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(all(test, feature = "artifact-binding", feature = "weak-algos"))]
 use crate::crypto::cert::certificate_fingerprint_set;
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
@@ -1103,22 +1103,37 @@ impl IdentityProvider {
                 // cannot authenticate an XML signature. The unsigned branch
                 // remains available only for explicitly mTLS-authenticated
                 // transports.
-                let current_sp_roots = certificate_fingerprint_set(&input.sp.signing_certs);
-                if current_sp_roots.is_empty()
-                    || !current_sp_roots.iter().all(|fingerprint| {
+                // Verify against the intersection of the SP's *current*
+                // certificates and the ones pinned when this transaction
+                // began, rather than requiring the two sets to agree.
+                //
+                // Requiring every current certificate to be pinned broke
+                // additive rotation: an SP publishing `[old, new]` mid-flight
+                // had a resolve validly signed by `old` refused, because
+                // `new` was not pinned. Intersecting instead keeps the
+                // property that matters — the key that actually verifies must
+                // have been pinned at the start — while a newly introduced
+                // key simply is not offered as a candidate, so it grants
+                // nothing.
+                let pinned_sp_certs: Vec<_> = input
+                    .sp
+                    .signing_certs
+                    .iter()
+                    .filter(|cert| {
                         input
                             .transaction
                             .sp_signing_cert_fingerprints
-                            .contains(fingerprint)
+                            .contains(&cert.fingerprint_sha256())
                     })
-                {
+                    .cloned()
+                    .collect();
+                if pinned_sp_certs.is_empty() {
                     return Err(Error::ArtifactSpTrustRootMismatch);
                 }
                 let policy = input
                     .peer_crypto_policy
                     .unwrap_or(&self.config.default_peer_crypto_policy);
-                let verified =
-                    verify_signature(document, signature, &input.sp.signing_certs, policy)?;
+                let verified = verify_signature(document, signature, &pinned_sp_certs, policy)?;
                 if verified.signed_element != root.id() {
                     return Err(Error::SignatureVerification {
                         reason: "ArtifactResolve signature does not cover the message root",
@@ -2965,6 +2980,128 @@ mod tests {
             })
             .expect_err("fresh metadata cannot introduce artifact-resolution authority");
         assert!(matches!(err, Error::ArtifactSpTrustRootMismatch));
+    }
+
+    /// Additive rotation must not break a transaction already in flight.
+    ///
+    /// An SP publishing `[old, new]` mid-flight, having pinned only `old`, is
+    /// doing ordinary key rollover. Requiring every current certificate to be
+    /// pinned refused a resolve validly signed by `old` — an outage with no
+    /// security benefit, since `new` is simply never offered as a candidate.
+    /// The companion test above covers the case that must still fail:
+    /// *replacing* the pinned key.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_accepts_the_pinned_key_during_additive_rotation() {
+        let idp = artifact_idp();
+        let old_key = rsa_keypair_with_cert();
+        let mut original_sp = sp_descriptor(false);
+        original_sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs-artifact",
+            9,
+            true,
+        )];
+        original_sp.signing_certs = vec![
+            old_key
+                .certificate()
+                .expect("test key carries cert")
+                .clone(),
+        ];
+        let issued = issue_artifact_with_transaction(&idp, &original_sp);
+
+        // Mid-rotation metadata: the pinned key is still published, alongside
+        // a newly introduced one.
+        let new_key = second_rsa_keypair_with_cert();
+        let mut rotating_sp = original_sp.clone();
+        rotating_sp.signing_certs = vec![
+            old_key
+                .certificate()
+                .expect("test key carries cert")
+                .clone(),
+            new_key
+                .certificate()
+                .expect("second test key carries cert")
+                .clone(),
+        ];
+
+        // Signed by the key that was pinned when the transaction began.
+        let envelope = artifact_resolve_envelope_signed_with(
+            &rotating_sp.entity_id,
+            &issued.redirect.artifact,
+            "_additive-rotation",
+            &old_key,
+        );
+        let replay_cache = InMemoryReplayCache::new(16);
+
+        idp.consume_artifact_resolve(ConsumeArtifactResolve {
+            sp: &rotating_sp,
+            transaction: &issued.transaction,
+            replay_cache: &replay_cache,
+            peer_crypto_policy: None,
+            soap_envelope: &envelope,
+            expected_destination: "https://idp.example.com/ars",
+            now: fixed_now(),
+            clock_skew: Duration::from_mins(2),
+            require_signed: true,
+        })
+        .expect("a resolve signed by the pinned key survives additive rotation");
+    }
+
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn consume_artifact_resolve_never_grants_the_new_key_during_additive_rotation() {
+        let idp = artifact_idp();
+        let old_key = rsa_keypair_with_cert();
+        let mut original_sp = sp_descriptor(false);
+        original_sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs-artifact",
+            9,
+            true,
+        )];
+        original_sp.signing_certs = vec![
+            old_key
+                .certificate()
+                .expect("test key carries cert")
+                .clone(),
+        ];
+        let issued = issue_artifact_with_transaction(&idp, &original_sp);
+        let new_key = second_rsa_keypair_with_cert();
+        let mut rotating_sp = original_sp.clone();
+        rotating_sp.signing_certs.push(
+            new_key
+                .certificate()
+                .expect("second test key carries cert")
+                .clone(),
+        );
+        let envelope = artifact_resolve_envelope_signed_with(
+            &rotating_sp.entity_id,
+            &issued.redirect.artifact,
+            "_new-key-during-additive-rotation",
+            &new_key,
+        );
+        let replay_cache = InMemoryReplayCache::new(16);
+
+        let err = idp
+            .consume_artifact_resolve(ConsumeArtifactResolve {
+                sp: &rotating_sp,
+                transaction: &issued.transaction,
+                replay_cache: &replay_cache,
+                peer_crypto_policy: None,
+                soap_envelope: &envelope,
+                expected_destination: "https://idp.example.com/ars",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(2),
+                require_signed: true,
+            })
+            .expect_err("a newly introduced key has no authority over this transaction");
+        assert!(
+            matches!(err, Error::SignatureVerification { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            replay_cache.is_empty(),
+            "a rejected new-key signature must not reserve the request ID"
+        );
     }
 
     #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]

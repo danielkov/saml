@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** every `LoginTracker` field is private and read-only. The
   tracker now pins the IdP signing-certificate fingerprints trusted by
   `start_login`; starting without any signing root is rejected, and response
-  consumption rejects an empty or same-entity descriptor that introduces
-  another signing key. For untrusted cookies/session storage,
+  consumption requires a nonempty intersection with the current descriptor
+  and verifies every signature using only those pinned roots. This permits an
+  overlapping key rotation without granting the newly introduced key authority
+  over an in-flight transaction. For untrusted cookies/session storage,
   persist `tracker.to_payload().seal(key)` and recover it with
   `LoginTracker::open`. The sealing-key holder is explicitly a tracker-issuing
   trust root because the transparent payload can describe arbitrary policy.

@@ -433,9 +433,10 @@ Each step short-circuits on error to a specific `Error` variant:
    - If `tracker.is_some()`: `tracker.acs_endpoint().url` MUST equal `expected_destination`. → `Error::DestinationMismatch`.
    - If `tracker.is_some()`: `tracker.acs_endpoint().binding` MUST equal
      `input.binding`. → `Error::ResponseBindingMismatch`.
-   - The supplied IdP descriptor MUST have the tracked entity ID, MUST retain
-     at least one signing certificate, and may not introduce a certificate
-     absent when `start_login` ran. Retiring an old root is allowed. →
+   - The supplied IdP descriptor MUST have the tracked entity ID and retain at
+     least one signing certificate pinned when `start_login` ran. Verification
+     uses only that current-and-pinned intersection: overlapping new roots are
+     ignored for this transaction, while retiring an old root is allowed. →
      `Error::IssuerMismatch` / `Error::IdpTrustRootMismatch`.
 2. Parse XML and require the `<samlp:Response>` root, including required `ID`,
    `Version="2.0"`, and parseable `IssueInstant`; hardening per RFC-002 §1.
