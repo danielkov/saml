@@ -22,8 +22,8 @@ pub struct Conditions {
     /// values. Audiences within one group are alternatives (OR), while all
     /// groups must be satisfied (AND) per SAML Core section 2.5.1.4.
     pub audience_restrictions: Vec<Vec<String>>,
-    /// `<saml:OneTimeUse>` was present. The caller is expected to enforce
-    /// single-use semantics by deduping on `assertion_id`.
+    /// `<saml:OneTimeUse>` was present. The SP role enforces single-use via
+    /// its configured atomic replay cache and fails closed without one.
     pub one_time_use: bool,
     /// `<saml:ProxyRestriction Count="…">` value.
     pub proxy_restriction_count: Option<u32>,

@@ -144,7 +144,7 @@ impl SsoResponseBinding {
 /// `Soap`. Use this everywhere ACS endpoints flow:
 ///   - `ServiceProviderConfig.acs`
 ///   - `SpDescriptor.assertion_consumer_services`
-///   - `LoginTracker.acs_endpoint`
+///   - `LoginTracker::acs_endpoint()`
 ///   - `AcsSelection` resolution result
 ///
 /// This closes the gap where `Endpoint::redirect("...", 0, true)` could be
@@ -203,14 +203,28 @@ pub struct StartLoginResult {
     pub dispatch: Dispatch,
 }
 
+#[derive(Clone)]
+pub struct LoginTracker { /* private authoritative fields */ }
+
+impl LoginTracker {
+    pub fn request_id(&self) -> &str;
+    pub fn issued_at(&self) -> SystemTime;
+    pub fn idp_entity_id(&self) -> &str;
+    pub fn acs_endpoint(&self) -> &SsoResponseEndpoint;
+    pub fn requested_authn_context(&self) -> Option<&RequestedAuthnContext>;
+    pub fn requested_name_id_format(&self) -> Option<&NameIdFormat>;
+    pub fn idp_signing_cert_fingerprints(&self) -> &[[u8; 32]];
+    pub fn idp_artifact_resolution_services(&self) -> &[Endpoint];
+    pub fn to_payload(&self) -> LoginTrackerPayload;
+    pub fn open(blob: &str, key: &[u8; 32], now: SystemTime, max_age: Duration)
+        -> Result<Self, Error>;
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct LoginTracker {
-    pub request_id: String,
-    pub issued_at: SystemTime,
-    pub idp_entity_id: String,
-    pub acs_endpoint: SsoResponseEndpoint,
-    pub requested_authn_context: Option<RequestedAuthnContext>,
-    pub requested_name_id_format: Option<NameIdFormat>,
+pub struct LoginTrackerPayload { /* transparent storage fields */ }
+
+impl LoginTrackerPayload {
+    pub fn seal(&self, key: &[u8; 32]) -> Result<String, Error>;
 }
 
 /// Dispatch for outbound SAML *requests* (AuthnRequest, LogoutRequest) and
@@ -252,12 +266,12 @@ pub struct ArtifactRedirect {
     /// Redirect the user agent here. URL contains `?SAMLart=...&RelayState=...`.
     pub redirect_to: url::Url,
     /// The artifact value embedded in `redirect_to`. The IdP MUST persist the
-    /// associated `<samlp:Response>` XML keyed by this value and serve it
-    /// from its ArtifactResolutionService.
+    /// associated `<samlp:Response>` XML keyed by this value and atomically
+    /// take it when serving its ArtifactResolutionService.
     pub artifact: String,
     /// The full `<samlp:Response>` XML the IdP's ArtifactResolutionService
     /// must return when the SP later resolves the artifact via SOAP. Library
-    /// is stateless; persistence is the caller's responsibility.
+    /// is stateless; one-time persistence is the caller's responsibility.
     pub response_xml: String,
 }
 
@@ -270,8 +284,29 @@ impl ServiceProvider {
 }
 ```
 
+For an Artifact response, `start_login` also pins the selected IdP metadata's
+SOAP `ArtifactResolutionService` endpoints (unique, required indices) into the
+tracker. Consumption base64-decodes an exact 44-byte Type-4 artifact, rejects a
+type other than `0x0004`, verifies `SourceID == SHA-1(tracked IdP entityID)`, and
+uses the embedded endpoint index to select only from that pinned snapshot. The
+fresh descriptor supplied at response time never supplies the outbound ARS URL,
+so metadata substitution cannot turn artifact resolution into SSRF. All these
+checks run before the caller's HTTP client is invoked. Artifact resolution is a
+solicited flow and therefore requires a `LoginTracker`.
+
+Every authoritative tracker field is read-only. A tracker is obtained from
+`start_login`, or by authenticating a sealed payload with `LoginTracker::open`.
+The sealing-key holder is a tracker-issuing trust root: because the payload is
+transparent, it can authorize arbitrary correlation and policy fields. This
+protects an honest tracker while it crosses an untrusted cookie/session store;
+it does not constrain an application that owns the key.
+
 ### 3.1 Build steps
 
+- Canonicalize (sort and deduplicate) `idp.signing_certs`, reject an empty set
+  with `Error::NoPeerSigningCert`, and pin its fingerprints in the tracker.
+- For an Artifact response, also require indexed SOAP
+  `ArtifactResolutionService` endpoints and pin their canonical endpoint set.
 - Look up `idp.sso_endpoint(opts.binding)`. If absent → `Error::UnsupportedByPeer`.
 - Generate `request_id` = `"_"` + lowercase-hex(16 random bytes). SAML IDs must start with a non-digit; `_` is the conventional prefix.
 - Resolve the selected ACS endpoint from `opts.acs_index` or the SP default. Resolve the requested Response binding as `opts.response_binding.unwrap_or(selected_acs.binding)` and reject if it does not match `selected_acs.binding`.
@@ -304,11 +339,14 @@ pub struct ConsumeResponse<'a> {
     /// Response's `Destination` and the assertion's `SubjectConfirmationData/Recipient`.
     /// An SP can advertise multiple ACS endpoints (multiple bindings or indices),
     /// so the library cannot infer which one received the message from `binding`
-    /// alone. For solicited flows it must equal `tracker.acs_endpoint.url`; the
+    /// alone. For solicited flows it must equal `tracker.acs_endpoint().url`; the
     /// library enforces that match.
     pub expected_destination: &'a str,
     pub now: SystemTime,
     pub clock_skew: Duration,
+    pub replay_cache: Option<&'a dyn ReplayCache>,
+    pub replay_mode: ReplayMode,
+    pub holder_of_key_cert: Option<&'a X509Certificate>,
 }
 
 /// Read-only by construction: every field is private and reached through an
@@ -323,6 +361,7 @@ impl Identity {
     pub fn session_index(&self) -> Option<&str>;
     pub fn authn_instant(&self) -> SystemTime;
     pub fn session_not_on_or_after(&self) -> Option<SystemTime>;
+    pub fn subject_confirmation_not_on_or_after(&self) -> SystemTime;
     pub fn authn_context_class_ref(&self) -> Option<&str>;
     pub fn attributes(&self) -> &[Attribute];
     /// For replay defense: the caller should dedupe on this ID until
@@ -345,14 +384,18 @@ Each step short-circuits on error to a specific `Error` variant:
 
 1. Parse XML; hardening per RFC-002 §1.
 2. Locate `<samlp:Response>` root. Reject if not present.
-3. **Destination binding**:
+3. **Destination and tracker binding**:
    - `expected_destination` MUST resolve to a registered ACS URL in `self.acs`. If not, `Error::InvalidConfiguration` (caller bug, not a wire-format issue).
-   - If `tracker.is_some()`: `tracker.acs_endpoint.url` MUST equal `expected_destination`. → `Error::DestinationMismatch`.
+   - If `tracker.is_some()`: `tracker.acs_endpoint().url` MUST equal `expected_destination`. → `Error::DestinationMismatch`.
+   - The supplied IdP descriptor MUST have the tracked entity ID, MUST retain
+     at least one signing certificate, and may not introduce a certificate
+     absent when `start_login` ran. Retiring an old root is allowed. →
+     `Error::IssuerMismatch` / `Error::IdpTrustRootMismatch`.
    - If `Response/@Destination` is present: it MUST equal `expected_destination`. → `Error::DestinationMismatch`.
 4. Check `Response/Issuer` equals `idp.entity_id`. → `Error::IssuerMismatch`.
 5. Check `Status/StatusCode/@Value` equals `urn:oasis:names:tc:SAML:2.0:status:Success`. Otherwise `Error::StatusNotSuccess { code, message }` carrying the StatusCode/StatusMessage from the response.
 6. **`Response/@InResponseTo` binding** (the rule is strict, not "match-if-present" — that pattern lets replayed solicited responses re-enter as "unsolicited"):
-   - If `tracker.is_some()`: `Response/@InResponseTo` MUST be present AND equal `tracker.request_id`. Any other state → `Error::InResponseToMismatch`.
+   - If `tracker.is_some()`: `Response/@InResponseTo` MUST be present AND equal `tracker.request_id()`. Any other state → `Error::InResponseToMismatch`.
    - If `tracker.is_none()`: `allow_unsolicited` MUST be true AND `Response/@InResponseTo` MUST be absent. If `InResponseTo` is present, the response is claiming to be solicited and the caller has no tracker for it — reject with `Error::UnsolicitedNotAllowed`. If `allow_unsolicited` is false, reject with `Error::UnsolicitedNotAllowed` regardless of `InResponseTo`.
 7. Locate `<saml:Assertion>` or `<saml:EncryptedAssertion>` children. Reject if not exactly one (multiple-assertion responses are out of scope for v0.1 and a known XSW vector).
 8. Select `policy = input.peer_crypto_policy.unwrap_or(&self.default_peer_crypto_policy)`.
@@ -371,14 +414,27 @@ Each step short-circuits on error to a specific `Error` variant:
     - `@Recipient` equals `expected_destination`. → `Error::RecipientMismatch`.
     - `@NotOnOrAfter` > `now - clock_skew`. → `Error::Expired`.
     - **`@InResponseTo` binding** (mirrors step 6 — both must agree, neither alone is sufficient):
-      - If `tracker.is_some()`: `@InResponseTo` MUST be present AND equal `tracker.request_id`. → `Error::InResponseToMismatch`.
+      - If `tracker.is_some()`: `@InResponseTo` MUST be present AND equal `tracker.request_id()`. → `Error::InResponseToMismatch`.
       - If `tracker.is_none()`: `@InResponseTo` MUST be absent. → `Error::UnsolicitedNotAllowed`.
-17. If `tracker.requested_authn_context` is set, the actual `AuthnStatement/AuthnContext/AuthnContextClassRef` must satisfy the comparator (default `exact`). → `Error::AuthnContextDowngrade`.
+17. If `tracker.requested_authn_context()` is set, the actual `AuthnStatement/AuthnContext/AuthnContextClassRef` must satisfy the comparator (default `exact`). → `Error::AuthnContextDowngrade`.
 18. Extract `Identity` from the Assertion.
+19. If `<OneTimeUse>` is present, a replay cache and an enabled replay mode are
+    mandatory; otherwise fail with `Error::OneTimeUseUnenforceable`. When a
+    replay check applies, atomic namespaced `check_and_insert(entries, now)` rejects duplicates with
+    `Error::AssertionReplay`.
+
+For HTTP-Artifact, these checks precede the shared XML validation: decode an
+exact 44-byte Type-4 artifact, require SourceID = SHA-1 of the tracked IdP
+entity, and resolve its EndpointIndex only through the transaction-pinned SOAP
+ARS set. Malformed, cross-issuer, unknown-index, and substituted-metadata
+inputs make no HTTP request.
 
 ### 4.2 What the caller does after
 
-- **Replay defense**: dedupe on `identity.assertion_id()` until `identity.not_on_or_after()` passes. The library does not own this store.
+- **Replay defense**: supply a `ReplayCache` (recommended with
+  `ReplayMode::All`) or dedupe ordinary assertions in an application store.
+  `<OneTimeUse>` always fails closed unless the library can perform the atomic
+  cache operation.
 - **Application session**: create a session keyed off `identity.name_id()` + `identity.session_index()`.
 - **Authorization**: apply policy to `identity.attributes()`.
 
@@ -450,14 +506,21 @@ let start = sp.start_login(&idp, StartLogin {
     acs_index: None,
     response_binding: None,
 })?;
-session.put("saml_tracker", &start.tracker)?;
+let sealed_tracker = start.tracker.to_payload().seal(&TRACKER_KEY)?;
+session.put("saml_tracker", &sealed_tracker)?;
 match start.dispatch {
     Dispatch::Redirect(url) => Redirect::to(url.as_str()),
     Dispatch::Post(form) => render_autosubmit(form),
 }
 
 // --- /saml/acs handler ---
-let tracker: LoginTracker = session.take("saml_tracker")?;
+let sealed_tracker: String = session.take("saml_tracker")?;
+let tracker = LoginTracker::open(
+    &sealed_tracker,
+    &TRACKER_KEY,
+    SystemTime::now(),
+    Duration::from_mins(10),
+)?;
 let identity = sp.consume_response(ConsumeResponse {
     idp: &idp,
     peer_crypto_policy: None,
@@ -468,8 +531,10 @@ let identity = sp.consume_response(ConsumeResponse {
     expected_destination: "https://app.example.com/saml/acs", // the URL this handler serves
     now: SystemTime::now(),
     clock_skew: Duration::from_secs(60),
+    replay_cache: Some(&replay_cache),
+    replay_mode: ReplayMode::All,
+    holder_of_key_cert: None,
 })?;
-// Dedupe identity.assertion_id() against your replay store.
 // Create app session keyed off identity.name_id() + identity.session_index().
 ```
 

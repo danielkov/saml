@@ -167,7 +167,7 @@ impl TrackerStore {
     fn insert(&mut self, tracker: LoginTracker) {
         let now = SystemTime::now();
         self.map.retain(|_, t| {
-            now.duration_since(t.issued_at)
+            now.duration_since(t.issued_at())
                 .map_or(true, |age| age < Self::STALE_AFTER)
         });
 
@@ -175,12 +175,12 @@ impl TrackerStore {
             && let Some(oldest) = self
                 .map
                 .iter()
-                .min_by_key(|(_, t)| t.issued_at)
+                .min_by_key(|(_, t)| t.issued_at())
                 .map(|(k, _)| k.clone())
         {
             self.map.remove(&oldest);
         }
-        self.map.insert(tracker.request_id.clone(), tracker);
+        self.map.insert(tracker.request_id().to_owned(), tracker);
     }
 
     fn take(&mut self, request_id: &str) -> Option<LoginTracker> {

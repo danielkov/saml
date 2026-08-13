@@ -21,7 +21,8 @@ pub struct IdentityProviderConfig {
     pub sso: Vec<Endpoint>,
     /// SLO endpoints.
     pub slo: Vec<Endpoint>,
-    /// ArtifactResolutionService endpoints.
+    /// Indexed SOAP ArtifactResolutionService endpoints; indices must be
+    /// unique because Type-4 artifacts route by this value.
     pub artifact_resolution: Vec<Endpoint>,
 
     pub supported_name_id_formats: Vec<NameIdFormat>,
@@ -232,10 +233,18 @@ impl IdentityProvider {
 3. Build `<saml:Assertion>`:
    - `Issuer` = `self.entity_id`.
    - `Subject`:
-     - `NameID` with format = `input.in_response_to.requested_name_id_format` if supported, else `self.default_name_id_format`.
-     - For `NameIdFormat::Persistent`: set `SPNameQualifier` = `input.sp.entity_id` (privacy — prevents downstream SPs from correlating users).
+     - `NameID` with the explicitly requested format when supported. An
+       unsupported explicit request fails with `InvalidNameIDPolicy`; the IdP
+       default is used only when no format was requested. The supplied
+       `NameId` must already carry that resolved format; issuance refuses a
+       mismatch rather than relabelling a value with different semantics.
+     - For `NameIdFormat::Persistent`: reject a caller-supplied `SPNameQualifier` for another SP, then set an absent qualifier to `input.sp.entity_id` (privacy — prevents downstream SPs from correlating users).
      - `SubjectConfirmation @Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"` with:
        - `Recipient` = ACS URL (the one resolved in step 1).
+
+For HTTP-Artifact, select an indexed SOAP `ArtifactResolutionService` from the
+IdP configuration and encode that index in the Type-4 artifact. The SP's ACS
+index identifies a different endpoint and MUST NOT be used as EndpointIndex.
        - `NotOnOrAfter` = `now + subject_confirmation_lifetime`.
        - `InResponseTo` = `input.in_response_to.id`.
    - `Conditions`:
@@ -416,13 +425,22 @@ match dispatch {
     SsoResponseDispatch::Post(form) => render_autosubmit(form),
     SsoResponseDispatch::Artifact(art) => {
         // 1. Persist `art.response_xml` keyed by `art.artifact` for later
-        //    ArtifactResolutionService SOAP resolution.
+        //    ArtifactResolutionService SOAP resolution. The ARS must
+        //    atomically take/delete it before returning the response: a
+        //    Type-4 artifact is a one-time bearer credential.
         // 2. Redirect the user agent to `art.redirect_to`.
-        artifact_store.put(&art.artifact, &art.response_xml)?;
+        artifact_store.put_once(&art.artifact, &art.response_xml)?;
         Redirect::to(art.redirect_to.as_str())
     }
 }
 ```
+
+For HTTP-Artifact dispatch, the IdP must advertise at least one indexed SOAP
+`ArtifactResolutionService`. Issuance selects the default endpoint (falling
+back to the first), and encodes that IdP ARS index in bytes 2–3 of the Type-4
+artifact. The SP's ACS index is unrelated and is never placed there. `SourceID`
+is the mandated SHA-1 of the issuing IdP's entity ID; the remaining 20-byte
+message handle is random.
 
 ---
 

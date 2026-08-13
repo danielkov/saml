@@ -109,6 +109,22 @@ pub enum Error {
         code: String,
         message: Option<String>,
     },
+    /// An inbound `SAMLart` value is not the exact 44-byte SAML 2.0 Type-4
+    /// structure required by Bindings §3.6.4.
+    #[error("Malformed SAML 2.0 Type-4 artifact: {reason}")]
+    MalformedArtifact { reason: &'static str },
+    /// A Type-4 artifact's `SourceID` is not SHA-1 of the IdP entity selected
+    /// for this login transaction.
+    #[error("artifact SourceID does not match the expected IdP entity")]
+    ArtifactSourceIdMismatch,
+    /// The Type-4 artifact names an ArtifactResolutionService index that was
+    /// not pinned for the selected IdP when this login transaction began.
+    #[error("artifact names an untrusted ArtifactResolutionService index {index}")]
+    ArtifactResolutionServiceMismatch { index: u16 },
+    /// HTTP-Artifact resolution cannot choose a back-channel destination
+    /// safely without the transaction-time IdP metadata pinned in a tracker.
+    #[error("artifact response resolution requires a LoginTracker")]
+    ArtifactTrackerRequired,
     /// The peer answered a SOAP request with a `<soap:Fault>` (SOAP 1.1 §4.4)
     /// instead of the expected payload. `faultcode` is the QName-shaped fault
     /// code (e.g. `soap:Client`, `soap:Server`); `faultstring` is the
@@ -225,6 +241,11 @@ pub enum Error {
     /// otherwise validate an attacker-signed response into a genuine flow.
     #[error("upstream IdP signing certificates differ from those sealed at bounce")]
     UpstreamTrustRootMismatch,
+    /// Direct SP response consumption received an IdP descriptor with no
+    /// signing certificate, or one introducing a certificate that was not
+    /// trusted when the login transaction began.
+    #[error("IdP signing certificates differ from those pinned when login began")]
+    IdpTrustRootMismatch,
     /// The `SpDescriptor` supplied to issuance carries different encryption
     /// key material than the one the request was validated against.
     ///
@@ -234,6 +255,19 @@ pub enum Error {
     /// plaintext.
     #[error("SP encryption certificates differ from those seen at validation")]
     SpKeyMaterialMismatch,
+    /// The assertion carries `<saml:OneTimeUse>` but no replay cache was
+    /// supplied, or [`ReplayMode::Off`](crate::ReplayMode) disabled the check.
+    ///
+    /// SAML 2.0 Core §2.5.1.5 makes single use a MUST: the asserting party has
+    /// stated the assertion is good for exactly one consumption. With no
+    /// atomic deduplication available there is no way to honour that, and
+    /// accepting it anyway silently discards the directive.
+    #[error("assertion is marked OneTimeUse but no replay cache is available to enforce it")]
+    OneTimeUseUnenforceable,
+    /// An authenticated proxy transaction was already redeemed by another
+    /// valid upstream Response.
+    #[error("proxy transaction was already redeemed")]
+    ProxyTransactionReplay,
     /// The SP's `<samlp:NameIDPolicy>/@Format` names a format this IdP cannot
     /// produce.
     ///
@@ -246,6 +280,18 @@ pub enum Error {
     /// `SamlStatusCode::InvalidNameIdPolicy`.
     #[error("requested NameIDPolicy format {requested} is not supported")]
     UnsupportedNameIdPolicy { requested: String },
+    /// The caller supplied a NameID whose declared format does not match the
+    /// format negotiated from the validated request and IdP policy.
+    ///
+    /// A format is semantic, not cosmetic: relabelling an email address or a
+    /// transient identifier as a persistent pseudonym makes a signed claim
+    /// that the value generator did not produce. Callers and proxy transforms
+    /// must mint the value for the negotiated format instead.
+    #[error("NameID format mismatch: expected {expected}, got {got}")]
+    NameIdFormatMismatch { expected: String, got: String },
+    /// A persistent NameID is explicitly scoped to another service provider.
+    #[error("persistent NameID is scoped to {got}, expected {expected}")]
+    NameIdSpQualifierMismatch { expected: String, got: String },
     /// A solicited Response arrived over a different binding than the ACS
     /// endpoint recorded in the `LoginTracker` when the `AuthnRequest` was
     /// issued. Both bindings are legal for SSO responses — they simply do not

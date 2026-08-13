@@ -295,7 +295,9 @@ pub struct SsoResponsePostForm {
 }
 
 /// Artifact redirect payload. The IdP MUST persist `response_xml` keyed by
-/// `artifact` and serve it from its ArtifactResolutionService.
+/// `artifact` and atomically take it from the store when serving its
+/// ArtifactResolutionService; a Type-4 artifact is a one-time bearer
+/// credential.
 #[derive(Debug, Clone)]
 pub struct ArtifactRedirect {
     /// Redirect the user agent here. URL contains `?SAMLart=...&RelayState=...`.
@@ -303,8 +305,8 @@ pub struct ArtifactRedirect {
     /// The artifact value embedded in `redirect_to`.
     pub artifact: String,
     /// The full `<samlp:Response>` XML to return when the SP resolves the
-    /// artifact via SOAP. Library is stateless; persistence is the caller's
-    /// responsibility.
+    /// artifact via SOAP. Library is stateless; one-time persistence and
+    /// atomic consumption are the caller's responsibility.
     pub response_xml: String,
 }
 

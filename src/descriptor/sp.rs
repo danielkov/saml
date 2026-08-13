@@ -174,11 +174,21 @@ impl SpDescriptor {
             .find(|e| e.binding == binding)
     }
 
-    /// First encryption cert, if any. Convenience: most SPs advertise exactly
-    /// one encryption cert and callers want it for `EncryptedAssertion`
-    /// decryption.
+    /// Canonical encryption certificate, if any.
+    ///
+    /// Metadata ordering carries no key-selection semantics, so this chooses
+    /// the certificate with the lexicographically smallest SHA-256
+    /// fingerprint. This keeps the actual encryption recipient consistent
+    /// with the order-insensitive certificate-set binding performed when an
+    /// AuthnRequest is validated: reordering the same keys cannot redirect an
+    /// assertion to a different recipient.
     pub fn encryption_cert(&self) -> Option<&X509Certificate> {
-        self.encryption_certs.first()
+        use crate::crypto::cert::PublicKeyAlgorithm;
+
+        self.encryption_certs
+            .iter()
+            .filter(|cert| cert.public_key().algorithm_family() == PublicKeyAlgorithm::Rsa)
+            .min_by_key(|cert| cert.fingerprint_sha256())
     }
 
     /// Default `<idpdisc:DiscoveryResponse>` endpoint: the entry flagged
@@ -198,7 +208,9 @@ mod tests {
     use super::*;
     use crate::binding::{Binding, SsoResponseBinding};
     use crate::crypto::cert::X509Certificate;
-    use crate::crypto::cert::test_vectors::RSA_CERT_PEM;
+    use crate::crypto::cert::test_vectors::{EC_P256_CERT_PEM, RSA_CERT_PEM};
+
+    const SECOND_RSA_CERT_PEM: &[u8] = include_bytes!("../../examples/demo/keys/sp.crt");
 
     fn rsa_cert_b64() -> String {
         X509Certificate::from_pem(RSA_CERT_PEM)
@@ -306,6 +318,41 @@ mod tests {
         let sp = SpDescriptor::from_metadata_xml(sp_metadata_xml().as_bytes()).unwrap();
         let enc = sp.encryption_cert().expect("has encryption cert");
         assert_eq!(enc, &sp.encryption_certs[0]);
+    }
+
+    #[test]
+    fn encryption_cert_selection_is_stable_across_metadata_reordering() {
+        let first = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let second = X509Certificate::from_pem(SECOND_RSA_CERT_PEM).unwrap();
+        let expected = first.fingerprint_sha256().min(second.fingerprint_sha256());
+        let mut sp = SpDescriptor::from_metadata_xml(sp_metadata_xml().as_bytes()).unwrap();
+
+        sp.encryption_certs = vec![first.clone(), second.clone()];
+        let before = sp
+            .encryption_cert()
+            .expect("recipient")
+            .fingerprint_sha256();
+        sp.encryption_certs.reverse();
+        let after = sp
+            .encryption_cert()
+            .expect("recipient")
+            .fingerprint_sha256();
+
+        assert_eq!(before, expected);
+        assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn encryption_cert_skips_non_rsa_keys() {
+        let rsa = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
+        let ec = X509Certificate::from_pem(EC_P256_CERT_PEM).unwrap();
+        let mut sp = SpDescriptor::from_metadata_xml(sp_metadata_xml().as_bytes()).unwrap();
+
+        sp.encryption_certs = vec![ec, rsa.clone()];
+        assert_eq!(sp.encryption_cert(), Some(&rsa));
+
+        sp.encryption_certs = vec![X509Certificate::from_pem(EC_P256_CERT_PEM).unwrap()];
+        assert!(sp.encryption_cert().is_none());
     }
 
     #[test]

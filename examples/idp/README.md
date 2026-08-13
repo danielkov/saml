@@ -70,7 +70,7 @@ examples/idp/
 | `GET,POST` | `/saml/sso/continue`  | Pull the stashed AuthnRequest, mint the signed Assertion, return a 200 auto-submit form posting `SAMLResponse` to the SP's ACS.                                                                        |
 | `POST`     | `/logout`             | IdP-self logout: clears the local IdP cookie. Does NOT initiate SP SLO.                                                                                                                                |
 | `GET,POST` | `/saml/slo`           | SP-initiated SLO. Verify the SP's signed `<samlp:LogoutRequest>`, clear the session, echo `<samlp:LogoutResponse>` back over the SP's preferred binding.                                                |
-| `POST`     | `/saml/artifact`      | Feature-gated (`artifact-binding`). Currently returns 501 — the saml crate exposes `parse_artifact_resolve` / `build_artifact_response` but this example doesn't ship a working artifact store.        |
+| `POST`     | `/saml/artifact`      | Feature-gated (`artifact-binding`). Authenticates the resolve, atomically consumes the one-time stored artifact, and returns the SOAP `ArtifactResponse`.                                                     |
 
 ## Configuration
 
@@ -126,10 +126,9 @@ Boots both halves on free ports and drives the full flow:
   works around this by pinning `prefer_slo_binding = "POST"` on the
   rust-idp entry; POST-bound LogoutRequests verify normally via
   enveloped XML-DSig.
-- **No artifact binding.** The `artifact-binding` feature flag wires
-  a stub `/saml/artifact` route, but no actual artifact store is
-  implemented. The saml crate exposes `IdentityProvider::parse_artifact_resolve`
-  and `build_artifact_response` for callers who want to add one.
+- **Artifact binding is feature-gated.** Enable `artifact-binding` (and the
+  required `weak-algos` feature) to expose `/saml/artifact` and its bounded,
+  one-time artifact store.
 - **No encrypted assertions.** `IdpAssertionSigning::sign_assertions = true`
   but `encrypt_assertions_when_possible = false`. The SP advertises an
   encryption cert in its metadata, so flipping `force_encrypt_assertion = Some(true)`

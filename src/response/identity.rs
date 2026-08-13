@@ -51,6 +51,7 @@ use crate::nameid::NameId;
 ///     session_index: None,
 ///     authn_instant: std::time::SystemTime::UNIX_EPOCH,
 ///     session_not_on_or_after: None,
+///     subject_confirmation_not_on_or_after: std::time::SystemTime::UNIX_EPOCH,
 ///     authn_context_class_ref: None,
 ///     attributes: vec![],
 ///     assertion_id: "_forged".to_owned(),
@@ -65,6 +66,9 @@ pub struct Identity {
     pub(crate) session_index: Option<String>,
     pub(crate) authn_instant: SystemTime,
     pub(crate) session_not_on_or_after: Option<SystemTime>,
+    /// Expiry of the specific SubjectConfirmation that authorized this
+    /// presentation. May be earlier than Conditions or session expiry.
+    pub(crate) subject_confirmation_not_on_or_after: SystemTime,
     pub(crate) authn_context_class_ref: Option<String>,
     pub(crate) attributes: Vec<Attribute>,
     /// For replay defense, retain this ID until `not_on_or_after` plus the
@@ -77,13 +81,13 @@ pub struct Identity {
     /// `<saml:OneTimeUse>` was present in `<saml:Conditions>` (SAML 2.0 Core
     /// §2.5.1.5). When `true` the relying party MUST consume the assertion
     /// only once — i.e. it MUST refuse a second presentation of the same
-    /// assertion regardless of `not_on_or_after`. The library does not
-    /// enforce this directive itself; the caller is responsible for plugging
-    /// in a replay cache (dedupe by `assertion_id`) and rejecting repeats
-    /// until `not_on_or_after` plus the clock skew used for response
-    /// validation. Note that single-use is *stricter*
-    /// than ordinary expiry-bounded replay defense: even within the validity
-    /// window the assertion is good for exactly one consumption.
+    /// assertion regardless of `not_on_or_after`.
+    /// [`ServiceProvider::consume_response`](crate::ServiceProvider::consume_response)
+    /// enforces this through the supplied replay cache and fails closed when
+    /// none is enabled, returning
+    /// `OneTimeUseUnenforceable`. Note that single-use is *stricter* than
+    /// ordinary expiry-bounded replay defense: even within the validity window
+    /// the assertion is good for exactly one consumption.
     pub(crate) is_one_time_use: bool,
     /// Witness that this value came out of the SP response validator.
     ///
@@ -119,6 +123,7 @@ impl Identity {
         session_index: Option<String>,
         authn_instant: SystemTime,
         session_not_on_or_after: Option<SystemTime>,
+        subject_confirmation_not_on_or_after: SystemTime,
         authn_context_class_ref: Option<String>,
         attributes: Vec<Attribute>,
         assertion_id: String,
@@ -131,6 +136,7 @@ impl Identity {
             session_index,
             authn_instant,
             session_not_on_or_after,
+            subject_confirmation_not_on_or_after,
             authn_context_class_ref,
             attributes,
             assertion_id,
@@ -163,6 +169,13 @@ impl Identity {
     #[must_use]
     pub fn session_not_on_or_after(&self) -> Option<SystemTime> {
         self.session_not_on_or_after
+    }
+
+    /// Expiry of the bearer/Holder-of-Key confirmation actually selected by
+    /// validation.
+    #[must_use]
+    pub fn subject_confirmation_not_on_or_after(&self) -> SystemTime {
+        self.subject_confirmation_not_on_or_after
     }
 
     /// The authentication context class the asserting party reported.
@@ -217,6 +230,7 @@ mod tests {
             session_index: Some("session-7".to_owned()),
             authn_instant: now,
             session_not_on_or_after: Some(now + Duration::from_hours(1)),
+            subject_confirmation_not_on_or_after: now + Duration::from_mins(5),
             authn_context_class_ref: Some(
                 "urn:oasis:names:tc:SAML:2.0:ac:classes:Password".to_owned(),
             ),
@@ -240,6 +254,7 @@ mod tests {
             session_index: None,
             authn_instant: SystemTime::UNIX_EPOCH,
             session_not_on_or_after: None,
+            subject_confirmation_not_on_or_after: SystemTime::UNIX_EPOCH,
             authn_context_class_ref: None,
             attributes: vec![],
             assertion_id: "_x".to_owned(),
