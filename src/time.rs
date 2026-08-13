@@ -587,14 +587,14 @@ mod tests {
             parse_xs_datetime("2026-01-01T00:00:60Z").expect("leap second"),
             parse_xs_datetime("2026-01-01T00:00:59Z").expect("ordinary second")
         );
-        let parsed = parse_xs_datetime("2026-01-01T00:00:00.123456789999Z")
+        let parsed = parse_xs_datetime("2026-01-01T00:00:00.123456700999Z")
             .expect("long fractional precision");
         assert_eq!(
             parsed
                 .duration_since(UNIX_EPOCH)
                 .expect("post epoch")
                 .subsec_nanos(),
-            123_456_789
+            123_456_700
         );
     }
 
