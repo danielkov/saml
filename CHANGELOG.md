@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Breaking:** `KeyPair::with_certificate` now returns `Result` and rejects a
+  certificate whose public key does not match the private key. Previously the
+  mismatch was accepted and produced signatures that peers could not verify
+  with the embedded certificate.
+- **Breaking:** `NameIdTransform::transform` receives the authenticated
+  upstream IdP entity ID. `PersistentPerSpHmac` includes that issuer, the
+  upstream subject, and the downstream SP in a versioned, length-prefixed HMAC
+  input, preventing cross-IdP subject collisions and ambiguous concatenations.
+- Authenticated ArtifactResolve replay reservations remain live through the
+  inclusive freshness boundary on Windows, whose `SystemTime` cannot represent
+  the previous one-nanosecond expiry margin.
+- Artifact-enabled IdP configuration now rejects a signing key without an
+  attached certificate at startup instead of failing after an artifact has
+  already been issued. The high-level SP artifact path accepts the optional
+  outer `ArtifactResponse/Issuer`; callers can still require it explicitly on
+  the low-level client.
 - **Breaking:** every `LoginTracker` field is private and read-only. The
   tracker now pins the IdP signing-certificate fingerprints trusted by
   `start_login`; starting without any signing root is rejected, and response

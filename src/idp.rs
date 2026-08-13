@@ -256,6 +256,11 @@ impl IdentityProvider {
                 reason: "IdentityProviderConfig.artifact_resolution endpoints must use SOAP and carry an index",
             });
         }
+        if !config.artifact_resolution.is_empty() && config.signing_key.certificate().is_none() {
+            return Err(Error::InvalidConfiguration {
+                reason: "IdentityProviderConfig.signing_key must carry a certificate when artifact resolution is configured",
+            });
+        }
         let mut ars_indices: Vec<u16> = config
             .artifact_resolution
             .iter()
@@ -271,6 +276,31 @@ impl IdentityProvider {
             });
         }
         Ok(Self { config })
+    }
+
+    /// Sign `element` in place when `should_sign`. Helper that wires the
+    /// outbound algorithm config into the dsig signer.
+    #[cfg(any(
+        feature = "slo",
+        all(feature = "artifact-binding", feature = "weak-algos")
+    ))]
+    fn maybe_sign_outbound(&self, element: Element, should_sign: bool) -> Result<Element, Error> {
+        if !should_sign {
+            return Ok(element);
+        }
+        let stash = Document::new(element)?;
+        crate::dsig::sign::sign_element(
+            stash.root().clone(),
+            &stash,
+            crate::dsig::sign::SignOptions {
+                signing_key: &self.config.signing_key,
+                sig_alg: self.config.outbound_signature_algorithm,
+                digest_alg: self.config.outbound_digest_algorithm,
+                c14n_alg: self.config.outbound_c14n,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
     }
 
     /// Borrow the configuration.
@@ -1104,11 +1134,13 @@ impl IdentityProvider {
         // the cache while ensuring the caller cannot take the artifact before
         // a captured signed request loses its replay race.
         // Freshness accepts both endpoints. ReplayCache expiry is exclusive
-        // (`expires_at <= now` is evicted), so retain the tombstone one tick
-        // beyond the inclusive upper endpoint.
+        // (`expires_at <= now` is evicted), so retain the tombstone beyond the
+        // inclusive upper endpoint. Use a millisecond rather than a nanosecond:
+        // Windows `SystemTime` is backed by 100ns FILETIME ticks and would
+        // otherwise truncate the margin to zero.
         let replay_expires_at = issue_instant
             .checked_add(input.clock_skew)
-            .and_then(|expires_at| expires_at.checked_add(Duration::from_nanos(1)))
+            .and_then(|expires_at| expires_at.checked_add(Duration::from_millis(1)))
             .ok_or_else(|| {
                 Error::XmlParse("ArtifactResolve replay expiry overflows SystemTime".to_owned())
             })?;
@@ -1954,27 +1986,6 @@ impl IdentityProvider {
             },
         )
     }
-
-    /// Sign `element` in place when `should_sign`. Helper that wires the
-    /// outbound algorithm config into the dsig signer.
-    fn maybe_sign_outbound(&self, element: Element, should_sign: bool) -> Result<Element, Error> {
-        if !should_sign {
-            return Ok(element);
-        }
-        let stash = Document::new(element)?;
-        crate::dsig::sign::sign_element(
-            stash.root().clone(),
-            &stash,
-            crate::dsig::sign::SignOptions {
-                signing_key: &self.config.signing_key,
-                sig_alg: self.config.outbound_signature_algorithm,
-                digest_alg: self.config.outbound_digest_algorithm,
-                c14n_alg: self.config.outbound_c14n,
-                inclusive_namespaces: &[],
-                include_x509_cert: true,
-            },
-        )
-    }
 }
 
 /// Inputs to [`IdentityProvider::consume_logout_request_wire`] — the wire-level
@@ -2265,6 +2276,7 @@ mod tests {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching test certificate")
     }
 
     fn rsa_cert() -> X509Certificate {
@@ -2278,6 +2290,7 @@ mod tests {
             .with_certificate(
                 X509Certificate::from_pem(SECOND_RSA_CERT_PEM).expect("second RSA cert"),
             )
+            .expect("matching second RSA certificate")
     }
 
     fn idp_with(want_authn_requests_signed: bool, sign_responses: bool) -> IdentityProvider {
@@ -2972,7 +2985,8 @@ mod tests {
             &rsa_keypair_with_cert(),
         );
         let replay_cache = InMemoryReplayCache::new(16);
-        let consume = || {
+        let clock_skew = Duration::from_mins(2);
+        let consume = |now| {
             idp.consume_artifact_resolve(ConsumeArtifactResolve {
                 sp: &sp,
                 transaction: &issued.transaction,
@@ -2980,14 +2994,19 @@ mod tests {
                 peer_crypto_policy: None,
                 soap_envelope: &envelope,
                 expected_destination: "https://idp.example.com/ars",
-                now: fixed_now(),
-                clock_skew: Duration::from_mins(2),
+                now,
+                clock_skew,
                 require_signed: true,
             })
         };
 
-        consume().expect("first authenticated resolve reserves its ID");
-        let err = consume().expect_err("captured resolve ID must be single-use");
+        consume(fixed_now()).expect("first authenticated resolve reserves its ID");
+        let err = consume(
+            fixed_now()
+                .checked_add(clock_skew)
+                .expect("freshness boundary"),
+        )
+        .expect_err("captured resolve ID must remain reserved at the inclusive boundary");
         assert!(matches!(err, Error::ArtifactResolveReplay));
     }
 
@@ -3105,6 +3124,17 @@ mod tests {
             Endpoint::soap("https://idp.example.com/ars-b", Some(7), false),
         ];
         let err = IdentityProvider::new(cfg).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn new_rejects_artifact_resolution_without_a_signing_certificate() {
+        let mut cfg = idp_with(false, false).config.clone();
+        cfg.artifact_resolution =
+            vec![Endpoint::soap("https://idp.example.com/ars", Some(7), true)];
+        cfg.signing_key = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("bare signing key");
+
+        let err = IdentityProvider::new(cfg).expect_err("outer response signing needs a cert");
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 

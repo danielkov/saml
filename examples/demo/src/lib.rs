@@ -321,7 +321,7 @@ impl AppState {
 pub fn build_service_provider(config: &AppConfig) -> Result<ServiceProvider, saml::Error> {
     let kp = KeyPair::from_pkcs8_pem(SP_KEY_PEM)?;
     let cert = saml::X509Certificate::from_pem(SP_CERT_PEM)?;
-    let signing_key = kp.with_certificate(cert);
+    let signing_key = kp.with_certificate(cert)?;
 
     let acs_url = format!("{}/saml/acs", config.sp_base_url);
     let slo_url = format!("{}/saml/slo", config.sp_base_url);
