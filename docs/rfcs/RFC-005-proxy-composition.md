@@ -295,10 +295,11 @@ impl<'a> Proxy<'a> {
 ```
 
 This authenticates the RelayState through the configured codec, rejects an
-expired context, and rejects an upstream descriptor that introduces signing
-certificates not pinned at bounce time. It then validates the Response against
-the tracker embedded in that exact context. On success, the required replay
-cache atomically reserves the namespaced proxy transaction using the same
+expired context, and requires the current upstream descriptor to retain at
+least one signing certificate pinned at bounce time. It then validates every
+Response signature using only that current-and-pinned intersection; overlapping
+new roots have no authority over the in-flight transaction. On success, the
+required replay cache atomically reserves the namespaced proxy transaction using the same
 `input.now` clock used for validation and retains it through
 `context.expires_at`. A concurrent or later response for that transaction
 fails with `ProxyTransactionReplay`, even if the IdP uses a different assertion

@@ -835,14 +835,20 @@ impl Proxy<'_> {
         // expected entity ID and their own signing certificate, and an
         // attacker-signed response would produce a genuine flow.
         //
-        // Subset rather than equality: retiring a key mid-flow is ordinary
-        // rotation, introducing one is the attack.
+        // Intersection, not equality.
+        //
+        // Requiring every current certificate to be pinned broke additive
+        // rotation: an IdP publishing `[old, new]` mid-flight had a response
+        // validly signed by `old` refused, because `new` was not pinned.
+        // Requiring at least one pinned key to still be on offer keeps the
+        // guarantee — validation below runs against the pinned intersection,
+        // so a newly introduced key cannot be the one that verifies.
         let sealed = &context.payload().upstream_signing_cert_fingerprints;
-        let current = certificate_fingerprint_set(&input.upstream_idp.signing_certs);
-        if current.is_empty()
-            || !current
-                .iter()
-                .all(|fingerprint| sealed.contains(fingerprint))
+        if !input
+            .upstream_idp
+            .signing_certs
+            .iter()
+            .any(|cert| sealed.contains(&cert.fingerprint_sha256()))
         {
             return Err(Error::UpstreamTrustRootMismatch);
         }
@@ -1741,6 +1747,7 @@ mod tests {
         C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
     };
     use crate::idp::{IdentityProvider, IdentityProviderConfig};
+    use crate::replay::InMemoryReplayCache;
     use crate::sp::{ServiceProvider, ServiceProviderConfig};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -2153,6 +2160,164 @@ mod tests {
             Some(NameIdFormat::Persistent),
             "the validated NameIDPolicy must survive tampering with the pub field"
         );
+    }
+
+    #[test]
+    fn consume_upstream_response_filters_roots_during_additive_rotation() {
+        fn upstream_response(key: &KeyPair, request_id: &str, now: SystemTime) -> Vec<u8> {
+            let issuing_idp = IdentityProvider::new(IdentityProviderConfig {
+                entity_id: "https://upstream-idp.example.com".into(),
+                sso: vec![Endpoint::post(
+                    "https://upstream-idp.example.com/sso/post",
+                    1,
+                    true,
+                )],
+                slo: vec![],
+                artifact_resolution: vec![],
+                supported_name_id_formats: vec![NameIdFormat::EmailAddress],
+                default_name_id_format: NameIdFormat::EmailAddress,
+                signing_key: key.clone(),
+                decryption_key: None,
+                want_authn_requests_signed: false,
+                assertion_signing: crate::idp::IdpAssertionSigning {
+                    sign_responses: false,
+                    sign_assertions: true,
+                },
+                encrypt_assertions_when_possible: false,
+                #[cfg(feature = "slo")]
+                logout_signing: crate::idp::IdpLogoutSigning::default(),
+                #[cfg(feature = "slo")]
+                logout_want_signed: crate::idp::IdpLogoutWantSigned::default(),
+                default_session_duration: Duration::from_hours(1),
+                default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+                outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
+                outbound_digest_algorithm: DigestAlgorithm::Sha256,
+                outbound_c14n: C14nAlgorithm::ExclusiveCanonical,
+                #[cfg(feature = "xmlenc")]
+                outbound_data_encryption_algorithm:
+                    crate::xmlenc::algorithms::DataEncryptionAlgorithm::Aes256Gcm,
+                #[cfg(feature = "xmlenc")]
+                outbound_key_transport_algorithm:
+                    crate::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
+            })
+            .expect("upstream issuer builds");
+            let upstream_sp = SpDescriptor {
+                entity_id: "https://proxy.example.com/sp".into(),
+                assertion_consumer_services: vec![SsoResponseEndpoint::post(
+                    "https://proxy.example.com/acs",
+                    0,
+                    true,
+                )],
+                single_logout_services: vec![],
+                signing_certs: vec![],
+                encryption_certs: vec![],
+                supported_name_id_formats: vec![NameIdFormat::EmailAddress],
+                want_assertions_signed: true,
+                authn_requests_signed: false,
+                valid_until: None,
+                cache_duration: None,
+                #[cfg(feature = "idp-disco")]
+                discovery_response_endpoints: vec![],
+            };
+            let request = ParsedAuthnRequest::for_proxy_reissue(
+                &upstream_sp,
+                request_id.to_owned(),
+                now,
+                upstream_sp.assertion_consumer_services[0].clone(),
+                None,
+                None,
+                None,
+            )
+            .expect("synthetic upstream request");
+            let dispatch = issuing_idp
+                .issue_response(IssueResponse {
+                    sp: &upstream_sp,
+                    in_response_to: &request,
+                    name_id: NameId::email("alice@example.com"),
+                    attributes: vec![],
+                    authn_instant: now,
+                    session_index: "upstream-session".into(),
+                    session_not_on_or_after: now.checked_add(Duration::from_hours(1)),
+                    authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+                    force_encrypt_assertion: Some(false),
+                    now,
+                    assertion_lifetime: Duration::from_mins(5),
+                    subject_confirmation_lifetime: Duration::from_mins(5),
+                    holder_of_key_cert: None,
+                })
+                .expect("issue upstream response");
+            let SsoResponseDispatch::Post(form) = dispatch else {
+                panic!("expected POST response");
+            };
+            crate::binding::post::decode(&form.saml_response, None)
+                .expect("decode response")
+                .xml
+        }
+
+        let old_key = rsa_keypair();
+        let new_key = KeyPair::from_pkcs8_pem(include_bytes!("../examples/demo/keys/sp.key"))
+            .expect("second RSA key")
+            .with_certificate(
+                X509Certificate::from_pem(include_bytes!("../examples/demo/keys/sp.crt"))
+                    .expect("second RSA cert"),
+            )
+            .expect("matching second RSA certificate");
+
+        for (response_key, old_key_should_succeed) in [(&old_key, true), (&new_key, false)] {
+            let sp = proxy_sp();
+            let idp = proxy_idp();
+            let proxy = Proxy::new(&sp, &idp, Box::new(Aes256GcmCodec::new([21u8; 32])));
+            let upstream = upstream_idp_descriptor();
+            let bounce = proxy
+                .bounce_to_upstream(BounceToUpstream {
+                    upstream_idp: &upstream,
+                    downstream_request: &synthetic_downstream_request(),
+                    propagate_request_flags: false,
+                    propagate_authn_context: false,
+                    propagate_name_id_policy: false,
+                    upstream_binding: Binding::HttpPost,
+                    now: SystemTime::now(),
+                })
+                .expect("bounce");
+            let context = proxy
+                .decode_context(&bounce.upstream_relay_state)
+                .expect("decode context");
+            let request_id = context.payload().upstream_tracker.request_id.clone();
+            let now = context.payload().issued_at;
+            let response = upstream_response(response_key, &request_id, now);
+            let mut rotating = upstream.clone();
+            rotating.signing_certs.push(
+                new_key
+                    .certificate()
+                    .expect("second key carries cert")
+                    .clone(),
+            );
+            let replay_cache = InMemoryReplayCache::new(16);
+            let result = proxy.consume_upstream_response(ConsumeUpstreamResponse {
+                relay_state: &bounce.upstream_relay_state,
+                upstream_idp: &rotating,
+                peer_crypto_policy: None,
+                saml_response: &response,
+                binding: crate::binding::SsoResponseBinding::HttpPost,
+                expected_destination: "https://proxy.example.com/acs",
+                now,
+                clock_skew: Duration::from_mins(1),
+                replay_cache: &replay_cache,
+                holder_of_key_cert: None,
+            });
+            if old_key_should_succeed {
+                result.expect("the pinned key remains valid during overlap");
+            } else {
+                assert!(
+                    matches!(&result, Err(Error::SignatureVerification { .. })),
+                    "new key must have no authority"
+                );
+                assert!(
+                    replay_cache.is_empty(),
+                    "a rejected new-key response must not reserve the transaction"
+                );
+            }
+        }
     }
 
     /// A flow is opaque, but opacity only prevents fabrication — not

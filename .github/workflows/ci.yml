@@ -60,7 +60,7 @@ jobs:
       # otherwise let example crates enable features (notably `slo`) that mask
       # invalid standalone feature combinations.
       - name: cargo clippy saml-only ${{ matrix.flags }}
-        run: cargo clippy -p saml --lib ${{ matrix.flags }} -- -D warnings
+        run: cargo clippy -p saml --all-targets ${{ matrix.flags }} -- -D warnings
       - name: cargo clippy ${{ matrix.flags }}
         run: cargo clippy --workspace --all-targets ${{ matrix.flags }} -- -D warnings
 
@@ -95,7 +95,7 @@ jobs:
         with:
           key: test-${{ matrix.rust }}-${{ matrix.features.name }}
       - name: cargo test saml-only ${{ matrix.features.flags }}
-        run: cargo test -p saml --lib ${{ matrix.features.flags }}
+        run: cargo test -p saml ${{ matrix.features.flags }}
       - name: cargo test ${{ matrix.features.flags }}
         # Exclude the keycloak example from default test runs — it requires
         # SAML_RUN_KEYCLOAK_E2E=1 and a live Keycloak instance.
