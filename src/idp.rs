@@ -155,6 +155,30 @@ pub struct IdentityProviderConfig {
     #[cfg(feature = "slo")]
     pub logout_want_signed: IdpLogoutWantSigned,
     pub default_session_duration: Duration,
+    /// Maximum age of an inbound `<samlp:AuthnRequest>`, measured from its
+    /// `IssueInstant` and widened by the call's `clock_skew`.
+    ///
+    /// SAML gives `AuthnRequest` no `NotOnOrAfter`, so unlike `LogoutRequest`
+    /// there is no peer-supplied expiry to enforce — the IdP has to supply the
+    /// bound. Without one a captured request stays replayable forever, which
+    /// makes `want_authn_requests_signed` much weaker than it looks: the
+    /// signature proves the SP authored the request, never that it authored it
+    /// recently.
+    ///
+    /// This bounds the replay window; it does not close it. Rejecting a
+    /// *repeat* within the window needs request-ID bookkeeping, which the
+    /// caller owns.
+    ///
+    /// This is a required field with no automatic default —
+    /// [`IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE`] is the
+    /// recommended value to pass, not a fallback applied on your behalf.
+    ///
+    /// `Duration::MAX` disables *age* enforcement only. A request dated into
+    /// the future is still rejected beyond the call's `clock_skew`: that
+    /// bound comes from the skew, not from this field, and dropping it would
+    /// make a future-dated request acceptable indefinitely — the same hole
+    /// this setting exists to close, wearing a different sign.
+    pub max_authn_request_age: Duration,
     pub default_peer_crypto_policy: PeerCryptoPolicy,
     pub outbound_signature_algorithm: SignatureAlgorithm,
     pub outbound_digest_algorithm: DigestAlgorithm,
@@ -169,6 +193,18 @@ pub struct IdentityProviderConfig {
 #[derive(Debug, Clone)]
 pub struct IdentityProvider {
     config: IdentityProviderConfig,
+}
+
+impl IdentityProviderConfig {
+    /// Recommended [`max_authn_request_age`]: five minutes.
+    ///
+    /// A browser-mediated `AuthnRequest` is redirected on within seconds, so
+    /// this is generous for real flows while keeping the replay window short.
+    /// The field is required, so nothing applies this automatically — pass it
+    /// explicitly, or a value your deployment justifies.
+    ///
+    /// [`max_authn_request_age`]: IdentityProviderConfig::max_authn_request_age
+    pub const DEFAULT_MAX_AUTHN_REQUEST_AGE: Duration = Duration::from_mins(5);
 }
 
 impl IdentityProvider {
@@ -220,6 +256,13 @@ pub struct ConsumeAuthnRequest<'a> {
     /// Per-peer inbound crypto policy. `None` falls back to the IdP's
     /// `default_peer_crypto_policy`.
     pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Overrides [`IdentityProviderConfig::max_authn_request_age`] for this
+    /// call.
+    ///
+    /// Scoped per call for the same reason `peer_crypto_policy` is: an SP
+    /// whose flow legitimately runs long should not force a wider window on
+    /// every other SP. `None` uses the IdP default.
+    pub max_authn_request_age: Option<Duration>,
     /// Already-decoded SAML XML bytes — caller is responsible for binding-
     /// layer decoding before passing the message here (see module docs).
     pub saml_request: &'a [u8],
@@ -310,11 +353,37 @@ impl IdentityProvider {
             }
         }
 
-        // Time-skew on AuthnRequest is not part of the spec validation set —
-        // `IssueInstant` is informational. We still surface `now` /
-        // `clock_skew` so future versions can plug in replay-window checks
-        // without breaking the call signature.
-        let _ = (input.now, input.clock_skew);
+        // 5. Freshness. Runs after the signature check so an unauthenticated
+        //    sender the effective policy refuses cannot probe the accepted
+        //    time window. That qualifier matters: when neither
+        //    `want_authn_requests_signed` nor the SP's metadata requires a
+        //    signature, unsigned requests are accepted and then judged on
+        //    freshness, so such a sender *can* probe it. The ordering is still
+        //    correct — it is simply not a probing defence on its own.
+        //
+        //    `AuthnRequest` carries no `NotOnOrAfter` (contrast
+        //    `LogoutRequest`, whose peer-supplied expiry is enforced in
+        //    `consume_logout_request`), so the bound comes from this IdP's
+        //    `max_authn_request_age`. Both directions are checked: a
+        //    future-dated request would otherwise stay valid for as long as
+        //    its `IssueInstant` is ahead of us.
+        let max_age = input
+            .max_authn_request_age
+            .unwrap_or(self.config.max_authn_request_age);
+        if let Ok(ahead) = parsed.issue_instant.duration_since(input.now)
+            && ahead > input.clock_skew
+        {
+            return Err(Error::AuthnRequestNotYetValid {
+                ahead,
+                clock_skew: input.clock_skew,
+            });
+        }
+        let limit = max_age.saturating_add(input.clock_skew);
+        if let Ok(age) = input.now.duration_since(parsed.issue_instant)
+            && age > limit
+        {
+            return Err(Error::StaleAuthnRequest { age, limit });
+        }
 
         parsed.relay_state = input.relay_state.map(str::to_owned);
         Ok(parsed)
@@ -362,6 +431,7 @@ impl IdentityProvider {
     /// let parsed = idp.consume_authn_request_wire(ConsumeAuthnRequestWire {
     ///     sp,
     ///     peer_crypto_policy: None,
+    ///     max_authn_request_age: None,
     ///     wire_body: raw_query.as_bytes(),
     ///     binding: Binding::HttpRedirect,
     ///     relay_state: None,
@@ -386,6 +456,7 @@ impl IdentityProvider {
         self.consume_authn_request(ConsumeAuthnRequest {
             sp: input.sp,
             peer_crypto_policy: input.peer_crypto_policy,
+            max_authn_request_age: input.max_authn_request_age,
             saml_request: &decoded.xml,
             binding: input.binding,
             relay_state: resolved_relay_state,
@@ -405,6 +476,13 @@ pub struct ConsumeAuthnRequestWire<'a> {
     /// Per-peer inbound crypto policy. `None` falls back to the IdP's
     /// `default_peer_crypto_policy`.
     pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Overrides [`IdentityProviderConfig::max_authn_request_age`] for this
+    /// call.
+    ///
+    /// Scoped per call for the same reason `peer_crypto_policy` is: an SP
+    /// whose flow legitimately runs long should not force a wider window on
+    /// every other SP. `None` uses the IdP default.
+    pub max_authn_request_age: Option<Duration>,
     /// Raw binding wire payload — query string for HTTP-Redirect, base64
     /// form value for HTTP-POST. See
     /// [`IdentityProvider::consume_authn_request_wire`] for binding-by-
@@ -1442,7 +1520,17 @@ mod tests {
     }
 
     fn idp_with(want_authn_requests_signed: bool, sign_responses: bool) -> IdentityProvider {
-        IdentityProvider::new(IdentityProviderConfig {
+        IdentityProvider::new(idp_config_with(want_authn_requests_signed, sign_responses))
+            .expect("idp config valid")
+    }
+
+    /// The config `idp_with` builds, exposed so tests can tweak one knob
+    /// without restating every field.
+    fn idp_config_with(
+        want_authn_requests_signed: bool,
+        sign_responses: bool,
+    ) -> IdentityProviderConfig {
+        IdentityProviderConfig {
             entity_id: "https://idp.example.com/saml".into(),
             sso: vec![
                 Endpoint::post("https://idp.example.com/sso", 0, true),
@@ -1465,6 +1553,7 @@ mod tests {
             #[cfg(feature = "slo")]
             logout_want_signed: IdpLogoutWantSigned::default(),
             default_session_duration: Duration::from_hours(1),
+            max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -1475,8 +1564,7 @@ mod tests {
             #[cfg(feature = "xmlenc")]
             outbound_key_transport_algorithm:
                 crate::xmlenc::algorithms::KeyTransportAlgorithm::RsaOaep,
-        })
-        .expect("idp config valid")
+        }
     }
 
     /// Synthetic SP descriptor with the IdP's test cert as its signing cert
@@ -1621,6 +1709,7 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 saml_request: &xml,
                 binding: Binding::HttpPost,
                 relay_state: Some("opaque-state"),
@@ -1640,6 +1729,206 @@ mod tests {
         assert_eq!(parsed.relay_state.as_deref(), Some("opaque-state"));
     }
 
+    // ---------- AuthnRequest freshness ----------
+
+    /// Drive `consume_authn_request` with a signed request built at
+    /// `fixed_now()`, evaluated as if the clock reads `now`.
+    fn consume_at(
+        idp: &IdentityProvider,
+        now: SystemTime,
+        clock_skew: Duration,
+    ) -> Result<ParsedAuthnRequest, Error> {
+        let sp = sp_descriptor(true);
+        let xml = build_signed_authn_request("_req-fresh");
+        idp.consume_authn_request(ConsumeAuthnRequest {
+            sp: &sp,
+            peer_crypto_policy: None,
+            max_authn_request_age: None,
+            saml_request: &xml,
+            binding: Binding::HttpPost,
+            relay_state: None,
+            detached_signature: None,
+            expected_destination: "https://idp.example.com/sso",
+            now,
+            clock_skew,
+        })
+    }
+
+    #[test]
+    fn stale_authn_request_is_rejected() {
+        // A valid signature proves the SP authored the request, never that it
+        // did so recently — without a bound, a captured request replays for
+        // ever.
+        let idp = idp_with(true, false);
+        let skew = Duration::from_mins(1);
+        let max_age = idp.config.max_authn_request_age;
+
+        consume_at(&idp, fixed_now() + max_age + skew, skew)
+            .expect("exactly at the limit is still fresh");
+
+        let err = consume_at(
+            &idp,
+            fixed_now() + max_age + skew + Duration::from_secs(1),
+            skew,
+        )
+        .expect_err("one second past the limit is stale");
+        // A dedicated variant, not `Expired`: that one is documented as an
+        // assertion's `Conditions/@NotOnOrAfter` having passed, and an
+        // AuthnRequest carries no such attribute.
+        assert!(
+            matches!(err, Error::StaleAuthnRequest { limit, .. } if limit == max_age + skew),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn future_dated_authn_request_beyond_skew_is_rejected() {
+        // Evaluating at a clock *behind* the IssueInstant is the same shape as
+        // a request dated into the future. Without this leg such a request
+        // stays acceptable for as long as it is dated ahead.
+        let idp = idp_with(true, false);
+        let skew = Duration::from_mins(1);
+
+        consume_at(&idp, fixed_now() - skew, skew).expect("within tolerated skew");
+
+        let err = consume_at(&idp, fixed_now() - skew - Duration::from_secs(1), skew)
+            .expect_err("beyond tolerated skew");
+        assert!(
+            matches!(err, Error::AuthnRequestNotYetValid { clock_skew, .. } if clock_skew == skew),
+            "got {err:?}"
+        );
+    }
+
+    /// The per-call override must actually win over the IdP default, so one
+    /// SP with a slow flow does not force a wider window on every other SP —
+    /// the same scoping argument `peer_crypto_policy` exists for.
+    #[test]
+    fn per_call_max_age_overrides_the_idp_default() {
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(true);
+        let xml = build_signed_authn_request("_req-fresh");
+        let skew = Duration::from_mins(1);
+        let default_max = idp.config.max_authn_request_age;
+        // Comfortably past the IdP default, comfortably inside the override.
+        let now = fixed_now() + default_max + skew + Duration::from_mins(10);
+
+        let consume = |max_authn_request_age| {
+            idp.consume_authn_request(ConsumeAuthnRequest {
+                sp: &sp,
+                peer_crypto_policy: None,
+                max_authn_request_age,
+                saml_request: &xml,
+                binding: Binding::HttpPost,
+                relay_state: None,
+                detached_signature: None,
+                expected_destination: "https://idp.example.com/sso",
+                now,
+                clock_skew: skew,
+            })
+        };
+
+        let err = consume(None).expect_err("the IdP default rejects it");
+        assert!(
+            matches!(err, Error::StaleAuthnRequest { .. }),
+            "got {err:?}"
+        );
+
+        consume(Some(default_max + Duration::from_hours(1)))
+            .expect("a wider per-call window accepts the same request");
+
+        assert_eq!(
+            idp.config.max_authn_request_age, default_max,
+            "the override must not have mutated the IdP default"
+        );
+    }
+
+    /// `Duration::MAX` opts out of the *age* bound, not of future-dating.
+    /// A request dated arbitrarily far ahead stays rejected, because that
+    /// bound comes from `clock_skew`. Covered at both the config level and
+    /// the per-call override, since either could have been wired to skip the
+    /// whole check.
+    #[test]
+    fn max_duration_opt_out_still_rejects_future_dated_requests() {
+        let skew = Duration::from_mins(1);
+        let far_behind = fixed_now() - skew - Duration::from_hours(24);
+
+        // Config-level opt-out.
+        let mut cfg = idp_config_with(true, false);
+        cfg.max_authn_request_age = Duration::MAX;
+        let idp = IdentityProvider::new(cfg).expect("idp config valid");
+        let err = consume_at(&idp, far_behind, skew)
+            .expect_err("future-dated beyond skew is still refused");
+        assert!(
+            matches!(err, Error::AuthnRequestNotYetValid { .. }),
+            "config opt-out: got {err:?}"
+        );
+
+        // Per-call opt-out.
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(true);
+        let xml = build_signed_authn_request("_req-fresh");
+        let err = idp
+            .consume_authn_request(ConsumeAuthnRequest {
+                sp: &sp,
+                peer_crypto_policy: None,
+                max_authn_request_age: Some(Duration::MAX),
+                saml_request: &xml,
+                binding: Binding::HttpPost,
+                relay_state: None,
+                detached_signature: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: far_behind,
+                clock_skew: skew,
+            })
+            .expect_err("per-call opt-out does not waive the skew bound either");
+        assert!(
+            matches!(err, Error::AuthnRequestNotYetValid { .. }),
+            "per-call opt-out: got {err:?}"
+        );
+    }
+
+    #[test]
+    fn max_duration_disables_the_freshness_bound() {
+        let mut cfg = idp_config_with(true, false);
+        cfg.max_authn_request_age = Duration::MAX;
+        let idp = IdentityProvider::new(cfg).expect("idp config valid");
+
+        consume_at(
+            &idp,
+            fixed_now() + Duration::from_hours(24 * 365),
+            Duration::from_mins(1),
+        )
+        .expect("Duration::MAX opts out without overflowing the skew addition");
+    }
+
+    #[test]
+    fn freshness_is_checked_after_the_signature() {
+        // A stale *and* unsigned request must surface the signature failure,
+        // so a sender the effective policy refuses cannot probe the accepted
+        // window. Where signing is optional, unsigned requests are accepted and
+        // then judged on freshness, so the ordering does not stop probing there.
+        let idp = idp_with(true, false);
+        let sp = sp_descriptor(false);
+        let xml = build_unsigned_authn_request("_req-stale-unsigned", true);
+        let skew = Duration::from_mins(1);
+
+        let err = idp
+            .consume_authn_request(ConsumeAuthnRequest {
+                sp: &sp,
+                peer_crypto_policy: None,
+                max_authn_request_age: None,
+                saml_request: &xml,
+                binding: Binding::HttpPost,
+                relay_state: None,
+                detached_signature: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now() + idp.config.max_authn_request_age + skew + Duration::from_secs(1),
+                clock_skew: skew,
+            })
+            .expect_err("unsigned and stale");
+        assert!(matches!(err, Error::SignatureMissing));
+    }
+
     #[test]
     fn consume_unsigned_post_request_rejected_when_required() {
         let idp = idp_with(true, false);
@@ -1649,6 +1938,7 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 saml_request: &xml,
                 binding: Binding::HttpPost,
                 relay_state: None,
@@ -1670,6 +1960,7 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 saml_request: &xml,
                 binding: Binding::HttpPost,
                 relay_state: None,
@@ -1691,6 +1982,7 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 saml_request: &xml,
                 binding: Binding::HttpRedirect,
                 relay_state: None,
@@ -1712,6 +2004,7 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 saml_request: &xml,
                 binding: Binding::HttpPost,
                 relay_state: None,
@@ -2315,6 +2608,7 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 saml_request: &decoded.xml,
                 binding: Binding::HttpRedirect,
                 relay_state: decoded.relay_state.as_deref(),
@@ -2330,6 +2624,7 @@ mod tests {
             .consume_authn_request_wire(ConsumeAuthnRequestWire {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 wire_body: raw_query.as_bytes(),
                 binding: Binding::HttpRedirect,
                 relay_state: None,
@@ -2360,6 +2655,7 @@ mod tests {
             .consume_authn_request_wire(ConsumeAuthnRequestWire {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 wire_body: raw_query.as_bytes(),
                 binding: Binding::HttpRedirect,
                 relay_state: None,
@@ -2407,6 +2703,7 @@ mod tests {
             .consume_authn_request_wire(ConsumeAuthnRequestWire {
                 sp: &sp,
                 peer_crypto_policy: None,
+                max_authn_request_age: None,
                 wire_body: tampered.as_bytes(),
                 binding: Binding::HttpRedirect,
                 relay_state: None,

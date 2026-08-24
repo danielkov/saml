@@ -75,6 +75,7 @@ fn make_artifact_idp() -> common::TestResult<IdentityProvider> {
         #[cfg(feature = "slo")]
         logout_want_signed: saml::IdpLogoutWantSigned::default(),
         default_session_duration: Duration::from_hours(1),
+        max_authn_request_age: saml::IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -163,7 +164,7 @@ async fn artifact_flow_end_to_end() {
     let idp = make_artifact_idp().expect("idp builds");
     let idp_descriptor: IdpDescriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor: SpDescriptor = common::sp_descriptor(&sp).expect("sp descriptor");
-    let now = common::fixed_now().expect("fixed_now");
+    let now = common::flow_now();
 
     // 1. SP starts login requesting Artifact response binding.
     let start = sp
@@ -201,6 +202,7 @@ async fn artifact_flow_end_to_end() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &authn_request_xml,
             binding: Binding::HttpPost,
             relay_state: Some("artifact-relay"),
@@ -316,7 +318,7 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     let idp = make_artifact_idp().expect("idp builds");
     let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
-    let now = common::fixed_now().expect("fixed_now");
+    let now = common::flow_now();
 
     let empty_stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
     let ars = ArtifactResolutionService {

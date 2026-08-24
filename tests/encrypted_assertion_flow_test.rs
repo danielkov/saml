@@ -86,6 +86,7 @@ fn make_encrypting_idp() -> common::TestResult<IdentityProvider> {
         #[cfg(feature = "slo")]
         logout_want_signed: saml::IdpLogoutWantSigned::default(),
         default_session_duration: Duration::from_hours(1),
+        max_authn_request_age: saml::IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
@@ -113,7 +114,7 @@ fn idp_encrypts_assertion_and_sp_decrypts_it() {
         let xml = sp.metadata_xml(false).expect("sp metadata");
         SpDescriptor::from_metadata_xml(xml.as_bytes()).expect("sp descriptor")
     };
-    let now = common::fixed_now().expect("fixed_now");
+    let now = common::flow_now();
 
     // Precondition: the SP's parsed descriptor exposes an encryption cert. This
     // is what the IdP example keys off of (`sp.encryption_cert().is_some()`).
@@ -154,6 +155,7 @@ fn idp_encrypts_assertion_and_sp_decrypts_it() {
         .consume_authn_request(ConsumeAuthnRequest {
             sp: &sp_descriptor,
             peer_crypto_policy: None,
+            max_authn_request_age: None,
             saml_request: &authn_request_xml,
             binding: Binding::HttpPost,
             relay_state: form.relay_state.as_deref(),
