@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Keep blocking compilers immutable between review and merge. Update these
+  # pins deliberately in a dedicated PR, together with any resulting fixes.
+  CI_RUST_STABLE: "1.97.1"
+  CI_RUST_NIGHTLY: "nightly-2026-08-12"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -19,16 +23,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (stable + rustfmt)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.CI_RUST_STABLE }} + rustfmt
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: ${{ env.CI_RUST_STABLE }}
           components: rustfmt
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
   # ---------------------------------------------------------------------------
   # Clippy: run across every feature combo we test
-  # Uses stable toolchain. Clippy on MSRV / beta would just duplicate noise.
+  # Uses pinned stable. Clippy on MSRV / beta would just duplicate noise.
   # ---------------------------------------------------------------------------
   clippy:
     name: clippy (${{ matrix.name }})
@@ -49,9 +54,10 @@ jobs:
             flags: --features "artifact-binding weak-algos" --no-default-features
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (stable + clippy)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.CI_RUST_STABLE }} + clippy
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: ${{ env.CI_RUST_STABLE }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -63,12 +69,20 @@ jobs:
   # Tests: matrix on Rust toolchain X feature combo, Ubuntu only
   # ---------------------------------------------------------------------------
   test:
-    name: test ${{ matrix.rust }} / ${{ matrix.features.name }}
+    name: test ${{ matrix.rust.name }} / ${{ matrix.features.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, beta, "1.91.0"]
+        rust:
+          # Preserve the existing display names for branch protection while
+          # resolving each one to the exact reviewed compiler snapshot.
+          - name: stable
+            toolchain: "1.97.1"
+          - name: beta
+            toolchain: "1.98.0-beta.7"
+          - name: "1.91.0"
+            toolchain: "1.91.0"
         features:
           - name: default
             flags: ""
@@ -82,13 +96,13 @@ jobs:
             flags: --features "artifact-binding weak-algos" --no-default-features
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Rust ${{ matrix.rust.name }} (${{ matrix.rust.toolchain }})
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: ${{ matrix.rust.toolchain }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-${{ matrix.rust }}-${{ matrix.features.name }}
+          key: test-${{ matrix.rust.name }}-${{ matrix.features.name }}
       - name: cargo test ${{ matrix.features.flags }}
         # Exclude the keycloak example from default test runs — it requires
         # SAML_RUN_KEYCLOAK_E2E=1 and a live Keycloak instance.
@@ -107,8 +121,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install xmlsec1
         run: sudo apt-get update && sudo apt-get install -y xmlsec1
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.CI_RUST_STABLE }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.CI_RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: xmlsec-interop
@@ -126,8 +142,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust ${{ env.CI_RUST_NIGHTLY }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.CI_RUST_NIGHTLY }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz-build
@@ -142,7 +160,7 @@ jobs:
       # (E0463 can't find `core`). gnu is the standard ASan fuzzing target and
       # ships std with the toolchain.
       - name: cargo fuzz build
-        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
 
   # ---------------------------------------------------------------------------
   # Coverage: instrument the workspace with cargo-llvm-cov, emit lcov, and push
@@ -159,9 +177,10 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (stable + llvm-tools)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.CI_RUST_STABLE }} + llvm-tools
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
+          toolchain: ${{ env.CI_RUST_STABLE }}
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
@@ -192,8 +211,10 @@ jobs:
         os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.CI_RUST_STABLE }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.CI_RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: smoke-${{ matrix.os }}
@@ -210,8 +231,10 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.CI_RUST_STABLE }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.CI_RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: doc
@@ -235,7 +258,9 @@ jobs:
   #       options: --health-cmd "curl -fsS http://localhost:8080/health/ready || exit 1"
   #   steps:
   #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+  #       with:
+  #         toolchain: ${{ env.CI_RUST_STABLE }}
   #     - uses: Swatinem/rust-cache@v2
   #     - name: Run keycloak e2e tests
   #       env:

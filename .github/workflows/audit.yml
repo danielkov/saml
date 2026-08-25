@@ -22,6 +22,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CI_RUST_STABLE: "1.97.1"
 
 jobs:
   cargo-deny:
@@ -41,8 +42,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ env.CI_RUST_STABLE }}
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: ${{ env.CI_RUST_STABLE }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: audit
