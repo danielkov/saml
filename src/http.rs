@@ -108,15 +108,17 @@ mod tests {
     struct EchoClient;
 
     impl HttpClient for EchoClient {
-        async fn send(
+        fn send(
             &self,
             request: HttpRequest,
-        ) -> Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(HttpResponse {
+        ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
+        {
+            let response: Result<_, Box<dyn std::error::Error + Send + Sync>> = Ok(HttpResponse {
                 status: 200,
                 headers: request.headers,
                 body: request.body,
-            })
+            });
+            std::future::ready(response)
         }
     }
 
