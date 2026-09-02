@@ -13,17 +13,23 @@
 //!
 //! # Feature gating
 //!
-//! This module compiles only when **both** the `artifact-binding` and
-//! `weak-algos` features are enabled. The SAML 2.0 spec mandates SHA-1 for the
-//! 20-byte `SourceID` (Bindings §3.6.4); SHA-1 here is **not** used for any
-//! security property — it is an identity-matching tag for routing artifact
-//! resolves to the correct IdP — but we still want callers to opt in to the
-//! `weak-algos` feature flag so the dependency on the `sha1` crate is
-//! explicit. When `weak-algos` is off the module's body is empty (the surface
-//! disappears) which is what the spec calls for in environments that ban all
-//! SHA-1 transitively.
+//! This module compiles under the `artifact-binding` feature, which pulls in
+//! the `sha1` crate on its own.
+//!
+//! The SAML 2.0 artifact format mandates SHA-1 for the 20-byte `SourceID`
+//! (Bindings §3.6.4, type 0x0004). That hash is **not** load-bearing for any
+//! security property — it is an identity-matching tag for routing an artifact
+//! resolve to the right IdP, and a collision would misroute rather than
+//! forge. It is therefore kept separate from `weak-algos`, which governs weak
+//! *signature* and *digest* algorithms (`RsaSha1`, `DsaSha1`,
+//! `DigestAlgorithm::Sha1`). Requiring `weak-algos` for the artifact binding
+//! forced every deployment that wanted artifacts to also compile in
+//! signature primitives it had no use for, which is backwards: the crate's
+//! rule is that compiling an algorithm in must never be what makes it
+//! acceptable, and the narrower the compiled surface the easier that is to
+//! hold.
 
-#![cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#![cfg(feature = "artifact-binding")]
 
 use std::time::SystemTime;
 

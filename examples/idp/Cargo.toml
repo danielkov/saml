@@ -15,10 +15,12 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Optional artifact-binding support. The saml crate's artifact path requires
-# the `weak-algos` feature (SHA-1) per its public API; flip both on if you
-# want this IdP example to expose `POST /saml/artifact`.
-artifact-binding = ["saml/artifact-binding", "saml/weak-algos"]
+# Optional artifact-binding support. Flip this on to expose
+# `POST /saml/artifact`. It no longer drags in `saml/weak-algos`: the SHA-1
+# the artifact SourceID needs is pulled in by `saml/artifact-binding` itself,
+# so enabling the binding does not also compile in weak signature and digest
+# algorithms.
+artifact-binding = ["saml/artifact-binding"]
 
 [dependencies]
 saml = { path = "../..", default-features = false, features = [
