@@ -1032,6 +1032,8 @@ mod tests {
         idp.consume_authn_request_wire(saml::ConsumeAuthnRequestWire {
             sp: &sp_descriptor,
             peer_crypto_policy: None,
+            // `None` uses the IdP's configured default.
+            max_authn_request_age: None,
             wire_body: form
                 .saml_request
                 .as_deref()

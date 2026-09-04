@@ -4714,6 +4714,8 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                // `None` uses the IdP's configured default.
+                max_authn_request_age: None,
                 saml_request: &substituted_xml,
                 binding: Binding::HttpRedirect,
                 relay_state: decoded.relay_state.as_deref(),
@@ -4729,6 +4731,8 @@ mod tests {
             .consume_authn_request(ConsumeAuthnRequest {
                 sp: &sp,
                 peer_crypto_policy: None,
+                // `None` uses the IdP's configured default.
+                max_authn_request_age: None,
                 saml_request: &decoded.xml,
                 binding: Binding::HttpRedirect,
                 relay_state: Some("substituted-relay-state"),
@@ -4751,6 +4755,8 @@ mod tests {
             .consume_authn_request_wire(ConsumeAuthnRequestWire {
                 sp: &sp,
                 peer_crypto_policy: None,
+                // `None` uses the IdP's configured default.
+                max_authn_request_age: None,
                 wire_body: raw_query.as_bytes(),
                 binding: Binding::HttpRedirect,
                 relay_state: Some("different-state"),
