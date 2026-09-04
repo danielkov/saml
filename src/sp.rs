@@ -646,11 +646,23 @@ impl ServiceProvider {
             SsoResponseBinding::HttpArtifact,
         )?;
 
+        // Bindings §3.6.4: a type 0x0004 artifact names the issuer's
+        // ArtifactResolutionService by index. Resolving against the default
+        // endpoint instead sends the artifact somewhere the IdP never
+        // nominated — wrong for any IdP advertising more than one ARS, and
+        // silently so, since the mismatch only shows up as a failed resolve.
+        let parsed = crate::binding::artifact::parse_artifact(input.artifact)?;
+        if input.idp.artifact_resolution_endpoints.is_empty() {
+            return Err(Error::UnsupportedByPeer {
+                binding: Binding::HttpArtifact,
+            });
+        }
         let ars = input
             .idp
-            .artifact_resolution_endpoint()
-            .ok_or(Error::UnsupportedByPeer {
-                binding: Binding::HttpArtifact,
+            .artifact_resolution_endpoint_by_index(parsed.endpoint_index)
+            .ok_or_else(|| Error::UnknownArtifactEndpointIndex {
+                entity_id: input.idp.entity_id.clone(),
+                index: parsed.endpoint_index,
             })?;
 
         // Route through the first-class BackchannelClient so callers can opt
@@ -3176,18 +3188,49 @@ mod tests {
         const ARS_URL: &str = "https://idp.example.com/ars";
 
         /// Mock `HttpClient` returning a fixed SOAP envelope body.
+        /// Builds an ArtifactResponse from the request's `@ID`.
+        type ResponderFn = Box<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
         struct MockClient {
-            response: Vec<u8>,
+            /// Builds the response from the ArtifactResolve `@ID`, so signed
+            /// fixtures can set `@InResponseTo` before signing.
+            respond: ResponderFn,
+        }
+
+        impl MockClient {
+            /// Canned response; `_req1` is rewritten to the actual request ID.
+            fn canned(response: Vec<u8>) -> Self {
+                Self {
+                    respond: Box::new(move |id| {
+                        String::from_utf8_lossy(&response)
+                            .replace("_req1", id)
+                            .into_bytes()
+                    }),
+                }
+            }
+
+            fn building(f: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
+                Self {
+                    respond: Box::new(f),
+                }
+            }
         }
 
         impl HttpClient for MockClient {
             fn send(
                 &self,
-                _request: HttpRequest,
+                request: HttpRequest,
             ) -> impl Future<
                 Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
             > + Send {
-                let body = self.response.clone();
+                // A real ARS echoes the ArtifactResolve `@ID` as
+                // `@InResponseTo`, and signs afterwards. Build per request so
+                // the signature covers the correlation.
+                let id = String::from_utf8_lossy(&request.body)
+                    .split_once(" ID=\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map_or_else(String::new, |(id, _)| id.to_owned());
+                let body = (self.respond)(&id);
                 async move {
                     Ok(HttpResponse {
                         status: 200,
@@ -3198,11 +3241,20 @@ mod tests {
             }
         }
 
+        /// A real type 0x0004 artifact naming ARS index 0 — the index
+        /// [`artifact_idp`] advertises. The SP now decodes bytes 2..4 to pick
+        /// the endpoint, so a placeholder string no longer reaches the
+        /// backchannel these tests are about.
+        static ARTIFACT_INDEX_0: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            crate::binding::artifact::make_artifact("https://idp.example.com", 0)
+                .expect("mint fixture artifact")
+        });
+
         /// IdP descriptor advertising an `ArtifactResolutionService` so the SP
         /// artifact path resolves an ARS endpoint.
         fn artifact_idp() -> IdpDescriptor {
             let mut idp = fixture_idp();
-            idp.artifact_resolution_endpoints = vec![Endpoint::post(ARS_URL, 0, true)];
+            idp.artifact_resolution_endpoints = vec![Endpoint::soap(ARS_URL, Some(0), true)];
             idp
         }
 
@@ -3220,7 +3272,7 @@ mod tests {
         /// ArtifactResponse element is enveloped-signed with the fixture key.
         /// When `tamper` is set, an attribute is mutated after signing so the
         /// envelope signature no longer verifies.
-        fn signed_envelope(tamper: bool) -> Vec<u8> {
+        fn signed_envelope(tamper: bool, in_response_to: &str) -> Vec<u8> {
             let kp = rsa_signing_key();
             let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
             let inner_doc = Document::parse(inner.as_bytes()).expect("inner parse");
@@ -3241,6 +3293,8 @@ mod tests {
                 .with_attribute(QName::new(None, "ID"), "_art-resp".to_owned())
                 .with_attribute(QName::new(None, "Version"), "2.0")
                 .with_attribute(QName::new(None, "IssueInstant"), "2026-01-01T00:00:00Z")
+                // Set before signing, as a real ARS does.
+                .with_attribute(QName::new(None, "InResponseTo"), in_response_to.to_owned())
                 .with_child(Node::Element(issuer))
                 .with_child(Node::Element(status))
                 .with_child(Node::Element(inner_elem))
@@ -3275,7 +3329,7 @@ mod tests {
             ConsumeArtifactResponse {
                 idp,
                 peer_crypto_policy: None,
-                artifact: "AAQAA-sample",
+                artifact: &ARTIFACT_INDEX_0,
                 relay_state: None,
                 tracker: None,
                 expected_destination: "https://sp.example.com/acs",
@@ -3321,6 +3375,141 @@ mod tests {
             }
         }
 
+        /// Records the URL the backchannel resolve was sent to, then fails.
+        /// The failure is irrelevant — these tests assert on *routing*, which
+        /// is decided before any response comes back.
+        #[derive(Default)]
+        struct UrlRecordingClient {
+            url: std::sync::Mutex<Option<String>>,
+        }
+
+        impl HttpClient for UrlRecordingClient {
+            fn send(
+                &self,
+                request: HttpRequest,
+            ) -> impl Future<
+                Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send {
+                *self.url.lock().expect("url lock") = Some(request.url.clone());
+                async move {
+                    Err::<HttpResponse, Box<dyn std::error::Error + Send + Sync>>(
+                        "routing recorded; response not needed".into(),
+                    )
+                }
+            }
+        }
+
+        const ARS_INDEX_7_URL: &str = "https://idp.example.com/ars/seven";
+
+        /// An IdP advertising two ARS endpoints at *different* URLs, so which
+        /// one gets called is observable.
+        fn multi_ars_idp() -> IdpDescriptor {
+            let mut idp = fixture_idp();
+            // SOAP: an ArtifactResolutionService is a SOAP endpoint
+            // (Bindings §3.6.3) and selection now requires it.
+            idp.artifact_resolution_endpoints = vec![
+                Endpoint::soap(ARS_URL, Some(0), true),
+                Endpoint::soap(ARS_INDEX_7_URL, Some(7), false),
+            ];
+            idp
+        }
+
+        /// Bindings §3.6.4: bytes 2..4 select the issuer's ARS. Index 7 is not
+        /// the default endpoint, so resolving the default instead would send
+        /// the ArtifactResolve to `ARS_URL` and this would fail.
+        #[tokio::test]
+        async fn artifact_endpoint_index_selects_the_named_ars_not_the_default() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+            let artifact = crate::binding::artifact::make_artifact("https://idp.example.com", 7)
+                .expect("mint artifact naming index 7");
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = &artifact;
+            let outcome = sp.consume_response_artifact(&client, input).await;
+            // The mock never returns a usable envelope; routing is decided
+            // before that and is what this asserts on.
+            assert!(outcome.is_err(), "mock always fails the resolve");
+
+            assert_eq!(
+                client.url.lock().expect("url lock").as_deref(),
+                Some(ARS_INDEX_7_URL),
+                "artifact named ARS index 7; the resolve must go there"
+            );
+        }
+
+        /// The default endpoint is still selected when the artifact names it —
+        /// otherwise the test above would pass for an implementation that just
+        /// always picked the last endpoint.
+        #[tokio::test]
+        async fn artifact_endpoint_index_zero_selects_the_index_zero_ars() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+            let artifact = crate::binding::artifact::make_artifact("https://idp.example.com", 0)
+                .expect("mint artifact naming index 0");
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = &artifact;
+            let outcome = sp.consume_response_artifact(&client, input).await;
+            assert!(outcome.is_err(), "mock always fails the resolve");
+
+            assert_eq!(
+                client.url.lock().expect("url lock").as_deref(),
+                Some(ARS_URL),
+                "artifact named ARS index 0; the resolve must go there"
+            );
+        }
+
+        /// An index the IdP never advertised is refused rather than quietly
+        /// falling back to the default endpoint.
+        #[tokio::test]
+        async fn artifact_naming_an_unadvertised_ars_index_is_refused() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+            let artifact = crate::binding::artifact::make_artifact("https://idp.example.com", 9)
+                .expect("mint artifact naming index 9");
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = &artifact;
+            let err = sp
+                .consume_response_artifact(&client, input)
+                .await
+                .expect_err("index 9 is not advertised");
+
+            assert!(
+                matches!(err, Error::UnknownArtifactEndpointIndex { index: 9, .. }),
+                "got {err:?}"
+            );
+            assert!(
+                client.url.lock().expect("url lock").is_none(),
+                "no backchannel call may be made for an unresolvable index"
+            );
+        }
+
+        /// A malformed artifact is rejected before any backchannel call.
+        #[tokio::test]
+        async fn malformed_artifact_is_refused_before_the_backchannel() {
+            let sp = artifact_sp();
+            let idp = multi_ars_idp();
+            let client = UrlRecordingClient::default();
+
+            let mut input = consume_input(&idp, None);
+            input.artifact = "AAQAA-not-a-real-artifact";
+            let err = sp
+                .consume_response_artifact(&client, input)
+                .await
+                .expect_err("malformed artifact must be refused");
+
+            assert!(matches!(err, Error::InvalidArtifact { .. }), "got {err:?}");
+            assert!(
+                client.url.lock().expect("url lock").is_none(),
+                "no backchannel call may be made for a malformed artifact"
+            );
+        }
+
         fn artifact_tracker(sp: &ServiceProvider, idp_entity_id: &str) -> LoginTracker {
             LoginTracker {
                 request_id: "_req1".to_owned(),
@@ -3343,7 +3532,7 @@ mod tests {
                 ConsumeArtifactResponse {
                     idp,
                     peer_crypto_policy: None,
-                    artifact: "AAQAAK1234567890",
+                    artifact: &ARTIFACT_INDEX_0,
                     relay_state: None,
                     tracker: Some(tracker),
                     expected_destination: "https://sp.example.com/acs",
@@ -3410,9 +3599,7 @@ mod tests {
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
             let policy = PeerCryptoPolicy::strong_defaults();
-            let client = MockClient {
-                response: signed_envelope(false),
-            };
+            let client = MockClient::building(|id| signed_envelope(false, id));
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3449,9 +3636,7 @@ mod tests {
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
             let policy = PeerCryptoPolicy::strong_defaults();
-            let client = MockClient {
-                response: signed_envelope(true),
-            };
+            let client = MockClient::building(|id| signed_envelope(true, id));
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3488,7 +3673,7 @@ mod tests {
             )
             .expect("build unsigned envelope")
             .into_bytes();
-            let client = MockClient { response: unsigned };
+            let client = MockClient::canned(unsigned);
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3521,7 +3706,7 @@ mod tests {
             )
             .expect("build unsigned envelope")
             .into_bytes();
-            let client = MockClient { response: unsigned };
+            let client = MockClient::canned(unsigned);
 
             let err = sp
                 .consume_response_artifact(&client, consume_input(&idp, None))

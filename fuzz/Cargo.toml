@@ -24,6 +24,10 @@ default-features = true
 default = ["xmlenc", "slo"]
 xmlenc = ["saml/xmlenc"]
 slo = ["saml/slo"]
+# Mirrors `saml/artifact-binding` so the `want_artifact_resolve_signed`
+# config field is visible to `#[cfg(feature = …)]` here. Needed for
+# `--all-features` workspace builds, which turn the feature on in `saml`.
+artifact-binding = ["saml/artifact-binding"]
 
 # `cargo-fuzz` injects `--cfg fuzzing` when building fuzz targets. Declare it
 # so non-fuzz builds (e.g. `cargo check --all`) don't warn about an unknown

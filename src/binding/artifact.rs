@@ -98,16 +98,68 @@ pub fn make_artifact(issuer_entity_id: &str, endpoint_index: u16) -> Result<Stri
     Ok(BASE64.encode(buf))
 }
 
+/// The fields a type `0x0004` artifact carries, per SAML 2.0 Bindings §3.6.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedArtifact {
+    /// Bytes 2..4. Identifies which of the **issuer's** (IdP's)
+    /// `<md:ArtifactResolutionService>` endpoints to resolve against — not
+    /// anything about the recipient. A recipient with several ARS endpoints
+    /// cannot pick correctly without it.
+    pub endpoint_index: u16,
+    /// Bytes 4..24. `SHA-1` of the issuer's entity ID for the derivation this
+    /// crate emits, though Bindings §3.6.4 permits an issuer to assign a
+    /// `SourceID` by other means. It is therefore exposed for callers that
+    /// index their own peers by it, and deliberately not enforced here: a
+    /// conformant IdP using a different derivation would otherwise be
+    /// unresolvable.
+    pub source_id: [u8; 20],
+}
+
+/// Decode a type `0x0004` artifact.
+///
+/// Rejects anything that is not exactly 44 bytes of the right type code, so a
+/// caller cannot read an endpoint index out of an artifact whose framing it
+/// has not established.
+pub fn parse_artifact(artifact: &str) -> Result<ParsedArtifact, Error> {
+    let raw = BASE64
+        .decode(artifact.as_bytes())
+        .map_err(|_decode_err| Error::InvalidArtifact {
+            reason: "artifact is not valid base64",
+        })?;
+    let raw: [u8; 44] = raw.try_into().map_err(|_len_err| Error::InvalidArtifact {
+        reason: "artifact is not 44 bytes",
+    })?;
+
+    let type_code = u16::from_be_bytes([raw[0], raw[1]]);
+    if type_code != ARTIFACT_TYPE_CODE {
+        return Err(Error::InvalidArtifact {
+            reason: "artifact is not type 0x0004",
+        });
+    }
+
+    let mut source_id = [0u8; 20];
+    source_id.copy_from_slice(&raw[4..24]);
+
+    Ok(ParsedArtifact {
+        endpoint_index: u16::from_be_bytes([raw[2], raw[3]]),
+        source_id,
+    })
+}
+
 /// Construct an [`ArtifactRedirect`] for an outbound SSO `<samlp:Response>`.
 ///
 /// `sp_acs_url` is the SP's ACS endpoint URL (where the browser lands).
+/// `issuer_entity_id` is this IdP (it seeds the artifact's `SourceID`).
+/// `recipient_entity_id` is the SP the artifact is minted for.
 /// `response_xml` is the full `<samlp:Response>` XML the IdP will return when
 /// the SP resolves the artifact via SOAP — the library does not persist this;
-/// the caller MUST stash it keyed by the returned `artifact` string and serve
-/// it from its `ArtifactResolutionService`.
+/// the caller MUST stash it, together with the recipient, keyed by the
+/// returned `artifact` string. See [`ArtifactRedirect`] for why the recipient
+/// is part of that contract rather than optional bookkeeping.
 pub fn build_artifact_redirect(
     sp_acs_url: &Url,
     issuer_entity_id: &str,
+    recipient_entity_id: &str,
     endpoint_index: u16,
     response_xml: String,
     relay_state: Option<&str>,
@@ -128,6 +180,7 @@ pub fn build_artifact_redirect(
     Ok(ArtifactRedirect {
         redirect_to,
         artifact,
+        recipient_entity_id: recipient_entity_id.to_owned(),
         response_xml,
     })
 }
@@ -147,18 +200,40 @@ pub fn build_artifact_resolve(
     issuer_entity_id: &str,
     destination: &str,
     artifact: &str,
-) -> Result<String, Error> {
-    let resolve_elem = build_artifact_resolve_element(issuer_entity_id, destination, artifact)?;
-    soap::wrap_element(resolve_elem)
+) -> Result<ArtifactResolveEnvelope, Error> {
+    let (resolve_elem, request_id) =
+        build_artifact_resolve_element(issuer_entity_id, destination, artifact)?;
+    Ok(ArtifactResolveEnvelope {
+        soap_envelope: soap::wrap_element(resolve_elem)?,
+        request_id,
+    })
+}
+
+/// A SOAP-wrapped `<samlp:ArtifactResolve>` and the `@ID` it carries.
+///
+/// The ID is returned rather than discarded because the caller needs it to
+/// correlate the answer: [`parse_artifact_response`] requires it. Returning
+/// only the envelope left the manual exchange uncorrelated, so a substituted
+/// or replayed `ArtifactResponse` was indistinguishable from the real one.
+#[derive(Debug, Clone)]
+pub struct ArtifactResolveEnvelope {
+    /// The SOAP envelope to POST to the ArtifactResolutionService.
+    pub soap_envelope: String,
+    /// `ArtifactResolve/@ID`. Pass to [`parse_artifact_response`].
+    pub request_id: String,
 }
 
 /// Build the bare `<samlp:ArtifactResolve>` element (no SOAP envelope), so the
 /// back-channel client can optionally enveloped-sign it before wrapping.
-fn build_artifact_resolve_element(
+///
+/// Returns the element together with its generated `@ID`. The caller needs
+/// that ID to correlate the `ArtifactResponse/@InResponseTo` that comes back;
+/// discarding it would leave the exchange uncorrelated.
+pub(crate) fn build_artifact_resolve_element(
     issuer_entity_id: &str,
     destination: &str,
     artifact: &str,
-) -> Result<Element, Error> {
+) -> Result<(Element, String), Error> {
     let id = crate::binding::random_xml_id()?;
     let issue_instant = format_xs_datetime(SystemTime::now())?;
 
@@ -173,18 +248,17 @@ fn build_artifact_resolve_element(
         .finish();
 
     // <samlp:ArtifactResolve ...>
-    Ok(
-        Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResolve"))
-            .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
-            .with_namespace(Some("saml".to_owned()), SAML_NS)
-            .with_attribute(QName::new(None, "ID"), id)
-            .with_attribute(QName::new(None, "Version"), "2.0")
-            .with_attribute(QName::new(None, "IssueInstant"), issue_instant)
-            .with_attribute(QName::new(None, "Destination"), destination.to_owned())
-            .with_child(Node::Element(issuer_elem))
-            .with_child(Node::Element(artifact_elem))
-            .finish(),
-    )
+    let element = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResolve"))
+        .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
+        .with_namespace(Some("saml".to_owned()), SAML_NS)
+        .with_attribute(QName::new(None, "ID"), id.clone())
+        .with_attribute(QName::new(None, "Version"), "2.0")
+        .with_attribute(QName::new(None, "IssueInstant"), issue_instant)
+        .with_attribute(QName::new(None, "Destination"), destination.to_owned())
+        .with_child(Node::Element(issuer_elem))
+        .with_child(Node::Element(artifact_elem))
+        .finish();
+    Ok((element, id))
 }
 
 /// Parse a `<samlp:ArtifactResponse>` SOAP envelope and extract the inner
@@ -201,7 +275,10 @@ fn build_artifact_resolve_element(
 /// 3. The `ArtifactResponse` contains a payload protocol message — the first
 ///    `samlp:*` child that is neither `Status` nor `Issuer`. The whole subtree
 ///    of that payload is serialized and returned.
-pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn parse_artifact_response(
+    soap_envelope: &[u8],
+    expected_request_id: &str,
+) -> Result<Vec<u8>, Error> {
     let body = soap::unwrap(soap_envelope)?;
     let artifact_response = body.payload();
     if artifact_response.qname().namespace() != Some(SAMLP_NS)
@@ -210,6 +287,16 @@ pub fn parse_artifact_response(soap_envelope: &[u8]) -> Result<Vec<u8>, Error> {
         return Err(Error::XmlParse(
             "ArtifactResponse: SOAP body payload is not samlp:ArtifactResponse".to_string(),
         ));
+    }
+
+    // Correlate before trusting the status, for the same reason the
+    // back-channel client does: a Success status on somebody else's response
+    // is not a Success for this request.
+    let in_response_to = artifact_response
+        .attribute(None, "InResponseTo")
+        .ok_or(Error::InResponseToMismatch)?;
+    if in_response_to != expected_request_id {
+        return Err(Error::InResponseToMismatch);
     }
 
     check_artifact_response_status(artifact_response)?;
@@ -374,7 +461,8 @@ impl<'a, H: HttpClient> BackchannelClient<'a, H> {
         artifact: &str,
     ) -> Result<ResolvedResponse, Error> {
         // 1. Build + (optionally) sign the ArtifactResolve, then SOAP-wrap it.
-        let resolve_elem = build_artifact_resolve_element(issuer_entity_id, ars_url, artifact)?;
+        let (resolve_elem, request_id) =
+            build_artifact_resolve_element(issuer_entity_id, ars_url, artifact)?;
         let resolve_elem = match &self.sign {
             None => resolve_elem,
             Some(cfg) => {
@@ -414,6 +502,22 @@ impl<'a, H: HttpClient> BackchannelClient<'a, H> {
             return Err(Error::XmlParse(
                 "ArtifactResponse: SOAP body payload is not samlp:ArtifactResponse".to_string(),
             ));
+        }
+
+        // 3b. Correlate the response to the request we just sent.
+        //
+        //     `@InResponseTo` is how an ArtifactResponse identifies which
+        //     ArtifactResolve it answers (SAML 2.0 Core §3.2.2). Without this
+        //     check the client accepts any otherwise-valid ArtifactResponse,
+        //     so a substituted or replayed one — for a different artifact, or
+        //     an earlier resolve of this one — is indistinguishable from the
+        //     real answer. Checked before the signature: a correctly signed
+        //     response to somebody else's request is still the wrong response.
+        let in_response_to = artifact_response
+            .attribute(None, "InResponseTo")
+            .ok_or(Error::InResponseToMismatch)?;
+        if in_response_to != request_id {
+            return Err(Error::InResponseToMismatch);
         }
 
         // 4. Verify the ArtifactResponse signature *before* trusting its
@@ -522,16 +626,159 @@ pub struct ArtifactResolveRequest {
     /// `samlp:ArtifactResolve/@ID` — echoed back in the response's
     /// `InResponseTo`.
     pub request_id: String,
-    /// `samlp:Issuer` text content — the SP entity ID requesting resolution.
-    pub issuer: String,
+    /// Resolver provenance, established by the parser.
+    ///
+    /// Private: authorization reads these, so a `pub` field would let a caller
+    /// take a request verified as SP-A, rewrite the issuer to SP-B, or
+    /// construct one asserting `signature_verified: true`, and collect SP-B's
+    /// stashed response without ever authenticating as SP-B. Read them via
+    /// [`issuer`](Self::issuer) and
+    /// [`signature_verified`](Self::signature_verified); only
+    /// `parse_artifact_resolve_with` can set them.
+    authenticated: ResolverProvenance,
+    /// Whether this came from [`IdentityProvider::parse_artifact_resolve`],
+    /// which applies the IdP's configured certificates, issuer-vs-descriptor
+    /// check, SOAP endpoint check and `@Destination` rules.
+    ///
+    /// The low-level parser below is public and applies none of those. Without
+    /// this marker a caller could parse unsigned XML — or XML verified under
+    /// unrelated configuration — and hand it straight to
+    /// `build_artifact_response`, leaving only the issuer/recipient comparison
+    /// standing.
+    role_validated: bool,
     /// `samlp:Artifact` text content — the opaque token to look up.
     pub artifact: String,
+    /// `samlp:ArtifactResolve/@Destination`, when present.
+    ///
+    /// Optional on the wire. The role layer compares it against the endpoint
+    /// that actually received the message; see
+    /// [`IdentityProvider::parse_artifact_resolve`](crate::IdentityProvider::parse_artifact_resolve).
+    pub destination: Option<String>,
+}
+
+/// Who a resolve came from, as established while parsing it.
+#[derive(Debug, Clone)]
+struct ResolverProvenance {
+    issuer: String,
+    signature_verified: bool,
+}
+
+impl ArtifactResolveRequest {
+    /// `samlp:Issuer` text content — the SP entity ID requesting resolution.
+    ///
+    /// The authenticated fields are private, so no caller outside this crate
+    /// can construct or alter one. Struct-literal construction does not
+    /// compile — this is what stops a caller from fabricating a
+    /// role-validated request and passing it to `build_artifact_response`:
+    ///
+    /// ```compile_fail
+    /// # use saml::ArtifactResolveRequest;
+    /// let forged = ArtifactResolveRequest {
+    ///     request_id: "_id".to_owned(),
+    ///     artifact: "AAQAA...".to_owned(),
+    ///     destination: None,
+    ///     authenticated: unimplemented!(),
+    ///     role_validated: true,
+    /// };
+    /// ```
+    ///
+    /// Nor can the validation marker be flipped on a request obtained from the
+    /// low-level parser:
+    ///
+    /// ```compile_fail
+    /// # use saml::ArtifactResolveRequest;
+    /// fn forge(req: &mut ArtifactResolveRequest) {
+    ///     req.role_validated = true;
+    /// }
+    /// ```
+    ///
+    /// On its own this is a claim; it is authenticated exactly when
+    /// [`signature_verified`](Self::signature_verified) is true, or by
+    /// client authentication at the transport.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.authenticated.issuer
+    }
+
+    /// Whether the IdP role layer validated this request.
+    #[must_use]
+    pub fn role_validated(&self) -> bool {
+        self.role_validated
+    }
+
+    /// Mark this request as role-validated. Crate-internal: only
+    /// `IdentityProvider::parse_artifact_resolve` may vouch for one.
+    pub(crate) fn mark_role_validated(&mut self) {
+        self.role_validated = true;
+    }
+
+    /// Whether an enveloped `<ds:Signature>` covering the whole
+    /// `<samlp:ArtifactResolve>` was present and verified.
+    ///
+    /// `false` means the request carried no signature *and* the caller did not
+    /// require one — never that an invalid signature was tolerated, which is
+    /// always an error. Treat `false` as "this request is authenticated only
+    /// to the extent the transport authenticates it".
+    #[must_use]
+    pub fn signature_verified(&self) -> bool {
+        self.authenticated.signature_verified
+    }
+}
+
+/// How to verify the enveloped signature on an inbound
+/// `<samlp:ArtifactResolve>`.
+///
+/// The resolve direction's mirror of [`VerifyConfig`]. SAML 2.0 Bindings
+/// §3.6.3 requires the requester be authenticated before an artifact is
+/// resolved — by signature, or by transport-level client authentication.
+/// An artifact travels in a URL query parameter, so it leaks into access
+/// logs, `Referer` headers and browser history; without authentication it is
+/// a bearer token that anyone who obtains it can redeem for the assertion.
+pub struct VerifyResolveConfig<'a> {
+    /// Candidate certificates for the SP the resolve claims to come from.
+    pub certs: &'a [X509Certificate],
+    /// Per-peer policy for the signature, reference digest, and
+    /// canonicalization algorithms accepted on the resolve.
+    ///
+    /// The whole policy, not just its signature allow-list: a strong
+    /// `RSA-SHA256` signature over a SHA-1 `<ds:Reference>` digest is only as
+    /// strong as SHA-1, and the artifact binding requires `weak-algos` to
+    /// compile at all, so `DigestAlgorithm::Sha1` is always present in these
+    /// builds. Threading only the signature slice would let it through in
+    /// spite of `strong_defaults`.
+    pub policy: &'a PeerCryptoPolicy,
+    /// When true, an `ArtifactResolve` with no `<ds:Signature>` is rejected
+    /// with [`Error::SignatureMissing`]. When false, an unsigned resolve is
+    /// accepted (and [`ArtifactResolveRequest::signature_verified`] is
+    /// `false`), but a present-but-invalid signature is *always* rejected.
+    ///
+    /// Set this false only when the artifact-resolution endpoint is behind
+    /// mutually-authenticated TLS, which is the other authentication mode
+    /// §3.6.3 permits.
+    pub require_signed: bool,
 }
 
 /// Parse a `<samlp:ArtifactResolve>` SOAP envelope received at the IdP's
 /// `ArtifactResolutionService`. Returns the request ID, requesting SP issuer,
 /// and the artifact value to look up.
 pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveRequest, Error> {
+    parse_artifact_resolve_with(soap_envelope, None)
+}
+
+/// Parse an inbound `<samlp:ArtifactResolve>`, verifying its enveloped
+/// signature against `verify`.
+///
+/// Passing `None` skips signature verification. An *unsigned* resolve then
+/// parses with `signature_verified: false`; a *signed* one is rejected rather
+/// than accepted unexamined, since reporting `false` for a signature nobody
+/// checked would misstate what the field means. Only pass `None` when the
+/// endpoint authenticates the requester some other way (see
+/// [`VerifyResolveConfig`]). Verification runs before any field is read, so
+/// an unauthenticated tree never reaches the caller's artifact store.
+pub fn parse_artifact_resolve_with(
+    soap_envelope: &[u8],
+    verify: Option<&VerifyResolveConfig<'_>>,
+) -> Result<ArtifactResolveRequest, Error> {
     let body = soap::unwrap(soap_envelope)?;
     let resolve = body.payload();
     if resolve.qname().namespace() != Some(SAMLP_NS) || resolve.qname().local() != "ArtifactResolve"
@@ -540,6 +787,8 @@ pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveReq
             "ArtifactResolve: SOAP body payload is not samlp:ArtifactResolve".to_string(),
         ));
     }
+
+    let signature_verified = verify_artifact_resolve(&body, verify)?;
 
     let request_id = resolve
         .attribute(None, "ID")
@@ -556,11 +805,70 @@ pub fn parse_artifact_resolve(soap_envelope: &[u8]) -> Result<ArtifactResolveReq
         .ok_or_else(|| Error::XmlParse("ArtifactResolve: missing samlp:Artifact".to_string()))?
         .text_content();
 
+    let destination = resolve.attribute(None, "Destination").map(str::to_owned);
+
     Ok(ArtifactResolveRequest {
         request_id,
-        issuer,
         artifact,
+        destination,
+        authenticated: ResolverProvenance {
+            issuer,
+            signature_verified,
+        },
+        // The low-level entry point performs no role-layer validation.
+        role_validated: false,
     })
+}
+
+/// Verify the enveloped signature on an inbound `ArtifactResolve`, honouring
+/// `verify`. Returns whether a signature was verified.
+///
+/// Mirrors `BackchannelClient::verify_artifact_response` on the SP side,
+/// including the XSW check: `soap::unwrap` re-roots the payload as its own
+/// `Document`, so requiring `signed_element == root` is exactly "the
+/// signature covers the whole `ArtifactResolve`" and rejects a signature
+/// moved onto a descendant.
+fn verify_artifact_resolve(
+    body: &soap::UnwrappedBody,
+    verify: Option<&VerifyResolveConfig<'_>>,
+) -> Result<bool, Error> {
+    let document = body.document_ref();
+    let root = document.root();
+    let signature = root.child_element(Some(crate::dsig::reference::DS_NS), "Signature");
+
+    let Some(cfg) = verify else {
+        // No verifier configured. Returning `Ok(false)` for a message that
+        // *does* carry a signature would report `signature_verified: false`
+        // for an unexamined — possibly forged — one, and `false` is
+        // documented to mean "no signature was present". Refuse instead:
+        // silently discarding a signature the sender asked us to check is
+        // never the safe reading.
+        if signature.is_some() {
+            return Err(Error::SignatureVerification {
+                reason: "ArtifactResolve carries a signature but no verifier was configured",
+            });
+        }
+        return Ok(false);
+    };
+    match signature {
+        Some(sig) => {
+            let verified =
+                crate::dsig::verify::verify_signature(document, sig, cfg.certs, cfg.policy)?;
+            if verified.signed_element != root.id() {
+                return Err(Error::SignatureVerification {
+                    reason: "ArtifactResolve signature does not cover the message root",
+                });
+            }
+            Ok(true)
+        }
+        None => {
+            if cfg.require_signed {
+                Err(Error::SignatureMissing)
+            } else {
+                Ok(false)
+            }
+        }
+    }
 }
 
 /// Build a `<samlp:ArtifactResponse>` SOAP envelope wrapping the IdP's stashed
@@ -674,6 +982,7 @@ mod tests {
         let redirect = build_artifact_redirect(
             &acs,
             "https://idp.example.com",
+            "https://sp.example.com/saml",
             0,
             "<samlp:Response/>".to_owned(),
             None,
@@ -705,6 +1014,7 @@ mod tests {
         let redirect = build_artifact_redirect(
             &acs,
             "https://idp.example.com",
+            "https://sp.example.com/saml",
             1,
             "<samlp:Response/>".to_owned(),
             Some("opaque-relay-state"),
@@ -725,8 +1035,15 @@ mod tests {
     #[test]
     fn build_artifact_redirect_percent_encodes_relay_state_with_specials() {
         let acs = Url::parse("https://sp.example.com/acs").unwrap();
-        let redirect =
-            build_artifact_redirect(&acs, "issuer", 0, String::new(), Some("a&b=c d")).unwrap();
+        let redirect = build_artifact_redirect(
+            &acs,
+            "issuer",
+            "https://sp.example.com/saml",
+            0,
+            String::new(),
+            Some("a&b=c d"),
+        )
+        .unwrap();
         // url::Url percent-encodes `&`, `=`, and ` ` in the value.
         let raw_query = redirect.redirect_to.query().unwrap();
         assert!(raw_query.contains("RelayState="), "{raw_query}");
@@ -744,12 +1061,13 @@ mod tests {
 
     #[test]
     fn build_artifact_resolve_is_well_formed_soap() {
-        let xml = build_artifact_resolve(
+        let resolve = build_artifact_resolve(
             "https://sp.example.com",
             "https://idp.example.com/ars",
             "AAQAA...",
         )
         .unwrap();
+        let xml = resolve.soap_envelope;
 
         let doc = Document::parse(xml.as_bytes()).expect("re-parse");
         let env = doc.root();
@@ -814,7 +1132,7 @@ mod tests {
         </samlp:Response>"#;
         let env = success_envelope_xml(payload);
 
-        let inner_bytes = parse_artifact_response(&env).expect("parse");
+        let inner_bytes = parse_artifact_response(&env, "_req1").expect("parse");
         let inner_doc = Document::parse(&inner_bytes).expect("re-parse inner");
         assert_eq!(inner_doc.root().qname().namespace(), Some(SAMLP_NS));
         assert_eq!(inner_doc.root().qname().local(), "Response");
@@ -828,6 +1146,7 @@ mod tests {
   <soap:Body>
     <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                             ID="_resp1" Version="2.0"
+                            InResponseTo="_req1"
                             IssueInstant="2026-01-01T00:00:00Z">
       <saml:Issuer>https://idp.example.com</saml:Issuer>
       <samlp:Status>
@@ -838,7 +1157,7 @@ mod tests {
   </soap:Body>
 </soap:Envelope>"#,
         );
-        let err = parse_artifact_response(xml.as_bytes()).unwrap_err();
+        let err = parse_artifact_response(xml.as_bytes(), "_req1").unwrap_err();
         match err {
             Error::StatusNotSuccess { code, message } => {
                 assert_eq!(code, "urn:oasis:names:tc:SAML:2.0:status:Responder");
@@ -848,11 +1167,42 @@ mod tests {
         }
     }
 
+    /// The manual `build_artifact_resolve` / `parse_artifact_response` pairing
+    /// must correlate too, not just the back-channel client. Returning only
+    /// the envelope from the builder left callers with no way to: the request
+    /// ID was generated internally and discarded, so a substituted response
+    /// was indistinguishable from the real one.
+    #[test]
+    fn parse_artifact_response_rejects_a_substituted_response() {
+        let resolve = build_artifact_resolve(
+            "https://sp.example.com",
+            "https://idp.example.com/ars",
+            "AAQAA...",
+        )
+        .expect("build resolve");
+
+        // A complete, Success-status ArtifactResponse — for a different
+        // request. `_req1` is the fixture's ID; the real one is random.
+        let env = success_envelope_xml(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                               ID="_inner" Version="2.0"
+                               IssueInstant="2026-01-01T00:00:00Z"/>"#,
+        );
+
+        let err = parse_artifact_response(&env, &resolve.request_id)
+            .expect_err("a response to a different request must be refused");
+        assert!(matches!(err, Error::InResponseToMismatch), "got {err:?}");
+
+        // Sanity: the same envelope parses for the ID it actually answers, so
+        // the rejection above is the correlation and not a malformed fixture.
+        parse_artifact_response(&env, "_req1").expect("correlates with its own request ID");
+    }
+
     #[test]
     fn parse_artifact_response_rejects_missing_envelope() {
         // Wrong root element.
         let xml = r"<not-soap/>";
-        let err = parse_artifact_response(xml.as_bytes()).unwrap_err();
+        let err = parse_artifact_response(xml.as_bytes(), "_req1").unwrap_err();
         assert!(matches!(err, Error::XmlParse(_)));
     }
 
@@ -864,6 +1214,7 @@ mod tests {
   <soap:Body>
     <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
                             ID="_resp1" Version="2.0"
+                            InResponseTo="_req1"
                             IssueInstant="2026-01-01T00:00:00Z">
       <saml:Issuer>https://idp.example.com</saml:Issuer>
       <samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status>
@@ -871,7 +1222,7 @@ mod tests {
   </soap:Body>
 </soap:Envelope>"#,
         );
-        let err = parse_artifact_response(xml.as_bytes()).unwrap_err();
+        let err = parse_artifact_response(xml.as_bytes(), "_req1").unwrap_err();
         match err {
             Error::XmlParse(msg) => {
                 assert!(msg.contains("payload"), "got: {msg}");
@@ -884,18 +1235,44 @@ mod tests {
 
     /// Mock `HttpClient` that returns a pre-built ArtifactResponse SOAP
     /// envelope and records the request it received for assertion.
+    /// Builds an ArtifactResponse from the request's `@ID`.
+    type ResponderFn = Box<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
     struct MockClient {
-        response: Vec<u8>,
+        /// Builds the response from the `@ID` of the ArtifactResolve received.
+        /// A canned blob cannot correlate: the client generates a fresh ID per
+        /// request, and a *signed* fixture must set `@InResponseTo` before it
+        /// is signed, exactly as a real ARS does.
+        respond: ResponderFn,
         last_request: std::sync::Mutex<Option<HttpRequest>>,
     }
 
     impl MockClient {
+        /// Canned response; the `_req1` placeholder is rewritten to the actual
+        /// request ID. For unsigned fixtures only — see [`Self::building`].
         fn new(response: Vec<u8>) -> Self {
+            Self::building(move |id| {
+                String::from_utf8_lossy(&response)
+                    .replace("_req1", id)
+                    .into_bytes()
+            })
+        }
+
+        /// Build the response from the request ID.
+        fn building(f: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
             Self {
-                response,
+                respond: Box::new(f),
                 last_request: std::sync::Mutex::new(None),
             }
         }
+    }
+
+    /// Extract the `@ID` of an outbound `<samlp:ArtifactResolve>`.
+    fn resolve_request_id(request: &[u8]) -> String {
+        let xml = String::from_utf8_lossy(request);
+        xml.split_once(" ID=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map_or_else(String::new, |(id, _)| id.to_owned())
     }
 
     impl HttpClient for MockClient {
@@ -904,8 +1281,8 @@ mod tests {
             request: HttpRequest,
         ) -> impl Future<Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>> + Send
         {
+            let body = (self.respond)(&resolve_request_id(&request.body));
             *self.last_request.lock().unwrap() = Some(request);
-            let body = self.response.clone();
             async move {
                 Ok(HttpResponse {
                     status: 200,
@@ -976,13 +1353,85 @@ mod tests {
         assert_eq!(issuer.text_content(), "https://sp.example.com");
     }
 
+    /// SAML 2.0 Core §3.2.2: `@InResponseTo` identifies the request being
+    /// answered. Without this check any otherwise-valid ArtifactResponse is
+    /// accepted, so a substituted or replayed one — for a different artifact,
+    /// or an earlier resolve of this one — cannot be told from the real
+    /// answer.
+    #[tokio::test]
+    async fn resolve_artifact_rejects_mismatched_in_response_to() {
+        // Correlates with nothing: a fixed ID that cannot equal the freshly
+        // generated one. Everything else about the envelope is well-formed.
+        let client = MockClient::building(|_id| {
+            format!(
+                r#"<soap:Envelope xmlns:soap="{SOAP_NS}">
+  <soap:Body>
+    <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+                            ID="_resp1" Version="2.0" InResponseTo="_some-other-request"
+                            IssueInstant="2026-01-01T00:00:00Z">
+      <saml:Issuer>https://idp.example.com</saml:Issuer>
+      <samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status>
+      <samlp:Response xmlns:samlp="{SAMLP_NS}" ID="_inner" Version="2.0"
+                      IssueInstant="2026-01-01T00:00:00Z"/>
+    </samlp:ArtifactResponse>
+  </soap:Body>
+</soap:Envelope>"#
+            )
+            .into_bytes()
+        });
+
+        let err = BackchannelClient::new(&client)
+            .resolve_artifact(
+                "https://idp.example.com/ars",
+                "https://sp.example.com/saml",
+                "AAQAAK1234567890",
+            )
+            .await
+            .expect_err("a response to a different request must be refused");
+        assert!(matches!(err, Error::InResponseToMismatch), "got {err:?}");
+    }
+
+    /// An absent `@InResponseTo` correlates with nothing either, so it is
+    /// refused rather than treated as "matches anything".
+    #[tokio::test]
+    async fn resolve_artifact_rejects_missing_in_response_to() {
+        let client = MockClient::building(|_id| {
+            format!(
+                r#"<soap:Envelope xmlns:soap="{SOAP_NS}">
+  <soap:Body>
+    <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
+                            ID="_resp1" Version="2.0"
+                            InResponseTo="_req1"
+                            IssueInstant="2026-01-01T00:00:00Z">
+      <saml:Issuer>https://idp.example.com</saml:Issuer>
+      <samlp:Status><samlp:StatusCode Value="{STATUS_SUCCESS}"/></samlp:Status>
+      <samlp:Response xmlns:samlp="{SAMLP_NS}" ID="_inner" Version="2.0"
+                      IssueInstant="2026-01-01T00:00:00Z"/>
+    </samlp:ArtifactResponse>
+  </soap:Body>
+</soap:Envelope>"#
+            )
+            .into_bytes()
+        });
+
+        let err = BackchannelClient::new(&client)
+            .resolve_artifact(
+                "https://idp.example.com/ars",
+                "https://sp.example.com/saml",
+                "AAQAAK1234567890",
+            )
+            .await
+            .expect_err("a response with no correlation must be refused");
+        assert!(matches!(err, Error::InResponseToMismatch), "got {err:?}");
+    }
+
     #[tokio::test]
     async fn resolve_artifact_propagates_status_error() {
         let envelope = format!(
             r#"<soap:Envelope xmlns:soap="{SOAP_NS}">
   <soap:Body>
     <samlp:ArtifactResponse xmlns:samlp="{SAMLP_NS}" xmlns:saml="{SAML_NS}"
-                            ID="_resp1" Version="2.0"
+                            ID="_resp1" Version="2.0" InResponseTo="_req1"
                             IssueInstant="2026-01-01T00:00:00Z">
       <saml:Issuer>https://idp.example.com</saml:Issuer>
       <samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Requester"/></samlp:Status>
@@ -1012,7 +1461,7 @@ mod tests {
 
     // --- BackchannelClient: signing + verification --------------------------
 
-    use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
+    use crate::crypto::cert::test_vectors::{EC_P256_CERT_PEM, RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
 
     fn test_keypair() -> KeyPair {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("key");
@@ -1023,7 +1472,301 @@ mod tests {
     /// Build an `ArtifactResponse` SOAP envelope whose ArtifactResponse element
     /// is enveloped-signed with the test key. When `tamper` is true, a byte of
     /// the embedded payload is mutated *after* signing so verification fails.
-    fn signed_artifact_response_envelope(payload_xml: &str, tamper: bool) -> Vec<u8> {
+    /// Build a `<samlp:ArtifactResolve>` SOAP envelope, optionally
+    /// enveloped-signed by the test key.
+    fn artifact_resolve_envelope(issuer: &str, signed: bool) -> Vec<u8> {
+        let (resolve, _id) = build_artifact_resolve_element(
+            issuer,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+
+        if !signed {
+            return soap::wrap_element(resolve).expect("wrap").into_bytes();
+        }
+
+        let stash = Document::new(resolve).expect("stash doc");
+        let signed_elem =
+            crate::dsig::sign::sign_element(stash.root().clone(), &stash, test_sign_options())
+                .expect("sign resolve");
+        soap::wrap_element(signed_elem).expect("wrap").into_bytes()
+    }
+
+    /// As [`artifact_resolve_envelope`], signed with a caller-chosen
+    /// `<ds:Reference>` digest so digest policy can be exercised independently
+    /// of the signature method.
+    fn artifact_resolve_envelope_with_digest(digest_alg: DigestAlgorithm) -> Vec<u8> {
+        let (resolve, _id) = build_artifact_resolve_element(
+            RESOLVE_ISSUER,
+            "https://idp.example.com/ars",
+            "AAQAAK1234567890",
+        )
+        .expect("build resolve");
+        let stash = Document::new(resolve).expect("stash doc");
+        let mut opts = test_sign_options();
+        opts.digest_alg = digest_alg;
+        let signed = crate::dsig::sign::sign_element(stash.root().clone(), &stash, opts)
+            .expect("sign resolve");
+        soap::wrap_element(signed).expect("wrap").into_bytes()
+    }
+
+    fn test_sign_options() -> crate::dsig::sign::SignOptions<'static> {
+        // `test_keypair` returns by value; leak one for a 'static borrow so
+        // the options can be shared between fixtures.
+        static KP: std::sync::OnceLock<KeyPair> = std::sync::OnceLock::new();
+        crate::dsig::sign::SignOptions {
+            signing_key: KP.get_or_init(test_keypair),
+            sig_alg: SignatureAlgorithm::RsaSha256,
+            digest_alg: DigestAlgorithm::Sha256,
+            c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+            inclusive_namespaces: &[],
+            include_x509_cert: true,
+        }
+    }
+
+    /// An `ArtifactResolve` whose `<ds:Signature>` sits at the canonical
+    /// position — a direct child of the message root — but whose
+    /// `<ds:Reference>` resolves to a *descendant*.
+    ///
+    /// This is the signature-wrapping shape the coverage check exists for:
+    /// cryptographically valid, correctly placed, and yet it authenticates
+    /// only the nested element. Merely relocating a signature elsewhere in
+    /// the tree is a weaker attack that never gets this far — nothing looks
+    /// for signatures off the canonical position, so it reads as absent.
+    fn xsw_artifact_resolve_envelope() -> Vec<u8> {
+        let xml = format!(
+            r#"<samlp:ArtifactResolve xmlns:samlp="{SAMLP_NS}" ID="_outer" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer xmlns:saml="{SAML_NS}" ID="_inner">{RESOLVE_ISSUER}</saml:Issuer><samlp:Artifact>AAQAAK1234567890</samlp:Artifact></samlp:ArtifactResolve>"#
+        );
+        let doc = Document::parse(xml.as_bytes()).expect("parse xsw resolve");
+        let inner = doc
+            .root()
+            .child_element(Some(SAML_NS), "Issuer")
+            .expect("issuer child")
+            .clone();
+
+        // Sign the descendant *in the document's context*, so its Reference
+        // URI is `#_inner`.
+        let signed_inner =
+            crate::dsig::sign::sign_element(inner, &doc, test_sign_options()).expect("sign inner");
+        let sig = signed_inner
+            .children
+            .iter()
+            .find_map(|n| match n {
+                Node::Element(e)
+                    if e.qname().namespace() == Some(crate::dsig::reference::DS_NS)
+                        && e.qname().local() == "Signature" =>
+                {
+                    Some(e.clone())
+                }
+                _ => None,
+            })
+            .expect("signature produced");
+
+        // Hoist it to the root, leaving the original (unsigned) Issuer alone.
+        let mut root = doc.root().clone();
+        root.children.push(Node::Element(sig));
+        soap::wrap_element(root).expect("wrap").into_bytes()
+    }
+
+    // ---------- inbound ArtifactResolve authentication ----------------------
+    //
+    // SAML 2.0 Bindings §3.6.3 requires the requester be authenticated before
+    // an artifact is resolved. An artifact rides in a URL query parameter, so
+    // it reaches access logs, `Referer` headers and browser history; if the
+    // resolve endpoint accepts anyone, the artifact is a bearer token for the
+    // full assertion.
+
+    const RESOLVE_ISSUER: &str = "https://sp.example.com/saml";
+
+    fn resolve_certs() -> Vec<X509Certificate> {
+        vec![X509Certificate::from_pem(RSA_CERT_PEM).expect("cert")]
+    }
+
+    fn resolve_cfg<'a>(
+        certs: &'a [X509Certificate],
+        policy: &'a PeerCryptoPolicy,
+        require_signed: bool,
+    ) -> VerifyResolveConfig<'a> {
+        VerifyResolveConfig {
+            certs,
+            policy,
+            require_signed,
+        }
+    }
+
+    #[test]
+    fn signed_artifact_resolve_verifies() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+        let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        let req = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
+            .expect("a correctly signed resolve must verify");
+
+        assert!(req.signature_verified());
+        assert_eq!(req.issuer(), RESOLVE_ISSUER);
+        assert_eq!(req.artifact, "AAQAAK1234567890");
+    }
+
+    #[test]
+    fn unsigned_artifact_resolve_rejected_when_required() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
+        let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
+            .expect_err("an unsigned resolve must not authenticate the requester");
+        assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
+    }
+
+    #[test]
+    fn unsigned_artifact_resolve_allowed_when_not_required() {
+        // The mutual-TLS deployment shape: the transport authenticates the
+        // requester, so no signature is demanded — but the caller can still
+        // see that nothing was verified at this layer.
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
+        let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        let req =
+            parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, false)))
+                .expect("unsigned is acceptable when not required");
+        assert!(!req.signature_verified());
+    }
+
+    #[test]
+    fn tampered_artifact_resolve_signature_rejected_even_when_not_required() {
+        // `require_signed = false` relaxes *absence*, never validity: a
+        // present-but-broken signature is always an error.
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+        let tampered = String::from_utf8(envelope)
+            .expect("utf8")
+            .replace("AAQAAK1234567890", "AAQAAK0000000000")
+            .into_bytes();
+        let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        for require_signed in [true, false] {
+            let err = parse_artifact_resolve_with(
+                &tampered,
+                Some(&resolve_cfg(&certs, &strong, require_signed)),
+            )
+            .expect_err("tampered payload must fail the digest check");
+            assert!(
+                matches!(err, Error::SignatureVerification { .. }),
+                "require_signed={require_signed}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_resolve_signed_by_an_untrusted_key_rejected() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+        let other = vec![X509Certificate::from_pem(EC_P256_CERT_PEM).expect("other cert")];
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&other, &strong, true)))
+            .expect_err("a signature from outside the SP's key set must be rejected");
+        assert!(
+            matches!(err, Error::SignatureVerification { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_resolve_signature_must_cover_the_message_root() {
+        // XSW: the signature still verifies, but covers a nested element
+        // rather than the ArtifactResolve. Without the coverage check an
+        // attacker could graft a captured signature onto a resolve carrying
+        // someone else's artifact.
+        let envelope = xsw_artifact_resolve_envelope();
+        let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
+            .expect_err("a signature not covering the root must be rejected");
+        assert!(
+            matches!(
+                err,
+                Error::SignatureVerification {
+                    reason: "ArtifactResolve signature does not cover the message root"
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// A strong signature method over a weak reference digest is only as
+    /// strong as that digest. The artifact binding requires `weak-algos` to
+    /// compile, so `DigestAlgorithm::Sha1` exists in every build that can
+    /// reach this code — policy, not compilation, has to be what rejects it.
+    #[test]
+    fn artifact_resolve_with_sha1_reference_digest_rejected_by_strong_policy() {
+        let envelope = artifact_resolve_envelope_with_digest(DigestAlgorithm::Sha1);
+        let certs = resolve_certs();
+        let strong = PeerCryptoPolicy::strong_defaults();
+
+        let err = parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &strong, true)))
+            .expect_err("strong defaults must reject a SHA-1 reference digest");
+        assert!(
+            matches!(err, Error::DisallowedAlgorithm { ref alg } if alg.contains("sha1")),
+            "got {err:?}"
+        );
+
+        // The same message verifies once the peer's policy admits SHA-1,
+        // proving the rejection came from policy rather than a broken
+        // signature.
+        let mut permissive = PeerCryptoPolicy::strong_defaults();
+        permissive
+            .allowed_digest_algorithms
+            .push(DigestAlgorithm::Sha1);
+        let req =
+            parse_artifact_resolve_with(&envelope, Some(&resolve_cfg(&certs, &permissive, true)))
+                .expect("explicit SHA-1 digest opt-in");
+        assert!(req.signature_verified());
+    }
+
+    /// `signature_verified: false` is documented to mean "no signature was
+    /// present". A signed message parsed with no verifier must therefore not
+    /// come back as unverified — that would report an unexamined, possibly
+    /// forged signature as a benign absence.
+    #[test]
+    fn signed_artifact_resolve_rejected_when_no_verifier_is_configured() {
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, true);
+
+        let err = parse_artifact_resolve(&envelope)
+            .expect_err("a signature we will not check must not be silently dropped");
+        assert!(
+            matches!(
+                err,
+                Error::SignatureVerification {
+                    reason: "ArtifactResolve carries a signature but no verifier was configured"
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_artifact_resolve_without_config_reports_unverified() {
+        // The no-verification entry point never claims verification it did
+        // not perform. For an *unsigned* message that is simply `false`; a
+        // signed one is refused outright, covered above.
+        let envelope = artifact_resolve_envelope(RESOLVE_ISSUER, false);
+
+        let req = parse_artifact_resolve(&envelope).expect("parses");
+        assert!(
+            !req.signature_verified(),
+            "no config supplied -> nothing was verified"
+        );
+    }
+
+    fn signed_artifact_response_envelope(
+        payload_xml: &str,
+        tamper: bool,
+        in_response_to: &str,
+    ) -> Vec<u8> {
         let kp = test_keypair();
         let payload_doc = Document::parse(payload_xml.as_bytes()).expect("payload parse");
         let payload_elem = payload_doc.root().clone();
@@ -1043,6 +1786,8 @@ mod tests {
             .with_attribute(QName::new(None, "ID"), "_resp-signed".to_owned())
             .with_attribute(QName::new(None, "Version"), "2.0")
             .with_attribute(QName::new(None, "IssueInstant"), "2026-01-01T00:00:00Z")
+            // Set before signing, so the signature covers the correlation.
+            .with_attribute(QName::new(None, "InResponseTo"), in_response_to.to_owned())
             .with_child(Node::Element(issuer))
             .with_child(Node::Element(status))
             .with_child(Node::Element(payload_elem))
@@ -1117,8 +1862,9 @@ mod tests {
     #[tokio::test]
     async fn backchannel_verifies_signed_artifact_response() {
         let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-signed" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
-        let envelope = signed_artifact_response_envelope(payload, false);
-        let client = MockClient::new(envelope);
+        let payload = payload.to_owned();
+        let client =
+            MockClient::building(move |id| signed_artifact_response_envelope(&payload, false, id));
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         let policy = PeerCryptoPolicy::strong_defaults();
 
@@ -1145,8 +1891,9 @@ mod tests {
     #[tokio::test]
     async fn backchannel_rejects_tampered_signature() {
         let payload = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-signed" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
-        let envelope = signed_artifact_response_envelope(payload, true);
-        let client = MockClient::new(envelope);
+        let payload = payload.to_owned();
+        let client =
+            MockClient::building(move |id| signed_artifact_response_envelope(&payload, true, id));
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         let policy = PeerCryptoPolicy::strong_defaults();
 

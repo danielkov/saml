@@ -27,17 +27,22 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt as _;
 
-use saml::dsig::algorithms::{DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm};
+use saml::binding::artifact::SignConfig;
+use saml::dsig::algorithms::{
+    C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
+};
 use saml::http::{HttpClient, HttpRequest, HttpResponse};
 use saml::{
-    Attribute, AuthnContextClassRef, Binding, ConsumeArtifactResponse, ConsumeAuthnRequest,
-    Dispatch, IdpDescriptor, IssueResponse, NameId, NameIdFormat, ReplayMode, ServiceProvider,
-    ServiceProviderConfig, SpDescriptor, SpWantSigned, SsoResponseBinding, SsoResponseDispatch,
-    SsoResponseEndpoint, StartLogin, X509Certificate,
+    ArtifactBackchannel, Attribute, AuthnContextClassRef, Binding, ConsumeArtifactResponse,
+    ConsumeAuthnRequest, Dispatch, IdpDescriptor, IssueResponse, NameId, NameIdFormat, ReplayMode,
+    ServiceProvider, ServiceProviderConfig, SpDescriptor, SpWantSigned, SsoResponseBinding,
+    SsoResponseDispatch, SsoResponseEndpoint, StartLogin, X509Certificate,
 };
 
 use saml_idp_example as idp;
-use saml_idp_example::{AppConfig, AppState, SpEntry, SpEntryConfig, StashedArtifact};
+use saml_idp_example::{
+    AppConfig, AppState, ArtifactTake, SpEntry, SpEntryConfig, StashedArtifact,
+};
 
 const IDP_BASE: &str = "http://idp.test";
 const IDP_ENTITY_ID: &str = "http://idp.test/saml/idp";
@@ -157,6 +162,11 @@ impl HttpClient for RouterClient {
 #[tokio::test]
 async fn artifact_round_trip_through_example_handlers() {
     let sp = make_artifact_sp();
+    // Same keypair the SP was built with, for signing the back-channel
+    // ArtifactResolve below.
+    let sp_signing_key = saml::KeyPair::from_pkcs8_pem(idp::IDP_KEY_PEM)
+        .expect("sp keypair")
+        .with_certificate(X509Certificate::from_pem(idp::IDP_CERT_PEM).expect("sp cert"));
     let state = make_app_state(&sp);
     let idp_descriptor = idp_descriptor(&state);
     let sp_descriptor = state
@@ -290,7 +300,20 @@ async fn artifact_round_trip_through_example_handlers() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The example IdP requires a signed ArtifactResolve (SAML 2.0
+                // Bindings §3.6.3), so the SP authenticates itself on the
+                // back-channel. Exercises the full loop: SP signs, the
+                // handler verifies against the SP's registered certificate
+                // before the artifact is taken out of the stash.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
@@ -300,7 +323,22 @@ async fn artifact_round_trip_through_example_handlers() {
     assert_eq!(identity.name_id.value, USER_EMAIL);
     assert_eq!(identity.session_index.as_deref(), Some("sess-artifact-1"));
 
-    // 6. The artifact is single-use. A second resolve hits the now-empty
+    // 6a. Assert the store directly: the first resolve consumed the artifact.
+    //     The second-resolve check below only ever proves "some error", which
+    //     stays true for unrelated reasons (an unsigned resolve refused before
+    //     the store, or the recovered Response failing an unrelated SP check),
+    //     so on its own it does not establish single-use at all.
+    assert!(
+        matches!(
+            state
+                .take_artifact_for(&redirect.artifact, SP_ENTITY_ID)
+                .expect("artifact store"),
+            ArtifactTake::Unknown
+        ),
+        "the first resolve must have consumed the artifact"
+    );
+
+    // 6b. The artifact is single-use. A second resolve hits the now-empty
     //    store: handle_artifact returns a 404 error page instead of a SOAP
     //    ArtifactResponse, so the SP-side resolve fails. (Over a real HTTP
     //    transport the SP receives the non-200 body and fails to parse it as
@@ -320,7 +358,19 @@ async fn artifact_round_trip_through_example_handlers() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The example IdP requires a signed ArtifactResolve, so an
+                // unsigned one is refused before the store is consulted —
+                // this assertion would pass without ever reaching the branch
+                // it names.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
@@ -335,6 +385,9 @@ async fn artifact_round_trip_through_example_handlers() {
 #[tokio::test]
 async fn unknown_artifact_is_rejected() {
     let sp = make_artifact_sp();
+    let sp_signing_key = saml::KeyPair::from_pkcs8_pem(idp::IDP_KEY_PEM)
+        .expect("sp keypair")
+        .with_certificate(X509Certificate::from_pem(idp::IDP_CERT_PEM).expect("sp cert"));
     let state = make_app_state(&sp);
     let idp_descriptor = idp_descriptor(&state);
     let client = RouterClient {
@@ -356,7 +409,19 @@ async fn unknown_artifact_is_rejected() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The example IdP requires a signed ArtifactResolve, so an
+                // unsigned one is refused before the store is consulted —
+                // this assertion would pass without ever reaching the branch
+                // it names.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await;

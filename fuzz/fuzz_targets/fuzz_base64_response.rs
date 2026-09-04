@@ -126,6 +126,8 @@ fn build_fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         signing_key: keypair.clone(),
         decryption_key: None,
         want_authn_requests_signed: false,
+        #[cfg(feature = "artifact-binding")]
+        want_artifact_resolve_signed: true,
         assertion_signing: IdpAssertionSigning {
             sign_responses: false,
             sign_assertions: true,

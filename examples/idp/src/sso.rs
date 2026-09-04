@@ -992,8 +992,14 @@ fn pick_slo_binding(entry: &SpEntry) -> Option<Binding> {
 /// 1. Peek the requesting SP's `<saml:Issuer>` to pick its descriptor.
 /// 2. Parse + issuer-verify the resolve via the IdP role layer.
 /// 3. One-time consume the stashed `<samlp:Response>` keyed by the artifact.
-/// 4. Wrap it in a signed `<samlp:ArtifactResponse>` SOAP envelope and return
-///    it with `Content-Type: text/xml`.
+/// 4. Wrap it in an **unsigned** `<samlp:ArtifactResponse>` SOAP envelope and
+///    return it with `Content-Type: text/xml`. The inner `<samlp:Response>`
+///    carries its own signature, which is what the SP verifies; the envelope
+///    itself is not signed here. An SP configured with `require_signed` on the
+///    back-channel would reject this — sign the envelope for that case.
+#[cfg(feature = "artifact-binding")]
+use crate::ArtifactTake;
+
 #[cfg(feature = "artifact-binding")]
 pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     let Some(issuer) = peek_issuer(&body) else {
@@ -1011,7 +1017,12 @@ pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::By
         );
     };
 
-    let resolve = match state.idp.parse_artifact_resolve(&entry.sp, &body) {
+    let resolve = match state.idp.parse_artifact_resolve(
+        &entry.sp,
+        None,
+        &format!("{}/saml/artifact", state.config.idp_base_url),
+        &body,
+    ) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, sp = %entry.sp.entity_id, "/saml/artifact: parse_artifact_resolve failed");
@@ -1022,9 +1033,13 @@ pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::By
         }
     };
 
-    let stashed = match state.take_artifact(&resolve.artifact) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+    // Ownership is checked inside the same locked operation that consumes the
+    // entry. Taking first and checking after would let a registered SP burn a
+    // victim's leaked artifact — it could not read the response, but the
+    // rightful SP's resolve would then fail.
+    let stashed = match state.take_artifact_for(&resolve.artifact, &entry.sp.entity_id) {
+        Ok(ArtifactTake::Consumed(s)) => s,
+        Ok(ArtifactTake::Unknown) => {
             warn!(
                 artifact = %resolve.artifact,
                 "/saml/artifact: unknown or already-consumed artifact"
@@ -1032,6 +1047,18 @@ pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::By
             return error_page(
                 StatusCode::NOT_FOUND,
                 "The requested artifact is unknown or has already been resolved.",
+            );
+        }
+        Ok(ArtifactTake::WrongRecipient { minted_for }) => {
+            warn!(
+                artifact = %resolve.artifact,
+                minted_for = %minted_for,
+                resolved_by = %entry.sp.entity_id,
+                "/saml/artifact: artifact resolved by a different SP than it was minted for"
+            );
+            return error_page(
+                StatusCode::FORBIDDEN,
+                "This artifact was not issued to the resolving SP.",
             );
         }
         Err(e) => {
@@ -1043,25 +1070,11 @@ pub async fn handle_artifact(State(state): State<AppState>, body: axum::body::By
         }
     };
 
-    // Defense in depth: the artifact was minted for one SP; refuse to hand it
-    // to a different (registered) SP even though the issuer-check above passed.
-    if stashed.sp_entity_id != entry.sp.entity_id {
-        warn!(
-            artifact = %resolve.artifact,
-            minted_for = %stashed.sp_entity_id,
-            resolved_by = %entry.sp.entity_id,
-            "/saml/artifact: artifact resolved by a different SP than it was minted for"
-        );
-        return error_page(
-            StatusCode::FORBIDDEN,
-            "This artifact was not issued to the resolving SP.",
-        );
-    }
-
-    let envelope = match state
-        .idp
-        .build_artifact_response(&resolve, &stashed.response_xml)
-    {
+    let envelope = match state.idp.build_artifact_response(
+        &resolve,
+        &stashed.sp_entity_id,
+        &stashed.response_xml,
+    ) {
         Ok(env) => env,
         Err(e) => {
             warn!(error = %e, "/saml/artifact: build_artifact_response failed");
@@ -1138,10 +1151,16 @@ fn finalize_sso_dispatch(
 #[cfg(feature = "artifact-binding")]
 fn finalize_artifact_dispatch(
     state: &AppState,
-    sp_entity_id: &str,
+    _sp_entity_id: &str,
     redirect: saml::ArtifactRedirect,
 ) -> Response {
-    let entry = crate::StashedArtifact::new(redirect.response_xml, sp_entity_id.to_owned());
+    // Store the recipient the library recorded on the redirect, not one
+    // threaded separately through this function. The two agree today, but the
+    // whole point of `recipient_entity_id` is to be the authoritative record
+    // of who the artifact was minted for; re-deriving it here would leave the
+    // ownership check trusting a value the library never vouched for.
+    let recipient = redirect.recipient_entity_id.clone();
+    let entry = crate::StashedArtifact::new(redirect.response_xml, recipient.clone());
     if let Err(e) = state.stash_artifact(redirect.artifact.clone(), entry) {
         warn!(error = %e, "/saml/sso: artifact store unavailable");
         return error_page(
@@ -1150,7 +1169,7 @@ fn finalize_artifact_dispatch(
         );
     }
     info!(
-        sp = %sp_entity_id,
+        sp = %recipient,
         acs = %redirect.redirect_to,
         "/saml/sso: dispatching SSO Response over HTTP-Artifact binding",
     );
