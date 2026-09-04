@@ -2167,6 +2167,7 @@ mod tests {
         fn upstream_response(key: &KeyPair, request_id: &str, now: SystemTime) -> Vec<u8> {
             let issuing_idp = IdentityProvider::new(IdentityProviderConfig {
                 entity_id: "https://upstream-idp.example.com".into(),
+                max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
                 sso: vec![Endpoint::post(
                     "https://upstream-idp.example.com/sso/post",
                     1,
