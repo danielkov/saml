@@ -286,16 +286,39 @@ impl KeyPair {
         })
     }
 
-    /// Attach a certificate to this keypair (consuming builder form). The cert
-    /// is what `<ds:KeyInfo>/<ds:X509Data>` emits when outbound signing is
-    /// configured to publish the signer's certificate. The library does NOT
-    /// verify that the certificate's public key matches the private key —
-    /// callers who care can compare `cert.public_key()` against
-    /// `keypair.public_key()` themselves; v0.1's posture is that configuration
-    /// is the caller's responsibility.
-    pub fn with_certificate(mut self, cert: X509Certificate) -> Self {
+    /// Attach a certificate to this keypair (consuming builder form).
+    ///
+    /// The certificate is what `<ds:KeyInfo>/<ds:X509Data>` emits when
+    /// outbound signing publishes the signer's identity. Attaching a
+    /// certificate for another key would produce signatures that no peer can
+    /// verify with the embedded certificate, so this method proves exact key
+    /// correspondence before accepting it: the private key signs a
+    /// domain-separated challenge and the certificate's public key verifies
+    /// that signature. Checking only the algorithm family is insufficient —
+    /// two unrelated RSA keys, for example, have the same family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] when the certificate does not
+    /// carry the public key corresponding to this private key.
+    pub fn with_certificate(mut self, cert: X509Certificate) -> Result<Self, Error> {
+        const KEY_BINDING_CHALLENGE: &[u8] = b"saml-rs:keypair-certificate-binding:v1";
+        let algorithm = match self.algorithm_family() {
+            PublicKeyAlgorithm::Rsa => SignatureAlgorithm::RsaSha256,
+            PublicKeyAlgorithm::EcdsaP256 => SignatureAlgorithm::EcdsaSha256,
+            PublicKeyAlgorithm::EcdsaP384 => SignatureAlgorithm::EcdsaSha384,
+        };
+        let mismatch = || Error::InvalidConfiguration {
+            reason: "certificate public key does not match private key",
+        };
+        let signature = self
+            .sign(algorithm, KEY_BINDING_CHALLENGE)
+            .map_err(|_err| mismatch())?;
+        cert.public_key()
+            .verify_signature(algorithm, KEY_BINDING_CHALLENGE, &signature)
+            .map_err(|_err| mismatch())?;
         self.cert = Some(cert);
-        self
+        Ok(self)
     }
 
     /// Borrow the attached certificate, if any.
@@ -537,11 +560,69 @@ mod tests {
     }
 
     #[test]
+    fn pkcs8_der_and_pkcs1_pem_parse_supported_rsa_key() {
+        use rsa::pkcs8::{DecodePrivateKey as _, EncodePrivateKey as _};
+
+        let pem = std::str::from_utf8(RSA_KEY_PKCS8_PEM).expect("ASCII PEM");
+        let rsa = RsaPrivateKey::from_pkcs8_pem(pem).expect("parse fixture");
+        let pkcs8_der = rsa.to_pkcs8_der().expect("encode PKCS#8");
+        assert_eq!(
+            KeyPair::from_pkcs8_der(pkcs8_der.as_bytes())
+                .expect("parse PKCS#8 DER")
+                .algorithm_family(),
+            PublicKeyAlgorithm::Rsa
+        );
+
+        use rsa::pkcs1::EncodeRsaPrivateKey as _;
+        let pkcs1_pem = rsa
+            .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+            .expect("encode PKCS#1 PEM");
+        assert_eq!(
+            KeyPair::from_pkcs1_pem(pkcs1_pem.as_bytes())
+                .expect("parse PKCS#1 PEM")
+                .algorithm_family(),
+            PublicKeyAlgorithm::Rsa
+        );
+    }
+
+    #[test]
+    fn key_parsers_reject_invalid_utf8_and_der() {
+        assert!(matches!(
+            KeyPair::from_pkcs8_pem(&[0xff]),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            KeyPair::from_pkcs1_pem(&[0xff]),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            KeyPair::from_pkcs8_der(b"not a private key"),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+    }
+
+    #[test]
     fn with_certificate_attaches_cert() {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
-        let kp_with_cert = kp.with_certificate(cert.clone());
+        let kp_with_cert = kp
+            .with_certificate(cert.clone())
+            .expect("matching certificate");
         assert_eq!(kp_with_cert.certificate(), Some(&cert));
+    }
+
+    #[test]
+    fn with_certificate_rejects_same_family_mismatched_key() {
+        use rsa::rand_core::OsRng;
+
+        let unrelated = RsaPrivateKey::new(&mut OsRng, 1024).expect("generate unrelated RSA key");
+        let kp = KeyPair::from_rsa_private_key(unrelated).expect("wrap unrelated RSA key");
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("parse RSA certificate");
+
+        let err = kp
+            .with_certificate(cert)
+            .expect_err("same algorithm family must not imply the same key");
+        assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
     #[test]
@@ -567,6 +648,19 @@ mod tests {
             .expect("sign");
         cert.public_key()
             .verify_signature(SignatureAlgorithm::RsaSha512, payload, &sig)
+            .expect("verify");
+    }
+
+    #[test]
+    fn rsa_sign_verify_round_trip_sha384() {
+        let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("parse key");
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("parse cert");
+        let payload = b"sha384 payload";
+        let signature = kp
+            .sign(SignatureAlgorithm::RsaSha384, payload)
+            .expect("sign");
+        cert.public_key()
+            .verify_signature(SignatureAlgorithm::RsaSha384, payload, &signature)
             .expect("verify");
     }
 
@@ -601,6 +695,16 @@ mod tests {
             .sign(SignatureAlgorithm::EcdsaSha384, b"x")
             .expect_err("P-256 with SHA-384 is not a supported pairing");
         assert!(matches!(err, Error::DisallowedAlgorithm { .. }));
+    }
+
+    #[test]
+    fn debug_reports_shape_without_private_material() {
+        let key = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("parse key");
+        let debug = format!("{key:?}");
+        assert!(debug.contains("KeyPair"));
+        assert!(debug.contains("algorithm_family"));
+        assert!(debug.contains("has_certificate"));
+        assert!(!debug.contains("PRIVATE KEY"));
     }
 
     #[test]

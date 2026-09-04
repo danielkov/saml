@@ -5,6 +5,12 @@
 
 use std::time::{Duration, SystemTime};
 
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::RngCore as _;
+
 use crate::authn::request_build::{AcsRequest, BuildAuthnRequest, build_authn_request_xml};
 use crate::authn_context::RequestedAuthnContext;
 use crate::binding::post::encode_request as post_encode_request;
@@ -17,6 +23,7 @@ use crate::binding::redirect::{
     encode_unsigned as redirect_encode_unsigned,
 };
 use crate::binding::{Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseEndpoint};
+use crate::crypto::cert::certificate_fingerprint_set;
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::IdpDescriptor;
 use crate::dsig::algorithms::{
@@ -46,7 +53,7 @@ use crate::logout::{
 use crate::metadata::MetadataExtras;
 use crate::metadata::emit_sp::{SpMetadataInputs, emit_sp_metadata};
 use crate::nameid::NameIdFormat;
-use crate::replay::{ReplayCache, ReplayMode};
+use crate::replay::{ReplayCache, ReplayEntry, ReplayMode};
 use crate::response::Identity;
 use crate::response::parse::parse_response;
 use crate::response::validate::{ValidateResponse, validate_response};
@@ -219,14 +226,292 @@ pub struct StartLoginResult {
 
 /// Caller-side state captured at AuthnRequest time and replayed into
 /// [`ServiceProvider::consume_response`] to verify the matching Response.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// Every field is read-only outside this crate. Mutation and construction from
+/// whole cloth do not compile:
+///
+/// ```compile_fail
+/// # use saml::LoginTracker;
+/// fn cross_wire(tracker: &mut LoginTracker) {
+///     tracker.request_id.clear();
+/// }
+/// ```
+#[derive(Debug, Clone)]
 pub struct LoginTracker {
+    request_id: String,
+    issued_at: SystemTime,
+    idp_entity_id: String,
+    acs_endpoint: SsoResponseEndpoint,
+    /// What this login asked the IdP for, as issued.
+    ///
+    /// Private: these drive response-side policy checks, so a caller that
+    /// could clear them after `start_login` would simply switch those checks
+    /// off — `requested_authn_context` disables non-downgrade enforcement,
+    /// `requested_name_id_format` disables the returned-format check. Read via
+    /// [`requested_authn_context`](Self::requested_authn_context) and
+    /// [`requested_name_id_format`](Self::requested_name_id_format).
+    ///
+    /// # Serialized trackers
+    ///
+    /// A tracker is usually stashed in a cookie or session store across the
+    /// round trip. Privacy here constrains this process, not that storage: if
+    /// you serialize a tracker, the serialized form MUST be
+    /// integrity-protected, or an attacker who can rewrite it can strip these
+    /// requirements exactly as a caller with public fields could.
+    requested_authn_context: Option<RequestedAuthnContext>,
+    requested_name_id_format: Option<NameIdFormat>,
+    /// SHA-256 fingerprints of the IdP signing certificates trusted when this
+    /// login began.
+    ///
+    /// `idp_entity_id` pins who the response claims to be from, not which keys
+    /// may speak for them — and `consume_response` takes a fresh
+    /// `IdpDescriptor`. Without this, a same-entity descriptor carrying an
+    /// attacker's certificate becomes the validation trust root, exactly as on
+    /// the proxy path before it sealed the same fingerprints.
+    idp_signing_cert_fingerprints: Vec<[u8; 32]>,
+    /// Canonical IdP ArtifactResolutionService endpoints trusted when this
+    /// login began. Artifact routing uses this snapshot, never a fresh
+    /// descriptor's URL, so a substituted index cannot induce an outbound
+    /// request to an attacker-controlled destination.
+    idp_artifact_resolution_services: Vec<Endpoint>,
+}
+
+/// Serialized form of a [`LoginTracker`].
+///
+/// Transparent wire form for storage and custom authenticated containers.
+///
+/// This value is deliberately not accepted by response validation. It becomes
+/// an authoritative [`LoginTracker`] only after [`LoginTracker::open`]
+/// authenticates a blob sealed by [`LoginTrackerPayload::seal`]. The sealing
+/// key holder is therefore a tracker-issuing trust root: it can construct a
+/// payload with arbitrary correlation or policy fields and authorize it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LoginTrackerPayload {
     pub request_id: String,
     pub issued_at: SystemTime,
     pub idp_entity_id: String,
     pub acs_endpoint: SsoResponseEndpoint,
     pub requested_authn_context: Option<RequestedAuthnContext>,
     pub requested_name_id_format: Option<NameIdFormat>,
+    /// See [`LoginTracker`]'s field of the same name.
+    pub idp_signing_cert_fingerprints: Vec<[u8; 32]>,
+    /// See [`LoginTracker`]'s field of the same name.
+    #[serde(default)]
+    pub idp_artifact_resolution_services: Vec<Endpoint>,
+}
+
+impl LoginTrackerPayload {
+    /// Seal this payload into an authenticated blob for the caller's storage.
+    ///
+    /// A tracker crosses the round trip in a cookie or session store, so it
+    /// leaves this process and comes back. Private fields say nothing about
+    /// what happens in between: a plain `Deserialize`, or any public
+    /// constructor, lets whoever controls that storage rebuild the tracker
+    /// with `requested_authn_context` and `requested_name_id_format` cleared —
+    /// which switches off non-downgrade enforcement and the returned-format
+    /// check exactly as mutating the fields would have.
+    ///
+    /// Sealing is therefore the only honest way to hand a tracker out. Same
+    /// construction as [`Aes256GcmCodec`](crate::Aes256GcmCodec):
+    /// `base64url(nonce_12 || ciphertext || tag_16)` under a 32-byte key the
+    /// application holds.
+    ///
+    /// # Errors
+    ///
+    /// If serialization or encryption fails.
+    pub fn seal(&self, key: &[u8; 32]) -> Result<String, Error> {
+        let wire = self;
+        let plaintext =
+            postcard::to_allocvec(&wire).map_err(|_err| Error::InvalidConfiguration {
+                reason: "login tracker serialize",
+            })?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|_err| Error::InvalidConfiguration {
+                reason: "AES-256-GCM key size mismatch",
+            })?;
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let ct = cipher
+            .encrypt(
+                aes_gcm::Nonce::from_slice(&nonce_bytes),
+                aes_gcm::aead::Payload {
+                    msg: &plaintext,
+                    aad: &[],
+                },
+            )
+            .map_err(|_err| Error::DecryptFailed {
+                reason: "login tracker",
+            })?;
+        let mut buf = Vec::with_capacity(12usize.saturating_add(ct.len()));
+        buf.extend_from_slice(&nonce_bytes);
+        buf.extend_from_slice(&ct);
+        Ok(URL_SAFE_NO_PAD.encode(&buf))
+    }
+}
+
+impl LoginTracker {
+    /// The inert wire form, for embedding in something the crate authenticates.
+    #[must_use]
+    pub fn to_payload(&self) -> LoginTrackerPayload {
+        LoginTrackerPayload {
+            request_id: self.request_id.clone(),
+            issued_at: self.issued_at,
+            idp_entity_id: self.idp_entity_id.clone(),
+            acs_endpoint: self.acs_endpoint.clone(),
+            requested_authn_context: self.requested_authn_context.clone(),
+            requested_name_id_format: self.requested_name_id_format.clone(),
+            idp_signing_cert_fingerprints: self.idp_signing_cert_fingerprints.clone(),
+            idp_artifact_resolution_services: self.idp_artifact_resolution_services.clone(),
+        }
+    }
+
+    /// Rebuild from a payload. Crate-internal: the caller reaching this would
+    /// be able to clear the policy fields, which is what privacy prevents.
+    pub(crate) fn from_payload(payload: LoginTrackerPayload) -> Self {
+        Self {
+            request_id: payload.request_id,
+            issued_at: payload.issued_at,
+            idp_entity_id: payload.idp_entity_id,
+            acs_endpoint: payload.acs_endpoint,
+            requested_authn_context: payload.requested_authn_context,
+            requested_name_id_format: payload.requested_name_id_format,
+            idp_signing_cert_fingerprints: payload.idp_signing_cert_fingerprints,
+            idp_artifact_resolution_services: payload.idp_artifact_resolution_services,
+        }
+    }
+
+    /// Recover a tracker sealed by [`LoginTrackerPayload::seal`].
+    ///
+    /// # What the key establishes
+    ///
+    /// The sealing key is the tracker-issuing trust root, and this crate makes
+    /// no claim beyond that. [`LoginTrackerPayload`] is public with public
+    /// fields, so whoever holds the key can mint a tracker with the policy
+    /// fields cleared just as easily as a genuine one — an AEAD proves the
+    /// holder of a key sealed something, not that this crate did.
+    ///
+    /// What it does establish is integrity across the round trip: a tracker
+    /// that went out through a cookie or session store comes back unmodified,
+    /// or not at all. That is the property that was missing, since the
+    /// response-side checks it carries — non-downgrade enforcement and the
+    /// returned-format check — are switched off by clearing the fields.
+    ///
+    /// The application is not in the threat model here: it can already skip
+    /// those checks by passing no tracker at all. Keep the key where the
+    /// application keeps its other secrets, and treat anyone who obtains it as
+    /// able to issue trackers.
+    ///
+    /// `max_age` bounds how long a sealed tracker stays usable. An
+    /// authenticated blob is still a bearer token: without a bound, one
+    /// captured from a log or a stale cookie authorizes a correlation
+    /// indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// If the blob is malformed, fails authentication, or is older than
+    /// `max_age`.
+    pub fn open(
+        blob: &str,
+        key: &[u8; 32],
+        now: SystemTime,
+        max_age: Duration,
+    ) -> Result<Self, Error> {
+        let bytes =
+            URL_SAFE_NO_PAD
+                .decode(blob.as_bytes())
+                .map_err(|_err| Error::DecryptFailed {
+                    reason: "login tracker",
+                })?;
+        if bytes.len() < 12 + 16 {
+            return Err(Error::DecryptFailed {
+                reason: "login tracker",
+            });
+        }
+        let (nonce_bytes, ct) = bytes.split_at(12);
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|_err| Error::InvalidConfiguration {
+                reason: "AES-256-GCM key size mismatch",
+            })?;
+        let plaintext = cipher
+            .decrypt(
+                aes_gcm::Nonce::from_slice(nonce_bytes),
+                aes_gcm::aead::Payload { msg: ct, aad: &[] },
+            )
+            .map_err(|_err| Error::DecryptFailed {
+                reason: "login tracker",
+            })?;
+        let wire: LoginTrackerPayload =
+            postcard::from_bytes(&plaintext).map_err(|_err| Error::DecryptFailed {
+                reason: "login tracker",
+            })?;
+
+        // Bounded in both directions, for the same reason the proxy context is:
+        // `issued_at` is whatever was sealed, so an unbounded future date would
+        // make `max_age` meaningless.
+        match now.duration_since(wire.issued_at) {
+            Ok(age) if age > max_age => {
+                return Err(Error::Expired);
+            }
+            Err(ahead) if ahead.duration() > Duration::from_mins(5) => {
+                return Err(Error::InvalidConfiguration {
+                    reason: "login tracker is dated too far in the future",
+                });
+            }
+            _ => {}
+        }
+
+        Ok(Self::from_payload(wire))
+    }
+
+    /// SHA-256 fingerprints of the IdP signing certificates trusted when this
+    /// login began. Crate-issued trackers always contain at least one; an
+    /// externally minted payload with an empty set fails response preflight.
+    #[must_use]
+    pub fn idp_signing_cert_fingerprints(&self) -> &[[u8; 32]] {
+        &self.idp_signing_cert_fingerprints
+    }
+
+    /// IdP ArtifactResolutionService endpoints pinned when login began.
+    #[must_use]
+    pub fn idp_artifact_resolution_services(&self) -> &[Endpoint] {
+        &self.idp_artifact_resolution_services
+    }
+
+    /// AuthnRequest `@ID` this tracker correlates.
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Time at which the tracked AuthnRequest was issued.
+    #[must_use]
+    pub fn issued_at(&self) -> SystemTime {
+        self.issued_at
+    }
+
+    /// Entity ID of the IdP selected when the login began.
+    #[must_use]
+    pub fn idp_entity_id(&self) -> &str {
+        &self.idp_entity_id
+    }
+
+    /// ACS endpoint selected when the login began.
+    #[must_use]
+    pub fn acs_endpoint(&self) -> &SsoResponseEndpoint {
+        &self.acs_endpoint
+    }
+
+    /// The `<samlp:RequestedAuthnContext>` this login was issued with.
+    #[must_use]
+    pub fn requested_authn_context(&self) -> Option<&RequestedAuthnContext> {
+        self.requested_authn_context.as_ref()
+    }
+
+    /// The `<samlp:NameIDPolicy>/@Format` this login was issued with.
+    #[must_use]
+    pub fn requested_name_id_format(&self) -> Option<&NameIdFormat> {
+        self.requested_name_id_format.as_ref()
+    }
 }
 
 impl ServiceProvider {
@@ -236,7 +521,15 @@ impl ServiceProvider {
         idp: &IdpDescriptor,
         opts: StartLogin<'_>,
     ) -> Result<StartLoginResult, Error> {
-        // 1. Look up IdP SSO endpoint for the requested transport binding.
+        // 1. Pin a real response-validation trust root before issuing a
+        // request. An empty set cannot authenticate the eventual response and
+        // would turn the tracker's subset check into a vacuous one.
+        let idp_signing_cert_fingerprints = certificate_fingerprint_set(&idp.signing_certs);
+        if idp_signing_cert_fingerprints.is_empty() {
+            return Err(Error::NoPeerSigningCert);
+        }
+
+        // 2. Look up IdP SSO endpoint for the requested transport binding.
         let sso_endpoint = idp
             .sso_endpoint(opts.binding)
             .ok_or(Error::UnsupportedByPeer {
@@ -295,6 +588,12 @@ impl ServiceProvider {
                 requested: response_binding.as_binding(),
             });
         }
+        let idp_artifact_resolution_services =
+            if response_binding == SsoResponseBinding::HttpArtifact {
+                validate_and_pin_artifact_resolution_services(idp)?
+            } else {
+                Vec::new()
+            };
 
         // 5. Build the AuthnRequest XML.
         let acs_selection = match (opts.acs_index, opts.acs_url) {
@@ -363,10 +662,51 @@ impl ServiceProvider {
             acs_endpoint,
             requested_authn_context: opts.requested_authn_context,
             requested_name_id_format: opts.requested_name_id_format,
+            idp_signing_cert_fingerprints,
+            idp_artifact_resolution_services,
         };
 
         Ok(StartLoginResult { tracker, dispatch })
     }
+}
+
+#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+fn validate_and_pin_artifact_resolution_services(
+    idp: &IdpDescriptor,
+) -> Result<Vec<Endpoint>, Error> {
+    if idp.artifact_resolution_endpoints.is_empty() {
+        return Err(Error::UnsupportedByPeer {
+            binding: Binding::HttpArtifact,
+        });
+    }
+
+    let mut endpoints = idp.artifact_resolution_endpoints.clone();
+    if endpoints
+        .iter()
+        .any(|endpoint| endpoint.binding != Binding::Soap || endpoint.index.is_none())
+    {
+        return Err(Error::InvalidConfiguration {
+            reason: "ArtifactResolutionService endpoints must use SOAP and carry an index",
+        });
+    }
+    endpoints.sort_by_key(|endpoint| endpoint.index);
+    if endpoints.windows(2).any(|pair| {
+        pair.first().map(|endpoint| endpoint.index) == pair.get(1).map(|endpoint| endpoint.index)
+    }) {
+        return Err(Error::InvalidConfiguration {
+            reason: "ArtifactResolutionService endpoint indices must be unique",
+        });
+    }
+    Ok(endpoints)
+}
+
+#[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
+fn validate_and_pin_artifact_resolution_services(
+    _idp: &IdpDescriptor,
+) -> Result<Vec<Endpoint>, Error> {
+    Err(Error::UnsupportedByPeer {
+        binding: Binding::HttpArtifact,
+    })
 }
 
 // =============================================================================
@@ -391,14 +731,16 @@ pub struct ConsumeResponse<'a> {
     /// `assertion_id` is offered to `cache.check_and_insert(...)`; a
     /// duplicate within the validity window surfaces as
     /// [`Error::AssertionReplay`]. When `None`, no replay check runs
-    /// — caller code is responsible for deduping `Identity::assertion_id`
-    /// against its own store, or for accepting the residual replay risk.
+    /// — caller code is responsible for deduping an ordinary
+    /// `Identity::assertion_id` against its own store, or for accepting that
+    /// residual risk. `<OneTimeUse>` is never accepted without this cache.
     pub replay_cache: Option<&'a dyn ReplayCache>,
     /// Selects which subset of assertions are submitted to `replay_cache`.
     /// Defaults to [`ReplayMode::All`] — the strictest setting and the
     /// crate's pre-`ReplayMode` behavior. See [`ReplayMode`] for the
-    /// trade-offs each variant makes. Ignored when `replay_cache` is
-    /// `None`.
+    /// trade-offs each variant makes. Ignored when `replay_cache` is `None`
+    /// except for `<OneTimeUse>`: that directive fails closed unless a cache
+    /// is present and the mode is not [`ReplayMode::Off`].
     pub replay_mode: ReplayMode,
     /// Opt-in Holder-of-Key confirmation (SAML 2.0 Profiles §3.1; SAML V2.0
     /// HoK SSO Profile). Supply the client certificate presented on the
@@ -447,7 +789,8 @@ pub struct ConsumeArtifactResponse<'a> {
     /// [`ConsumeResponse::holder_of_key_cert`] for semantics.
     pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
     /// Optional SOAP back-channel hardening for the artifact-resolution
-    /// exchange itself. When `None` (the default), the outbound
+    /// exchange itself. When `None`, mutually authenticated TLS MUST
+    /// authenticate the back channel: the outbound
     /// `<samlp:ArtifactResolve>` is sent unsigned and the inbound
     /// `<samlp:ArtifactResponse>` *envelope* signature is not checked — the
     /// recovered `<samlp:Response>`/assertion is still independently verified
@@ -460,7 +803,8 @@ pub struct ConsumeArtifactResponse<'a> {
 
 /// Opt-in SOAP back-channel hardening for [`ConsumeArtifactResponse`].
 ///
-/// The artifact back channel is mutually authenticated in practice. This
+/// The artifact back channel must authenticate both peers, either through
+/// mutually authenticated TLS or these message signatures. This
 /// struct lets the high-level SP artifact path route through the first-class
 /// [`BackchannelClient`](crate::binding::artifact::BackchannelClient) instead
 /// of the bare unsigned/unverified resolution helper:
@@ -471,8 +815,8 @@ pub struct ConsumeArtifactResponse<'a> {
 ///   signature against the IdP certificates.
 ///
 /// Both are additive and independent — either, both, or neither may be set.
-/// Leaving the field `None` on [`ConsumeArtifactResponse`] preserves the
-/// pre-existing default behavior exactly.
+/// Leaving the field `None` on [`ConsumeArtifactResponse`] is safe only when
+/// mutual TLS supplies the missing authentication.
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
 #[derive(Default)]
 pub struct ArtifactBackchannel<'a> {
@@ -528,20 +872,31 @@ impl ServiceProvider {
         let Some(tracker) = tracker else {
             return Ok(());
         };
-        if tracker.idp_entity_id != idp.entity_id {
+        if tracker.idp_entity_id() != idp.entity_id {
             return Err(Error::IssuerMismatch {
-                expected: tracker.idp_entity_id.clone(),
+                expected: tracker.idp_entity_id().to_owned(),
                 got: Some(idp.entity_id.clone()),
             });
         }
-        if tracker.acs_endpoint.url != expected_destination {
+        if tracker.acs_endpoint().url != expected_destination {
             return Err(Error::DestinationMismatch);
         }
-        if tracker.acs_endpoint.binding != binding {
+        if tracker.acs_endpoint().binding != binding {
             return Err(Error::ResponseBindingMismatch {
-                expected: tracker.acs_endpoint.binding.as_binding(),
+                expected: tracker.acs_endpoint().binding.as_binding(),
                 received: binding.as_binding(),
             });
+        }
+        // Requiring every current certificate to be pinned broke additive
+        // rotation. This preflight establishes that a current-and-pinned
+        // verification root remains; response validation below receives only
+        // that intersection, so newly introduced roots are never candidates.
+        if !idp.signing_certs.iter().any(|cert| {
+            tracker
+                .idp_signing_cert_fingerprints()
+                .contains(&cert.fingerprint_sha256())
+        }) {
+            return Err(Error::IdpTrustRootMismatch);
         }
         Ok(())
     }
@@ -549,6 +904,20 @@ impl ServiceProvider {
     /// Validate an inbound `<samlp:Response>` and extract the `Identity`.
     /// See RFC-003 §4.1.
     pub fn consume_response(&self, input: ConsumeResponse<'_>) -> Result<Identity, Error> {
+        self.consume_response_with_replay(input, None, Error::AssertionReplay)
+    }
+
+    /// Validate a Response and optionally substitute a caller-supplied replay
+    /// tombstone for the assertion ID. The proxy uses one namespaced
+    /// transaction tombstone: the already-validated `InResponseTo` binds that
+    /// transaction to this assertion, so one cache slot makes the complete
+    /// login single-use even if the IdP later emits a fresh assertion ID.
+    pub(crate) fn consume_response_with_replay(
+        &self,
+        input: ConsumeResponse<'_>,
+        transaction_replay_entry: Option<ReplayEntry<'_>>,
+        replay_error: Error,
+    ) -> Result<Identity, Error> {
         // Steps 3a/3b: registered ACS URL, plus tracker correlation for a
         // solicited flow. Shared with the artifact path, which runs them
         // before it dereferences the artifact.
@@ -578,16 +947,34 @@ impl ServiceProvider {
             .map(|k| vec![k])
             .unwrap_or_default();
 
+        // For a solicited response, verification candidates are exactly the
+        // intersection of the IdP's current metadata and the roots pinned when
+        // the login began. This permits ordinary additive rotation
+        // (`[old] -> [old, new]`) without allowing `new` to authenticate any
+        // part of this in-flight response. Filtering before validation matters
+        // for responses that require both Response and Assertion signatures:
+        // a single post-validation fingerprint cannot describe both keys.
+        let pinned_idp = input.tracker.map(|tracker| {
+            let mut idp = input.idp.clone();
+            idp.signing_certs.retain(|cert| {
+                tracker
+                    .idp_signing_cert_fingerprints()
+                    .contains(&cert.fingerprint_sha256())
+            });
+            idp
+        });
+        let validation_idp = pinned_idp.as_ref().unwrap_or(input.idp);
+
         let identity = validate_response(ValidateResponse {
             document: &document,
             parsed,
-            idp: input.idp,
+            idp: validation_idp,
             peer_crypto_policy: policy,
             #[cfg(feature = "xmlenc")]
             decryption_keys: &decryption_keys_owned,
             sp_entity_id: &self.config.entity_id,
             expected_destination: input.expected_destination,
-            tracker_request_id: input.tracker.map(|t| t.request_id.as_str()),
+            tracker_request_id: input.tracker.map(LoginTracker::request_id),
             allow_unsolicited: self.config.allow_unsolicited,
             want_response_signed: self.config.want_signed.response,
             want_assertions_signed: self.config.want_signed.assertions,
@@ -595,9 +982,37 @@ impl ServiceProvider {
             clock_skew: input.clock_skew,
             requested_authn_context: input
                 .tracker
-                .and_then(|t| t.requested_authn_context.as_ref()),
+                .and_then(LoginTracker::requested_authn_context),
             holder_of_key_cert: input.holder_of_key_cert,
         })?;
+
+        // The NameID Format must be the one we asked for.
+        //
+        // Core §3.4.1.1 requires the IdP to answer `InvalidNameIDPolicy`
+        // rather than substitute a format it cannot produce, but an SP cannot
+        // assume every peer does. A substituted format has different
+        // semantics — a persistent pseudonym where a transient one was
+        // requested is durably linkable across sessions — so accepting it
+        // silently defeats the reason the format was specified.
+        if let Some(requested) = input
+            .tracker
+            .and_then(LoginTracker::requested_name_id_format)
+            && identity.name_id().format != *requested
+        {
+            return Err(Error::UnsupportedNameIdPolicy {
+                requested: requested.as_uri().to_owned(),
+            });
+        }
+
+        if matches!(identity.name_id().format, NameIdFormat::Persistent)
+            && let Some(qualifier) = identity.name_id().sp_name_qualifier.as_deref()
+            && qualifier != self.config.entity_id
+        {
+            return Err(Error::NameIdSpQualifierMismatch {
+                expected: self.config.entity_id.clone(),
+                got: qualifier.to_owned(),
+            });
+        }
 
         // Replay-cache check, AFTER signature + all spec checks succeed.
         // We never offer an `assertion_id` to the cache until the
@@ -609,15 +1024,34 @@ impl ServiceProvider {
         // SAML 2.0 Core §2.5.1.5 (OneTimeUse): `<OneTimeUse/>` MUST be
         // enforced. For other assertions the spec recommends but does not
         // mandate replay defense; `input.replay_mode` selects the policy.
+        // `<saml:OneTimeUse>` is a MUST (Core §2.5.1.5), not a preference: the
+        // asserting party has said this assertion is good for exactly one
+        // consumption. Accepting it with no cache — or with `ReplayMode::Off`
+        // — silently ignores that, which is the one case where failing closed
+        // is not a judgement call. Other assertions keep the opt-in policy,
+        // where the spec recommends rather than mandates replay defence.
+        if identity.is_one_time_use()
+            && (input.replay_cache.is_none() || input.replay_mode == ReplayMode::Off)
+        {
+            return Err(Error::OneTimeUseUnenforceable);
+        }
+
         if let Some(cache) = input.replay_cache
-            && replay_check_needed(input.replay_mode, identity.is_one_time_use)
+            && (replay_check_needed(input.replay_mode, identity.is_one_time_use())
+                || transaction_replay_entry.is_some())
         {
             // The tombstone must outlive every instant at which the assertion
             // would still validate — see `replay_expires_at`.
             let expires_at = replay_expires_at(identity.not_on_or_after, input.clock_skew)?;
-            let fresh = cache.check_and_insert(&identity.assertion_id, expires_at)?;
+            let assertion_entry = ReplayEntry::assertion(&identity.assertion_id, expires_at);
+            // The proxy substitutes its transaction tombstone for the raw
+            // assertion ID. `InResponseTo` binds the assertion to that exact
+            // transaction, so one namespaced key enforces both assertion and
+            // transaction single-use while needing only one cache slot.
+            let entry = transaction_replay_entry.unwrap_or(assertion_entry);
+            let fresh = cache.check_and_insert(&[entry], input.now)?;
             if !fresh {
-                return Err(Error::AssertionReplay);
+                return Err(replay_error);
             }
         }
 
@@ -645,26 +1079,73 @@ impl ServiceProvider {
             input.expected_destination,
             SsoResponseBinding::HttpArtifact,
         )?;
+        let tracker = input.tracker.ok_or(Error::ArtifactTrackerRequired)?;
 
-        let ars = input
-            .idp
-            .artifact_resolution_endpoint()
-            .ok_or(Error::UnsupportedByPeer {
-                binding: Binding::HttpArtifact,
+        // A Type-4 artifact is routing data, not an opaque URL-independent
+        // token. Parse and authenticate all routing fields before touching the
+        // network: SourceID binds it to the tracked IdP and EndpointIndex
+        // selects from the ARS URLs pinned by `start_login`. The fresh
+        // descriptor is intentionally not the source of the outbound URL.
+        let parsed = crate::binding::artifact::parse_type4_artifact(input.artifact)?;
+        let expected_source = crate::binding::artifact::source_id(tracker.idp_entity_id());
+        if parsed.source_id != expected_source {
+            return Err(Error::ArtifactSourceIdMismatch);
+        }
+        let ars = tracker
+            .idp_artifact_resolution_services()
+            .iter()
+            .find(|endpoint| endpoint.index == Some(parsed.endpoint_index))
+            .ok_or(Error::ArtifactResolutionServiceMismatch {
+                index: parsed.endpoint_index,
             })?;
+
+        // Intersection of the caller's verification certificates with those
+        // pinned when the login began. Hoisted here so it outlives the
+        // borrow the client holds.
+        //
+        // Equality would break additive rotation: an IdP mid-rotation offers
+        // `[old, new]` while only `old` was pinned, and refusing that takes
+        // the transaction down for no security gain. Verifying against the
+        // intersection accepts `old` and never offers `new`.
+        let pinned_certs: Vec<_> = input
+            .backchannel
+            .as_ref()
+            .and_then(|bc| bc.verify.as_ref())
+            .map(|verify| {
+                verify
+                    .certs
+                    .iter()
+                    .filter(|cert| {
+                        tracker
+                            .idp_signing_cert_fingerprints()
+                            .contains(&cert.fingerprint_sha256())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         // Route through the first-class BackchannelClient so callers can opt
         // into signing the outbound resolve and/or verifying the inbound
-        // envelope signature. With no `backchannel` config this is byte-for-
-        // byte the old `resolve_artifact` behavior (unsigned, unverified) —
-        // the recovered inner Response is still independently verified below.
+        // envelope signature. ArtifactResponse/Issuer is optional, so the
+        // high-level path does not require it: the envelope is authenticated
+        // by pinned signing roots or the caller's mutually-authenticated
+        // transport, and the embedded Response is independently validated
+        // against the tracked IdP below. Low-level callers that require an
+        // exact outer Issuer can opt into `expect_response_issuer` directly.
         let mut client = crate::binding::artifact::BackchannelClient::new(http);
         if let Some(bc) = input.backchannel {
             if let Some(sign) = bc.sign {
                 client = client.sign_with(sign);
             }
             if let Some(verify) = bc.verify {
-                client = client.verify_with(verify);
+                if pinned_certs.is_empty() {
+                    return Err(Error::IdpTrustRootMismatch);
+                }
+                client = client.verify_with(crate::binding::artifact::VerifyConfig {
+                    certs: &pinned_certs,
+                    ..verify
+                });
             }
         }
         let inner_xml = client
@@ -1427,12 +1908,25 @@ mod tests {
     use crate::xml::parse::{Document, Element, Node, QName};
     use std::time::{Duration, UNIX_EPOCH};
 
+    const SECOND_RSA_CERT_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.crt");
+    const SECOND_RSA_KEY_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.key");
+
     // ---------- Fixtures ----------
 
     fn rsa_signing_key() -> KeyPair {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching test certificate")
+    }
+
+    fn second_rsa_signing_key() -> KeyPair {
+        KeyPair::from_pkcs8_pem(SECOND_RSA_KEY_PEM)
+            .expect("second RSA key")
+            .with_certificate(
+                X509Certificate::from_pem(SECOND_RSA_CERT_PEM).expect("second RSA cert"),
+            )
+            .expect("matching second RSA certificate")
     }
 
     fn fixture_idp() -> IdpDescriptor {
@@ -1643,6 +2137,177 @@ mod tests {
             }
             other @ Dispatch::Post(_) => panic!("expected Redirect, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn start_login_tracker_pins_idp_signing_roots() {
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let result = sp
+            .start_login(
+                &idp,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login");
+
+        assert_eq!(
+            result.tracker.idp_signing_cert_fingerprints(),
+            &[idp.signing_certs[0].fingerprint_sha256()]
+        );
+    }
+
+    #[test]
+    fn sealed_login_tracker_round_trips_authoritative_policy_and_rejects_tampering() {
+        use crate::authn_context::{AuthnContextClassRef, AuthnContextComparison};
+
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let mut tracker = sp
+            .start_login(
+                &idp,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: Some(NameIdFormat::Persistent),
+                    requested_authn_context: Some(RequestedAuthnContext {
+                        class_refs: vec![AuthnContextClassRef::MultiFactorAuth],
+                        comparison: AuthnContextComparison::Minimum,
+                    }),
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login")
+            .tracker;
+        // Pin deterministic time so expiry/future checks do not depend on the
+        // wall clock used by start_login.
+        tracker.issued_at = fixed_now();
+        let key = [0x5au8; 32];
+        let blob = tracker.to_payload().seal(&key).expect("seal tracker");
+
+        let opened = LoginTracker::open(
+            &blob,
+            &key,
+            fixed_now() + Duration::from_mins(1),
+            Duration::from_mins(2),
+        )
+        .expect("open tracker");
+        assert_eq!(opened.request_id(), tracker.request_id());
+        assert_eq!(opened.issued_at(), fixed_now());
+        assert_eq!(opened.idp_entity_id(), idp.entity_id);
+        assert_eq!(opened.acs_endpoint(), tracker.acs_endpoint());
+        assert_eq!(
+            opened.requested_name_id_format(),
+            Some(&NameIdFormat::Persistent)
+        );
+        assert_eq!(
+            opened.requested_authn_context(),
+            tracker.requested_authn_context()
+        );
+        assert_eq!(
+            opened.idp_signing_cert_fingerprints(),
+            tracker.idp_signing_cert_fingerprints()
+        );
+        assert_eq!(
+            opened.idp_artifact_resolution_services(),
+            tracker.idp_artifact_resolution_services()
+        );
+
+        let mut tampered = URL_SAFE_NO_PAD.decode(&blob).expect("sealed base64");
+        let last = tampered.last_mut().expect("ciphertext tag");
+        *last ^= 1;
+        let tampered = URL_SAFE_NO_PAD.encode(tampered);
+        assert!(matches!(
+            LoginTracker::open(&tampered, &key, fixed_now(), Duration::from_mins(2)),
+            Err(Error::DecryptFailed {
+                reason: "login tracker"
+            })
+        ));
+    }
+
+    #[test]
+    fn sealed_login_tracker_rejects_malformed_expired_and_future_blobs() {
+        let tracker = LoginTracker {
+            request_id: "_sealed".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: "https://idp.example.com".to_owned(),
+            acs_endpoint: SsoResponseEndpoint::post("https://sp.example.com/acs", 0, true),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+            idp_signing_cert_fingerprints: vec![[7; 32]],
+            idp_artifact_resolution_services: vec![],
+        };
+        let key = [0x31u8; 32];
+        let blob = tracker.to_payload().seal(&key).expect("seal tracker");
+
+        let truncated = URL_SAFE_NO_PAD.encode([0u8; 27]);
+        for malformed in ["%%not-base64%%", truncated.as_str()] {
+            assert!(matches!(
+                LoginTracker::open(malformed, &key, fixed_now(), Duration::from_mins(1)),
+                Err(Error::DecryptFailed {
+                    reason: "login tracker"
+                })
+            ));
+        }
+        assert!(matches!(
+            LoginTracker::open(
+                &blob,
+                &key,
+                fixed_now() + Duration::from_secs(61),
+                Duration::from_mins(1),
+            ),
+            Err(Error::Expired)
+        ));
+        assert!(matches!(
+            LoginTracker::open(
+                &blob,
+                &key,
+                fixed_now() - Duration::from_secs(301),
+                Duration::from_mins(1),
+            ),
+            Err(Error::InvalidConfiguration {
+                reason: "login tracker is dated too far in the future"
+            })
+        ));
+    }
+
+    #[test]
+    fn start_login_rejects_an_idp_without_a_signing_root() {
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let mut idp = fixture_idp();
+        idp.signing_certs.clear();
+
+        let err = sp
+            .start_login(
+                &idp,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect_err("there is no response-validation trust root to pin");
+
+        assert!(matches!(err, Error::NoPeerSigningCert), "got {err:?}");
     }
 
     #[test]
@@ -1887,6 +2552,8 @@ mod tests {
         not_on_or_after: &'a str,
         assertion_id: &'a str,
         one_time_use: bool,
+        name_id_format: NameIdFormat,
+        sp_name_qualifier: Option<&'a str>,
     }
 
     fn build_signed_response_xml(
@@ -1907,6 +2574,8 @@ mod tests {
                 not_on_or_after,
                 assertion_id: "_a1",
                 one_time_use: false,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         )
     }
@@ -1948,10 +2617,15 @@ mod tests {
         let name_id = Element::build(QName::new(Some(saml_ns.to_owned()), "NameID"))
             .with_attribute(
                 QName::new(None, "Format"),
-                "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_owned(),
-            )
-            .with_text("alice@example.com")
-            .finish();
+                opts.name_id_format.as_uri().to_owned(),
+            );
+        let name_id = if let Some(qualifier) = opts.sp_name_qualifier {
+            name_id.with_attribute(QName::new(None, "SPNameQualifier"), qualifier.to_owned())
+        } else {
+            name_id
+        }
+        .with_text("alice@example.com")
+        .finish();
         let subject = Element::build(QName::new(Some(saml_ns.to_owned()), "Subject"))
             .with_child(Node::Element(name_id))
             .with_child(Node::Element(sc))
@@ -2073,6 +2747,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
 
         let xml = build_signed_response_xml(
@@ -2105,6 +2781,302 @@ mod tests {
         assert_eq!(identity.name_id.value, "alice@example.com");
         assert_eq!(identity.name_id.format, NameIdFormat::EmailAddress);
         assert_eq!(identity.session_index.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn consume_response_enforces_the_tracked_name_id_format() {
+        let kp = rsa_signing_key();
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-nameid-format".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: Some(NameIdFormat::Transient),
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
+        };
+        let xml = build_signed_response_xml(
+            &kp,
+            Some("_req-nameid-format"),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("IdP substituted a different NameID format");
+
+        assert!(matches!(
+            err,
+            Error::UnsupportedNameIdPolicy { ref requested }
+                if requested == NameIdFormat::Transient.as_uri()
+        ));
+    }
+
+    #[test]
+    fn consume_response_rejects_persistent_name_id_scoped_to_another_sp() {
+        let kp = rsa_signing_key();
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-nameid-scope".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: Some(NameIdFormat::Persistent),
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
+        };
+        let xml = build_signed_response_xml_with_options(
+            &kp,
+            &ResponseFixtureOptions {
+                in_response_to: Some("_req-nameid-scope"),
+                recipient_url: "https://sp.example.com/acs",
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T11:59:00Z",
+                not_on_or_after: "2026-05-26T12:10:00Z",
+                assertion_id: "_a-nameid-scope",
+                one_time_use: false,
+                name_id_format: NameIdFormat::Persistent,
+                sp_name_qualifier: Some("https://other-sp.example.com"),
+            },
+        );
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("persistent identifier belongs to another SP");
+
+        assert!(matches!(
+            err,
+            Error::NameIdSpQualifierMismatch { ref expected, ref got }
+                if expected == "https://sp.example.com"
+                    && got == "https://other-sp.example.com"
+        ));
+    }
+
+    #[test]
+    fn consume_response_rejects_a_signing_root_introduced_after_start_login() {
+        use crate::crypto::cert::test_vectors::EC_P256_CERT_PEM;
+
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let trusted = fixture_idp();
+        let tracker = sp
+            .start_login(
+                &trusted,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login")
+            .tracker;
+        let mut substituted = trusted.clone();
+        substituted.signing_certs = vec![X509Certificate::from_pem(EC_P256_CERT_PEM).unwrap()];
+        let xml = build_signed_response_xml(
+            &rsa_signing_key(),
+            Some(tracker.request_id()),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &substituted,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("a fresh same-entity signing root must not be trusted");
+
+        assert!(matches!(err, Error::IdpTrustRootMismatch), "got {err:?}");
+    }
+
+    #[test]
+    fn consume_response_accepts_the_pinned_key_during_additive_rotation() {
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let trusted = fixture_idp();
+        let tracker = sp
+            .start_login(
+                &trusted,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login")
+            .tracker;
+        let mut rotating = trusted.clone();
+        rotating.signing_certs.push(
+            second_rsa_signing_key()
+                .certificate()
+                .expect("second key carries cert")
+                .clone(),
+        );
+        let xml = build_signed_response_xml(
+            &rsa_signing_key(),
+            Some(tracker.request_id()),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+
+        sp.consume_response(ConsumeResponse {
+            idp: &rotating,
+            peer_crypto_policy: None,
+            saml_response: &xml,
+            binding: SsoResponseBinding::HttpPost,
+            relay_state: None,
+            tracker: Some(&tracker),
+            expected_destination: "https://sp.example.com/acs",
+            now: fixed_now(),
+            clock_skew: Duration::from_secs(30),
+            replay_cache: None,
+            replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
+        })
+        .expect("the pinned key remains valid while a new key overlaps");
+    }
+
+    #[test]
+    fn consume_response_never_uses_the_new_key_in_a_double_signed_response() {
+        let mut cfg = fixture_sp_config(None, false, false);
+        cfg.want_signed.response = true;
+        cfg.want_signed.assertions = true;
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let trusted = fixture_idp();
+        let tracker = sp
+            .start_login(
+                &trusted,
+                StartLogin {
+                    relay_state: None,
+                    binding: Binding::HttpRedirect,
+                    force_authn: false,
+                    is_passive: false,
+                    requested_name_id_format: None,
+                    requested_authn_context: None,
+                    acs_index: None,
+                    acs_url: None,
+                    response_binding: None,
+                },
+            )
+            .expect("start login")
+            .tracker;
+        let new_key = second_rsa_signing_key();
+        let mut rotating = trusted.clone();
+        rotating.signing_certs.push(
+            new_key
+                .certificate()
+                .expect("second key carries cert")
+                .clone(),
+        );
+
+        // The Assertion is signed by the old, pinned key. Add a required
+        // Response signature made with the newly introduced key. A singular
+        // post-validation fingerprint sees only the Assertion key, so this is
+        // the regression that requires filtering verification roots up front.
+        let assertion_signed = build_signed_response_xml(
+            &rsa_signing_key(),
+            Some(tracker.request_id()),
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+        let document = Document::parse(&assertion_signed).expect("response parses");
+        let double_signed = sign_element(
+            document.root().clone(),
+            &document,
+            SignOptions {
+                signing_key: &new_key,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign Response with new key");
+        let double_signed = emit_document(&Document::new(double_signed).expect("document"))
+            .expect("emit")
+            .into_bytes();
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &rotating,
+                peer_crypto_policy: None,
+                saml_response: &double_signed,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            })
+            .expect_err("a newly introduced key cannot satisfy any required signature");
+        assert!(
+            matches!(err, Error::SignatureVerification { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2157,6 +3129,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
 
         // Build a Response whose InResponseTo is `_wrong`.
@@ -2202,6 +3176,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         let xml = build_signed_response_xml(
             &kp,
@@ -2244,6 +3220,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         idp.entity_id = "https://different-idp.example.com".to_owned();
 
@@ -2283,6 +3261,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
 
         let err = sp
@@ -2335,8 +3315,8 @@ mod tests {
     impl ReplayCache for RecordingReplayCache {
         fn check_and_insert(
             &self,
-            _assertion_id: &str,
-            expires_at: SystemTime,
+            entries: &[ReplayEntry<'_>],
+            _now: SystemTime,
         ) -> Result<bool, Error> {
             // Recover through poisoning rather than mapping it to an error:
             // this double has no failure mode worth modelling, and an error
@@ -2345,7 +3325,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(expires_at);
+                .extend(entries.iter().map(|entry| entry.expires_at));
             Ok(true)
         }
     }
@@ -2363,6 +3343,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         let xml = build_signed_response_xml(
             &kp,
@@ -2432,6 +3414,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         // Set the assertion's NotOnOrAfter ~30 years out so the cache's
         // wall-clock-based lazy sweep doesn't drop the entry between
@@ -2510,6 +3494,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         let xml = build_signed_response_xml_with_options(
             &kp,
@@ -2521,6 +3507,8 @@ mod tests {
                 not_on_or_after: "2099-05-26T12:10:00Z",
                 assertion_id: "_a-otu-skip",
                 one_time_use: false,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         );
         let cache = crate::replay::InMemoryReplayCache::new(32);
@@ -2586,6 +3574,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         let xml = build_signed_response_xml_with_options(
             &kp,
@@ -2597,6 +3587,8 @@ mod tests {
                 not_on_or_after: "2099-05-26T12:10:00Z",
                 assertion_id: "_a-otu-must",
                 one_time_use: true,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         );
         let cache = crate::replay::InMemoryReplayCache::new(32);
@@ -2646,8 +3638,80 @@ mod tests {
         );
     }
 
+    /// Core §2.5.1.5 makes `<saml:OneTimeUse>` a MUST. With no cache — or
+    /// with `ReplayMode::Off` — there is no way to honour it, and accepting
+    /// the assertion anyway silently discards the asserting party's
+    /// instruction. It fails closed instead.
+    #[test]
+    fn one_time_use_without_enforcement_is_refused() {
+        let kp = rsa_signing_key();
+        let cfg = fixture_sp_config(None, false, false);
+        let sp = ServiceProvider::new(cfg).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: "_req-otu".to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
+        };
+        let xml = build_signed_response_xml_with_options(
+            &kp,
+            &ResponseFixtureOptions {
+                in_response_to: Some("_req-otu"),
+                recipient_url: "https://sp.example.com/acs",
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T11:59:00Z",
+                not_on_or_after: "2099-05-26T12:10:00Z",
+                assertion_id: "_a-otu",
+                one_time_use: true,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
+            },
+        );
+        let cache = crate::replay::InMemoryReplayCache::new(32);
+
+        let consume = |replay_cache: Option<&dyn crate::replay::ReplayCache>, mode| {
+            sp.consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: &xml,
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: Some(&tracker),
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache,
+                replay_mode: mode,
+                holder_of_key_cert: None,
+            })
+        };
+
+        // No cache at all.
+        let err = consume(None, ReplayMode::All).expect_err("nothing can enforce it");
+        assert!(matches!(err, Error::OneTimeUseUnenforceable), "got {err:?}");
+
+        // A cache, but explicitly disabled.
+        let err = consume(Some(&cache), ReplayMode::Off).expect_err("Off cannot enforce it");
+        assert!(matches!(err, Error::OneTimeUseUnenforceable), "got {err:?}");
+
+        // With enforcement available it is accepted — once.
+        consume(Some(&cache), ReplayMode::All).expect("first consumption is allowed");
+        let err = consume(Some(&cache), ReplayMode::All).expect_err("exactly one consumption");
+        assert!(matches!(err, Error::AssertionReplay), "got {err:?}");
+    }
+
     /// `ReplayMode::Off` must never consult the cache, even for a literal
     /// repeat of the same assertion bytes.
+    ///
+    /// Uses an assertion *without* `<saml:OneTimeUse>`: that directive is a
+    /// MUST, so it now fails closed rather than being silently discarded by
+    /// `Off`. This test is about the opt-out for assertions the spec merely
+    /// recommends deduplicating.
     #[test]
     fn replay_mode_off_accepts_repeated_assertion() {
         let kp = rsa_signing_key();
@@ -2661,6 +3725,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         let xml = build_signed_response_xml_with_options(
             &kp,
@@ -2671,7 +3737,9 @@ mod tests {
                 not_before: "2026-05-26T11:59:00Z",
                 not_on_or_after: "2099-05-26T12:10:00Z",
                 assertion_id: "_a-off",
-                one_time_use: true,
+                one_time_use: false,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
             },
         );
         let cache = crate::replay::InMemoryReplayCache::new(32);
@@ -2772,6 +3840,8 @@ mod tests {
             acs_endpoint: sp.config.acs[0].clone(),
             requested_authn_context: None,
             requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
         };
         let xml = build_signed_response_xml(
             &kp,
@@ -3174,20 +4244,94 @@ mod tests {
         const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
         const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
         const ARS_URL: &str = "https://idp.example.com/ars";
+        const ARS_INDEX: u16 = 23;
 
-        /// Mock `HttpClient` returning a fixed SOAP envelope body.
+        /// Mock `HttpClient` whose ArtifactResponse echoes the generated
+        /// ArtifactResolve ID, as the real synchronous protocol requires.
         struct MockClient {
-            response: Vec<u8>,
+            signed: bool,
+            tamper: bool,
         }
 
         impl HttpClient for MockClient {
             fn send(
                 &self,
-                _request: HttpRequest,
+                request: HttpRequest,
             ) -> impl Future<
                 Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
             > + Send {
-                let body = self.response.clone();
+                let document = Document::parse(&request.body).expect("resolve parses");
+                let resolve = document
+                    .find_first(Some(SAMLP_NS), "ArtifactResolve")
+                    .expect("ArtifactResolve");
+                let request_id = resolve.attribute(None, "ID").expect("resolve ID");
+                let body = if self.signed {
+                    signed_envelope(request_id, self.tamper)
+                } else {
+                    let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
+                    crate::binding::artifact::build_artifact_response(
+                        "https://idp.example.com",
+                        request_id,
+                        inner,
+                    )
+                    .expect("build unsigned envelope")
+                    .into_bytes()
+                };
+                async move {
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![("Content-Type".to_owned(), "text/xml".to_owned())],
+                        body,
+                    })
+                }
+            }
+        }
+
+        /// Models a SOAP channel authenticated by mutual TLS: the outer
+        /// ArtifactResponse needs no XML signature and deliberately omits its
+        /// optional Issuer, while the embedded Response remains signed.
+        struct IssuerlessMockClient {
+            inner_xml: Vec<u8>,
+        }
+
+        impl HttpClient for IssuerlessMockClient {
+            fn send(
+                &self,
+                request: HttpRequest,
+            ) -> impl Future<
+                Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+            > + Send {
+                assert_eq!(request.url, ARS_URL);
+                let resolve_document = Document::parse(&request.body).expect("resolve parses");
+                let request_id = resolve_document
+                    .find_first(Some(SAMLP_NS), "ArtifactResolve")
+                    .expect("ArtifactResolve")
+                    .attribute(None, "ID")
+                    .expect("resolve ID");
+                let inner_document =
+                    Document::parse(&self.inner_xml).expect("inner Response parses");
+
+                let status_code =
+                    Element::build(QName::new(Some(SAMLP_NS.to_owned()), "StatusCode"))
+                        .with_attribute(QName::new(None, "Value"), STATUS_SUCCESS.to_owned())
+                        .finish();
+                let status = Element::build(QName::new(Some(SAMLP_NS.to_owned()), "Status"))
+                    .with_child(Node::Element(status_code))
+                    .finish();
+                let artifact_response =
+                    Element::build(QName::new(Some(SAMLP_NS.to_owned()), "ArtifactResponse"))
+                        .with_namespace(Some("samlp".to_owned()), SAMLP_NS)
+                        .with_attribute(QName::new(None, "ID"), "_issuerless-art-resp")
+                        .with_attribute(QName::new(None, "Version"), "2.0")
+                        .with_attribute(QName::new(None, "IssueInstant"), "2026-05-26T12:00:00Z")
+                        .with_attribute(QName::new(None, "InResponseTo"), request_id.to_owned())
+                        .with_child(Node::Element(status))
+                        .with_child(Node::Element(inner_document.root().clone()))
+                        .finish();
+                let body = soap::wrap_element(artifact_response)
+                    .expect("wrap issuer-less ArtifactResponse")
+                    .into_bytes();
+
                 async move {
                     Ok(HttpResponse {
                         status: 200,
@@ -3202,7 +4346,8 @@ mod tests {
         /// artifact path resolves an ARS endpoint.
         fn artifact_idp() -> IdpDescriptor {
             let mut idp = fixture_idp();
-            idp.artifact_resolution_endpoints = vec![Endpoint::post(ARS_URL, 0, true)];
+            idp.artifact_resolution_endpoints =
+                vec![Endpoint::soap(ARS_URL, Some(ARS_INDEX), true)];
             idp
         }
 
@@ -3220,8 +4365,11 @@ mod tests {
         /// ArtifactResponse element is enveloped-signed with the fixture key.
         /// When `tamper` is set, an attribute is mutated after signing so the
         /// envelope signature no longer verifies.
-        fn signed_envelope(tamper: bool) -> Vec<u8> {
-            let kp = rsa_signing_key();
+        fn signed_envelope(request_id: &str, tamper: bool) -> Vec<u8> {
+            signed_envelope_with(request_id, tamper, &rsa_signing_key())
+        }
+
+        fn signed_envelope_with(request_id: &str, tamper: bool, kp: &KeyPair) -> Vec<u8> {
             let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"><saml:Issuer>https://idp.example.com</saml:Issuer></samlp:Response>"#;
             let inner_doc = Document::parse(inner.as_bytes()).expect("inner parse");
             let inner_elem = inner_doc.root().clone();
@@ -3240,6 +4388,7 @@ mod tests {
                 .with_namespace(Some("saml".to_owned()), SAML_NS)
                 .with_attribute(QName::new(None, "ID"), "_art-resp".to_owned())
                 .with_attribute(QName::new(None, "Version"), "2.0")
+                .with_attribute(QName::new(None, "InResponseTo"), request_id.to_owned())
                 .with_attribute(QName::new(None, "IssueInstant"), "2026-01-01T00:00:00Z")
                 .with_child(Node::Element(issuer))
                 .with_child(Node::Element(status))
@@ -3251,7 +4400,7 @@ mod tests {
                 stash.root().clone(),
                 &stash,
                 SignOptions {
-                    signing_key: &kp,
+                    signing_key: kp,
                     sig_alg: SignatureAlgorithm::RsaSha256,
                     digest_alg: DigestAlgorithm::Sha256,
                     c14n_alg: C14nAlgorithm::ExclusiveCanonical,
@@ -3270,14 +4419,16 @@ mod tests {
 
         fn consume_input<'a>(
             idp: &'a IdpDescriptor,
+            tracker: &'a LoginTracker,
+            artifact: &'a str,
             backchannel: Option<ArtifactBackchannel<'a>>,
         ) -> ConsumeArtifactResponse<'a> {
             ConsumeArtifactResponse {
                 idp,
                 peer_crypto_policy: None,
-                artifact: "AAQAA-sample",
+                artifact,
                 relay_state: None,
-                tracker: None,
+                tracker: Some(tracker),
                 expected_destination: "https://sp.example.com/acs",
                 now: SystemTime::UNIX_EPOCH
                     .checked_add(Duration::from_hours(490_896))
@@ -3290,6 +4441,13 @@ mod tests {
             }
         }
 
+        fn tracked_artifact(sp: &ServiceProvider, idp: &IdpDescriptor) -> (LoginTracker, String) {
+            let tracker = artifact_tracker(sp, &idp.entity_id, &idp.signing_certs);
+            let artifact = crate::binding::artifact::make_artifact(&idp.entity_id, ARS_INDEX)
+                .expect("artifact");
+            (tracker, artifact)
+        }
+
         /// Mock `HttpClient` that records how many requests it received and
         /// fails loudly if one arrives. Used to prove that tracker
         /// correlation short-circuits the artifact path before the
@@ -3297,22 +4455,28 @@ mod tests {
         #[derive(Default)]
         struct CountingClient {
             calls: std::sync::atomic::AtomicUsize,
+            urls: std::sync::Mutex<Vec<String>>,
         }
 
         impl CountingClient {
             fn calls(&self) -> usize {
                 self.calls.load(std::sync::atomic::Ordering::SeqCst)
             }
+
+            fn urls(&self) -> Vec<String> {
+                self.urls.lock().expect("URL log lock").clone()
+            }
         }
 
         impl HttpClient for CountingClient {
             fn send(
                 &self,
-                _request: HttpRequest,
+                request: HttpRequest,
             ) -> impl Future<
                 Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
             > + Send {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.urls.lock().expect("URL log lock").push(request.url);
                 async move {
                     Err::<HttpResponse, Box<dyn std::error::Error + Send + Sync>>(
                         "artifact resolve must not be reached".into(),
@@ -3321,7 +4485,11 @@ mod tests {
             }
         }
 
-        fn artifact_tracker(sp: &ServiceProvider, idp_entity_id: &str) -> LoginTracker {
+        fn artifact_tracker(
+            sp: &ServiceProvider,
+            idp_entity_id: &str,
+            signing_certs: &[X509Certificate],
+        ) -> LoginTracker {
             LoginTracker {
                 request_id: "_req1".to_owned(),
                 issued_at: fixed_now(),
@@ -3329,21 +4497,29 @@ mod tests {
                 acs_endpoint: sp.config.acs[0].clone(),
                 requested_authn_context: None,
                 requested_name_id_format: None,
+                idp_signing_cert_fingerprints: certificate_fingerprint_set(signing_certs),
+                idp_artifact_resolution_services: vec![Endpoint::soap(
+                    ARS_URL,
+                    Some(ARS_INDEX),
+                    true,
+                )],
             }
         }
 
-        fn consume_artifact_with<'a>(
-            sp: &'a ServiceProvider,
-            client: &'a CountingClient,
-            idp: &'a IdpDescriptor,
-            tracker: &'a LoginTracker,
-        ) -> impl Future<Output = Result<Identity, Error>> + 'a {
+        async fn consume_artifact_with(
+            sp: &ServiceProvider,
+            client: &CountingClient,
+            idp: &IdpDescriptor,
+            tracker: &LoginTracker,
+        ) -> Result<Identity, Error> {
+            let artifact =
+                crate::binding::artifact::make_artifact(tracker.idp_entity_id(), ARS_INDEX)?;
             sp.consume_response_artifact(
                 client,
                 ConsumeArtifactResponse {
                     idp,
                     peer_crypto_policy: None,
-                    artifact: "AAQAAK1234567890",
+                    artifact: &artifact,
                     relay_state: None,
                     tracker: Some(tracker),
                     expected_destination: "https://sp.example.com/acs",
@@ -3355,6 +4531,7 @@ mod tests {
                     backchannel: None,
                 },
             )
+            .await
         }
 
         /// A tracker naming a different IdP must be rejected *before* the
@@ -3365,7 +4542,8 @@ mod tests {
         async fn artifact_tracker_idp_mismatch_makes_no_http_call() {
             let sp = artifact_sp();
             let idp = artifact_idp();
-            let tracker = artifact_tracker(&sp, "https://other-idp.example.com");
+            let tracker =
+                artifact_tracker(&sp, "https://other-idp.example.com", &idp.signing_certs);
             let client = CountingClient::default();
 
             let err = consume_artifact_with(&sp, &client, &idp, &tracker)
@@ -3389,7 +4567,7 @@ mod tests {
         async fn artifact_tracker_acs_mismatch_makes_no_http_call() {
             let sp = artifact_sp();
             let idp = artifact_idp();
-            let mut tracker = artifact_tracker(&sp, &idp.entity_id);
+            let mut tracker = artifact_tracker(&sp, &idp.entity_id, &idp.signing_certs);
             tracker.acs_endpoint.url = "https://sp.example.com/other-acs".to_owned();
             let client = CountingClient::default();
 
@@ -3399,6 +4577,83 @@ mod tests {
 
             assert!(matches!(err, Error::DestinationMismatch));
             assert_eq!(client.calls(), 0, "artifact must not be resolved");
+        }
+
+        #[tokio::test]
+        async fn malformed_or_untrusted_artifact_routing_makes_no_http_call() {
+            enum ExpectedFailure {
+                Malformed,
+                Source,
+                Index,
+            }
+
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let tracker = artifact_tracker(&sp, &idp.entity_id, &idp.signing_certs);
+
+            for (artifact, expected) in [
+                ("not-base64".to_owned(), ExpectedFailure::Malformed),
+                (
+                    crate::binding::artifact::make_artifact(
+                        "https://other-idp.example.com",
+                        ARS_INDEX,
+                    )
+                    .expect("artifact"),
+                    ExpectedFailure::Source,
+                ),
+                (
+                    crate::binding::artifact::make_artifact(&idp.entity_id, ARS_INDEX + 1)
+                        .expect("artifact"),
+                    ExpectedFailure::Index,
+                ),
+            ] {
+                let client = CountingClient::default();
+                let err = sp
+                    .consume_response_artifact(
+                        &client,
+                        consume_input(&idp, &tracker, &artifact, None),
+                    )
+                    .await
+                    .expect_err("preflight must reject artifact");
+                match expected {
+                    ExpectedFailure::Malformed => {
+                        assert!(matches!(err, Error::MalformedArtifact { .. }));
+                    }
+                    ExpectedFailure::Source => {
+                        assert!(matches!(err, Error::ArtifactSourceIdMismatch));
+                    }
+                    ExpectedFailure::Index => assert!(matches!(
+                        err,
+                        Error::ArtifactResolutionServiceMismatch { index }
+                            if index == ARS_INDEX + 1
+                    )),
+                }
+                assert_eq!(client.calls(), 0, "artifact preflight must precede HTTP");
+            }
+        }
+
+        #[tokio::test]
+        async fn fresh_descriptor_ars_substitution_cannot_change_destination() {
+            let sp = artifact_sp();
+            let mut idp = artifact_idp();
+            let tracker = artifact_tracker(&sp, &idp.entity_id, &idp.signing_certs);
+            idp.artifact_resolution_endpoints = vec![Endpoint::soap(
+                "https://attacker.example.com/ars",
+                Some(ARS_INDEX),
+                true,
+            )];
+            let artifact = crate::binding::artifact::make_artifact(&idp.entity_id, ARS_INDEX)
+                .expect("artifact");
+            let client = CountingClient::default();
+
+            let err = sp
+                .consume_response_artifact(&client, consume_input(&idp, &tracker, &artifact, None))
+                .await
+                .expect_err("mock pinned ARS refuses the request");
+
+            assert!(matches!(err, Error::Http(_)), "got {err:?}");
+            assert_eq!(client.calls(), 1);
+            assert_eq!(client.urls(), vec![ARS_URL.to_owned()]);
         }
 
         /// A validly-signed envelope passes envelope verification routed
@@ -3411,8 +4666,10 @@ mod tests {
             let certs = idp.signing_certs.clone();
             let policy = PeerCryptoPolicy::strong_defaults();
             let client = MockClient {
-                response: signed_envelope(false),
+                signed: true,
+                tamper: false,
             };
+            let (tracker, artifact) = tracked_artifact(&sp, &idp);
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3429,7 +4686,10 @@ mod tests {
             // but crucially NOT with an envelope SignatureVerification/Missing
             // error, which would mean the envelope check itself failed.
             let err = sp
-                .consume_response_artifact(&client, consume_input(&idp, Some(bc)))
+                .consume_response_artifact(
+                    &client,
+                    consume_input(&idp, &tracker, &artifact, Some(bc)),
+                )
                 .await
                 .expect_err("inner Response is minimal -> downstream rejects");
             assert!(
@@ -3441,6 +4701,93 @@ mod tests {
             );
         }
 
+        /// Envelope verification uses only current roots pinned when the
+        /// transaction began: an overlapping new root neither breaks the old
+        /// key nor gains authority itself.
+        #[tokio::test]
+        async fn sp_filters_artifact_envelope_roots_during_additive_rotation() {
+            struct RotatingClient {
+                key: KeyPair,
+            }
+
+            impl HttpClient for RotatingClient {
+                fn send(
+                    &self,
+                    request: HttpRequest,
+                ) -> impl Future<
+                    Output = Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>>,
+                > + Send {
+                    let document = Document::parse(&request.body).expect("resolve parses");
+                    let request_id = document
+                        .find_first(Some(SAMLP_NS), "ArtifactResolve")
+                        .expect("ArtifactResolve")
+                        .attribute(None, "ID")
+                        .expect("resolve ID");
+                    let body = signed_envelope_with(request_id, false, &self.key);
+                    async move {
+                        Ok(HttpResponse {
+                            status: 200,
+                            headers: vec![("Content-Type".to_owned(), "text/xml".to_owned())],
+                            body,
+                        })
+                    }
+                }
+            }
+
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let new_key = second_rsa_signing_key();
+            let mut rotating_certs = idp.signing_certs.clone();
+            rotating_certs.push(
+                new_key
+                    .certificate()
+                    .expect("second key carries cert")
+                    .clone(),
+            );
+            let policy = PeerCryptoPolicy::strong_defaults();
+
+            for (client, old_key_should_verify) in [
+                (
+                    RotatingClient {
+                        key: rsa_signing_key(),
+                    },
+                    true,
+                ),
+                (RotatingClient { key: new_key }, false),
+            ] {
+                let (tracker, artifact) = tracked_artifact(&sp, &idp);
+                let bc = ArtifactBackchannel {
+                    sign: None,
+                    verify: Some(VerifyConfig {
+                        certs: &rotating_certs,
+                        policy: &policy,
+                        require_signed: true,
+                    }),
+                };
+                let result = sp
+                    .consume_response_artifact(
+                        &client,
+                        consume_input(&idp, &tracker, &artifact, Some(bc)),
+                    )
+                    .await;
+                if old_key_should_verify {
+                    let err = result.expect_err("minimal inner Response remains invalid");
+                    assert!(
+                        !matches!(
+                            err,
+                            Error::SignatureMissing | Error::SignatureVerification { .. }
+                        ),
+                        "old pinned envelope key must verify; got {err:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::SignatureVerification { .. })),
+                        "new envelope key must be ignored; got {result:?}"
+                    );
+                }
+            }
+        }
+
         /// A tampered envelope signature is rejected by the SP artifact path
         /// before any inner-Response processing.
         #[tokio::test]
@@ -3450,8 +4797,10 @@ mod tests {
             let certs = idp.signing_certs.clone();
             let policy = PeerCryptoPolicy::strong_defaults();
             let client = MockClient {
-                response: signed_envelope(true),
+                signed: true,
+                tamper: true,
             };
+            let (tracker, artifact) = tracked_artifact(&sp, &idp);
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3463,7 +4812,10 @@ mod tests {
             };
 
             let err = sp
-                .consume_response_artifact(&client, consume_input(&idp, Some(bc)))
+                .consume_response_artifact(
+                    &client,
+                    consume_input(&idp, &tracker, &artifact, Some(bc)),
+                )
                 .await
                 .expect_err("tampered envelope signature must be rejected");
             assert!(
@@ -3479,16 +4831,11 @@ mod tests {
             let idp = artifact_idp();
             let certs = idp.signing_certs.clone();
             let policy = PeerCryptoPolicy::strong_defaults();
-            // Build an unsigned ArtifactResponse envelope via the binding helper.
-            let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
-            let unsigned = crate::binding::artifact::build_artifact_response(
-                "https://idp.example.com",
-                "_req1",
-                inner,
-            )
-            .expect("build unsigned envelope")
-            .into_bytes();
-            let client = MockClient { response: unsigned };
+            let client = MockClient {
+                signed: false,
+                tamper: false,
+            };
+            let (tracker, artifact) = tracked_artifact(&sp, &idp);
 
             let bc = ArtifactBackchannel {
                 sign: None,
@@ -3500,7 +4847,10 @@ mod tests {
             };
 
             let err = sp
-                .consume_response_artifact(&client, consume_input(&idp, Some(bc)))
+                .consume_response_artifact(
+                    &client,
+                    consume_input(&idp, &tracker, &artifact, Some(bc)),
+                )
                 .await
                 .expect_err("require_signed must reject an unsigned envelope");
             assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
@@ -3513,18 +4863,14 @@ mod tests {
         async fn sp_default_is_unchanged_no_envelope_check() {
             let sp = artifact_sp();
             let idp = artifact_idp();
-            let inner = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_inner-art" Version="2.0" IssueInstant="2026-01-01T00:00:00Z"/>"#;
-            let unsigned = crate::binding::artifact::build_artifact_response(
-                "https://idp.example.com",
-                "_req1",
-                inner,
-            )
-            .expect("build unsigned envelope")
-            .into_bytes();
-            let client = MockClient { response: unsigned };
+            let client = MockClient {
+                signed: false,
+                tamper: false,
+            };
+            let (tracker, artifact) = tracked_artifact(&sp, &idp);
 
             let err = sp
-                .consume_response_artifact(&client, consume_input(&idp, None))
+                .consume_response_artifact(&client, consume_input(&idp, &tracker, &artifact, None))
                 .await
                 .expect_err("minimal inner Response -> downstream rejects");
             // No envelope signature check ran: the failure is a downstream
@@ -3533,6 +4879,51 @@ mod tests {
                 !matches!(err, Error::SignatureMissing),
                 "default path must not require an envelope signature; got {err:?}"
             );
+        }
+
+        /// SAML Core makes StatusResponseType/Issuer optional. On a mutually
+        /// authenticated SOAP channel, an unsigned, issuer-less outer
+        /// ArtifactResponse is conforming; trust in the embedded Response is
+        /// still established by its own IdP signature and normal SP checks.
+        #[tokio::test]
+        async fn sp_accepts_issuerless_artifact_response_over_authenticated_transport() {
+            let sp = artifact_sp();
+            let idp = artifact_idp();
+            let (tracker, artifact) = tracked_artifact(&sp, &idp);
+            let client = IssuerlessMockClient {
+                inner_xml: build_signed_response_xml(
+                    &rsa_signing_key(),
+                    Some("_req1"),
+                    "https://sp.example.com/acs",
+                    "https://sp.example.com",
+                    "2026-05-26T11:59:00Z",
+                    "2026-05-26T12:10:00Z",
+                ),
+            };
+
+            let identity = sp
+                .consume_response_artifact(
+                    &client,
+                    ConsumeArtifactResponse {
+                        idp: &idp,
+                        peer_crypto_policy: None,
+                        artifact: &artifact,
+                        relay_state: None,
+                        tracker: Some(&tracker),
+                        expected_destination: "https://sp.example.com/acs",
+                        now: fixed_now(),
+                        clock_skew: Duration::from_secs(30),
+                        replay_cache: None,
+                        replay_mode: ReplayMode::All,
+                        holder_of_key_cert: None,
+                        backchannel: None,
+                    },
+                )
+                .await
+                .expect("issuer-less ArtifactResponse is conforming");
+
+            assert_eq!(identity.assertion_id, "_a1");
+            assert_eq!(identity.name_id.value, "alice@example.com");
         }
     }
 }

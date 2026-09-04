@@ -566,4 +566,55 @@ mod tests {
         // silently round to a wrong date via downstream arithmetic.
         parse_xs_datetime("100000-01-01T00:00:00Z").unwrap_err();
     }
+
+    #[test]
+    fn rejects_invalid_time_and_offset_components() {
+        for value in [
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:61Z",
+            "2026-01-01T00:00:00.badZ",
+            "2026-01-01T00:00:00+15:00",
+            "2026-01-01T00:00:00+01:60",
+            "2026-01-01T00:00:00+aa:00",
+        ] {
+            assert!(parse_xs_datetime(value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn accepts_leap_second_and_truncates_long_fraction() {
+        assert_eq!(
+            parse_xs_datetime("2026-01-01T00:00:60Z").expect("leap second"),
+            parse_xs_datetime("2026-01-01T00:00:59Z").expect("ordinary second")
+        );
+        // The fraction ends in `00` on purpose. Windows models `SystemTime` as
+        // a `FILETIME`, whose resolution is 100ns, so a value like
+        // `...789` is not representable there and comes back as `...700` —
+        // the assertion below would fail on that platform alone. What this
+        // test is about is that digits beyond the ninth are *truncated* rather
+        // than rounded, which the trailing `999` still exercises.
+        let parsed = parse_xs_datetime("2026-01-01T00:00:00.123456700999Z")
+            .expect("long fractional precision");
+        assert_eq!(
+            parsed
+                .duration_since(UNIX_EPOCH)
+                .expect("post epoch")
+                .subsec_nanos(),
+            123_456_700
+        );
+    }
+
+    #[test]
+    fn format_rejects_pre_epoch_and_unrepresentable_civil_date() {
+        assert!(
+            format_xs_datetime(UNIX_EPOCH - Duration::from_secs(1)).is_err(),
+            "pre-epoch time must fail closed"
+        );
+        if let Some(far_future) = UNIX_EPOCH.checked_add(Duration::from_secs(u64::MAX)) {
+            assert!(
+                format_xs_datetime(far_future).is_err(),
+                "a civil date outside the supported range must fail closed"
+            );
+        }
+    }
 }

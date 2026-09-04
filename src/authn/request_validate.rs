@@ -41,6 +41,17 @@ pub struct ParsedAuthnRequest {
     pub protocol_binding: Option<SsoResponseBinding>,
     /// Raw selection from the request, kept for logging.
     pub assertion_consumer_service_selection: AcsSelection,
+    /// The SP this request was validated against, the canonical ACS endpoint
+    /// resolved from that SP's metadata, and the policies it carried.
+    ///
+    /// Private on purpose. Every other field here is wire-derived and `pub`,
+    /// so provenance cannot be reconstructed from them: a caller can validate
+    /// against SP-A and then rewrite `issuer` and `assertion_consumer_service`
+    /// to SP-B's values, and any check built on those fields agrees. This one
+    /// records what `validate_authn_request` actually saw, and only it can set
+    /// it — see [`ParsedAuthnRequest::validated_sp`] and
+    /// [`ParsedAuthnRequest::validated_acs`].
+    validated: ValidatedBinding,
     pub force_authn: bool,
     pub is_passive: bool,
     pub requested_name_id_format: Option<NameIdFormat>,
@@ -50,6 +61,228 @@ pub struct ParsedAuthnRequest {
     /// `validate_authn_request` initializes this to `None`; the caller
     /// overwrites it after a successful validate.
     pub relay_state: Option<String>,
+}
+
+/// The SP an [`ParsedAuthnRequest`] was validated against, together with the
+/// canonical ACS endpoint taken from that SP's metadata.
+///
+/// Held privately so it cannot be rewritten after validation.
+#[derive(Debug, Clone)]
+struct ValidatedBinding {
+    sp_entity_id: String,
+    acs: SsoResponseEndpoint,
+    /// `@ForceAuthn` and `@IsPassive` as validated.
+    ///
+    /// `ForceAuthn` is a security requirement, not a preference: clearing it
+    /// after validation lets a proxy satisfy the request with a cached
+    /// upstream session when the SP demanded fresh authentication.
+    force_authn: bool,
+    is_passive: bool,
+    /// SHA-256 fingerprints of the SP's encryption certificates as validated.
+    ///
+    /// Issuance encrypts the assertion to whichever descriptor the caller
+    /// passes in. Entity ID and ACS alone do not pin the key material, so a
+    /// later descriptor with the same identity and a substituted encryption
+    /// certificate would have the assertion encrypted to that key — and one
+    /// with the certificate removed silently downgrades opportunistic
+    /// encryption to plaintext.
+    encryption_cert_fingerprints: Vec<[u8; 32]>,
+    /// SHA-256 fingerprints of the SP signing certificates trusted while the
+    /// request was validated. Artifact issuance carries these into its
+    /// one-time transaction record so a later ArtifactResolve cannot replace
+    /// the transaction's trust roots through fresh metadata.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    signing_cert_fingerprints: Vec<[u8; 32]>,
+    /// RelayState as the role layer sealed it, straight from the binding.
+    ///
+    /// The `pub` copy is caller-mutable and rewriting it cross-wires
+    /// application state: the downstream SP correlates its own session on this
+    /// value when the response comes back.
+    relay_state: Option<String>,
+    /// The `@ID` this request carried when it was validated.
+    ///
+    /// It becomes the Response's `@InResponseTo`, which the SP correlates
+    /// against its own tracker — so it decides which transaction the assertion
+    /// claims to answer. The `pub` copy is caller-mutable, and rewriting it to
+    /// another outstanding request from the *same* SP cross-wires the two
+    /// without tripping any issuer or ACS check.
+    request_id: String,
+    /// The policies the request actually carried when it was validated.
+    ///
+    /// Held here for the same reason as the SP and ACS: the `pub` copies are
+    /// caller-mutable, and these decide what gets enforced. A caller could
+    /// validate a request demanding `Exact(MultiFactorAuth)`, clear the field,
+    /// and have the weakened policy sealed into the proxy context as
+    /// authoritative — or drive direct issuance with nothing to check against.
+    requested_authn_context: Option<RequestedAuthnContext>,
+    requested_name_id_format: Option<NameIdFormat>,
+}
+
+impl ParsedAuthnRequest {
+    /// SHA-256 fingerprints of the SP encryption certificates seen at
+    /// validation. Issuance refuses a descriptor whose set differs.
+    #[must_use]
+    pub fn validated_encryption_cert_fingerprints(&self) -> &[[u8; 32]] {
+        &self.validated.encryption_cert_fingerprints
+    }
+
+    /// Canonical signing-root fingerprints seen while validating the request.
+    /// Crate-internal because callers consume these only through the opaque
+    /// artifact transaction created by the IdP role.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    pub(crate) fn validated_signing_cert_fingerprints(&self) -> &[[u8; 32]] {
+        &self.validated.signing_cert_fingerprints
+    }
+
+    /// RelayState as the role layer sealed it from the binding.
+    ///
+    /// Read-only: the `pub` copy is caller-mutable, and this is what the
+    /// downstream SP correlates its session on.
+    #[must_use]
+    pub fn validated_relay_state(&self) -> Option<&str> {
+        self.validated.relay_state.as_deref()
+    }
+
+    /// Seal the RelayState the binding layer produced. Crate-internal: only
+    /// the role layer, immediately after validation, may vouch for it.
+    pub(crate) fn seal_relay_state(&mut self, relay_state: Option<String>) {
+        self.relay_state.clone_from(&relay_state);
+        self.validated.relay_state = relay_state;
+    }
+
+    /// `@ForceAuthn` as validated. Read-only: clearing the `pub` copy would
+    /// let a proxy answer with a cached upstream session when the SP required
+    /// fresh authentication.
+    #[must_use]
+    pub fn validated_force_authn(&self) -> bool {
+        self.validated.force_authn
+    }
+
+    /// `@IsPassive` as validated. Read-only for the same reason.
+    #[must_use]
+    pub fn validated_is_passive(&self) -> bool {
+        self.validated.is_passive
+    }
+
+    /// The `@ID` this request carried when it was validated.
+    ///
+    /// Unlike [`id`](Self::id) this cannot be rewritten by the caller, so it
+    /// is what issuance echoes as `@InResponseTo`.
+    #[must_use]
+    pub fn validated_request_id(&self) -> &str {
+        &self.validated.request_id
+    }
+
+    /// The `<samlp:RequestedAuthnContext>` this request carried when it was
+    /// validated.
+    ///
+    /// Unlike [`requested_authn_context`](Self::requested_authn_context) this
+    /// cannot be rewritten by the caller, so it is what enforcement uses.
+    #[must_use]
+    pub fn validated_authn_context(&self) -> Option<&RequestedAuthnContext> {
+        self.validated.requested_authn_context.as_ref()
+    }
+
+    /// The `<samlp:NameIDPolicy>/@Format` this request carried when it was
+    /// validated. Read-only for the same reason as
+    /// [`validated_authn_context`](Self::validated_authn_context).
+    #[must_use]
+    pub fn validated_name_id_format(&self) -> Option<&NameIdFormat> {
+        self.validated.requested_name_id_format.as_ref()
+    }
+
+    /// Entity ID of the SP this request was validated against.
+    ///
+    /// Unlike [`issuer`](Self::issuer) this cannot be rewritten by the
+    /// caller, so it is what issuance correlates on.
+    #[must_use]
+    pub fn validated_sp(&self) -> &str {
+        &self.validated.sp_entity_id
+    }
+
+    /// The ACS endpoint as registered in that SP's metadata.
+    ///
+    /// Distinct from the `pub` [`assertion_consumer_service`] field, which a
+    /// caller can rewrite — including
+    /// [`SsoResponseEndpoint::index`], which artifact issuance uses to name
+    /// the endpoint. Issuance uses this one, so a mutated index cannot reach
+    /// the wire.
+    ///
+    /// [`assertion_consumer_service`]: Self::assertion_consumer_service
+    #[must_use]
+    pub fn validated_acs(&self) -> &SsoResponseEndpoint {
+        &self.validated.acs
+    }
+
+    /// Construct a request that was not parsed from the wire, for a proxy
+    /// re-issuing downstream.
+    ///
+    /// Crate-internal: this mints the same provenance the validator produces,
+    /// so exposing it would let any caller manufacture a trusted binding from
+    /// an arbitrary descriptor — reopening exactly what the private field
+    /// closes.
+    ///
+    /// `sp` is the descriptor the resulting response will be issued to; the
+    /// ACS must be one it registers, which is checked here rather than taken
+    /// on trust. This is the only way to obtain a `ParsedAuthnRequest` outside
+    /// the crate-internal validator, so the provenance binding cannot be
+    /// forged by constructing the struct directly.
+    pub(crate) fn for_proxy_reissue(
+        sp: &SpDescriptor,
+        id: String,
+        issue_instant: SystemTime,
+        acs: SsoResponseEndpoint,
+        requested_name_id_format: Option<NameIdFormat>,
+        requested_authn_context: Option<RequestedAuthnContext>,
+        relay_state: Option<String>,
+    ) -> Result<Self, Error> {
+        // URL and binding do not identify an endpoint on their own: an SP may
+        // register several Artifact endpoints at the same location with
+        // different indices, and the artifact encodes the index. Matching on
+        // the first URL/binding hit would emit the wrong one.
+        let canonical = sp
+            .assertion_consumer_services
+            .iter()
+            .find(|e| e.url == acs.url && e.binding == acs.binding && e.index == acs.index)
+            .cloned()
+            .ok_or_else(|| Error::UnregisteredAcs {
+                entity_id: sp.entity_id.clone(),
+            })?;
+        let protocol_binding = Some(canonical.binding);
+        Ok(Self {
+            id: id.clone(),
+            issuer: sp.entity_id.clone(),
+            issue_instant,
+            destination: None,
+            assertion_consumer_service: canonical.clone(),
+            protocol_binding,
+            assertion_consumer_service_selection: AcsSelection::Default,
+            validated: ValidatedBinding {
+                sp_entity_id: sp.entity_id.clone(),
+                acs: canonical,
+                request_id: id.clone(),
+                force_authn: false,
+                is_passive: false,
+                encryption_cert_fingerprints: sp
+                    .encryption_certs
+                    .iter()
+                    .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+                    .collect(),
+                #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+                signing_cert_fingerprints: crate::crypto::cert::certificate_fingerprint_set(
+                    &sp.signing_certs,
+                ),
+                relay_state: relay_state.clone(),
+                requested_authn_context: requested_authn_context.clone(),
+                requested_name_id_format: requested_name_id_format.clone(),
+            },
+            force_authn: false,
+            is_passive: false,
+            requested_name_id_format,
+            requested_authn_context,
+            relay_state,
+        })
+    }
 }
 
 /// How the SP nominated its ACS endpoint on the wire. Retained on the
@@ -136,6 +369,7 @@ pub(crate) fn validate_authn_request(
             let endpoint = sp.default_acs().cloned().ok_or_else(unregistered)?;
             (endpoint, AcsSelection::Default)
         };
+    let resolved_canonical = resolved.clone();
 
     // Step 7a: binding consistency.
     //
@@ -154,13 +388,33 @@ pub(crate) fn validate_authn_request(
     }
 
     Ok(ParsedAuthnRequest {
-        id: raw.id,
+        id: raw.id.clone(),
         issuer: raw.issuer,
         issue_instant: raw.issue_instant,
         destination: raw.destination,
-        assertion_consumer_service: resolved,
+        assertion_consumer_service: resolved.clone(),
         protocol_binding: raw.protocol_binding,
         assertion_consumer_service_selection: selection,
+        validated: ValidatedBinding {
+            sp_entity_id: sp.entity_id.clone(),
+            acs: resolved_canonical,
+            request_id: raw.id.clone(),
+            force_authn: raw.force_authn,
+            is_passive: raw.is_passive,
+            encryption_cert_fingerprints: sp
+                .encryption_certs
+                .iter()
+                .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
+                .collect(),
+            #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+            signing_cert_fingerprints: crate::crypto::cert::certificate_fingerprint_set(
+                &sp.signing_certs,
+            ),
+            requested_authn_context: raw.requested_authn_context.clone(),
+            requested_name_id_format: raw.requested_name_id_format.clone(),
+            // The role layer seals this immediately after validate.
+            relay_state: None,
+        },
         force_authn: raw.force_authn,
         is_passive: raw.is_passive,
         requested_name_id_format: raw.requested_name_id_format,
@@ -553,5 +807,51 @@ mod tests {
             parsed.assertion_consumer_service.binding,
             SsoResponseBinding::HttpArtifact
         );
+    }
+
+    /// Two Artifact endpoints may share a URL and binding while differing by
+    /// index, and the artifact encodes the index. Matching on URL and binding
+    /// alone selects the first and emits the wrong endpoint.
+    #[test]
+    fn canonical_acs_lookup_distinguishes_duplicate_endpoints_by_index() {
+        let mut sp = default_sp();
+        sp.assertion_consumer_services = vec![
+            SsoResponseEndpoint::artifact("https://sp.example.com/acs", 0, true),
+            SsoResponseEndpoint::artifact("https://sp.example.com/acs", 1, false),
+        ];
+
+        for want in [0u16, 1u16] {
+            let parsed = ParsedAuthnRequest::for_proxy_reissue(
+                &sp,
+                "_req".into(),
+                SystemTime::UNIX_EPOCH,
+                SsoResponseEndpoint::artifact("https://sp.example.com/acs", want, false),
+                None,
+                None,
+                None,
+            )
+            .expect("both endpoints are registered");
+            assert_eq!(
+                parsed.validated_acs().index,
+                Some(want),
+                "canonical lookup must not collapse endpoints that differ only by index"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_reissue_rejects_an_unregistered_acs() {
+        let sp = default_sp();
+        let err = ParsedAuthnRequest::for_proxy_reissue(
+            &sp,
+            "_req".into(),
+            SystemTime::UNIX_EPOCH,
+            SsoResponseEndpoint::post("https://attacker.example.com/acs", 99, false),
+            None,
+            None,
+            None,
+        )
+        .expect_err("the proxy cannot mint provenance for an unregistered endpoint");
+        assert!(matches!(err, Error::UnregisteredAcs { .. }));
     }
 }

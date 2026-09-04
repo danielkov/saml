@@ -65,6 +65,13 @@ pub struct NameId {
     pub value: String,
     pub format: NameIdFormat,
     pub name_qualifier: Option<String>,
+    /// `SPNameQualifier` — the entity the identifier is scoped to.
+    ///
+    /// For [`NameIdFormat::Persistent`] the issue path requires this to be
+    /// absent or equal to the recipient SP entity ID; absence gets that safe
+    /// default. The SP consume path applies the same check. Affiliation-scoped
+    /// identifiers require an explicit affiliation policy that this crate does
+    /// not currently expose.
     pub sp_name_qualifier: Option<String>,
     pub sp_provided_id: Option<String>,
 }

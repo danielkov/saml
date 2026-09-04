@@ -675,6 +675,7 @@ mod tests {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("key");
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("cert");
         kp.with_certificate(cert)
+            .expect("matching test certificate")
     }
 
     /// Build a signed `<samlp:Response>` XML for use as the IdP body payload.

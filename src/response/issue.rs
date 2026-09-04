@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::attribute::Attribute;
 use crate::authn_context::AuthnContextClassRef;
-use crate::binding::{SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint};
+use crate::binding::{Endpoint, SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint};
 use crate::crypto::cert::X509Certificate;
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
@@ -59,6 +59,10 @@ pub(crate) struct IssueResponseInputs<'a> {
     pub outbound_key_transport_algorithm: KeyTransportAlgorithm,
     /// Resolved ACS endpoint (from the SP descriptor); determines POST vs Artifact.
     pub acs_endpoint: &'a SsoResponseEndpoint,
+    /// IdP ArtifactResolutionService selected for a Type-4 artifact. Required
+    /// exactly when `acs_endpoint` uses HTTP-Artifact; its index, not the SP's
+    /// ACS index, is encoded into the artifact (Bindings §3.6.4).
+    pub artifact_resolution_service: Option<&'a Endpoint>,
     pub relay_state: Option<&'a str>,
     /// Opt-in Holder-of-Key (SAML V2.0 HoK SSO Profile). When `Some`, the
     /// assertion's `<saml:SubjectConfirmation>` uses the holder-of-key method
@@ -70,26 +74,35 @@ pub(crate) struct IssueResponseInputs<'a> {
 
 /// Build the SSO Response and return a binding-encoded dispatch.
 pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoResponseDispatch, Error> {
+    ensure_name_id_sp_qualifier(&input.name_id, &input.sp.entity_id)?;
     let response_id = crate::binding::random_xml_id()?;
     let assertion_id = crate::binding::random_xml_id()?;
 
+    // Every fallible timestamp operation, done once up front. `Proxy` runs the
+    // same function as a preflight before its callbacks, so the two cannot
+    // disagree about whether this assertion can be issued.
+    let instants = issuance_instants(
+        input.now,
+        input.assertion_lifetime,
+        input.subject_confirmation_lifetime,
+        input.authn_instant,
+        input.session_not_on_or_after,
+    )?;
+    let issue_instant = instants.now.clone();
+
     let assertion_elem = build_assertion(&BuildAssertionParams {
+        instants: &instants,
         assertion_id: &assertion_id,
         idp_entity_id: input.idp_entity_id,
         name_id: &input.name_id,
         sp_entity_id: input.sp.entity_id.as_str(),
         acs_url: input.acs_endpoint.url.as_str(),
         in_response_to: input.in_response_to,
-        now: input.now,
-        assertion_lifetime: input.assertion_lifetime,
-        subject_confirmation_lifetime: input.subject_confirmation_lifetime,
         session_index: input.session_index.as_str(),
-        session_not_on_or_after: input.session_not_on_or_after,
         authn_context_class_ref: &input.authn_context_class_ref,
-        authn_instant: input.authn_instant,
         attributes: &input.attributes,
         holder_of_key_cert: input.holder_of_key_cert,
-    })?;
+    });
 
     // ---- Optionally sign the assertion in-place. ---------------------------
     let assertion_elem = maybe_sign(
@@ -133,15 +146,18 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
         assertion_elem
     };
 
+    // Same formatted instant the assertion carries, from the one preflighted
+    // computation — not a second `format_xs_datetime` call that could fail
+    // after the caller's callbacks have already run.
     let response_elem = build_response(
         &response_id,
         input.idp_entity_id,
         input.acs_endpoint.url.as_str(),
         input.in_response_to,
-        input.now,
+        &issue_instant,
         Status::success(),
         Some(assertion_or_encrypted),
-    )?;
+    );
 
     let response_elem = maybe_sign(
         response_elem,
@@ -158,6 +174,7 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
 
     dispatch_binding(
         input.acs_endpoint,
+        input.artifact_resolution_service,
         &xml,
         input.relay_state,
         input.idp_entity_id,
@@ -253,6 +270,7 @@ pub(crate) struct IssueErrorResponseInputs<'a> {
     pub outbound_digest_algorithm: DigestAlgorithm,
     pub outbound_c14n: C14nAlgorithm,
     pub acs_endpoint: &'a SsoResponseEndpoint,
+    pub artifact_resolution_service: Option<&'a Endpoint>,
     pub relay_state: Option<&'a str>,
 }
 
@@ -268,15 +286,16 @@ pub(crate) fn issue_error_response(
         message: input.message,
     };
 
+    // No assertion on this path, so there are no other instants to derive.
     let response_elem = build_response(
         &response_id,
         input.idp_entity_id,
         input.acs_endpoint.url.as_str(),
         input.in_response_to,
-        input.now,
+        &format_xs_datetime(input.now)?,
         status,
         None,
-    )?;
+    );
 
     let response_elem = maybe_sign(
         response_elem,
@@ -292,6 +311,7 @@ pub(crate) fn issue_error_response(
 
     dispatch_binding(
         input.acs_endpoint,
+        input.artifact_resolution_service,
         &xml,
         input.relay_state,
         input.idp_entity_id,
@@ -357,18 +377,79 @@ struct BuildAssertionParams<'a> {
     sp_entity_id: &'a str,
     acs_url: &'a str,
     in_response_to: Option<&'a str>,
+    session_index: &'a str,
+    authn_context_class_ref: &'a AuthnContextClassRef,
+    attributes: &'a [Attribute],
+    holder_of_key_cert: Option<&'a X509Certificate>,
+    /// Computed once by the caller and shared with `<samlp:Response>`, so the
+    /// two carry the same `@IssueInstant` and neither re-runs a fallible
+    /// formatting step that the relay preflight already cleared.
+    instants: &'a IssuanceInstants,
+}
+
+/// Every `xs:dateTime` an assertion carries, computed and formatted together.
+///
+/// This exists so that "can this assertion be issued at all?" is answerable
+/// *before* anything irreversible happens — notably before
+/// [`Proxy::relay_to_downstream`](crate::Proxy::relay_to_downstream) runs its
+/// caller-supplied attribute-release and NameID-transform callbacks, which may
+/// write to a pseudonym store or an audit log.
+///
+/// Both the preflight and the assertion builder go through this one function,
+/// so the check cannot drift from what issuance actually does. Every operation
+/// that can fail lives here: the additions and the subtraction can overflow or
+/// underflow `SystemTime`, and the formatting rejects pre-epoch and
+/// non-representable instants. `now = UNIX_EPOCH` fails on `NotBefore`, which
+/// an overflow-only check missed.
+pub(crate) struct IssuanceInstants {
+    /// `now` itself, formatted. Both `<saml:Assertion>` and
+    /// `<samlp:Response>` carry it as `@IssueInstant`, and formatting it is
+    /// fallible like every other instant here — so it belongs in the
+    /// preflight rather than being re-derived during issuance.
+    pub now: String,
+    pub conditions_not_before: String,
+    pub conditions_not_on_or_after: String,
+    pub subject_confirmation_not_on_or_after: String,
+    pub authn_instant: String,
+    pub session_not_on_or_after: Option<String>,
+}
+
+pub(crate) fn issuance_instants(
     now: SystemTime,
     assertion_lifetime: Duration,
     subject_confirmation_lifetime: Duration,
-    session_index: &'a str,
-    session_not_on_or_after: Option<SystemTime>,
-    authn_context_class_ref: &'a AuthnContextClassRef,
     authn_instant: SystemTime,
-    attributes: &'a [Attribute],
-    holder_of_key_cert: Option<&'a X509Certificate>,
+    session_not_on_or_after: Option<SystemTime>,
+) -> Result<IssuanceInstants, Error> {
+    let not_before =
+        now.checked_sub(Duration::from_mins(1))
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now - 1min underflows SystemTime",
+            })?;
+    let conditions_noa =
+        now.checked_add(assertion_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now + assertion_lifetime overflows SystemTime",
+            })?;
+    let scd_noa =
+        now.checked_add(subject_confirmation_lifetime)
+            .ok_or(Error::InvalidConfiguration {
+                reason: "now + subject_confirmation_lifetime overflows SystemTime",
+            })?;
+
+    Ok(IssuanceInstants {
+        now: format_xs_datetime(now)?,
+        conditions_not_before: format_xs_datetime(not_before)?,
+        conditions_not_on_or_after: format_xs_datetime(conditions_noa)?,
+        subject_confirmation_not_on_or_after: format_xs_datetime(scd_noa)?,
+        authn_instant: format_xs_datetime(authn_instant)?,
+        session_not_on_or_after: session_not_on_or_after
+            .map(format_xs_datetime)
+            .transpose()?,
+    })
 }
 
-fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> {
+fn build_assertion(params: &BuildAssertionParams<'_>) -> Element {
     let &BuildAssertionParams {
         assertion_id,
         idp_entity_id,
@@ -376,15 +457,11 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
         sp_entity_id,
         acs_url,
         in_response_to,
-        now,
-        assertion_lifetime,
-        subject_confirmation_lifetime,
         session_index,
-        session_not_on_or_after,
         authn_context_class_ref,
-        authn_instant,
         attributes,
         holder_of_key_cert,
+        instants,
     } = params;
 
     let issuer = Element::build(saml_qname("Issuer"))
@@ -403,7 +480,8 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
             name_id_builder.with_attribute(QName::new(None, "NameQualifier"), nq.clone());
     }
     // For Persistent format: always populate SPNameQualifier with the SP entity
-    // ID for privacy (RFC-004 §3.1). If the caller already set it, prefer that.
+    // ID for privacy (RFC-004 §3.1). A conflicting caller value was rejected
+    // before any signing/encryption work.
     let sp_name_qualifier = name_id.sp_name_qualifier.clone().or_else(|| {
         matches!(name_id.format, NameIdFormat::Persistent).then(|| sp_entity_id.to_owned())
     });
@@ -416,16 +494,11 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     }
     let name_id_elem = name_id_builder.finish();
 
-    let subject_confirmation_not_on_or_after = now
-        .checked_add(subject_confirmation_lifetime)
-        .ok_or(Error::InvalidConfiguration {
-            reason: "now + subject_confirmation_lifetime overflows SystemTime",
-        })?;
     let mut scd_builder = Element::build(saml_qname("SubjectConfirmationData"))
         .with_attribute(QName::new(None, "Recipient"), acs_url.to_owned())
         .with_attribute(
             QName::new(None, "NotOnOrAfter"),
-            format_xs_datetime(subject_confirmation_not_on_or_after)?,
+            instants.subject_confirmation_not_on_or_after.clone(),
         );
     if let Some(irt) = in_response_to {
         scd_builder = scd_builder.with_attribute(QName::new(None, "InResponseTo"), irt.to_owned());
@@ -461,24 +534,14 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     let audience_restriction = Element::build(saml_qname("AudienceRestriction"))
         .with_child(Node::Element(audience))
         .finish();
-    let conditions_not_before =
-        now.checked_sub(Duration::from_mins(1))
-            .ok_or(Error::InvalidConfiguration {
-                reason: "now - 1min underflows SystemTime",
-            })?;
-    let conditions_not_on_or_after =
-        now.checked_add(assertion_lifetime)
-            .ok_or(Error::InvalidConfiguration {
-                reason: "now + assertion_lifetime overflows SystemTime",
-            })?;
     let conditions = Element::build(saml_qname("Conditions"))
         .with_attribute(
             QName::new(None, "NotBefore"),
-            format_xs_datetime(conditions_not_before)?,
+            instants.conditions_not_before.clone(),
         )
         .with_attribute(
             QName::new(None, "NotOnOrAfter"),
-            format_xs_datetime(conditions_not_on_or_after)?,
+            instants.conditions_not_on_or_after.clone(),
         )
         .with_child(Node::Element(audience_restriction))
         .finish();
@@ -493,14 +556,12 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
     let mut authn_stmt_builder = Element::build(saml_qname("AuthnStatement"))
         .with_attribute(
             QName::new(None, "AuthnInstant"),
-            format_xs_datetime(authn_instant)?,
+            instants.authn_instant.clone(),
         )
         .with_attribute(QName::new(None, "SessionIndex"), session_index.to_owned());
-    if let Some(snoa) = session_not_on_or_after {
-        authn_stmt_builder = authn_stmt_builder.with_attribute(
-            QName::new(None, "SessionNotOnOrAfter"),
-            format_xs_datetime(snoa)?,
-        );
+    if let Some(snoa) = instants.session_not_on_or_after.clone() {
+        authn_stmt_builder =
+            authn_stmt_builder.with_attribute(QName::new(None, "SessionNotOnOrAfter"), snoa);
     }
     let authn_stmt = authn_stmt_builder
         .with_child(Node::Element(authn_context))
@@ -511,7 +572,7 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
         .with_namespace(Some("saml".to_owned()), SAML_NS)
         .with_attribute(QName::new(None, "ID"), assertion_id.to_owned())
         .with_attribute(QName::new(None, "Version"), "2.0")
-        .with_attribute(QName::new(None, "IssueInstant"), format_xs_datetime(now)?)
+        .with_attribute(QName::new(None, "IssueInstant"), instants.now.clone())
         .with_child(Node::Element(issuer))
         .with_child(Node::Element(subject))
         .with_child(Node::Element(conditions))
@@ -525,7 +586,20 @@ fn build_assertion(params: &BuildAssertionParams<'_>) -> Result<Element, Error> 
         assertion_builder = assertion_builder.with_child(Node::Element(attr_stmt.finish()));
     }
 
-    Ok(assertion_builder.finish())
+    assertion_builder.finish()
+}
+
+fn ensure_name_id_sp_qualifier(name_id: &NameId, sp_entity_id: &str) -> Result<(), Error> {
+    if matches!(name_id.format, NameIdFormat::Persistent)
+        && let Some(qualifier) = name_id.sp_name_qualifier.as_deref()
+        && qualifier != sp_entity_id
+    {
+        return Err(Error::NameIdSpQualifierMismatch {
+            expected: sp_entity_id.to_owned(),
+            got: qualifier.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Build the Holder-of-Key `<ds:KeyInfo>` subtree carrying the subject cert.
@@ -560,10 +634,10 @@ fn build_response(
     idp_entity_id: &str,
     destination: &str,
     in_response_to: Option<&str>,
-    now: SystemTime,
+    issue_instant: &str,
     status: Status,
     assertion_or_encrypted: Option<Element>,
-) -> Result<Element, Error> {
+) -> Element {
     let issuer = Element::build(saml_qname("Issuer"))
         .with_text(idp_entity_id.to_owned())
         .finish();
@@ -592,7 +666,7 @@ fn build_response(
         .with_namespace(Some("saml".to_owned()), SAML_NS)
         .with_attribute(QName::new(None, "ID"), response_id.to_owned())
         .with_attribute(QName::new(None, "Version"), "2.0")
-        .with_attribute(QName::new(None, "IssueInstant"), format_xs_datetime(now)?)
+        .with_attribute(QName::new(None, "IssueInstant"), issue_instant.to_owned())
         .with_attribute(QName::new(None, "Destination"), destination.to_owned());
     if let Some(irt) = in_response_to {
         response_builder =
@@ -604,7 +678,7 @@ fn build_response(
     if let Some(a) = assertion_or_encrypted {
         response_builder = response_builder.with_child(Node::Element(a));
     }
-    Ok(response_builder.finish())
+    response_builder.finish()
 }
 
 // =============================================================================
@@ -613,6 +687,7 @@ fn build_response(
 
 fn dispatch_binding(
     acs_endpoint: &SsoResponseEndpoint,
+    artifact_resolution_service: Option<&Endpoint>,
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
@@ -631,7 +706,10 @@ fn dispatch_binding(
             ))
         }
         SsoResponseBinding::HttpArtifact => {
-            issue_artifact(acs_endpoint, xml, relay_state, idp_entity_id)
+            let ars = artifact_resolution_service.ok_or(Error::UnsupportedByPeer {
+                binding: crate::binding::Binding::HttpArtifact,
+            })?;
+            issue_artifact(acs_endpoint, ars, xml, relay_state, idp_entity_id)
         }
     }
 }
@@ -639,6 +717,7 @@ fn dispatch_binding(
 #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
 fn issue_artifact(
     acs_endpoint: &SsoResponseEndpoint,
+    artifact_resolution_service: &Endpoint,
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
@@ -654,7 +733,11 @@ fn issue_artifact(
     let redirect = crate::binding::artifact::build_artifact_redirect(
         &url,
         idp_entity_id,
-        acs_endpoint.index.unwrap_or(0),
+        artifact_resolution_service
+            .index
+            .ok_or(Error::InvalidConfiguration {
+                reason: "ArtifactResolutionService endpoint is missing its required index",
+            })?,
         xml_str.to_owned(),
         relay_state,
     )?;
@@ -664,6 +747,7 @@ fn issue_artifact(
 #[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
 fn issue_artifact(
     _acs_endpoint: &SsoResponseEndpoint,
+    _artifact_resolution_service: &Endpoint,
     _xml: &[u8],
     _relay_state: Option<&str>,
     _idp_entity_id: &str,
@@ -686,12 +770,15 @@ mod tests {
     use crate::response::parse::parse_response;
     use crate::response::validate::{ValidateResponse, validate_response};
     use crate::xml::parse::Document;
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    use base64::Engine as _;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn rsa_signing_key() -> KeyPair {
         let kp = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).unwrap();
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).unwrap();
         kp.with_certificate(cert)
+            .expect("matching test certificate")
     }
 
     fn sp_descriptor(with_encryption_cert: bool) -> SpDescriptor {
@@ -775,6 +862,7 @@ mod tests {
             #[cfg(feature = "xmlenc")]
             outbound_key_transport_algorithm: KeyTransportAlgorithm::RsaOaep,
             acs_endpoint: &sp.assertion_consumer_services[0],
+            artifact_resolution_service: None,
             relay_state: Some("opaque-state"),
             holder_of_key_cert: None,
         }
@@ -939,6 +1027,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn persistent_name_id_rejects_foreign_sp_qualifier() {
+        let sp = sp_descriptor(false);
+        let kp = rsa_signing_key();
+        let mut name_id = NameId::new("opaque-pairwise-id", NameIdFormat::Persistent);
+        name_id.sp_name_qualifier = Some("https://other-sp.example.com".to_owned());
+
+        let err = issue_response(make_inputs(&sp, &kp, vec![], name_id))
+            .expect_err("a persistent identifier cannot be relayed across SP scopes");
+        assert!(matches!(err, Error::NameIdSpQualifierMismatch { .. }));
+    }
+
     #[cfg(feature = "xmlenc")]
     #[test]
     fn encryption_is_invoked_when_sp_has_encryption_cert() {
@@ -1025,6 +1125,46 @@ mod tests {
         );
     }
 
+    /// `<saml:Assertion>` and `<samlp:Response>` both carry an `@IssueInstant`
+    /// derived from the same `now`. They are now formatted once and shared
+    /// rather than each re-running `format_xs_datetime` during issuance, so
+    /// this pins that they cannot disagree.
+    #[test]
+    fn assertion_and_response_share_one_issue_instant() {
+        let sp = sp_descriptor(false);
+        let kp = rsa_signing_key();
+        let inputs = make_inputs(
+            &sp,
+            &kp,
+            vec![Attribute::email("alice@example.com")],
+            NameId::email("alice@example.com"),
+        );
+
+        let dispatch = issue_response(inputs).expect("issue");
+        let form = match dispatch {
+            SsoResponseDispatch::Post(f) => f,
+            other @ SsoResponseDispatch::Artifact(_) => panic!("expected Post, got {other:?}"),
+        };
+        let decoded = crate::binding::post::decode(&form.saml_response, None).expect("decode");
+        let doc = Document::parse(&decoded.xml).expect("reparse");
+
+        let response = doc.root();
+        let assertion = response
+            .child_element(Some(SAML_NS), "Assertion")
+            .expect("assertion present");
+
+        let response_instant = response
+            .attribute(None, "IssueInstant")
+            .expect("Response @IssueInstant");
+        let assertion_instant = assertion
+            .attribute(None, "IssueInstant")
+            .expect("Assertion @IssueInstant");
+        assert_eq!(
+            response_instant, assertion_instant,
+            "Response and Assertion must carry the same IssueInstant"
+        );
+    }
+
     #[test]
     fn issue_error_response_emits_status_not_success() {
         let sp = sp_descriptor(false);
@@ -1042,6 +1182,7 @@ mod tests {
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
             outbound_c14n: C14nAlgorithm::ExclusiveCanonical,
             acs_endpoint: &sp.assertion_consumer_services[0],
+            artifact_resolution_service: None,
             relay_state: None,
         };
         let dispatch = issue_error_response(inputs).expect("issue error");
@@ -1100,12 +1241,14 @@ mod tests {
             true,
         )];
         let kp = rsa_signing_key();
-        let inputs = make_inputs(
+        let ars = Endpoint::soap("https://idp.example.com/ars", Some(41), true);
+        let mut inputs = make_inputs(
             &sp,
             &kp,
             vec![Attribute::email("alice@example.com")],
             NameId::email("alice@example.com"),
         );
+        inputs.artifact_resolution_service = Some(&ars);
         let dispatch = issue_response(inputs).expect("issue");
         match dispatch {
             SsoResponseDispatch::Artifact(redirect) => {
@@ -1116,6 +1259,10 @@ mod tests {
                         .starts_with("https://sp.example.com/acs/art")
                 );
                 assert!(!redirect.artifact.is_empty());
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(redirect.artifact.as_bytes())
+                    .expect("artifact base64");
+                assert_eq!(&decoded[2..4], &41u16.to_be_bytes());
                 assert!(
                     redirect.response_xml.contains("<samlp:Response")
                         || redirect.response_xml.contains("Response")
@@ -1137,7 +1284,9 @@ mod tests {
             true,
         )];
         let kp = rsa_signing_key();
-        let inputs = make_inputs(&sp, &kp, vec![], NameId::email("alice@example.com"));
+        let ars = Endpoint::soap("https://idp.example.com/ars", Some(41), true);
+        let mut inputs = make_inputs(&sp, &kp, vec![], NameId::email("alice@example.com"));
+        inputs.artifact_resolution_service = Some(&ars);
         let err = issue_response(inputs).unwrap_err();
         match err {
             Error::UnsupportedByPeer { binding } => {

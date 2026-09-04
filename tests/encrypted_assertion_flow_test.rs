@@ -227,5 +227,5 @@ fn idp_encrypts_assertion_and_sp_decrypts_it() {
         })
         .expect("SP decrypts and consumes the encrypted Response");
 
-    assert_eq!(identity.name_id.value, "encrypted-user@example.com");
+    assert_eq!(identity.name_id().value, "encrypted-user@example.com");
 }

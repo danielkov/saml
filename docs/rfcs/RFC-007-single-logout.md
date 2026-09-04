@@ -200,7 +200,14 @@ pub enum LogoutOutcome {
 
 ## 5. Validation rules
 
-SLO signature policy uses dedicated config knobs (`sign_logout_requests`, `sign_logout_responses`, `want_logout_requests_signed`, `want_logout_responses_signed` on both `ServiceProviderConfig` and `IdentityProviderConfig`). It is **not** derived from `want_authn_requests_signed` or `want_response_signed` / `want_assertions_signed`; the same process can legitimately want signed assertions but tolerate unsigned LogoutResponses (or any other mix), and conflating the policies would couple unrelated decisions and create silent acceptance of unsigned logout messages.
+SLO signature policy uses dedicated grouped config knobs on both roles:
+`logout_signing.{sign_requests, sign_responses}` and
+`logout_want_signed.{requests, responses}`. It is **not** derived from the SSO
+policies (`sign_authn_requests` / `want_signed` on the SP, or
+`want_authn_requests_signed` / `assertion_signing` on the IdP); the same process
+can legitimately want signed assertions but tolerate unsigned LogoutResponses
+(or any other mix), and conflating the policies would couple unrelated
+decisions and create silent acceptance of unsigned logout messages.
 
 ### 5.1 LogoutRequest (both directions)
 
@@ -209,12 +216,14 @@ SLO signature policy uses dedicated config knobs (`sign_logout_requests`, `sign_
 3. `Issuer` matches the peer's EntityID. → `Error::IssuerMismatch`.
 4. **Destination binding**: `expected_destination` MUST resolve to a registered SLO endpoint URL in our `slo` list. If not, `Error::InvalidConfiguration` (caller bug). Then if `LogoutRequest/@Destination` is present, it MUST equal `expected_destination`. → `Error::DestinationMismatch`.
 5. **Signature**. Select `policy = peer_crypto_policy.unwrap_or(&self.default_peer_crypto_policy)`. The same allow-list discipline applies on both bindings — detached Redirect signatures go through `verify_detached_signature` (RFC-002 §3.3) and embedded POST/SOAP signatures go through `verify_signature` (RFC-002 §3); both calls receive `policy.allowed_signature_algorithms`.
-   - If `self.want_logout_requests_signed` is true: a valid signature is required.
+   - If `self.config().logout_want_signed.requests` is true: a valid signature is required.
      - For `Binding::HttpRedirect`: detached query-string signature, verified via `verify_detached_signature` with `candidate_certs = peer.signing_certs`, `allowed_algorithms = policy.allowed_signature_algorithms`.
      - For `Binding::HttpPost` / `Binding::Soap`: enveloped XML-DSig, verified via `verify_signature` with the same allow-list.
      - Missing signature → `Error::SignatureMissing`. Invalid signature → `Error::SignatureVerification`. Algorithm outside allow-list → `Error::DisallowedAlgorithm`.
-   - If `self.want_logout_requests_signed` is false: a signature is optional; if present it MUST verify under the same allow-list; if absent the message is accepted.
-   - The SSO flags (`want_authn_requests_signed`, `want_response_signed`, `want_assertions_signed`) are not consulted here.
+   - If `self.config().logout_want_signed.requests` is false: a signature is optional; if present it MUST verify under the same allow-list; if absent the message is accepted.
+   - The role's SSO signing fields (`sign_authn_requests` / `want_signed` for
+     the SP, `want_authn_requests_signed` / `assertion_signing` for the IdP)
+     are not consulted here.
 6. `NotOnOrAfter`, if present, > `now - clock_skew`. → `Error::Expired`.
 
 ### 5.2 LogoutResponse
@@ -223,7 +232,7 @@ SLO signature policy uses dedicated config knobs (`sign_logout_requests`, `sign_
 2. Decode binding wire format.
 3. `Issuer` matches the peer's EntityID.
 4. **Destination binding**: same rule as §5.1 step 4.
-5. **Signature**: select the effective peer policy the same way as §5.1 step 5, then use the same per-binding dispatch to `verify_detached_signature` for Redirect or `verify_signature` for POST/SOAP. The requirement is gated on `self.want_logout_responses_signed`; the algorithm allow-list is `policy.allowed_signature_algorithms` and applies to both bindings.
+5. **Signature**: select the effective peer policy the same way as §5.1 step 5, then use the same per-binding dispatch to `verify_detached_signature` for Redirect or `verify_signature` for POST/SOAP. The requirement is gated on `self.config().logout_want_signed.responses`; the algorithm allow-list is `policy.allowed_signature_algorithms` and applies to both bindings.
 6. `InResponseTo` matches `tracker.request_id`. → `Error::InResponseToMismatch`.
 7. `Status/StatusCode @Value` mapped to `LogoutOutcome`:
    - `urn:oasis:names:tc:SAML:2.0:status:Success` → `LogoutOutcome::Success`.
@@ -232,8 +241,8 @@ SLO signature policy uses dedicated config knobs (`sign_logout_requests`, `sign_
 
 ### 5.3 Outbound signing
 
-- LogoutRequest is signed iff `self.sign_logout_requests` is true.
-- LogoutResponse is signed iff `self.sign_logout_responses` is true.
+- LogoutRequest is signed iff `self.config().logout_signing.sign_requests` is true.
+- LogoutResponse is signed iff `self.config().logout_signing.sign_responses` is true.
 - Signing key is `self.signing_key`; algorithm is the role's `outbound_signature_algorithm`; digest is `outbound_digest_algorithm`; canonicalization is Exclusive C14N. Both `ServiceProviderConfig` and `IdentityProviderConfig` define these outbound fields.
 - For `Binding::HttpRedirect`, the signature is detached (query-string `Signature` + `SigAlg`); for `Binding::HttpPost` and `Binding::Soap`, the signature is embedded via XML-DSig.
 - `send_soap_logout_request` sends outbound XML and then consumes the SOAP LogoutResponse internally, so it takes the same optional `peer_crypto_policy` as `consume_logout_response`; otherwise back-channel SLO would silently fall back to the role default for peer verification.
