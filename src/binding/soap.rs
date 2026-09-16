@@ -145,7 +145,7 @@ impl UnwrappedBody {
     /// external callers use [`UnwrappedBody::payload_xml`] to get the bytes.
     /// Only the artifact binding inspects the element directly; SLO unwrapping
     /// re-serializes via `payload_xml`.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub(crate) fn payload(&self) -> &Element {
         self.document.root()
     }
@@ -160,7 +160,7 @@ impl UnwrappedBody {
     /// for the back-channel client's signature verification, which needs the
     /// owning arena to run the XSW `signed_element == root` check. Only the
     /// artifact binding consumes this; SLO unwrapping uses `payload_xml`.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub(crate) fn document_ref(&self) -> &Document {
         &self.document
     }

@@ -70,7 +70,12 @@ ecdsa-sha = []
 xmlenc = []
 slo = []
 metadata-emit = []
-artifact-binding = []
+# The SAML 2.0 artifact format (Bindings §3.6.4, type 0x0004) derives its
+# SourceID as SHA-1 of the issuer entity ID. That is an identifier
+# derivation, not a signature, so it is pulled in directly rather than via
+# `weak-algos` — enabling the artifact binding must not also compile in
+# weak *signature* and *digest* algorithms.
+artifact-binding = ["dep:sha1"]
 # Identity Provider Discovery: the Common Domain Cookie profile (SAML 2.0
 # Profiles §4.3) and the Identity Provider Discovery Service Protocol and
 # Profile (OASIS sstc-saml-idp-discovery-cs-01). Pure string / URL codecs plus

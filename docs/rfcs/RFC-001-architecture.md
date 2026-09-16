@@ -36,7 +36,7 @@ The crate inherits five operational principles from `arctic-oauth`:
 Two principles are specific to SAML's threat model:
 
 6. **XML-Signature-Wrapping (XSW) resistance is a structural property, not an optional check.** The Reference URI inside `<ds:Signature>` MUST resolve to the same element whose contents the library subsequently exposes to the caller as the validated payload. There is no API path that returns a "validated" payload distinct from the signed payload.
-7. **Algorithm agility with weak-algorithm quarantine.** SHA-1 digests, RSA-PKCS1-v1.5 key transport, and DSA signatures are implemented but gated behind a `weak-algos` feature that is off by default. Real-world legacy IdPs sometimes still require these; making the dependency explicit at compile time documents the trade-off in `cargo tree`.
+7. **Algorithm agility with weak-algorithm quarantine.** SHA-1 digests, RSA-PKCS1-v1.5 key transport, and DSA signatures are implemented but gated behind a `weak-algos` feature that is off by default. Real-world legacy IdPs sometimes still require these; making the choice explicit at compile time documents the trade-off. Note the quarantine is over *algorithms*, not over the `sha1` crate: `artifact-binding` enables that dependency on its own for the artifact `SourceID` (Bindings §3.6.4), an identity-matching tag where a collision misroutes rather than forges. Audit enabled features, not `cargo tree`.
 
 ---
 
@@ -188,7 +188,7 @@ rsa = "0.9"                          # RSA verify/sign + RSA-OAEP key transport
 ecdsa = "0.16"
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
-sha1 = { version = "0.10", optional = true }  # behind weak-algos
+sha1 = { version = "0.10", optional = true }  # weak-algos, and artifact-binding (SourceID)
 sha2 = "0.10"
 rand = "0.9"
 x509-cert = "0.2"
@@ -210,7 +210,7 @@ ecdsa-sha = []
 xmlenc = []
 slo = []
 metadata-emit = []
-artifact-binding = []
+artifact-binding = ["dep:sha1"]      # SHA-1 SourceID only — independent of weak-algos
 weak-algos = ["dep:sha1"]            # SHA-1 verify, RSA-1.5 key transport, DSA
 
 [dev-dependencies]

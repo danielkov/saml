@@ -681,7 +681,7 @@ impl IdentityProvider {
     ///
     /// Verifies the requesting SP's issuer matches the supplied
     /// [`SpDescriptor`]; mismatches return [`Error::IssuerMismatch`].
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub fn parse_artifact_resolve(
         &self,
         sp: &SpDescriptor,
@@ -705,7 +705,7 @@ impl IdentityProvider {
     ///
     /// The returned SOAP envelope is ready to be served as the HTTP response
     /// body with `Content-Type: text/xml`.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub fn build_artifact_response(
         &self,
         request: &crate::binding::artifact::ArtifactResolveRequest,

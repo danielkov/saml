@@ -636,7 +636,7 @@ fn dispatch_binding(
     }
 }
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 fn issue_artifact(
     acs_endpoint: &SsoResponseEndpoint,
     xml: &[u8],
@@ -661,7 +661,7 @@ fn issue_artifact(
     Ok(SsoResponseDispatch::Artifact(redirect))
 }
 
-#[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
+#[cfg(not(feature = "artifact-binding"))]
 fn issue_artifact(
     _acs_endpoint: &SsoResponseEndpoint,
     _xml: &[u8],
@@ -1090,7 +1090,7 @@ mod tests {
         assert_eq!(parsed.status_code, SamlStatusCode::AuthnFailed.uri());
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn artifact_binding_dispatch_returns_artifact_redirect() {
         let mut sp = sp_descriptor(false);
@@ -1127,7 +1127,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
+    #[cfg(not(feature = "artifact-binding"))]
     #[test]
     fn artifact_binding_returns_unsupported_when_feature_off() {
         let mut sp = sp_descriptor(false);

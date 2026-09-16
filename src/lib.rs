@@ -11,8 +11,12 @@
 //! - Stateless API: caller owns clock, persistence, replay storage.
 //! - XSW-resistant by structure: validated payload extraction is bound to
 //!   the signature's resolved element via [`VerifiedSignature`].
-//! - Weak algorithms (SHA-1 / RSA-PKCS#1-v1.5 / DSA-SHA1) feature-gated
-//!   behind `weak-algos`, off by default.
+//! - Weak *signature and digest* algorithms (RSA-SHA1, DSA-SHA1,
+//!   `DigestAlgorithm::Sha1`, RSA-PKCS#1-v1.5 key transport) feature-gated
+//!   behind `weak-algos`, off by default. The `sha1` crate may still be
+//!   present without it: `artifact-binding` uses SHA-1 for the artifact
+//!   `SourceID` (Bindings §3.6.4), which is a routing tag, not a security
+//!   primitive.
 //!
 //! # Quickstart — Service Provider
 //!
@@ -298,7 +302,10 @@
 //! - `xmlenc` (default) — XML Encryption (EncryptedAssertion).
 //! - `slo` (default) — Single Logout.
 //! - `metadata-emit` (default) — `metadata_xml` / `metadata_xml_with_extras`.
-//! - `artifact-binding` — HTTP-Artifact binding (requires `weak-algos`).
+//! - `artifact-binding` — HTTP-Artifact binding. Pulls in `sha1` for the
+//!   spec-mandated `SourceID` derivation (Bindings §3.6.4); this is
+//!   independent of `weak-algos`, which governs weak signature and digest
+//!   algorithms.
 //! - `idp-disco` — IdP Discovery: Common Domain Cookie + discovery service
 //!   protocol (off by default).
 //! - `ecp` — Enhanced Client or Proxy profile + PAOS binding (off by default).
@@ -398,7 +405,7 @@ pub use crate::metadata::{
 pub use crate::response::Identity;
 pub use crate::response::issue::SamlStatusCode;
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 pub use crate::sp::{ArtifactBackchannel, ConsumeArtifactResponse};
 pub use crate::sp::{
     ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
@@ -407,7 +414,7 @@ pub use crate::sp::{
 #[cfg(feature = "slo")]
 pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 pub use crate::binding::artifact::ArtifactResolveRequest;
 
 #[cfg(feature = "ecp")]

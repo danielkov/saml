@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `artifact-binding` no longer requires `weak-algos`. The SHA-1 it needs is
+  the artifact `SourceID` derivation (SAML 2.0 Bindings §3.6.4) — an
+  identity-matching tag, not a security primitive — so it now pulls in `sha1`
+  directly. Weak *signature and digest* algorithms remain gated behind
+  `weak-algos`. This supersedes the note under 0.0.1-alpha.1 that the
+  artifact binding requires `weak-algos`.
+
 ## [0.0.1-alpha.2] - 2026-08-08
 
 ### Fixed

@@ -422,7 +422,7 @@ pub struct ConsumeResponse<'a> {
 /// validated exactly as in [`ServiceProvider::consume_response`].
 ///
 /// See SAML 2.0 Bindings §3.6.
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 pub struct ConsumeArtifactResponse<'a> {
     pub idp: &'a crate::descriptor::IdpDescriptor,
     pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
@@ -473,7 +473,7 @@ pub struct ConsumeArtifactResponse<'a> {
 /// Both are additive and independent — either, both, or neither may be set.
 /// Leaving the field `None` on [`ConsumeArtifactResponse`] preserves the
 /// pre-existing default behavior exactly.
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 #[derive(Default)]
 pub struct ArtifactBackchannel<'a> {
     /// When set, enveloped-sign the outbound `ArtifactResolve` with this key
@@ -629,7 +629,7 @@ impl ServiceProvider {
     /// `<samlp:Response>` exactly as [`ServiceProvider::consume_response`].
     ///
     /// Returns the validated [`Identity`].
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub async fn consume_response_artifact<H: crate::http::HttpClient>(
         &self,
         http: &H,
@@ -3160,7 +3160,7 @@ mod tests {
     // verifying the inbound `<samlp:ArtifactResponse>` *envelope* signature
     // (routed through `BackchannelClient`), independently of the inner
     // `<samlp:Response>` validation that always runs downstream.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     mod artifact_backchannel {
         use super::*;
         use crate::binding::artifact::VerifyConfig;
