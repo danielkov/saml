@@ -364,6 +364,20 @@ impl std::fmt::Debug for StashedArtifact {
     }
 }
 
+/// Outcome of an owner-checked artifact consume.
+#[cfg(feature = "artifact-binding")]
+#[derive(Debug)]
+pub enum ArtifactTake {
+    /// Consumed; the requester owned it.
+    Consumed(Box<StashedArtifact>),
+    /// No such artifact, or already consumed.
+    Unknown,
+    /// A registered SP other than the recipient asked. The artifact is
+    /// deliberately left in the store, so an unauthorized attempt cannot burn
+    /// it out from under the rightful recipient.
+    WrongRecipient { minted_for: String },
+}
+
 /// Bounded in-memory map of stashed artifact responses, keyed by the opaque
 /// artifact string. A hostile actor can hammer `/saml/sso` to fill memory, so
 /// we cap and evict the same way [`PendingStore`] does.
@@ -396,10 +410,29 @@ impl ArtifactStore {
         self.map.insert(artifact, entry);
     }
 
-    /// One-time consume: the artifact is removed on lookup so it cannot be
-    /// resolved twice (SAML 2.0 Bindings §3.6.3 — artifacts are single-use).
-    fn take(&mut self, artifact: &str) -> Option<StashedArtifact> {
-        self.map.remove(artifact)
+    /// One-time consume by the SP the artifact was minted for.
+    ///
+    /// Ownership is checked *before* removal, in one operation under one lock.
+    /// Taking first and checking after would let any registered SP burn a
+    /// victim's leaked artifact: it could not read the response, but the
+    /// entry would be gone and the rightful SP's resolve would fail — a login
+    /// denial primitive.
+    ///
+    /// Returns [`ArtifactTake::WrongRecipient`] without consuming when the
+    /// requester does not own the entry, so an unauthorized attempt leaves the
+    /// artifact intact (SAML 2.0 Bindings §3.6.3 — artifacts are single-use,
+    /// and that single use belongs to the recipient).
+    fn take_for(&mut self, artifact: &str, requester: &str) -> ArtifactTake {
+        match self.map.get(artifact) {
+            None => ArtifactTake::Unknown,
+            Some(entry) if entry.sp_entity_id != requester => ArtifactTake::WrongRecipient {
+                minted_for: entry.sp_entity_id.clone(),
+            },
+            Some(_) => match self.map.remove(artifact) {
+                Some(entry) => ArtifactTake::Consumed(Box::new(entry)),
+                None => ArtifactTake::Unknown,
+            },
+        }
     }
 }
 
@@ -540,12 +573,21 @@ impl AppState {
 
     /// One-time consume of a stashed artifact.
     #[cfg(feature = "artifact-binding")]
-    pub fn take_artifact(&self, artifact: &str) -> Result<Option<StashedArtifact>, String> {
+    /// Owner-checked, single-locked consume.
+    ///
+    /// Ownership is checked *before* removal, in one operation under one lock,
+    /// so a registered SP that is not the recipient cannot burn a victim's
+    /// artifact out from under them.
+    pub fn take_artifact_for(
+        &self,
+        artifact: &str,
+        requester: &str,
+    ) -> Result<ArtifactTake, String> {
         let mut store = self
             .artifacts
             .lock()
             .map_err(|e| format!("artifact store poisoned: {e}"))?;
-        Ok(store.take(artifact))
+        Ok(store.take_for(artifact, requester))
     }
 }
 
@@ -640,6 +682,8 @@ pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, s
         // The SP demo signs its outbound AuthnRequests; the IdP requires
         // signed inbound requests so we exercise the verify path.
         want_authn_requests_signed: true,
+        #[cfg(feature = "artifact-binding")]
+        want_artifact_resolve_signed: true,
         assertion_signing: IdpAssertionSigning {
             // Sign the Assertion, not the Response envelope, matching what
             // the SP's `SpWantSigned { response: false, assertions: true }`
@@ -848,6 +892,41 @@ pub fn extract_session_from_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-owner must not be able to burn a victim's artifact. Checking
+    /// ownership *after* removal would leave the entry consumed and the
+    /// rightful SP's resolve failing — a login-denial primitive, even though
+    /// the attacker never reads the response.
+    #[cfg(feature = "artifact-binding")]
+    #[test]
+    fn wrong_recipient_cannot_consume_another_sps_artifact() {
+        let mut store = ArtifactStore::default();
+        store.insert(
+            "art-1".to_owned(),
+            StashedArtifact::new("<xml/>".to_owned(), "https://victim.example.com".to_owned()),
+        );
+
+        let outcome = store.take_for("art-1", "https://attacker.example.com");
+        assert!(
+            matches!(outcome, ArtifactTake::WrongRecipient { ref minted_for }
+                if minted_for == "https://victim.example.com"),
+            "unexpected outcome"
+        );
+
+        // Still there: the failed attempt must not have consumed it.
+        match store.take_for("art-1", "https://victim.example.com") {
+            ArtifactTake::Consumed(entry) => {
+                assert_eq!(entry.sp_entity_id, "https://victim.example.com");
+            }
+            _ => panic!("the rightful recipient must still be able to resolve it"),
+        }
+
+        // And it is single-use.
+        assert!(matches!(
+            store.take_for("art-1", "https://victim.example.com"),
+            ArtifactTake::Unknown
+        ));
+    }
 
     #[test]
     fn build_identity_provider_succeeds_with_default_config() {

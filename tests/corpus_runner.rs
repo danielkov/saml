@@ -148,6 +148,9 @@ impl Fixture {
         self
     }
 
+    // Both call sites are `xmlenc`-gated; without the same gate here this
+    // is dead code in an isolated non-`xmlenc` build.
+    #[cfg(feature = "xmlenc")]
     const fn with_acs(mut self, url: &'static str) -> Self {
         self.acs_url_override = Some(url);
         self

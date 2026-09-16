@@ -139,6 +139,8 @@
 //!     signing_key: KeyPair::from_pkcs8_pem(idp_priv)?,
 //!     decryption_key: None,
 //!     want_authn_requests_signed: true,
+//!     #[cfg(feature = "artifact-binding")]
+//!     want_artifact_resolve_signed: true,
 //!     assertion_signing: IdpAssertionSigning { sign_responses: false, sign_assertions: true },
 //!     encrypt_assertions_when_possible: true,
 //!     logout_signing: IdpLogoutSigning { sign_requests: true, sign_responses: true },

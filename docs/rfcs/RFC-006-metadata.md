@@ -225,7 +225,7 @@ Produces `<md:EntityDescriptor>` containing `<md:IDPSSODescriptor>` with:
 - `<md:NameIDFormat>` entries from `config.supported_name_id_formats`.
 - `<md:SingleSignOnService>` entries from `config.sso`.
 - `<md:SingleLogoutService>` entries from `config.slo`.
-- `<md:ArtifactResolutionService>` entries from `config.artifact_resolution`.
+- `<md:ArtifactResolutionService>` entries from `config.artifact_resolution`. `index` is REQUIRED on an `IndexedEndpoint` and is what a type `0x0004` artifact carries to name the endpoint to resolve against, so emission **rejects** a set where any entry lacks an index or two share one, rather than defaulting to `0`. Publishing metadata that names an endpoint the operator never chose — or the same index twice — creates exactly the ambiguity the consuming side refuses. Both the standalone and aggregate emitters share the validated builder.
 
 ### 6.3 Extended metadata fields
 

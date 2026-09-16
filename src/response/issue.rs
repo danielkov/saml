@@ -57,6 +57,14 @@ pub(crate) struct IssueResponseInputs<'a> {
     pub outbound_data_encryption_algorithm: DataEncryptionAlgorithm,
     #[cfg(feature = "xmlenc")]
     pub outbound_key_transport_algorithm: KeyTransportAlgorithm,
+    /// Index of *this IdP's* `<md:ArtifactResolutionService>` to name in the
+    /// artifact (Bindings §3.6.4 bytes 2..4). `None` when the IdP advertises
+    /// no ARS, which `issue_artifact` refuses — minting an artifact the SP
+    /// cannot resolve would strand the login.
+    ///
+    /// This is emphatically *not* the SP's ACS index: the field tells the
+    /// recipient which of the **issuer's** endpoints to call back.
+    pub artifact_resolution_index: Option<u16>,
     /// Resolved ACS endpoint (from the SP descriptor); determines POST vs Artifact.
     pub acs_endpoint: &'a SsoResponseEndpoint,
     pub relay_state: Option<&'a str>,
@@ -161,6 +169,8 @@ pub(crate) fn issue_response(input: IssueResponseInputs<'_>) -> Result<SsoRespon
         &xml,
         input.relay_state,
         input.idp_entity_id,
+        &input.sp.entity_id,
+        input.artifact_resolution_index,
     )
 }
 
@@ -253,7 +263,12 @@ pub(crate) struct IssueErrorResponseInputs<'a> {
     pub outbound_digest_algorithm: DigestAlgorithm,
     pub outbound_c14n: C14nAlgorithm,
     pub acs_endpoint: &'a SsoResponseEndpoint,
+    /// See [`IssueResponseInputs::artifact_resolution_index`].
+    pub artifact_resolution_index: Option<u16>,
     pub relay_state: Option<&'a str>,
+    /// Entity ID of the SP this response is for. Recorded on an artifact so
+    /// the resolve can be bound to its intended recipient.
+    pub recipient_entity_id: &'a str,
 }
 
 /// Issue an error Response — Status != Success, no Assertion.
@@ -295,6 +310,8 @@ pub(crate) fn issue_error_response(
         &xml,
         input.relay_state,
         input.idp_entity_id,
+        input.recipient_entity_id,
+        input.artifact_resolution_index,
     )
 }
 
@@ -616,6 +633,8 @@ fn dispatch_binding(
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
+    recipient_entity_id: &str,
+    artifact_resolution_index: Option<u16>,
 ) -> Result<SsoResponseDispatch, Error> {
     match acs_endpoint.binding {
         SsoResponseBinding::HttpPost => {
@@ -630,9 +649,14 @@ fn dispatch_binding(
                 relay_state,
             ))
         }
-        SsoResponseBinding::HttpArtifact => {
-            issue_artifact(acs_endpoint, xml, relay_state, idp_entity_id)
-        }
+        SsoResponseBinding::HttpArtifact => issue_artifact(
+            acs_endpoint,
+            xml,
+            relay_state,
+            idp_entity_id,
+            recipient_entity_id,
+            artifact_resolution_index,
+        ),
     }
 }
 
@@ -642,6 +666,8 @@ fn issue_artifact(
     xml: &[u8],
     relay_state: Option<&str>,
     idp_entity_id: &str,
+    recipient_entity_id: &str,
+    artifact_resolution_index: Option<u16>,
 ) -> Result<SsoResponseDispatch, Error> {
     let url = url::Url::parse(&acs_endpoint.url).map_err(|_url_parse_err| {
         Error::InvalidConfiguration {
@@ -654,7 +680,13 @@ fn issue_artifact(
     let redirect = crate::binding::artifact::build_artifact_redirect(
         &url,
         idp_entity_id,
-        acs_endpoint.index.unwrap_or(0),
+        recipient_entity_id,
+        // Bindings §3.6.4: bytes 2..4 name the *issuer's* ARS endpoint so the
+        // SP knows where to send the ArtifactResolve. Writing the SP's ACS
+        // index here misdescribes the artifact.
+        artifact_resolution_index.ok_or(Error::InvalidConfiguration {
+            reason: "HTTP-Artifact response requires a registered ArtifactResolutionService",
+        })?,
         xml_str.to_owned(),
         relay_state,
     )?;
@@ -667,6 +699,8 @@ fn issue_artifact(
     _xml: &[u8],
     _relay_state: Option<&str>,
     _idp_entity_id: &str,
+    _recipient_entity_id: &str,
+    _artifact_resolution_index: Option<u16>,
 ) -> Result<SsoResponseDispatch, Error> {
     Err(Error::UnsupportedByPeer {
         binding: crate::binding::Binding::HttpArtifact,
@@ -752,6 +786,7 @@ mod tests {
         IssueResponseInputs {
             sp,
             idp_entity_id: "https://idp.example.com",
+            artifact_resolution_index: Some(0),
             in_response_to: Some("_req1"),
             name_id,
             attributes,
@@ -1031,6 +1066,8 @@ mod tests {
         let kp = rsa_signing_key();
         let inputs = IssueErrorResponseInputs {
             idp_entity_id: "https://idp.example.com",
+            artifact_resolution_index: Some(0),
+            recipient_entity_id: &sp.entity_id,
             in_response_to: Some("_req1"),
             now: fixed_now(),
             status_code: SamlStatusCode::AuthnFailed,
@@ -1125,6 +1162,72 @@ mod tests {
                 panic!("expected Artifact, got {other:?}")
             }
         }
+    }
+
+    /// Bindings §3.6.4: bytes 2..4 name the **issuer's**
+    /// `<md:ArtifactResolutionService>`, telling the SP where to send the
+    /// ArtifactResolve. Writing the SP's ACS index there misdescribes the
+    /// artifact and misroutes resolution for any IdP whose ARS index differs.
+    ///
+    /// The two indices are deliberately different here — an implementation
+    /// that wrote either the ACS index or a hardcoded 0 fails this.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_carries_the_idp_ars_index_not_the_sp_acs_index() {
+        let mut sp = sp_descriptor(false);
+        sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs/art",
+            2,
+            true,
+        )];
+        let kp = rsa_signing_key();
+        let mut inputs = make_inputs(
+            &sp,
+            &kp,
+            vec![Attribute::email("alice@example.com")],
+            NameId::email("alice@example.com"),
+        );
+        inputs.artifact_resolution_index = Some(7);
+
+        let dispatch = issue_response(inputs).expect("issue");
+        let SsoResponseDispatch::Artifact(redirect) = dispatch else {
+            panic!("expected Artifact");
+        };
+
+        let parsed = crate::binding::artifact::parse_artifact(&redirect.artifact)
+            .expect("minted artifact must decode");
+        assert_eq!(
+            parsed.endpoint_index, 7,
+            "artifact must name the IdP ARS index (7), not the SP ACS index (2)"
+        );
+    }
+
+    /// An IdP with no registered ArtifactResolutionService cannot mint a
+    /// resolvable artifact. Defaulting to index 0 would emit one naming an
+    /// endpoint that does not exist, stranding the login at the SP.
+    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[test]
+    fn artifact_issuance_without_an_ars_is_a_configuration_error() {
+        let mut sp = sp_descriptor(false);
+        sp.assertion_consumer_services = vec![SsoResponseEndpoint::artifact(
+            "https://sp.example.com/acs/art",
+            2,
+            true,
+        )];
+        let kp = rsa_signing_key();
+        let mut inputs = make_inputs(
+            &sp,
+            &kp,
+            vec![Attribute::email("alice@example.com")],
+            NameId::email("alice@example.com"),
+        );
+        inputs.artifact_resolution_index = None;
+
+        let err = issue_response(inputs).expect_err("no ARS registered");
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
     }
 
     #[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]

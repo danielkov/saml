@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use saml::attribute::Attribute;
 use saml::authn_context::AuthnContextClassRef;
+use saml::binding::artifact::SignConfig;
 use saml::binding::{
     Binding, Dispatch, Endpoint, SsoResponseBinding, SsoResponseDispatch, SsoResponseEndpoint,
 };
@@ -41,7 +42,10 @@ use saml::http::{HttpClient, HttpRequest, HttpResponse};
 use saml::idp::{ConsumeAuthnRequest, IdentityProvider, IdentityProviderConfig, IssueResponse};
 use saml::nameid::{NameId, NameIdFormat};
 use saml::replay::ReplayMode;
-use saml::sp::{ConsumeArtifactResponse, ServiceProvider, ServiceProviderConfig, StartLogin};
+use saml::sp::{
+    ArtifactBackchannel, ConsumeArtifactResponse, ServiceProvider, ServiceProviderConfig,
+    StartLogin,
+};
 use saml::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
 
 const SP_ENTITY_ID: &str = "https://sp.example.com/artifact";
@@ -59,12 +63,16 @@ fn make_artifact_idp() -> common::TestResult<IdentityProvider> {
         entity_id: IDP_ENTITY_ID.to_owned(),
         sso: vec![Endpoint::post(IDP_SSO_URL, 0, true)],
         slo: vec![],
-        artifact_resolution: vec![Endpoint::post(IDP_ARS_URL, 0, true)],
+        // `index` is REQUIRED on a metadata IndexedEndpoint and is what
+        // the artifact names, so it must be explicit.
+        artifact_resolution: vec![Endpoint::soap(IDP_ARS_URL, Some(0), true)],
         supported_name_id_formats: vec![NameIdFormat::Persistent, NameIdFormat::EmailAddress],
         default_name_id_format: NameIdFormat::EmailAddress,
         signing_key,
         decryption_key: None,
         want_authn_requests_signed: false,
+        #[cfg(feature = "artifact-binding")]
+        want_artifact_resolve_signed: true,
         assertion_signing: saml::IdpAssertionSigning {
             sign_responses: false,
             sign_assertions: true,
@@ -92,7 +100,9 @@ fn make_artifact_sp() -> common::TestResult<ServiceProvider> {
         acs: vec![SsoResponseEndpoint::artifact(SP_ACS_URL, 0, true)],
         slo: vec![],
         name_id_formats: vec![NameIdFormat::EmailAddress, NameIdFormat::Persistent],
-        signing_key: None,
+        // An SP that signs its back-channel ArtifactResolve must publish the
+        // matching certificate, or the IdP has nothing to verify against.
+        signing_key: Some(common::rsa_keypair_with_cert()?),
         decryption_key: None,
         sign_authn_requests: false,
         want_signed: saml::SpWantSigned {
@@ -129,7 +139,7 @@ impl HttpClient for ArtifactResolutionService<'_> {
     {
         let parsed = self
             .idp
-            .parse_artifact_resolve(self.sp_descriptor, &request.body)
+            .parse_artifact_resolve(self.sp_descriptor, None, IDP_ARS_URL, &request.body)
             .map_err(|e| format!("parse_artifact_resolve: {e:?}"));
         let stash = self.stash.clone();
         let idp_response = parsed.and_then(|req| {
@@ -142,7 +152,7 @@ impl HttpClient for ArtifactResolutionService<'_> {
                 .clone();
             drop(guard);
             self.idp
-                .build_artifact_response(&req, &response_xml)
+                .build_artifact_response(&req, SP_ENTITY_ID, &response_xml)
                 .map_err(|e| format!("build_artifact_response: {e:?}"))
         });
 
@@ -164,6 +174,7 @@ async fn artifact_flow_end_to_end() {
     let idp = make_artifact_idp().expect("idp builds");
     let idp_descriptor: IdpDescriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor: SpDescriptor = common::sp_descriptor(&sp).expect("sp descriptor");
+    let sp_signing_key = common::rsa_keypair_with_cert().expect("sp signing key");
     let now = common::flow_now();
 
     // 1. SP starts login requesting Artifact response binding.
@@ -293,7 +304,20 @@ async fn artifact_flow_end_to_end() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The IdP fixture requires a signed ArtifactResolve (SAML 2.0
+                // Bindings §3.6.3), so the SP authenticates itself on the
+                // back-channel. This exercises the full loop: the SP signs the
+                // resolve, the IdP verifies it against the SP's metadata certs
+                // before the artifact is looked up.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
@@ -319,8 +343,11 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     let idp_descriptor = common::idp_descriptor(&idp).expect("idp descriptor");
     let sp_descriptor = common::sp_descriptor(&sp).expect("sp descriptor");
     let now = common::flow_now();
+    let sp_signing_key = common::rsa_keypair_with_cert().expect("sp signing key");
 
     let empty_stash: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let unknown_artifact = saml::binding::artifact::make_artifact(IDP_ENTITY_ID, 0)
+        .expect("mint an artifact the store has never seen");
     let ars = ArtifactResolutionService {
         idp: &idp,
         sp_descriptor: &sp_descriptor,
@@ -333,7 +360,10 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
             ConsumeArtifactResponse {
                 idp: &idp_descriptor,
                 peer_crypto_policy: None,
-                artifact: "AAQAA-totally-unknown",
+                // Well-formed type 0x0004 naming the IdP's ARS, so the SP
+                // routes it to the backchannel and the store — not rejected
+                // as malformed before the path under test is reached.
+                artifact: &unknown_artifact,
                 relay_state: None,
                 tracker: None,
                 expected_destination: SP_ACS_URL,
@@ -342,7 +372,19 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
                 replay_cache: None,
                 replay_mode: ReplayMode::All,
                 holder_of_key_cert: None,
-                backchannel: None,
+                // The IdP requires a signed ArtifactResolve. Sending an
+                // unsigned one would be refused for the missing signature and
+                // never reach the store, so this assertion would pass without
+                // exercising the unknown-artifact path at all.
+                backchannel: Some(ArtifactBackchannel {
+                    sign: Some(SignConfig {
+                        key: &sp_signing_key,
+                        sig_alg: SignatureAlgorithm::RsaSha256,
+                        digest_alg: DigestAlgorithm::Sha256,
+                        c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                    }),
+                    verify: None,
+                }),
             },
         )
         .await
@@ -353,5 +395,60 @@ async fn artifact_flow_unknown_artifact_propagates_error() {
     assert!(
         matches!(err, saml::error::Error::Http(_)),
         "expected Error::Http, got {err:?}"
+    );
+}
+
+/// The low-level [`parse_artifact_resolve`] is public and applies none of the
+/// role-layer checks — configured certificates, issuer-vs-`IDPSSODescriptor`,
+/// the SOAP `ArtifactResolutionService` endpoint, or the `@Destination` rules.
+/// It returns the same type the role builder consumes, so without an explicit
+/// provenance marker a caller could parse attacker-supplied XML and hand it
+/// straight to `build_artifact_response`, leaving only the issuer/recipient
+/// comparison standing.
+///
+/// This is the runtime half of that gate; the compile-time half is the
+/// `compile_fail` pair on `ArtifactResolveRequest::issuer`, which proves the
+/// marker cannot be set from outside the crate.
+#[test]
+fn build_artifact_response_refuses_a_request_the_role_layer_did_not_validate() {
+    let idp = make_artifact_idp().expect("idp builds");
+
+    // Well-formed and correctly addressed: the *only* thing wrong with it is
+    // that it never passed through `IdentityProvider::parse_artifact_resolve`.
+    // If the gate keyed off anything else, this would still be accepted.
+    let envelope = format!(
+        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+             <soap:Body>
+               <samlp:ArtifactResolve xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                      xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                      ID="_unvalidated" Version="2.0"
+                                      IssueInstant="2024-01-01T00:00:00Z"
+                                      Destination="{IDP_ARS_URL}">
+                 <saml:Issuer>{SP_ENTITY_ID}</saml:Issuer>
+                 <samlp:Artifact>AAQAA-artifact</samlp:Artifact>
+               </samlp:ArtifactResolve>
+             </soap:Body>
+           </soap:Envelope>"#
+    );
+
+    let unvalidated = saml::binding::artifact::parse_artifact_resolve(envelope.as_bytes())
+        .expect("the low-level parser accepts well-formed XML without any verification");
+    assert!(
+        !unvalidated.role_validated(),
+        "the low-level parser must not vouch for a request"
+    );
+    assert_eq!(unvalidated.issuer(), SP_ENTITY_ID);
+
+    let err = idp
+        .build_artifact_response(&unvalidated, SP_ENTITY_ID, "<samlp:Response/>")
+        .expect_err("an unvalidated request must not yield an ArtifactResponse");
+    assert!(
+        matches!(
+            err,
+            saml::error::Error::SignatureVerification {
+                reason: "ArtifactResolve was not validated by IdentityProvider::parse_artifact_resolve"
+            }
+        ),
+        "expected the provenance gate to fire, got {err:?}"
     );
 }

@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Breaking:** a type `0x0004` artifact now carries the issuing IdP's
+  `<md:ArtifactResolutionService>` index in bytes 2..4, as SAML 2.0 Bindings
+  §3.6.4 requires. Issuance previously wrote the *service provider's* ACS
+  index and consumption ignored the field entirely, always resolving against
+  the default/first ARS. Any IdP advertising more than one ARS was misrouted.
+  `ServiceProvider::consume_response_artifact` now decodes the index and
+  selects that exact endpoint, refusing an index the IdP does not advertise.
+
+- **Breaking:** `binding::artifact::build_artifact_resolve` returns an
+  `ArtifactResolveEnvelope` carrying both the SOAP envelope and the
+  `ArtifactResolve/@ID`, and `parse_artifact_response` takes that ID and
+  requires the response's `@InResponseTo` to match. The pair previously
+  discarded the generated ID and checked nothing, so callers of the manual
+  low-level exchange had no way to correlate a response at all.
+- **Breaking:** IdP metadata emission rejects an `ArtifactResolutionService`
+  with no `index`, or two sharing one, instead of emitting `index="0"`.
+  Publishing metadata that names an endpoint the operator never chose, or the
+  same index twice, is the same defect as accepting it. Both the standalone and
+  aggregate emitters share the validated builder.
+- `BackchannelClient::resolve_artifact` now requires the
+  `ArtifactResponse/@InResponseTo` to match the `ArtifactResolve/@ID` it sent.
+  It previously accepted any otherwise-valid `ArtifactResponse`, so a
+  substituted or replayed one could not be distinguished from the real answer.
+- `<md:ArtifactResolutionService>` endpoints are now selected by exact `index`
+  **and** `Binding::Soap`. Selection previously accepted any binding and then
+  SOAP-posted to it, which contradicted the SOAP-only enforcement on the
+  receiving side.
+- **Breaking:** an `ArtifactResolutionService` with no `index`, or two sharing
+  one, is now rejected when parsing metadata and when constructing an
+  `IdentityProvider`. `index` is REQUIRED on an `IndexedEndpoint` and is what
+  the artifact carries; a missing one left the endpoint unaddressable and a
+  duplicate made routing depend on parse order.
+
+### Added
+
+- `binding::artifact::parse_artifact` and `ParsedArtifact`, exposing the
+  endpoint index and `SourceID` of a type `0x0004` artifact.
+- `IdpDescriptor::artifact_resolution_endpoint_by_index`.
+- `Error::InvalidArtifact`, `Error::UnknownArtifactEndpointIndex` and
+  `Error::AmbiguousArtifactEndpointIndex`.
+
+### Security
+
+- `IdentityProvider::build_artifact_response` now refuses an
+  `ArtifactResolveRequest` that did not come from
+  `IdentityProvider::parse_artifact_resolve`. The low-level
+  `binding::artifact::parse_artifact_resolve` is public and applies none of the
+  role-layer checks — configured certificates, issuer-vs-`IDPSSODescriptor`,
+  the SOAP endpoint, `@Destination` — so a caller could previously parse
+  unsigned XML and have it answered as though it had been authenticated.
+
 ## [0.0.1-alpha.2] - 2026-08-08
 
 ### Fixed

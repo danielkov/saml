@@ -153,6 +153,8 @@ pub fn make_idp(entity_id: &str, sso_url: &str) -> TestResult<IdentityProvider> 
         signing_key,
         decryption_key: None,
         want_authn_requests_signed: false,
+        #[cfg(feature = "artifact-binding")]
+        want_artifact_resolve_signed: true,
         assertion_signing: saml::IdpAssertionSigning {
             sign_responses: false,
             sign_assertions: true,

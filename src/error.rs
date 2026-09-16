@@ -203,6 +203,38 @@ pub enum Error {
     NoPeerSigningCert,
     #[error("Peer does not advertise the requested binding: {binding:?}")]
     UnsupportedByPeer { binding: Binding },
+    /// An `<samlp:ArtifactResolve>` came from a registered SP other than the
+    /// one the artifact was minted for.
+    ///
+    /// Authenticating the resolver establishes *who* is asking; this is the
+    /// separate question of whether they are entitled to *this* artifact.
+    /// Without it, any registered SP could redeem another's leaked artifact —
+    /// and artifacts travel in URL query parameters, so they leak readily.
+    #[error("artifact was minted for {expected}, resolve came from {received}")]
+    ArtifactRecipientMismatch { expected: String, received: String },
+    /// An `<md:ArtifactResolutionService>` lacked the REQUIRED `index`, or two
+    /// shared one.
+    ///
+    /// `ArtifactResolutionService` is an `IndexedEndpoint`: the index is what a
+    /// type `0x0004` artifact carries to say which endpoint to resolve against,
+    /// so it must identify exactly one. A missing index makes an endpoint
+    /// unaddressable; a duplicate makes routing ambiguous, silently resolved by
+    /// whichever entry happens to come first.
+    #[error("ArtifactResolutionService index is missing or duplicated: {reason}")]
+    AmbiguousArtifactEndpointIndex { reason: &'static str },
+    /// An artifact was not a well-formed type `0x0004` value.
+    #[error("malformed artifact: {reason}")]
+    InvalidArtifact { reason: &'static str },
+    /// A type `0x0004` artifact named an `<md:ArtifactResolutionService>`
+    /// endpoint index the issuing IdP's metadata does not advertise.
+    ///
+    /// Resolving against some other endpoint instead would send the artifact
+    /// somewhere its issuer never nominated, so this is refused rather than
+    /// falling back to the default endpoint.
+    #[error(
+        "artifact names ArtifactResolutionService index {index}, which {entity_id} does not advertise"
+    )]
+    UnknownArtifactEndpointIndex { entity_id: String, index: u16 },
     #[error("AuthnRequest/@ProtocolBinding is not legal for SSO Response: {requested:?}")]
     IllegalResponseBinding { requested: Binding },
     /// A solicited Response arrived over a different binding than the ACS
