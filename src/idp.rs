@@ -584,6 +584,39 @@ pub struct IssueResponse<'a> {
     pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
 }
 
+/// Inputs for [`IdentityProvider::issue_unsolicited`]. See RFC-004 §3.2.
+///
+/// Mirrors [`IssueResponse`] except that the ACS endpoint and the NameID
+/// format are named directly: there is no `<samlp:AuthnRequest>` to resolve
+/// them from.
+pub struct IssueUnsolicited<'a> {
+    pub sp: &'a SpDescriptor,
+    /// ACS URL to deliver to. MUST appear in `sp`'s descriptor, otherwise
+    /// [`Error::UnregisteredAcs`].
+    pub acs_url: &'a str,
+    pub name_id: NameId,
+    pub attributes: Vec<Attribute>,
+    pub authn_instant: SystemTime,
+    pub session_index: String,
+    pub session_not_on_or_after: Option<SystemTime>,
+    pub authn_context_class_ref: AuthnContextClassRef,
+    /// Format to request for the outbound `NameID`, resolved against the
+    /// IdP's supported formats exactly as a solicited Response resolves the
+    /// SP's requested format. `None` uses `default_name_id_format`.
+    pub requested_name_id_format: Option<NameIdFormat>,
+    /// RelayState to echo into the binding. For IdP-initiated SSO this is
+    /// where a deep link to the intended resource travels.
+    pub relay_state: Option<&'a str>,
+    /// Override default behavior. `None` = encrypt only when SP has an
+    /// encryption cert AND `config.encrypt_assertions_when_possible` is true.
+    pub force_encrypt_assertion: Option<bool>,
+    pub now: SystemTime,
+    pub assertion_lifetime: Duration,
+    pub subject_confirmation_lifetime: Duration,
+    /// Opt-in Holder-of-Key, as on [`IssueResponse`].
+    pub holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
+}
+
 /// Inputs to [`IdentityProvider::issue_error_response`]. See RFC-004 §4.
 pub struct IssueErrorResponse<'a> {
     pub sp: &'a SpDescriptor,
@@ -638,6 +671,80 @@ impl IdentityProvider {
             outbound_key_transport_algorithm: self.config.outbound_key_transport_algorithm,
             acs_endpoint,
             relay_state,
+            holder_of_key_cert: input.holder_of_key_cert,
+        };
+
+        issue_response(inputs)
+    }
+
+    /// Mint and binding-encode an unsolicited `<samlp:Response>` — one no
+    /// `<samlp:AuthnRequest>` asked for. See RFC-004 §3.2.
+    ///
+    /// SAML 2.0 Profiles §4.1.5 permits an IdP to deliver an assertion with no
+    /// preceding request; this is IdP-initiated SSO. [`ServiceProvider`] has
+    /// always been able to consume one via
+    /// [`ServiceProviderConfig::allow_unsolicited`], and this is the other
+    /// half.
+    ///
+    /// The emitted `<samlp:Response>` and its
+    /// `<saml:SubjectConfirmationData>` carry no `@InResponseTo`, there being
+    /// no request to name. A relying party MUST reject an `@InResponseTo` it
+    /// did not issue (RFC-003 §4.1 step 6), so a synthesised identifier would
+    /// make the assertion unusable rather than merely untidy.
+    ///
+    /// [`ServiceProvider`]: crate::sp::ServiceProvider
+    /// [`ServiceProviderConfig::allow_unsolicited`]: crate::sp::ServiceProviderConfig::allow_unsolicited
+    pub fn issue_unsolicited(
+        &self,
+        input: IssueUnsolicited<'_>,
+    ) -> Result<SsoResponseDispatch, Error> {
+        // The caller nominates the ACS by URL, so it is checked against the
+        // SP's descriptor here — the echo-prevention that §2.1 step 7 performs
+        // at consume time for the solicited path.
+        let acs_endpoint = input
+            .sp
+            .assertion_consumer_services
+            .iter()
+            .find(|endpoint| endpoint.url == input.acs_url)
+            .ok_or_else(|| Error::UnregisteredAcs {
+                entity_id: input.sp.entity_id.clone(),
+            })?;
+
+        let chosen_format = pick_name_id_format(
+            input.requested_name_id_format.as_ref(),
+            &self.config.supported_name_id_formats,
+            &self.config.default_name_id_format,
+        );
+        let mut name_id = input.name_id;
+        name_id.format = chosen_format;
+
+        let inputs = IssueResponseInputs {
+            sp: input.sp,
+            idp_entity_id: &self.config.entity_id,
+            in_response_to: None,
+            name_id,
+            attributes: input.attributes,
+            authn_instant: input.authn_instant,
+            session_index: input.session_index,
+            session_not_on_or_after: input.session_not_on_or_after,
+            authn_context_class_ref: input.authn_context_class_ref,
+            force_encrypt_assertion: input.force_encrypt_assertion,
+            encrypt_assertions_when_possible: self.config.encrypt_assertions_when_possible,
+            now: input.now,
+            assertion_lifetime: input.assertion_lifetime,
+            subject_confirmation_lifetime: input.subject_confirmation_lifetime,
+            signing_key: &self.config.signing_key,
+            sign_responses: self.config.assertion_signing.sign_responses,
+            sign_assertions: self.config.assertion_signing.sign_assertions,
+            outbound_signature_algorithm: self.config.outbound_signature_algorithm,
+            outbound_digest_algorithm: self.config.outbound_digest_algorithm,
+            outbound_c14n: self.config.outbound_c14n,
+            #[cfg(feature = "xmlenc")]
+            outbound_data_encryption_algorithm: self.config.outbound_data_encryption_algorithm,
+            #[cfg(feature = "xmlenc")]
+            outbound_key_transport_algorithm: self.config.outbound_key_transport_algorithm,
+            acs_endpoint,
+            relay_state: input.relay_state,
             holder_of_key_cert: input.holder_of_key_cert,
         };
 
@@ -1591,6 +1698,37 @@ mod tests {
         }
     }
 
+    /// An SP matching [`sp_descriptor`], for round-tripping an issued Response
+    /// back through the consuming half. `allow_unsolicited` is false here;
+    /// the tests that want it set it.
+    fn sp_config_allowing_unsolicited() -> crate::sp::ServiceProviderConfig {
+        crate::sp::ServiceProviderConfig {
+            entity_id: "https://sp.example.com/saml".into(),
+            acs: vec![SsoResponseEndpoint::post(
+                "https://sp.example.com/acs",
+                0,
+                true,
+            )],
+            slo: vec![],
+            name_id_formats: vec![],
+            signing_key: None,
+            decryption_key: None,
+            sign_authn_requests: false,
+            want_signed: crate::sp::SpWantSigned {
+                response: false,
+                assertions: true,
+            },
+            allow_unsolicited: false,
+            #[cfg(feature = "slo")]
+            logout_signing: crate::sp::SpLogoutSigning::default(),
+            #[cfg(feature = "slo")]
+            logout_want_signed: crate::sp::SpLogoutWantSigned::default(),
+            default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+            outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
+            outbound_digest_algorithm: DigestAlgorithm::Sha256,
+        }
+    }
+
     fn fixed_now() -> SystemTime {
         UNIX_EPOCH
             .checked_add(Duration::from_hours(494_388))
@@ -2036,6 +2174,186 @@ mod tests {
             .expect("validate");
         parsed.relay_state = Some("rs-token".into());
         parsed
+    }
+
+    fn issue_unsolicited_fixture<'a>(
+        sp: &'a SpDescriptor,
+        acs_url: &'a str,
+    ) -> IssueUnsolicited<'a> {
+        IssueUnsolicited {
+            sp,
+            acs_url,
+            name_id: NameId::email("alice@example.com"),
+            attributes: vec![Attribute::email("alice@example.com")],
+            authn_instant: fixed_now(),
+            session_index: "sess-unsolicited".into(),
+            session_not_on_or_after: fixed_now().checked_add(Duration::from_hours(1)),
+            authn_context_class_ref: AuthnContextClassRef::PasswordProtectedTransport,
+            requested_name_id_format: None,
+            relay_state: Some("deep-link"),
+            force_encrypt_assertion: Some(false),
+            now: fixed_now(),
+            assertion_lifetime: Duration::from_mins(10),
+            subject_confirmation_lifetime: Duration::from_mins(5),
+            holder_of_key_cert: None,
+        }
+    }
+
+    #[test]
+    fn issue_unsolicited_omits_in_response_to() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+
+        let dispatch = idp
+            .issue_unsolicited(issue_unsolicited_fixture(&sp, "https://sp.example.com/acs"))
+            .expect("issue ok");
+
+        let form = match dispatch {
+            SsoResponseDispatch::Post(f) => f,
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected POST dispatch, got {other:?}")
+            }
+        };
+        assert_eq!(form.action.as_str(), "https://sp.example.com/acs");
+        assert_eq!(form.relay_state.as_deref(), Some("deep-link"));
+
+        let decoded = crate::binding::post::decode(&form.saml_response, None).unwrap();
+        let xml = String::from_utf8(decoded.xml).expect("utf-8");
+        // Neither the Response nor the SubjectConfirmationData may claim to
+        // answer a request: RFC-003 §4.1 step 6 rejects an InResponseTo the
+        // relying party did not issue.
+        assert!(
+            !xml.contains("InResponseTo"),
+            "unsolicited Response carried InResponseTo: {xml}"
+        );
+    }
+
+    #[test]
+    fn issue_unsolicited_is_accepted_by_an_sp_allowing_unsolicited() {
+        use crate::sp::{ConsumeResponse, ServiceProvider};
+
+        let idp = idp_with(false, false);
+        let sp_desc = sp_descriptor(false);
+        let idp_descriptor =
+            IdpDescriptor::from_metadata_xml(idp.metadata_xml(false).unwrap().as_bytes())
+                .expect("idp metadata");
+
+        let dispatch = idp
+            .issue_unsolicited(issue_unsolicited_fixture(
+                &sp_desc,
+                "https://sp.example.com/acs",
+            ))
+            .expect("issue ok");
+        let form = match dispatch {
+            SsoResponseDispatch::Post(f) => f,
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected POST dispatch, got {other:?}")
+            }
+        };
+        let decoded = crate::binding::post::decode(&form.saml_response, None).unwrap();
+
+        let mut config = sp_config_allowing_unsolicited();
+        config.allow_unsolicited = true;
+        let sp = ServiceProvider::new(config).expect("sp");
+
+        let identity = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp_descriptor,
+                peer_crypto_policy: None,
+                saml_response: &decoded.xml,
+                binding: crate::binding::SsoResponseBinding::HttpPost,
+                relay_state: form.relay_state.as_deref(),
+                tracker: None,
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(2),
+                replay_cache: None,
+                replay_mode: crate::replay::ReplayMode::default(),
+                holder_of_key_cert: None,
+            })
+            .expect("sp accepts the unsolicited assertion");
+
+        assert_eq!(identity.session_index.as_deref(), Some("sess-unsolicited"));
+        assert_eq!(identity.attributes.len(), 1);
+    }
+
+    #[test]
+    fn issue_unsolicited_is_rejected_by_an_sp_forbidding_unsolicited() {
+        use crate::sp::{ConsumeResponse, ServiceProvider};
+
+        let idp = idp_with(false, false);
+        let sp_desc = sp_descriptor(false);
+        let idp_descriptor =
+            IdpDescriptor::from_metadata_xml(idp.metadata_xml(false).unwrap().as_bytes())
+                .expect("idp metadata");
+
+        let dispatch = idp
+            .issue_unsolicited(issue_unsolicited_fixture(
+                &sp_desc,
+                "https://sp.example.com/acs",
+            ))
+            .expect("issue ok");
+        let form = match dispatch {
+            SsoResponseDispatch::Post(f) => f,
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected POST dispatch, got {other:?}")
+            }
+        };
+        let decoded = crate::binding::post::decode(&form.saml_response, None).unwrap();
+
+        let sp = ServiceProvider::new(sp_config_allowing_unsolicited()).expect("sp");
+
+        let err = sp
+            .consume_response(ConsumeResponse {
+                idp: &idp_descriptor,
+                peer_crypto_policy: None,
+                saml_response: &decoded.xml,
+                binding: crate::binding::SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: None,
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(2),
+                replay_cache: None,
+                replay_mode: crate::replay::ReplayMode::default(),
+                holder_of_key_cert: None,
+            })
+            .expect_err("allow_unsolicited is false");
+        assert!(matches!(err, Error::UnsolicitedNotAllowed));
+    }
+
+    #[test]
+    fn issue_unsolicited_rejects_an_unregistered_acs() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+
+        let err = idp
+            .issue_unsolicited(issue_unsolicited_fixture(
+                &sp,
+                "https://attacker.example/acs",
+            ))
+            .expect_err("ACS is not in the SP descriptor");
+        assert!(matches!(err, Error::UnregisteredAcs { .. }));
+    }
+
+    #[test]
+    fn issue_unsolicited_honors_the_requested_name_id_format() {
+        let idp = idp_with(false, false);
+        let sp = sp_descriptor(false);
+
+        let mut input = issue_unsolicited_fixture(&sp, "https://sp.example.com/acs");
+        input.requested_name_id_format = Some(NameIdFormat::Persistent);
+        let dispatch = idp.issue_unsolicited(input).expect("issue ok");
+
+        let form = match dispatch {
+            SsoResponseDispatch::Post(f) => f,
+            other @ SsoResponseDispatch::Artifact(_) => {
+                panic!("expected POST dispatch, got {other:?}")
+            }
+        };
+        let decoded = crate::binding::post::decode(&form.saml_response, None).unwrap();
+        let xml = String::from_utf8(decoded.xml).expect("utf-8");
+        assert!(xml.contains(NameIdFormat::Persistent.as_uri()));
     }
 
     #[test]

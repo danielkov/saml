@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `IdentityProvider::issue_unsolicited` mints a `<samlp:Response>` that no
+  `<samlp:AuthnRequest>` asked for (SAML 2.0 Profiles §4.1.5), which is
+  IdP-initiated SSO. The SP role could already consume one via
+  `allow_unsolicited`; this is the other half. The emitted Response and its
+  `SubjectConfirmationData` carry no `InResponseTo`, since a relying party
+  rejects one it did not issue. The ACS is nominated by URL and checked
+  against the SP descriptor.
+
 ### Changed
 
 - `artifact-binding` no longer requires `weak-algos`. The SHA-1 it needs is
