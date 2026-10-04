@@ -902,9 +902,9 @@ mod tests {
         let parsed =
             saml::IdpDescriptor::from_metadata_xml(xml.as_bytes()).expect("metadata parses");
         assert_eq!(parsed.entity_id, "http://test/idp");
-        assert!(!parsed.sso_endpoints.is_empty());
-        assert!(!parsed.slo_endpoints.is_empty());
-        assert!(!parsed.signing_certs.is_empty());
+        assert_ne!(parsed.sso_endpoints, Vec::<saml::Endpoint>::new());
+        assert_ne!(parsed.slo_endpoints, Vec::<saml::Endpoint>::new());
+        assert_ne!(parsed.signing_certs, Vec::<saml::X509Certificate>::new());
     }
 
     #[test]

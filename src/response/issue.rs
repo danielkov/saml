@@ -1258,7 +1258,7 @@ mod tests {
                         .as_str()
                         .starts_with("https://sp.example.com/acs/art")
                 );
-                assert!(!redirect.artifact.is_empty());
+                assert_ne!(redirect.artifact, "");
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(redirect.artifact.as_bytes())
                     .expect("artifact base64");

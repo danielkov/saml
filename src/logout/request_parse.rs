@@ -275,7 +275,7 @@ mod tests {
             <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">u@example.com</saml:NameID>
         </samlp:LogoutRequest>"#;
         let (req, _) = parse(xml).expect("parse");
-        assert!(req.session_index.is_empty());
+        assert_eq!(req.session_index, Vec::<String>::new());
     }
 
     #[test]

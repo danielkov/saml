@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn empty_value_parses_to_empty_cookie() {
         let cookie = CommonDomainCookie::parse("").unwrap();
-        assert!(cookie.entity_ids.is_empty());
+        assert_eq!(cookie.entity_ids, Vec::<String>::new());
         assert_eq!(cookie.most_recent(), None);
         assert_eq!(cookie.to_cookie_value(), "");
     }
@@ -243,6 +243,6 @@ mod tests {
         let mut cookie = CommonDomainCookie::default();
         cookie.record("https://idp.example.com");
         cookie.truncate_to_fit(0);
-        assert!(cookie.entity_ids.is_empty());
+        assert_eq!(cookie.entity_ids, Vec::<String>::new());
     }
 }

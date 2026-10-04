@@ -480,7 +480,10 @@ mod tests {
     #[test]
     fn no_extensions_means_no_discovery_endpoints() {
         let sp = SpDescriptor::from_metadata_xml(sp_metadata_xml().as_bytes()).unwrap();
-        assert!(sp.discovery_response_endpoints.is_empty());
+        assert_eq!(
+            sp.discovery_response_endpoints,
+            Vec::<crate::disco::DiscoveryResponseEndpoint>::new()
+        );
         assert!(sp.default_discovery_response().is_none());
     }
 

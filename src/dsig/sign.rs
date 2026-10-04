@@ -529,7 +529,7 @@ mod tests {
         let x509_cert = x509_data
             .child_element(Some(DSIG_NS), "X509Certificate")
             .expect("X509Certificate present");
-        assert!(!x509_cert.text_content().is_empty());
+        assert_ne!(x509_cert.text_content(), "");
     }
 
     #[test]

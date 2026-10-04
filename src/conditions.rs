@@ -58,7 +58,7 @@ mod tests {
         );
         assert!(!c.one_time_use);
         assert!(c.proxy_restriction_count.is_none());
-        assert!(c.proxy_restriction_audiences.is_empty());
+        assert_eq!(c.proxy_restriction_audiences, Vec::<String>::new());
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod tests {
         c.one_time_use = true;
         c.audience_restrictions.clear();
         assert!(c.one_time_use);
-        assert!(c.audience_restrictions.is_empty());
+        assert_eq!(c.audience_restrictions, Vec::<Vec<String>>::new());
     }
 
     #[test]

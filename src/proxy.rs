@@ -2540,7 +2540,7 @@ mod tests {
             ttl: Duration::from_mins(10),
         };
         let handle = codec.encode(&grant).expect("16 bytes is sufficient");
-        assert!(!handle.is_empty());
+        assert_ne!(handle, "");
     }
 
     #[test]
@@ -3114,7 +3114,7 @@ mod tests {
                 assert_eq!(form.relay_state.as_deref(), Some("opaque-downstream-state"),);
                 // The body is a base64-encoded Response; we just smoke-check
                 // non-empty here (full parse coverage lives in idp.rs).
-                assert!(!form.saml_response.is_empty());
+                assert_ne!(form.saml_response, "");
             }
             other @ SsoResponseDispatch::Artifact(_) => {
                 panic!("expected Post, got {other:?}")
@@ -3157,7 +3157,7 @@ mod tests {
         let sp = downstream_sp_descriptor();
         let attrs = vec![Attribute::email("x@example.com")];
         let out = ReleaseNone.release(&attrs, &sp);
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<Attribute>::new());
     }
 
     #[test]
