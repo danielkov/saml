@@ -335,6 +335,65 @@ quantized and cannot reliably equal the receiver's higher-precision clock.
 `ArtifactResponse` with the configured IdP key so SPs can enable envelope
 verification independently of validating the embedded Response/assertion.
 
+### 3.2 Issuing an unsolicited POST Response
+
+SAML 2.0 Profiles §4.1.5 permits an IdP to deliver an assertion with no
+preceding `<samlp:AuthnRequest>` — IdP-initiated SSO. The SP role has always
+been able to consume one (`allow_unsolicited`, RFC-003 §4.1 step 6); this is
+the other half.
+
+```rust
+pub struct IssueUnsolicited<'a> {
+    pub sp: &'a SpDescriptor,
+    pub acs_url: &'a str,
+    pub name_id: NameId,
+    pub attributes: Vec<Attribute>,
+    pub authn_instant: SystemTime,
+    pub session_index: String,
+    pub session_not_on_or_after: Option<SystemTime>,
+    pub authn_context_class_ref: AuthnContextClassRef,
+    pub requested_name_id_format: Option<NameIdFormat>,
+    pub relay_state: Option<&'a str>,
+    pub force_encrypt_assertion: Option<bool>,
+    pub now: SystemTime,
+    pub assertion_lifetime: Duration,
+    pub subject_confirmation_lifetime: Duration,
+    pub holder_of_key_cert: Option<&'a X509Certificate>,
+}
+
+impl IdentityProvider {
+    pub fn issue_unsolicited(&self, input: IssueUnsolicited<'_>) -> Result<SsoResponseDispatch, Error>;
+}
+```
+
+Build steps are §3.1 with two differences:
+
+1. The ACS endpoint is resolved from `input.acs_url` against
+   `input.sp.assertion_consumer_services` rather than from a request. A URL
+   not in the descriptor is `Error::UnregisteredAcs` — the same
+   echo-prevention §2.1 step 7 applies on the solicited path, enforced here
+   because no consume step ran. Only HTTP-POST is supported. An Artifact ACS
+   returns `Error::ArtifactTransactionRequired` with `artifact-binding`, or
+   `Error::UnsupportedByPeer(HttpArtifact)` without it. Unsolicited Artifact
+   issuance must wait for an API that carries its authenticated resolution
+   trust transaction; this API must not emit an unbound artifact.
+2. `Response/@InResponseTo` and `SubjectConfirmationData/@InResponseTo` are
+   **omitted**. There is no request to name, and RFC-003 §4.1 step 6 rejects
+   an `@InResponseTo` the relying party did not issue, so a synthesised
+   identifier would make the assertion unusable rather than merely untidy.
+
+The NameID format is resolved from `requested_name_id_format` against the
+IdP's supported formats, the same resolution §3.1 applies to the format an
+AuthnRequest asked for. An unsupported explicit format returns
+`Error::UnsupportedNameIdPolicy`. The supplied identifier must already use
+the resolved format, otherwise issuance returns `Error::NameIdFormatMismatch`;
+it never relabels an email address as a persistent identifier.
+
+A relying party accepts the result only when it has opted in with
+`allow_unsolicited`. The consuming half is unchanged by this addition.
+
+---
+
 ---
 
 ## 4. Issuing an error Response
