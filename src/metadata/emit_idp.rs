@@ -132,12 +132,18 @@ pub(super) fn build_idp_entity_descriptor(
         idp_descriptor = idp_descriptor.with_child(Node::Element(build_slo_endpoint(endpoint)));
     }
 
-    // ArtifactResolutionService endpoints (indexed; the schema requires an
-    // `index` attribute on each — we emit one even if the caller forgot, to
-    // keep the output schema-valid).
-    for endpoint in inputs.artifact_resolution {
-        idp_descriptor =
-            idp_descriptor.with_child(Node::Element(build_artifact_resolution_endpoint(endpoint)));
+    // ArtifactResolutionService endpoints require explicit, unique indices
+    // and SOAP bindings; never synthesize an index for the caller.
+    // Publishing an ARS set that cannot route an artifact is the same defect
+    // as accepting one: `index` is REQUIRED and must identify exactly one
+    // endpoint. Checked here so both the standalone and aggregate emitters
+    // inherit it — they share this builder.
+    let ars_indices =
+        crate::descriptor::idp::validate_artifact_resolution_endpoints(inputs.artifact_resolution)?;
+    for (endpoint, index) in inputs.artifact_resolution.iter().zip(ars_indices) {
+        idp_descriptor = idp_descriptor.with_child(Node::Element(
+            build_artifact_resolution_endpoint(endpoint, index),
+        ));
     }
 
     let idp_descriptor = idp_descriptor.finish();
@@ -189,14 +195,14 @@ fn build_slo_endpoint(endpoint: &Endpoint) -> Element {
         .finish()
 }
 
-fn build_artifact_resolution_endpoint(endpoint: &Endpoint) -> Element {
+fn build_artifact_resolution_endpoint(endpoint: &Endpoint, index: u16) -> Element {
     let mut builder = Element::build(md_qname("ArtifactResolutionService"))
         .with_attribute(QName::new(None, "Binding"), endpoint.binding.uri())
-        .with_attribute(QName::new(None, "Location"), endpoint.url.clone());
-    // Schema requires an `index` attribute on ArtifactResolutionService.
-    // Fall back to `0` if the caller did not supply one.
-    let index = endpoint.index.unwrap_or(0);
-    builder = builder.with_attribute(QName::new(None, "index"), index.to_string());
+        .with_attribute(QName::new(None, "Location"), endpoint.url.clone())
+        // Validated by the caller: emitting `unwrap_or(0)` here published
+        // metadata that named an endpoint the operator never chose, and could
+        // publish the same index twice.
+        .with_attribute(QName::new(None, "index"), index.to_string());
     if endpoint.is_default {
         builder = builder.with_attribute(QName::new(None, "isDefault"), "true");
     }
@@ -214,6 +220,7 @@ mod tests {
     use crate::binding::{Binding, Endpoint};
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
+    use crate::descriptor::idp::IdpDescriptor;
     use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
     use crate::metadata::{
         MetadataContact, MetadataContactType, MetadataExtras, MetadataOrganization,
@@ -225,6 +232,106 @@ mod tests {
 
     fn rsa_cert() -> X509Certificate {
         X509Certificate::from_pem(RSA_CERT_PEM).unwrap()
+    }
+
+    /// Publishing an ARS set that cannot route an artifact is the same defect
+    /// as accepting one, so emission enforces the rule too. `index` is
+    /// REQUIRED on an IndexedEndpoint and must identify exactly one endpoint;
+    /// emitting `unwrap_or(0)` named an endpoint the operator never chose.
+    #[test]
+    fn emit_rejects_artifact_resolution_without_an_index() {
+        let cert = rsa_cert();
+        let ars = [Endpoint::soap("https://idp.example.com/ars", None, true)];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+
+        let err = emit_idp_metadata(&inputs, None)
+            .expect_err("index is REQUIRED on ArtifactResolutionService");
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn emit_rejects_duplicate_artifact_resolution_indices() {
+        let cert = rsa_cert();
+        let ars = [
+            Endpoint::soap("https://idp.example.com/ars-a", Some(0), true),
+            Endpoint::soap("https://idp.example.com/ars-b", Some(0), false),
+        ];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+
+        let err =
+            emit_idp_metadata(&inputs, None).expect_err("two endpoints cannot share an index");
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_emit_inherits_the_artifact_index_rule() {
+        use crate::metadata::emit_aggregate::{
+            AggregateMember, EntitiesDescriptorInputs, emit_entities_descriptor,
+        };
+
+        let cert = rsa_cert();
+        for ars in [
+            vec![Endpoint::soap("https://idp.example.com/ars", None, true)],
+            vec![
+                Endpoint::soap("https://idp.example.com/ars-a", Some(0), true),
+                Endpoint::soap("https://idp.example.com/ars-b", Some(0), false),
+            ],
+        ] {
+            let members = [AggregateMember::Idp(baseline_inputs(
+                &cert,
+                &[],
+                &[],
+                &ars,
+                &[],
+                &[],
+            ))];
+            let inputs = EntitiesDescriptorInputs {
+                name: None,
+                valid_until: None,
+                cache_duration: None,
+                members: &members,
+            };
+            assert!(matches!(
+                emit_entities_descriptor(&inputs, None),
+                Err(Error::InvalidConfiguration { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn emit_rejects_non_soap_artifact_resolution() {
+        let cert = rsa_cert();
+        let ars = [Endpoint::post("https://idp.example.com/ars", 0, true)];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+        assert!(matches!(
+            emit_idp_metadata(&inputs, None),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+    }
+
+    #[test]
+    fn emit_preserves_multiple_artifact_resolution_endpoints() {
+        let cert = rsa_cert();
+        let ars = [
+            Endpoint::soap("https://idp.example.com/ars-a", Some(7), true),
+            Endpoint::soap("https://idp.example.com/ars-b", Some(u16::MAX), false),
+        ];
+        let inputs = baseline_inputs(&cert, &[], &[], &ars, &[], &[]);
+        let xml = emit_idp_metadata(&inputs, None).expect("valid ARS set emits");
+        let parsed = IdpDescriptor::from_metadata_xml(xml.as_bytes()).expect("round trip");
+        assert_eq!(parsed.artifact_resolution_endpoints.len(), ars.len());
+        for (actual, expected) in parsed.artifact_resolution_endpoints.iter().zip(&ars) {
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(actual.url, expected.url);
+            assert_eq!(actual.binding, Binding::Soap);
+            assert_eq!(actual.is_default, expected.is_default);
+        }
     }
 
     fn signing_keypair() -> KeyPair {
