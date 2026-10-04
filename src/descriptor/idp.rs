@@ -91,6 +91,7 @@ impl IdpDescriptor {
         for child in idp.all_child_elements(Some(MD_NS), "ArtifactResolutionService") {
             artifact_resolution_endpoints.push(parse_endpoint(child)?);
         }
+        validate_artifact_resolution_endpoints(&artifact_resolution_endpoints)?;
 
         let supported_name_id_formats = parse_name_id_formats(idp);
 
@@ -136,9 +137,99 @@ impl IdpDescriptor {
     }
 }
 
+/// Reject `<md:ArtifactResolutionService>` sets that cannot route an artifact.
+///
+/// `index` is REQUIRED on an `IndexedEndpoint` and is what a type `0x0004`
+/// artifact carries. Accepting a missing one leaves the endpoint unaddressable;
+/// accepting duplicates makes routing depend on ordering. Both are refused at
+/// the boundary rather than producing a silently wrong resolve later.
+/// SOAP is required by SAML Bindings §3.6.3, as in runtime ARS validation.
+/// Returns the validated indices, in endpoint order, so a caller that needs
+/// them does not have to re-unwrap `Option` and carry an unreachable error
+/// branch for a case this already rejected.
+pub(crate) fn validate_artifact_resolution_endpoints(
+    endpoints: &[crate::binding::Endpoint],
+) -> Result<Vec<u16>, Error> {
+    let mut seen = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        if endpoint.binding != Binding::Soap {
+            return Err(Error::InvalidConfiguration {
+                reason: "ArtifactResolutionService endpoints must use SOAP",
+            });
+        }
+        let Some(index) = endpoint.index else {
+            return Err(Error::InvalidConfiguration {
+                reason: "ArtifactResolutionService is missing the required index attribute",
+            });
+        };
+        if seen.contains(&index) {
+            return Err(Error::InvalidConfiguration {
+                reason: "two ArtifactResolutionService endpoints share an index",
+            });
+        }
+        seen.push(index);
+    }
+    Ok(seen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_ars(endpoints: &str) -> Result<IdpDescriptor, Error> {
+        let xml = format!(
+            r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com">
+              <md:IDPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+                {endpoints}
+              </md:IDPSSODescriptor>
+            </md:EntityDescriptor>"#
+        );
+        IdpDescriptor::from_metadata_xml(xml.as_bytes())
+    }
+
+    fn ars_xml(index: &str, binding: Binding) -> String {
+        format!(
+            r#"<md:ArtifactResolutionService Binding="{}" Location="https://idp.example.com/ars" {index}/>"#,
+            binding.uri()
+        )
+    }
+
+    #[test]
+    fn parse_rejects_missing_artifact_resolution_index() {
+        assert!(matches!(
+            parse_ars(&ars_xml("", Binding::Soap)),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_artifact_resolution_indices() {
+        let endpoint = ars_xml(r#"index="0""#, Binding::Soap);
+        assert!(matches!(
+            parse_ars(&(endpoint.clone() + &endpoint)),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_non_soap_artifact_resolution() {
+        assert!(matches!(
+            parse_ars(&ars_xml(r#"index="0""#, Binding::HttpPost)),
+            Err(Error::InvalidConfiguration { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_accepts_distinct_artifact_resolution_indices() {
+        let endpoints = ars_xml(r#"index="0" isDefault="true""#, Binding::Soap)
+            + &ars_xml(r#"index="65535""#, Binding::Soap);
+        let idp = parse_ars(&endpoints).expect("distinct indices are unambiguous");
+        assert_eq!(idp.artifact_resolution_endpoints.len(), 2);
+        assert_eq!(idp.artifact_resolution_endpoints[0].index, Some(0));
+        assert!(idp.artifact_resolution_endpoints[0].is_default);
+        assert_eq!(idp.artifact_resolution_endpoints[1].index, Some(u16::MAX));
+    }
+
     use crate::binding::Binding;
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::RSA_CERT_PEM;

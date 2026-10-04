@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- IdP metadata parsing and emission now reject ArtifactResolutionService
+  endpoints with missing or duplicate indices or non-SOAP bindings. Emission
+  preserves explicit indices instead of synthesizing index zero; the same
+  validation applies to standalone and aggregate metadata.
+
 - `artifact-binding` no longer requires `weak-algos`. The SHA-1 it needs is
   the artifact `SourceID` derivation (SAML 2.0 Bindings §3.6.4) — an
   identity-matching tag, not a security primitive — so it now pulls in `sha1`
