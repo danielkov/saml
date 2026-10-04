@@ -11,7 +11,7 @@ Stateless, async-native SAML 2.0 toolkit with no libxml2 / xmlsec C build chain.
 
 ## Status
 
-Pre-release: **v0.0.1-alpha**. The protocol surface described below is implemented and exercised against an interop corpus drawn from Okta, Microsoft Entra ID, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, and Shibboleth fixtures. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
+Pre-release: **v0.1.0-alpha.1**. The protocol surface described below is implemented and exercised against an interop corpus drawn from Okta, Microsoft Entra ID, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, and Shibboleth fixtures. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
 
 ## Why this vs. samael
 
