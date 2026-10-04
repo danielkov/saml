@@ -670,7 +670,7 @@ impl ServiceProvider {
     }
 }
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 fn validate_and_pin_artifact_resolution_services(
     idp: &IdpDescriptor,
 ) -> Result<Vec<Endpoint>, Error> {
@@ -700,7 +700,7 @@ fn validate_and_pin_artifact_resolution_services(
     Ok(endpoints)
 }
 
-#[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
+#[cfg(not(feature = "artifact-binding"))]
 fn validate_and_pin_artifact_resolution_services(
     _idp: &IdpDescriptor,
 ) -> Result<Vec<Endpoint>, Error> {

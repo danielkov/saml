@@ -93,7 +93,7 @@ impl<'a> ReplayEntry<'a> {
         }
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub(crate) fn artifact_resolve(id: &'a str, expires_at: SystemTime) -> Self {
         Self {
             namespace: ReplayNamespace::ArtifactResolve,

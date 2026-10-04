@@ -35,20 +35,17 @@
 
 use std::time::{Duration, SystemTime};
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 use aes_gcm::Aes256Gcm;
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 use aes_gcm::aead::{Aead as _, KeyInit as _, Payload as AeadPayload};
-#[cfg(any(
-    feature = "slo",
-    all(feature = "artifact-binding", feature = "weak-algos")
-))]
+#[cfg(any(feature = "slo", feature = "artifact-binding"))]
 use base64::Engine as _;
 #[cfg(feature = "slo")]
 use base64::engine::general_purpose::STANDARD as BASE64;
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 use rand::RngCore as _;
 
 use crate::attribute::Attribute;
@@ -58,7 +55,7 @@ use crate::authn_context::AuthnContextClassRef;
 #[cfg(any(feature = "slo", test))]
 use crate::binding::Dispatch;
 use crate::binding::{Binding, Endpoint, SsoResponseBinding, SsoResponseDispatch};
-#[cfg(all(test, feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(all(test, feature = "artifact-binding"))]
 use crate::crypto::cert::certificate_fingerprint_set;
 use crate::crypto::keypair::KeyPair;
 use crate::descriptor::SpDescriptor;
@@ -86,7 +83,7 @@ use crate::logout::{
 use crate::metadata::MetadataExtras;
 use crate::metadata::emit_idp::{IdpMetadataInputs, emit_idp_metadata};
 use crate::nameid::{NameId, NameIdFormat};
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 use crate::replay::{ReplayCache, ReplayEntry};
 use crate::response::issue::{
     IssueErrorResponseInputs, IssueResponseInputs, SamlStatusCode, issue_error_response,
@@ -280,10 +277,7 @@ impl IdentityProvider {
 
     /// Sign `element` in place when `should_sign`. Helper that wires the
     /// outbound algorithm config into the dsig signer.
-    #[cfg(any(
-        feature = "slo",
-        all(feature = "artifact-binding", feature = "weak-algos")
-    ))]
+    #[cfg(any(feature = "slo", feature = "artifact-binding"))]
     fn maybe_sign_outbound(&self, element: Element, should_sign: bool) -> Result<Element, Error> {
         if !should_sign {
             return Ok(element);
@@ -695,11 +689,11 @@ pub struct IssueErrorResponse<'a> {
 }
 
 fn artifact_issuance_without_transaction_error() -> Error {
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     {
         Error::ArtifactTransactionRequired
     }
-    #[cfg(not(all(feature = "artifact-binding", feature = "weak-algos")))]
+    #[cfg(not(feature = "artifact-binding"))]
     {
         Error::UnsupportedByPeer {
             binding: Binding::HttpArtifact,
@@ -803,7 +797,7 @@ impl IdentityProvider {
     /// every Artifact-capable request; the compatibility
     /// [`issue_response`](Self::issue_response) API refuses Artifact because it
     /// cannot carry this transaction.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub fn issue_response_with_artifact_transaction(
         &self,
         input: IssueResponse<'_>,
@@ -888,7 +882,7 @@ impl IdentityProvider {
 
     /// Issue an error response while preserving the trust transaction needed
     /// for authenticated HTTP-Artifact resolution.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub fn issue_error_response_with_artifact_transaction(
         &self,
         input: IssueErrorResponse<'_>,
@@ -946,7 +940,7 @@ impl IdentityProvider {
     /// take that stored pair atomically, but only after
     /// [`consume_artifact_resolve`](Self::consume_artifact_resolve) has
     /// authenticated and replay-reserved the resolve request.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn bind_artifact(
         &self,
         in_response_to: &ParsedAuthnRequest,
@@ -1019,7 +1013,7 @@ impl IdentityProvider {
     /// the supplied SP issuer, fall within `clock_skew` of `now`, and satisfy
     /// the configured root-signature requirement. A present signature is
     /// always verified even when `require_signed` is false.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub fn consume_artifact_resolve(
         &self,
         input: ConsumeArtifactResolve<'_>,
@@ -1197,7 +1191,7 @@ impl IdentityProvider {
 }
 
 /// Security-bearing input to [`IdentityProvider::consume_artifact_resolve`].
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 pub struct ConsumeArtifactResolve<'a> {
     pub sp: &'a SpDescriptor,
     /// Opaque trust record stored with the exact one-time artifact at issue.
@@ -1219,7 +1213,7 @@ pub struct ConsumeArtifactResolve<'a> {
 }
 
 /// SSO response issued with the artifact-resolution trust transaction intact.
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 #[derive(Debug)]
 pub enum IssuedResponse {
     Post(crate::binding::SsoResponsePostForm),
@@ -1228,7 +1222,7 @@ pub enum IssuedResponse {
 
 /// An Artifact redirect and the opaque transaction that must be persisted
 /// beside its response XML.
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 #[derive(Debug)]
 pub struct IssuedArtifact {
     pub redirect: crate::binding::ArtifactRedirect,
@@ -1241,7 +1235,7 @@ pub struct IssuedArtifact {
 /// deserialization path. The IdP role creates it only from a validated
 /// AuthnRequest and the exact issued artifact through
 /// [`IdentityProvider::issue_response_with_artifact_transaction`].
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 #[derive(Clone)]
 pub struct ArtifactResolveTransaction {
     artifact: String,
@@ -1249,7 +1243,7 @@ pub struct ArtifactResolveTransaction {
     sp_signing_cert_fingerprints: Vec<[u8; 32]>,
 }
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ArtifactResolveTransactionWire {
     artifact: String,
@@ -1257,7 +1251,7 @@ struct ArtifactResolveTransactionWire {
     sp_signing_cert_fingerprints: Vec<[u8; 32]>,
 }
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 impl std::fmt::Debug for ArtifactResolveTransaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArtifactResolveTransaction")
@@ -1265,7 +1259,7 @@ impl std::fmt::Debug for ArtifactResolveTransaction {
     }
 }
 
-#[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+#[cfg(feature = "artifact-binding")]
 impl ArtifactResolveTransaction {
     /// Seal this transaction into authenticated opaque bytes suitable for a
     /// database, cache, or another worker.
@@ -2271,16 +2265,16 @@ mod tests {
     #[cfg(feature = "slo")]
     use crate::logout::{LogoutOutcome, LogoutStatus, StartLogout};
     use crate::nameid::{NameId, NameIdFormat};
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     use crate::replay::InMemoryReplayCache;
     use crate::response::issue::SamlStatusCode;
     use crate::xml::emit::emit_document;
     use crate::xml::parse::Node;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     const SECOND_RSA_CERT_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.crt");
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     const SECOND_RSA_KEY_PEM: &[u8] = include_bytes!("../examples/demo/keys/sp.key");
 
     // -------------------------------------------------------------------------
@@ -2298,7 +2292,7 @@ mod tests {
         X509Certificate::from_pem(RSA_CERT_PEM).unwrap()
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn second_rsa_keypair_with_cert() -> KeyPair {
         KeyPair::from_pkcs8_pem(SECOND_RSA_KEY_PEM)
             .expect("second RSA key")
@@ -2356,7 +2350,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn artifact_idp() -> IdentityProvider {
         let mut config = idp_with(false, false).config.clone();
         config.artifact_resolution =
@@ -2470,7 +2464,7 @@ mod tests {
         emit_document(&final_doc).unwrap().into_bytes()
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn artifact_resolve_envelope(
         issuer: &str,
         destination: &str,
@@ -2516,7 +2510,7 @@ mod tests {
             .into_bytes()
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn artifact_resolve_envelope_signed_with(
         issuer: &str,
         artifact: &str,
@@ -2555,7 +2549,7 @@ mod tests {
             .into_bytes()
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn artifact_transaction(sp: &SpDescriptor) -> ArtifactResolveTransaction {
         ArtifactResolveTransaction {
             artifact: test_type4_artifact(),
@@ -2564,7 +2558,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn test_type4_artifact() -> String {
         use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -2578,7 +2572,7 @@ mod tests {
         BASE64.encode(bytes)
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn artifact_authn_request(sp: &SpDescriptor) -> ParsedAuthnRequest {
         ParsedAuthnRequest::for_proxy_reissue(
             sp,
@@ -2592,7 +2586,7 @@ mod tests {
         .expect("fixture ACS is registered")
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn issue_artifact_with_transaction(
         idp: &IdentityProvider,
         sp: &SpDescriptor,
@@ -2621,7 +2615,7 @@ mod tests {
         issued
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn artifact_resolve_envelope_signed_over_artifact(issuer: &str, destination: &str) -> Vec<u8> {
         let issue_instant =
             crate::time::format_xs_datetime(fixed_now()).expect("format fixed time");
@@ -2688,7 +2682,7 @@ mod tests {
             .into_bytes()
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     fn consume_artifact_resolve<'a>(
         idp: &IdentityProvider,
         sp: &'a SpDescriptor,
@@ -2711,7 +2705,7 @@ mod tests {
         })
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_accepts_valid_signed_request() {
         let idp = artifact_idp();
@@ -2731,7 +2725,7 @@ mod tests {
         assert_eq!(request.artifact, test_type4_artifact());
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_rejects_unsigned_when_required() {
         let idp = artifact_idp();
@@ -2749,7 +2743,7 @@ mod tests {
         assert!(matches!(err, Error::SignatureMissing), "got {err:?}");
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_rejects_wrong_issuer_and_destination() {
         let idp = artifact_idp();
@@ -2787,7 +2781,7 @@ mod tests {
         assert!(matches!(err, Error::DestinationMismatch), "got {err:?}");
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_rejects_stale_issue_instant() {
         let idp = artifact_idp();
@@ -2804,7 +2798,7 @@ mod tests {
         assert!(matches!(err, Error::Expired), "got {err:?}");
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_verifies_present_optional_signature() {
         let idp = artifact_idp();
@@ -2829,7 +2823,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_accepts_optional_unsigned_at_registered_endpoint() {
         let idp = artifact_idp();
@@ -2847,7 +2841,7 @@ mod tests {
         assert_eq!(request.artifact, test_type4_artifact());
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_rejects_unregistered_receiver_and_child_signature() {
         let idp = artifact_idp();
@@ -2883,7 +2877,7 @@ mod tests {
         assert!(matches!(err, Error::SignatureVerification { .. }));
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_binds_the_type4_index_to_the_receiving_ars() {
         let mut idp = artifact_idp();
@@ -2911,7 +2905,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn idp_build_artifact_response_signs_the_outer_envelope() {
         let idp = artifact_idp();
@@ -2939,7 +2933,7 @@ mod tests {
         assert_eq!(verified.signed_element, response.id());
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_rejects_a_root_introduced_after_issuance() {
         let idp = artifact_idp();
@@ -2990,7 +2984,7 @@ mod tests {
     /// security benefit, since `new` is simply never offered as a candidate.
     /// The companion test above covers the case that must still fail:
     /// *replacing* the pinned key.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_accepts_the_pinned_key_during_additive_rotation() {
         let idp = artifact_idp();
@@ -3047,7 +3041,7 @@ mod tests {
         .expect("a resolve signed by the pinned key survives additive rotation");
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_never_grants_the_new_key_during_additive_rotation() {
         let idp = artifact_idp();
@@ -3104,7 +3098,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_atomically_reserves_request_id() {
         let idp = artifact_idp();
@@ -3147,7 +3141,7 @@ mod tests {
         assert!(matches!(err, Error::ArtifactResolveReplay));
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn consume_artifact_resolve_rejects_zero_skew_explicitly() {
         let idp = artifact_idp();
@@ -3177,7 +3171,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfiguration { .. }));
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn artifact_transaction_seal_round_trips_and_rejects_tampering() {
         let mut sp = sp_descriptor(false);
@@ -3746,7 +3740,7 @@ mod tests {
     /// The Type-4 endpoint index identifies the issuing IdP's ARS, never the
     /// receiving SP's ACS. A caller-mutated ACS index therefore cannot affect
     /// the artifact, and a deliberately different ARS index reaches the wire.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn mutating_the_acs_index_does_not_reach_the_artifact() {
         use base64::Engine as _;
@@ -3820,7 +3814,7 @@ mod tests {
             subject_confirmation_lifetime: Duration::from_mins(5),
             holder_of_key_cert: None,
         };
-        #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+        #[cfg(feature = "artifact-binding")]
         if req.validated_acs().binding == SsoResponseBinding::HttpArtifact {
             return idp.issue_response_with_artifact_transaction(input).map(
                 |issued| match issued {
@@ -4022,7 +4016,7 @@ mod tests {
         assert!(matches!(err, Error::IssuerMismatch { .. }));
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn artifact_issuance_requires_and_returns_a_trust_transaction() {
         let idp = artifact_idp();

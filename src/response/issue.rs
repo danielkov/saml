@@ -770,7 +770,7 @@ mod tests {
     use crate::response::parse::parse_response;
     use crate::response::validate::{ValidateResponse, validate_response};
     use crate::xml::parse::Document;
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     use base64::Engine as _;
     use std::time::{Duration, UNIX_EPOCH};
 

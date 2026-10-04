@@ -3562,7 +3562,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     #[test]
     fn relay_refuses_artifact_before_callbacks() {
         let sp = proxy_sp();

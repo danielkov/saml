@@ -91,7 +91,7 @@ struct ValidatedBinding {
     /// request was validated. Artifact issuance carries these into its
     /// one-time transaction record so a later ArtifactResolve cannot replace
     /// the transaction's trust roots through fresh metadata.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     signing_cert_fingerprints: Vec<[u8; 32]>,
     /// RelayState as the role layer sealed it, straight from the binding.
     ///
@@ -129,7 +129,7 @@ impl ParsedAuthnRequest {
     /// Canonical signing-root fingerprints seen while validating the request.
     /// Crate-internal because callers consume these only through the opaque
     /// artifact transaction created by the IdP role.
-    #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+    #[cfg(feature = "artifact-binding")]
     pub(crate) fn validated_signing_cert_fingerprints(&self) -> &[[u8; 32]] {
         &self.validated.signing_cert_fingerprints
     }
@@ -268,7 +268,7 @@ impl ParsedAuthnRequest {
                     .iter()
                     .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
                     .collect(),
-                #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+                #[cfg(feature = "artifact-binding")]
                 signing_cert_fingerprints: crate::crypto::cert::certificate_fingerprint_set(
                     &sp.signing_certs,
                 ),
@@ -406,7 +406,7 @@ pub(crate) fn validate_authn_request(
                 .iter()
                 .map(crate::crypto::cert::X509Certificate::fingerprint_sha256)
                 .collect(),
-            #[cfg(all(feature = "artifact-binding", feature = "weak-algos"))]
+            #[cfg(feature = "artifact-binding")]
             signing_cert_fingerprints: crate::crypto::cert::certificate_fingerprint_set(
                 &sp.signing_certs,
             ),
