@@ -58,6 +58,7 @@ fn make_decrypting_sp() -> common::TestResult<ServiceProvider> {
         #[cfg(feature = "slo")]
         logout_want_signed: saml::SpLogoutWantSigned::default(),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
     })?)
@@ -88,6 +89,7 @@ fn make_encrypting_idp() -> common::TestResult<IdentityProvider> {
         default_session_duration: Duration::from_hours(1),
         max_authn_request_age: saml::IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
         outbound_c14n: C14nAlgorithm::ExclusiveCanonical,

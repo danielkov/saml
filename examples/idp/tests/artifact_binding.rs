@@ -73,6 +73,7 @@ fn make_artifact_sp() -> ServiceProvider {
         logout_signing: saml::SpLogoutSigning::default(),
         logout_want_signed: saml::SpLogoutWantSigned::default(),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
     })

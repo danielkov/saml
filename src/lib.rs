@@ -57,6 +57,7 @@
 //!     logout_signing: SpLogoutSigning { sign_requests: true, sign_responses: true },
 //!     logout_want_signed: SpLogoutWantSigned { requests: true, responses: true },
 //!     default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+//!     verifier: None,
 //!     outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
 //!     outbound_digest_algorithm: DigestAlgorithm::Sha256,
 //! })?;
@@ -150,6 +151,7 @@
 //!     default_session_duration: Duration::from_secs(3600),
 //!     max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
 //!     default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+//!     verifier: None,
 //!     outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
 //!     outbound_digest_algorithm: DigestAlgorithm::Sha256,
 //!     outbound_c14n: C14nAlgorithm::ExclusiveCanonical,

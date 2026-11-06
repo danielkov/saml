@@ -15,10 +15,11 @@ use crate::authn_context::{AuthnContextClassRef, AuthnContextComparison};
 use crate::authn_context::{ComparatorOutcome, RequestedAuthnContext, StandardComparator};
 #[cfg(any(test, feature = "xmlenc"))]
 use crate::crypto::keypair::KeyPair;
+use crate::crypto::verifier::SignatureVerifier;
 use crate::descriptor::IdpDescriptor;
 use crate::dsig::algorithms::PeerCryptoPolicy;
 use crate::dsig::reference::DS_NS;
-use crate::dsig::verify::{VerifiedSignature, verify_signature};
+use crate::dsig::verify::{VerifiedSignature, verify_signature_with};
 use crate::error::Error;
 use crate::response::identity::Identity;
 use crate::response::parse::{
@@ -32,6 +33,9 @@ pub(crate) struct ValidateResponse<'a> {
     pub parsed: ParsedResponse,
     pub idp: &'a IdpDescriptor,
     pub peer_crypto_policy: &'a PeerCryptoPolicy,
+    /// Inbound signature verifier, resolved from the role config
+    /// (`None` falls back to `DefaultVerifier`).
+    pub verifier: &'a dyn SignatureVerifier,
     /// SP's signing/decryption keypair(s) (for EncryptedAssertion unwrap).
     #[cfg(feature = "xmlenc")]
     pub decryption_keys: &'a [&'a KeyPair],
@@ -70,6 +74,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         parsed,
         idp,
         peer_crypto_policy,
+        verifier,
         #[cfg(feature = "xmlenc")]
         decryption_keys,
         sp_entity_id,
@@ -155,6 +160,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
                 *assertion_id,
                 idp,
                 peer_crypto_policy,
+                verifier,
                 want_response_signed,
                 want_assertions_signed,
             )?;
@@ -177,6 +183,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
             encrypted_assertion_id: *enc_id,
             idp,
             policy: peer_crypto_policy,
+            verifier,
             decryption_keys,
             want_response_signed,
             want_assertions_signed,
@@ -389,12 +396,17 @@ fn enforce_signature_positions(document: &Document) -> Result<(), Error> {
 /// `verified.signed_element` when the assertion signature was the one
 /// verified — never via name lookup. That is the structural XSW defense
 /// (RFC-002 §3.2).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one parameter per validation input; the verifier joins the existing peer-policy pair, and a context struct would add indirection for two call sites"
+)]
 fn verify_response_and_or_assertion(
     document: &Document,
     response_root_id: ElementId,
     assertion_name_lookup_id: ElementId,
     idp: &IdpDescriptor,
     policy: &PeerCryptoPolicy,
+    verifier: &dyn SignatureVerifier,
     want_response_signed: bool,
     want_assertions_signed: bool,
 ) -> Result<(VerifiedSignature, ElementId), Error> {
@@ -410,7 +422,7 @@ fn verify_response_and_or_assertion(
     let assertion_signature = assertion_elem.child_element(Some(DS_NS), "Signature");
 
     let verify_response = |sig: &Element| -> Result<VerifiedSignature, Error> {
-        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
+        let verified = verify_signature_with(document, sig, &idp.signing_certs, policy, verifier)?;
         if verified.signed_element != response_root_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Response root",
@@ -419,7 +431,7 @@ fn verify_response_and_or_assertion(
         Ok(verified)
     };
     let verify_assertion = |sig: &Element| -> Result<VerifiedSignature, Error> {
-        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
+        let verified = verify_signature_with(document, sig, &idp.signing_certs, policy, verifier)?;
         if verified.signed_element != assertion_name_lookup_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Assertion",
@@ -477,6 +489,7 @@ struct HandleEncryptedParams<'a> {
     encrypted_assertion_id: ElementId,
     idp: &'a IdpDescriptor,
     policy: &'a PeerCryptoPolicy,
+    verifier: &'a dyn SignatureVerifier,
     decryption_keys: &'a [&'a KeyPair],
     want_response_signed: bool,
     want_assertions_signed: bool,
@@ -492,6 +505,7 @@ fn handle_encrypted(
         encrypted_assertion_id,
         idp,
         policy,
+        verifier,
         decryption_keys,
         want_response_signed,
         want_assertions_signed,
@@ -509,7 +523,7 @@ fn handle_encrypted(
 
     let mut response_verified_fingerprint: Option<[u8; 32]> = None;
     if let Some(sig) = response_signature {
-        let verified = verify_signature(document, sig, &idp.signing_certs, policy)?;
+        let verified = verify_signature_with(document, sig, &idp.signing_certs, policy, verifier)?;
         if verified.signed_element != response_root_id {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Response root",
@@ -540,7 +554,8 @@ fn handle_encrypted(
     // the same verify-and-resolve dance; differ only on what to do when the
     // signature is absent.
     let verify_inner = |sig: &Element| -> Result<([u8; 32], Element), Error> {
-        let verified = verify_signature(&decrypted_doc, sig, &idp.signing_certs, policy)?;
+        let verified =
+            verify_signature_with(&decrypted_doc, sig, &idp.signing_certs, policy, verifier)?;
         if verified.signed_element != assertion_root.id() {
             return Err(Error::SignatureVerification {
                 reason: "signature does not cover Assertion",
@@ -745,6 +760,7 @@ mod tests {
     use crate::binding::Endpoint;
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
+    use crate::crypto::verifier::DefaultVerifier;
     use crate::dsig::algorithms::{C14nAlgorithm, DigestAlgorithm, SignatureAlgorithm};
     use crate::dsig::sign::{SignOptions, sign_element};
     use crate::nameid::NameIdFormat;
@@ -1276,6 +1292,7 @@ mod tests {
             parsed,
             idp,
             peer_crypto_policy: policy,
+            verifier: &DefaultVerifier,
             #[cfg(feature = "xmlenc")]
             decryption_keys: &[],
             sp_entity_id: "https://sp.example.com",

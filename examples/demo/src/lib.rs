@@ -363,6 +363,7 @@ pub fn build_service_provider(config: &AppConfig) -> Result<ServiceProvider, sam
             responses: false,
         },
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
     })

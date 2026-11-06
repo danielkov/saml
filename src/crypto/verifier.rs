@@ -98,11 +98,15 @@ pub struct VerifyMatch {
 /// custom implementations can intercept this trait without leaking key
 /// material into the process. See RFC-002 §4.
 ///
+/// `Debug` is a supertrait so verifiers can live inside the SP/IdP config
+/// structs (which derive `Debug` and are logged on misconfiguration) behind
+/// an `Arc<dyn SignatureVerifier>`.
+///
 /// Custom implementations MUST NOT accept an `algorithm` that's not present
 /// in `allowed_algorithms`, even if they know how to perform it. This keeps
 /// per-peer algorithm policy enforced uniformly regardless of which verifier
 /// the role is configured with.
-pub trait SignatureVerifier: Send + Sync {
+pub trait SignatureVerifier: Send + Sync + std::fmt::Debug {
     fn verify(
         &self,
         algorithm: SignatureAlgorithm,
