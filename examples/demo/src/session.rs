@@ -10,7 +10,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -116,7 +116,7 @@ pub fn decode(cookie_value: &str, key: &[u8], now_unix: u64) -> Result<Session, 
     let expected = mac.finalize().into_bytes();
 
     let provided = B64.decode(tag_b64).map_err(|_| SessionError::Malformed)?;
-    if expected.ct_eq(provided.as_slice()).unwrap_u8() != 1 {
+    if expected.as_slice().ct_eq(provided.as_slice()).unwrap_u8() != 1 {
         return Err(SessionError::BadSignature);
     }
 

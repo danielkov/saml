@@ -29,10 +29,10 @@ use crate::error::Error;
 pub(crate) fn random_xml_id() -> Result<String, Error> {
     use std::fmt::Write as _;
 
-    use rsa::rand_core::{OsRng, RngCore as _};
+    use rand::{TryRng as _, rngs::SysRng};
 
     let mut bytes = [0u8; 16];
-    OsRng
+    SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|_err| Error::InvalidConfiguration {
             reason: "RNG failure generating random XML ID",

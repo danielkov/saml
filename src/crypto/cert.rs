@@ -26,7 +26,7 @@ use std::fmt;
 use std::time::SystemTime;
 
 use const_oid::db::rfc5912::{ID_EC_PUBLIC_KEY, RSA_ENCRYPTION, SECP_256_R_1, SECP_384_R_1};
-use rsa::RsaPublicKey;
+use rsa::PublicKey as RsaPublicKey;
 use rsa::pkcs1v15::VerifyingKey as RsaPkcs1v15VerifyingKey;
 use signature::Verifier as _;
 use spki::SubjectPublicKeyInfoRef;
@@ -135,13 +135,13 @@ impl X509Certificate {
 
     fn finalize(cert: Certificate, der: Vec<u8>) -> Result<Self, Error> {
         let spki_der = cert
-            .tbs_certificate
-            .subject_public_key_info
+            .tbs_certificate()
+            .subject_public_key_info()
             .to_der()
             .map_err(|_e| Error::X509Parse)?;
         let public_key = PublicKey::from_spki_der(&spki_der)?;
-        let subject_str = cert.tbs_certificate.subject.to_string();
-        let issuer_str = cert.tbs_certificate.issuer.to_string();
+        let subject_str = cert.tbs_certificate().subject().to_string();
+        let issuer_str = cert.tbs_certificate().issuer().to_string();
         let mut hasher = Sha256::new();
         hasher.update(&der);
         let fingerprint: [u8; 32] = hasher.finalize().into();
@@ -177,8 +177,8 @@ impl X509Certificate {
     /// `notBefore` validity bound.
     pub fn not_before(&self) -> SystemTime {
         self.inner
-            .tbs_certificate
-            .validity
+            .tbs_certificate()
+            .validity()
             .not_before
             .to_system_time()
     }
@@ -186,8 +186,8 @@ impl X509Certificate {
     /// `notAfter` validity bound.
     pub fn not_after(&self) -> SystemTime {
         self.inner
-            .tbs_certificate
-            .validity
+            .tbs_certificate()
+            .validity()
             .not_after
             .to_system_time()
     }
@@ -653,6 +653,109 @@ mod tests {
         let fingerprints = certificate_fingerprint_set(&[rsa.clone(), ec, rsa]);
         assert_eq!(fingerprints.len(), 2);
         assert!(fingerprints.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn spki_rejects_unsupported_algorithms_parameters_and_key_encodings() {
+        use x509_cert::der::asn1::{AnyRef, BitStringRef};
+
+        let cert = X509Certificate::from_pem(EC_P256_CERT_PEM).expect("EC certificate");
+        let original = cert.subject_public_key_info_der();
+        let parsed = SubjectPublicKeyInfoRef::from_der(original).expect("fixture SPKI");
+        let p384_oid = SECP_384_R_1.to_der().expect("curve OID");
+        let unknown_oid = const_oid::ObjectIdentifier::new_unwrap("1.2.3.4");
+        let unknown_der = unknown_oid.to_der().expect("unknown OID");
+        let invalid_point = BitStringRef::new(0, &[4, 0, 0]).expect("byte-aligned bits");
+        let cases = [
+            // Neither unknown algorithms nor missing/mistyped curve parameters are guessed.
+            (
+                unknown_oid,
+                parsed.algorithm.parameters,
+                parsed.subject_public_key,
+            ),
+            (ID_EC_PUBLIC_KEY, None, parsed.subject_public_key),
+            (
+                ID_EC_PUBLIC_KEY,
+                Some(AnyRef::from_der(&[5, 0]).unwrap()),
+                parsed.subject_public_key,
+            ),
+            (
+                ID_EC_PUBLIC_KEY,
+                Some(AnyRef::from_der(&unknown_der).unwrap()),
+                parsed.subject_public_key,
+            ),
+            // A recognized curve OID must not bypass SEC1 point validation.
+            (ID_EC_PUBLIC_KEY, parsed.algorithm.parameters, invalid_point),
+            (
+                ID_EC_PUBLIC_KEY,
+                Some(AnyRef::from_der(&p384_oid).unwrap()),
+                invalid_point,
+            ),
+            (RSA_ENCRYPTION, None, invalid_point),
+            (
+                ID_EC_PUBLIC_KEY,
+                parsed.algorithm.parameters,
+                BitStringRef::new(1, &[0]).unwrap(),
+            ),
+        ];
+        for (oid, parameters, subject_public_key) in cases {
+            let spki = SubjectPublicKeyInfoRef {
+                algorithm: spki::AlgorithmIdentifierRef { oid, parameters },
+                subject_public_key,
+            }
+            .to_der()
+            .expect("encode structurally valid SPKI");
+            assert!(matches!(
+                PublicKey::from_spki_der(&spki),
+                Err(Error::X509Parse)
+            ));
+        }
+        for cut in [0, 1, original.len() / 2, original.len() - 1] {
+            assert!(matches!(
+                PublicKey::from_spki_der(&original[..cut]),
+                Err(Error::X509Parse)
+            ));
+        }
+        let mut trailing = original.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            PublicKey::from_spki_der(&trailing),
+            Err(Error::X509Parse)
+        ));
+    }
+
+    #[test]
+    fn certificate_parsers_reject_truncation_trailing_der_and_wrong_pem_label() {
+        let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("RSA certificate");
+        let der = cert.to_der();
+        for cut in [0, 1, der.len() / 2, der.len() - 1] {
+            assert!(matches!(
+                X509Certificate::from_der(&der[..cut]),
+                Err(Error::X509Parse)
+            ));
+            let encoded = BASE64_STANDARD.encode(&der[..cut]);
+            assert!(matches!(
+                X509Certificate::from_base64_x509(&encoded),
+                Err(Error::X509Parse)
+            ));
+        }
+        let mut trailing = der.to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            X509Certificate::from_der(&trailing),
+            Err(Error::X509Parse)
+        ));
+        let wrong_label = std::str::from_utf8(RSA_CERT_PEM)
+            .unwrap()
+            .replace("CERTIFICATE", "PUBLIC KEY");
+        assert!(matches!(
+            X509Certificate::from_pem(wrong_label.as_bytes()),
+            Err(Error::X509Parse)
+        ));
+        assert!(matches!(
+            X509Certificate::from_pem(&[0xff]),
+            Err(Error::X509Parse)
+        ));
     }
 
     #[test]

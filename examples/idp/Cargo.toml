@@ -52,13 +52,13 @@ serde_json = "1"
 toml = "0.8"
 
 # Session cookie crypto (HMAC-SHA256 signed JSON).
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 subtle = "2"
 base64 = "0.22"
 
 # Password hashing.
-argon2 = "0.5"
+argon2 = "0.6"
 
 # DEFLATE for HTTP-Redirect inbound decoding of SAMLRequest/SAMLResponse.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -66,7 +66,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # Misc small utilities.
 url = "2"
 percent-encoding = "2"
-rand = "0.9"
+rand = "0.10"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

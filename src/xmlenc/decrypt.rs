@@ -8,7 +8,7 @@
 //! `PeerCryptoPolicy`); compile-time `weak-algos` only controls which
 //! variants exist — never which are accepted at runtime.
 
-use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use base64::Engine as _;
@@ -42,8 +42,8 @@ const XENC11_NS: &str = "http://www.w3.org/2009/xmlenc11#";
 /// acceptance.
 ///
 /// Decryption-key rotation: `decryption_keys` is tried in order; the first
-/// key whose `RSA` key-transport unwrap succeeds wins. Failures from earlier
-/// keys are discarded (Bleichenbacher-safe per `KeyPair::decrypt_rsa_pkcs1v15`).
+/// key that yields a correctly sized session key and decryptable XML wins.
+/// CBC does not authenticate the plaintext; callers must still verify signatures.
 pub(crate) fn decrypt_encrypted_assertion(
     encrypted_assertion: &Element,
     decryption_keys: &[&KeyPair],
@@ -173,31 +173,50 @@ pub(crate) fn decrypt_encrypted_assertion(
     // -- 5. Base64-decode the wrapped session key. --
     let wrapped_key_bytes = extract_cipher_value(encrypted_key)?;
 
-    // -- 6. Try each decryption key; first success wins. --
-    let session_key = unwrap_session_key(
-        &wrapped_key_bytes,
-        decryption_keys,
-        key_transport_algorithm,
-        oaep_digest,
-        mgf1_digest,
-    )?;
-
-    // -- 7. Verify key length matches the data algorithm. --
-    if session_key.len() != data_algorithm.key_size() {
+    // Decode the payload once, not once per candidate key.
+    let ciphertext = extract_cipher_value(encrypted_data)?;
+    let mut failure = Error::DecryptFailed {
+        reason: "key transport",
+    };
+    for key in decryption_keys {
+        let attempt = (|| {
+            let session_key = match key_transport_algorithm {
+                KeyTransportAlgorithm::RsaOaep | KeyTransportAlgorithm::RsaOaepMgf1Sha1 => {
+                    key.decrypt_rsa_oaep(&wrapped_key_bytes, oaep_digest, mgf1_digest)?
+                }
+                #[cfg(feature = "weak-algos")]
+                KeyTransportAlgorithm::RsaPkcs1V15 => {
+                    key.decrypt_rsa_pkcs1v15(&wrapped_key_bytes)?
+                }
+            };
+            // PKCS#1 v1.5 implicit rejection can return synthetic plaintext
+            // even for a wrong key. Unwrap success alone cannot select a key.
+            if session_key.len() != data_algorithm.key_size() {
+                return Err(Error::DecryptFailed {
+                    reason: "key size mismatch",
+                });
+            }
+            let plaintext = decrypt_data(data_algorithm, &session_key, &ciphertext)?;
+            // Parse only candidates that pass length and data decryption.
+            // CBC has no authentication, so signature verification remains
+            // the caller's responsibility even when XML parsing succeeds.
+            let doc = Document::parse(&plaintext)?;
+            Ok(doc.root().clone())
+        })();
+        match attempt {
+            Ok(root) => return Ok(root),
+            Err(error) => failure = error,
+        }
+    }
+    // Do not distinguish synthetic PKCS#1 v1.5 plaintext from other failed
+    // candidates through their length, padding, tag, or XML parse errors.
+    #[cfg(feature = "weak-algos")]
+    if key_transport_algorithm == KeyTransportAlgorithm::RsaPkcs1V15 {
         return Err(Error::DecryptFailed {
-            reason: "key size mismatch",
+            reason: "key transport",
         });
     }
-
-    // -- 8. Base64-decode the payload ciphertext (iv/nonce || ct [|| tag]). --
-    let ciphertext = extract_cipher_value(encrypted_data)?;
-
-    // -- 9. Decrypt the payload. --
-    let plaintext = decrypt_data(data_algorithm, &session_key, &ciphertext)?;
-
-    // -- 10. Re-parse the decrypted XML and return the root element. --
-    let doc = Document::parse(&plaintext)?;
-    Ok(doc.root().clone())
+    Err(failure)
 }
 
 // =============================================================================
@@ -270,41 +289,6 @@ fn decode_base64_ws_tolerant(text: &str) -> Result<Vec<u8>, Error> {
         .map_err(|_err| Error::Base64Decode)
 }
 
-/// Try each candidate `KeyPair` against the wrapped session key until one
-/// succeeds. Per RFC-002 §7.3, all per-key failure modes collapse into a
-/// single generic `Error::DecryptFailed { reason: "key transport" }` so that
-/// the failure does not leak chosen-ciphertext-distinguishable information.
-fn unwrap_session_key(
-    wrapped: &[u8],
-    keys: &[&KeyPair],
-    algorithm: KeyTransportAlgorithm,
-    oaep_digest: OaepDigest,
-    mgf1_digest: OaepDigest,
-) -> Result<Vec<u8>, Error> {
-    for key in keys {
-        let attempt = match algorithm {
-            KeyTransportAlgorithm::RsaOaep | KeyTransportAlgorithm::RsaOaepMgf1Sha1 => {
-                key.decrypt_rsa_oaep(wrapped, oaep_digest, mgf1_digest)
-            }
-            #[cfg(feature = "weak-algos")]
-            KeyTransportAlgorithm::RsaPkcs1V15 => key.decrypt_rsa_pkcs1v15(wrapped),
-        };
-        if let Ok(session_key) = attempt {
-            return Ok(session_key);
-        }
-        // Discard the error; try the next key. Bleichenbacher safety: do not
-        // surface the per-key failure reason — `decrypt_rsa_pkcs1v15` already
-        // folds its internal padding/length errors into a single
-        // `DecryptFailed { reason: "key transport" }`, and we do the same here
-        // for OAEP. Surfacing per-key reasons would let an attacker tell
-        // "this key didn't match" apart from "padding parse failed", which is
-        // the exact side-channel we are eliminating.
-    }
-    Err(Error::DecryptFailed {
-        reason: "key transport",
-    })
-}
-
 /// Decrypt `ciphertext` (formatted as `iv/nonce || ct [|| tag]`) under
 /// `session_key`. Failure surfaces as `Error::DecryptFailed { reason: "data" }`
 /// regardless of where in the AEAD/CBC pipeline it occurred.
@@ -323,7 +307,7 @@ fn decrypt_data(
 
 fn decrypt_cbc<C>(session_key: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Error>
 where
-    C: aes::cipher::BlockCipher + aes::cipher::BlockDecrypt + aes::cipher::KeyInit,
+    C: aes::cipher::BlockCipherDecrypt + aes::cipher::KeyInit,
 {
     if ciphertext.len() < 16 {
         return Err(Error::DecryptFailed { reason: "data" });
@@ -343,7 +327,7 @@ where
     // Discarded intentionally: padding-failure detail is a known side-channel
     // (cf. Vaudenay padding-oracle attacks); collapse to a generic reason.
     let written = decryptor
-        .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut out)
+        .decrypt_padded_b2b::<Pkcs7>(ct, &mut out)
         .map_err(|_err| Error::DecryptFailed { reason: "data" })?
         .len();
     out.truncate(written);
@@ -364,7 +348,9 @@ where
     })?;
     cipher
         .decrypt(
-            aes_gcm::Nonce::from_slice(nonce_bytes),
+            nonce_bytes
+                .try_into()
+                .map_err(|_err| Error::DecryptFailed { reason: "data" })?,
             Payload {
                 msg: ct_with_tag,
                 aad: &[],
@@ -550,7 +536,7 @@ mod tests {
 
     #[test]
     fn outbound_rsa_oaep_declares_the_mgf_it_actually_used() {
-        // `wrap_session_key` builds the padding with `Oaep::new::<Sha256>()`,
+        // `wrap_session_key` builds the padding with `Oaep::<Sha256>::new()`,
         // which uses SHA-256 for the MGF1 hash too. Declaring `mgf1sha1` would
         // misdescribe the ciphertext, so a peer honouring the declaration
         // derives the wrong mask and cannot unwrap the session key.
@@ -965,6 +951,80 @@ mod tests {
         let decrypted = decrypt_encrypted_assertion(&encrypted, &[&wrong, &right], &policy)
             .expect("rotation must find the matching key");
         assert_eq!(decrypted.qname().local(), "Assertion");
+    }
+
+    #[cfg(feature = "weak-algos")]
+    #[test]
+    fn pkcs1v15_rotation_wrong_rsa_then_matching_key() {
+        use pkcs8::EncodePrivateKey as _;
+
+        let wrong_rsa = rsa::PrivateKey::new(&mut rand::rngs::SysRng, 2048)
+            .expect("generate unrelated RSA key");
+        let wrong_der = wrong_rsa.to_pkcs8_der().unwrap();
+        let wrong = KeyPair::from_pkcs8_der(wrong_der.as_bytes()).unwrap();
+        let right = rsa_keypair();
+        for data_algorithm in [
+            DataEncryptionAlgorithm::Aes256Gcm,
+            DataEncryptionAlgorithm::Aes256Cbc,
+        ] {
+            let encrypted = encrypt_assertion(
+                &sample_assertion(),
+                &rsa_cert(),
+                data_algorithm,
+                KeyTransportAlgorithm::RsaOaep,
+            )
+            .expect("encrypt");
+            // Outbound v1.5 is intentionally unsupported. Rewrap the OAEP
+            // fixture's session key to exercise legacy inbound transport.
+            let encrypted_data = encrypted
+                .child_element(Some(XENC_NS), "EncryptedData")
+                .unwrap();
+            let key_info = encrypted_data
+                .child_element(Some(DS_NS), "KeyInfo")
+                .unwrap();
+            let encrypted_key = key_info
+                .child_element(Some(XENC_NS), "EncryptedKey")
+                .unwrap();
+            let wrapped = extract_cipher_value(encrypted_key).unwrap();
+            let session_key = right
+                .decrypt_rsa_oaep(&wrapped, OaepDigest::Sha256, OaepDigest::Sha256)
+                .unwrap();
+            use pkcs8::DecodePrivateKey as _;
+            let private =
+                rsa::PrivateKey::from_pkcs8_pem(std::str::from_utf8(RSA_KEY_PKCS8_PEM).unwrap())
+                    .unwrap();
+            let wrapped_v15 = private
+                .to_public_key()
+                .encrypt(&mut rand::rngs::SysRng, rsa::Pkcs1v15Encrypt, &session_key)
+                .unwrap();
+            let xml = emit_element(&encrypted)
+                .unwrap()
+                .replace(
+                    &BASE64_STANDARD.encode(&wrapped),
+                    &BASE64_STANDARD.encode(&wrapped_v15),
+                )
+                .replace(
+                    KeyTransportAlgorithm::RsaOaep.uri(),
+                    KeyTransportAlgorithm::RsaPkcs1V15.uri(),
+                );
+            let document = Document::parse(xml.as_bytes()).unwrap();
+            let encrypted = document.root();
+            let policy = policy_allowing(data_algorithm, KeyTransportAlgorithm::RsaPkcs1V15);
+            let decrypted = decrypt_encrypted_assertion(encrypted, &[&wrong, &right], &policy)
+                .expect("rotation must reach matching RSA key");
+            assert_eq!(
+                emit_element(&decrypted).unwrap(),
+                emit_element(&sample_assertion()).unwrap()
+            );
+            let error = decrypt_encrypted_assertion(encrypted, &[&wrong, &wrong], &policy)
+                .expect_err("all wrong RSA keys must reject");
+            assert!(matches!(
+                error,
+                Error::DecryptFailed {
+                    reason: "key transport"
+                }
+            ));
+        }
     }
 
     #[test]

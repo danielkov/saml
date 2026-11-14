@@ -22,7 +22,7 @@
 //! mismatches would invite test-coverage gaps.
 
 use pkcs8::DecodePrivateKey;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey as RsaPrivateKey;
 use sha2::{Sha256, Sha384, Sha512};
 use std::str;
 use zeroize::ZeroizeOnDrop;
@@ -363,7 +363,7 @@ impl KeyPair {
                 sign_rsa::<sha1::Sha1>(&secret.key, signed_bytes)
             }
             (KeyPairInner::EcdsaP256(secret), SignatureAlgorithm::EcdsaSha256) => {
-                use signature::Signer as _;
+                use ecdsa::signature::Signer as _;
                 let sig: p256::ecdsa::Signature =
                     secret.key.try_sign(signed_bytes).map_err(|_e| {
                         Error::SignatureVerification {
@@ -373,7 +373,7 @@ impl KeyPair {
                 Ok(sig.to_bytes().to_vec())
             }
             (KeyPairInner::EcdsaP384(secret), SignatureAlgorithm::EcdsaSha384) => {
-                use signature::Signer as _;
+                use ecdsa::signature::Signer as _;
                 let sig: p384::ecdsa::Signature =
                     secret.key.try_sign(signed_bytes).map_err(|_e| {
                         Error::SignatureVerification {
@@ -427,17 +427,14 @@ impl KeyPair {
 
     /// RSA-PKCS1-v1.5 key transport unwrap. Used only for legacy interop with
     /// IdPs that still send `<xenc:EncryptionMethod
-    /// Algorithm=".../rsa-1_5">` payloads. Every internal failure mode
-    /// (padding error, length error, downstream RSA error) is folded into a
-    /// single `Error::DecryptFailed { reason: "key transport" }` so the
-    /// returned error does not leak chosen-ciphertext-distinguishable
-    /// information to the attacker. See RFC-002 §7.3.
+    /// Algorithm=".../rsa-1_5">` payloads. RSA errors are folded into a
+    /// single `Error::DecryptFailed { reason: "key transport" }` rather than
+    /// exposing per-key failure details. See RFC-002 §7.3.
     ///
-    /// Bleichenbacher hardening at the boundary relies on the `rsa` crate's
-    /// `Pkcs1v15Encrypt` decrypter, which is documented to perform constant-
-    /// time padding validation. The shape of this method (no separate
-    /// "padding error" return, no early returns based on internal state) keeps
-    /// callers from accidentally surfacing a side-channel.
+    /// Bleichenbacher hardening relies on the `rsa` crate's implicit rejection:
+    /// invalid padding yields synthetic plaintext rather than a padding error.
+    /// Callers must authenticate the decrypted payload; all actual RSA errors
+    /// are still folded into the same key-transport error.
     #[cfg(all(feature = "xmlenc", feature = "weak-algos"))]
     pub fn decrypt_rsa_pkcs1v15(&self, ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
         let KeyPairInner::Rsa(secret) = &self.inner else {
@@ -454,62 +451,106 @@ impl KeyPair {
     }
 }
 
-/// Build an `rsa::Oaep` padding with independently-selected OAEP label and
-/// MGF1 hashes, per XML Encryption 1.1 §5.5.2.
-///
-/// SHA-1 in either position requires `weak-algos`; without it the request is
-/// refused rather than served with a different hash.
+/// Runtime selection of independently typed OAEP and MGF1 hashes.
+#[cfg(feature = "xmlenc")]
+pub(crate) struct OaepPadding {
+    oaep_digest: OaepDigest,
+    mgf1_digest: OaepDigest,
+}
+
+// Instantiate concrete padding at the operation boundary: RSA 0.10 requires
+// digest type parameters, but the wire selects the two hashes independently.
+#[cfg(feature = "xmlenc")]
+macro_rules! dispatch_oaep {
+    ($selection:expr, |$padding:ident| $operation:expr) => {{
+        macro_rules! with_mgf_hash {
+            ($oaep:ty) => {
+                match $selection.mgf1_digest {
+                    #[cfg(feature = "weak-algos")]
+                    OaepDigest::Sha1 => {
+                        let $padding = rsa::Oaep::<$oaep, sha1::Sha1>::new_with_mgf_hash();
+                        $operation
+                    }
+                    #[cfg(not(feature = "weak-algos"))]
+                    OaepDigest::Sha1 => Err(rsa::Error::InvalidPaddingScheme),
+                    OaepDigest::Sha256 => {
+                        let $padding = rsa::Oaep::<$oaep, Sha256>::new_with_mgf_hash();
+                        $operation
+                    }
+                    OaepDigest::Sha384 => {
+                        let $padding = rsa::Oaep::<$oaep, Sha384>::new_with_mgf_hash();
+                        $operation
+                    }
+                    OaepDigest::Sha512 => {
+                        let $padding = rsa::Oaep::<$oaep, Sha512>::new_with_mgf_hash();
+                        $operation
+                    }
+                }
+            };
+        }
+        match $selection.oaep_digest {
+            #[cfg(feature = "weak-algos")]
+            OaepDigest::Sha1 => with_mgf_hash!(sha1::Sha1),
+            #[cfg(not(feature = "weak-algos"))]
+            OaepDigest::Sha1 => Err(rsa::Error::InvalidPaddingScheme),
+            OaepDigest::Sha256 => with_mgf_hash!(Sha256),
+            OaepDigest::Sha384 => with_mgf_hash!(Sha384),
+            OaepDigest::Sha512 => with_mgf_hash!(Sha512),
+        }
+    }};
+}
+
+#[cfg(feature = "xmlenc")]
+impl rsa::traits::PaddingScheme for OaepPadding {
+    fn decrypt<R: rsa::rand_core::TryCryptoRng + ?Sized>(
+        self,
+        rng: Option<&mut R>,
+        key: &RsaPrivateKey,
+        ciphertext: &[u8],
+    ) -> rsa::Result<Vec<u8>> {
+        dispatch_oaep!(self, |padding| padding.decrypt(rng, key, ciphertext))
+    }
+
+    fn encrypt<R: rsa::rand_core::TryCryptoRng + ?Sized>(
+        self,
+        rng: &mut R,
+        key: &rsa::PublicKey,
+        plaintext: &[u8],
+    ) -> rsa::Result<Vec<u8>> {
+        dispatch_oaep!(self, |padding| padding.encrypt(rng, key, plaintext))
+    }
+}
+
+/// Select OAEP label and MGF1 hashes independently, per XML Encryption 1.1 §5.5.2.
+/// SHA-1 in either position requires `weak-algos`.
 #[cfg(feature = "xmlenc")]
 #[cfg_attr(
     feature = "weak-algos",
     expect(
         clippy::unnecessary_wraps,
-        reason = "the error arms are the not(weak-algos) build, where SHA-1 OAEP/MGF1 \
-                  cannot be constructed; the signature is stable across both builds"
+        reason = "SHA-1 is rejected without weak-algos"
     )
 )]
 pub(crate) fn oaep_padding(
     oaep_digest: OaepDigest,
     mgf1_digest: OaepDigest,
-) -> Result<rsa::Oaep, Error> {
-    macro_rules! with_mgf_hash {
-        ($oaep:ty) => {
-            match mgf1_digest {
-                OaepDigest::Sha1 => {
-                    #[cfg(feature = "weak-algos")]
-                    {
-                        rsa::Oaep::new_with_mgf_hash::<$oaep, sha1::Sha1>()
-                    }
-                    #[cfg(not(feature = "weak-algos"))]
-                    {
-                        return Err(Error::DisallowedAlgorithm {
-                            alg: "RSA-OAEP MGF1-SHA1 requires the weak-algos feature".into(),
-                        });
-                    }
-                }
-                OaepDigest::Sha256 => rsa::Oaep::new_with_mgf_hash::<$oaep, Sha256>(),
-                OaepDigest::Sha384 => rsa::Oaep::new_with_mgf_hash::<$oaep, Sha384>(),
-                OaepDigest::Sha512 => rsa::Oaep::new_with_mgf_hash::<$oaep, Sha512>(),
-            }
-        };
-    }
-
-    Ok(match oaep_digest {
-        OaepDigest::Sha1 => {
-            #[cfg(feature = "weak-algos")]
-            {
-                with_mgf_hash!(sha1::Sha1)
-            }
-            #[cfg(not(feature = "weak-algos"))]
-            {
-                return Err(Error::DisallowedAlgorithm {
-                    alg: "RSA-OAEP-SHA1 requires the weak-algos feature".into(),
-                });
-            }
+) -> Result<OaepPadding, Error> {
+    #[cfg(not(feature = "weak-algos"))]
+    {
+        if oaep_digest == OaepDigest::Sha1 {
+            return Err(Error::DisallowedAlgorithm {
+                alg: "RSA-OAEP-SHA1 requires the weak-algos feature".into(),
+            });
         }
-        OaepDigest::Sha256 => with_mgf_hash!(Sha256),
-        OaepDigest::Sha384 => with_mgf_hash!(Sha384),
-        OaepDigest::Sha512 => with_mgf_hash!(Sha512),
+        if mgf1_digest == OaepDigest::Sha1 {
+            return Err(Error::DisallowedAlgorithm {
+                alg: "RSA-OAEP MGF1-SHA1 requires the weak-algos feature".into(),
+            });
+        }
+    }
+    Ok(OaepPadding {
+        oaep_digest,
+        mgf1_digest,
     })
 }
 
@@ -557,6 +598,103 @@ mod tests {
     fn ec_p256_pkcs8_pem_parses() {
         let kp = KeyPair::from_pkcs8_pem(EC_P256_KEY_PKCS8_PEM).expect("parse P-256 PKCS#8");
         assert_eq!(kp.algorithm_family(), PublicKeyAlgorithm::EcdsaP256);
+    }
+
+    #[test]
+    fn ec_pkcs8_encodings_preserve_signing_and_public_keys() {
+        use pkcs8::{EncodePrivateKey as _, LineEnding};
+        use spki::EncodePublicKey as _;
+
+        macro_rules! check_curve {
+            ($curve:ident, $scalar:expr, $family:ident, $algorithm:ident, $width:expr) => {{
+                let signing = $curve::ecdsa::SigningKey::from_slice(&$scalar)
+                    .expect("valid deterministic scalar");
+                let der = signing.to_pkcs8_der().expect("encode PKCS#8 DER");
+                let pem = signing
+                    .to_pkcs8_pem(LineEnding::LF)
+                    .expect("encode PKCS#8 PEM");
+                let spki = signing
+                    .verifying_key()
+                    .to_public_key_der()
+                    .expect("encode SPKI");
+                let public = PublicKey::from_spki_der(spki.as_bytes()).expect("parse SPKI");
+                assert_eq!(public.algorithm_family(), PublicKeyAlgorithm::$family);
+                let algorithm = SignatureAlgorithm::$algorithm;
+                let payload = b"EC migration regression";
+
+                for key in [
+                    KeyPair::from_pkcs8_der(der.as_bytes()).expect("parse EC PKCS#8 DER"),
+                    KeyPair::from_pkcs8_pem(pem.as_bytes()).expect("parse EC PKCS#8 PEM"),
+                ] {
+                    assert_eq!(key.algorithm_family(), PublicKeyAlgorithm::$family);
+                    let raw = key.sign(algorithm, payload).expect("sign EC payload");
+                    assert_eq!(raw.len(), $width, "XMLDSig requires fixed-width r || s");
+                    let signature =
+                        $curve::ecdsa::Signature::from_slice(&raw).expect("fixed-width signature");
+                    let der_signature = signature.to_der();
+                    for encoded in [raw.as_slice(), der_signature.as_bytes()] {
+                        public
+                            .verify_signature(algorithm, payload, encoded)
+                            .expect("verify SPKI key");
+                        key.public_key()
+                            .verify_signature(algorithm, payload, encoded)
+                            .expect("verify derived public key");
+                        assert!(matches!(
+                            public.verify_signature(algorithm, b"tampered payload", encoded),
+                            Err(Error::SignatureVerification { .. })
+                        ));
+                        let mut tampered = encoded.to_vec();
+                        let last = tampered.len() - 1;
+                        tampered[last] ^= 1;
+                        assert!(matches!(
+                            public.verify_signature(algorithm, payload, &tampered),
+                            Err(Error::SignatureVerification { .. })
+                        ));
+                    }
+                }
+            }};
+        }
+        check_curve!(p256, [7; 32], EcdsaP256, EcdsaSha256, 64);
+        check_curve!(p384, [11; 48], EcdsaP384, EcdsaSha384, 96);
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn oaep_digest_and_mgf_uris_round_trip_without_cross_acceptance() {
+        for digest in [
+            OaepDigest::Sha1,
+            OaepDigest::Sha256,
+            OaepDigest::Sha384,
+            OaepDigest::Sha512,
+        ] {
+            assert_eq!(OaepDigest::from_uri(digest.uri()).unwrap(), digest);
+            assert_eq!(
+                OaepDigest::from_mgf1_uri(digest.mgf1_uri()).unwrap(),
+                digest
+            );
+            assert!(
+                matches!(OaepDigest::from_uri(digest.mgf1_uri()), Err(Error::DisallowedAlgorithm { alg }) if alg == digest.mgf1_uri())
+            );
+            assert!(
+                matches!(OaepDigest::from_mgf1_uri(digest.uri()), Err(Error::DisallowedAlgorithm { alg }) if alg == digest.uri())
+            );
+        }
+        assert_eq!(
+            OaepDigest::from_uri("http://www.w3.org/2001/04/xmlenc#sha384").unwrap(),
+            OaepDigest::Sha384
+        );
+        for uri in [
+            "",
+            "http://www.w3.org/2009/xmlenc11#mgf1sha224",
+            "urn:unsupported",
+        ] {
+            assert!(
+                matches!(OaepDigest::from_uri(uri), Err(Error::DisallowedAlgorithm { alg }) if alg == uri)
+            );
+            assert!(
+                matches!(OaepDigest::from_mgf1_uri(uri), Err(Error::DisallowedAlgorithm { alg }) if alg == uri)
+            );
+        }
     }
 
     #[test]
@@ -613,9 +751,9 @@ mod tests {
 
     #[test]
     fn with_certificate_rejects_same_family_mismatched_key() {
-        use rsa::rand_core::OsRng;
+        use rand::rngs::SysRng;
 
-        let unrelated = RsaPrivateKey::new(&mut OsRng, 1024).expect("generate unrelated RSA key");
+        let unrelated = RsaPrivateKey::new(&mut SysRng, 1024).expect("generate unrelated RSA key");
         let kp = KeyPair::from_rsa_private_key(unrelated).expect("wrap unrelated RSA key");
         let cert = X509Certificate::from_pem(RSA_CERT_PEM).expect("parse RSA certificate");
 
@@ -695,6 +833,89 @@ mod tests {
             .sign(SignatureAlgorithm::EcdsaSha384, b"x")
             .expect_err("P-256 with SHA-384 is not a supported pairing");
         assert!(matches!(err, Error::DisallowedAlgorithm { .. }));
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn rsa_oaep_dispatch_matches_each_independent_digest_pair() {
+        let pem = std::str::from_utf8(RSA_KEY_PKCS8_PEM).expect("ASCII PEM");
+        let private = RsaPrivateKey::from_pkcs8_pem(pem).expect("parse fixture");
+        let public = rsa::PublicKey::from(&private);
+        let keypair = KeyPair::from_pkcs8_pem(RSA_KEY_PKCS8_PEM).expect("parse keypair");
+        let plaintext = b"session key";
+        let mut rng = rand::rngs::SysRng;
+
+        macro_rules! check_pair {
+            ($digest:ident, $digest_type:ty, $mgf:ident, $mgf_type:ty) => {{
+                // Encrypt with concrete upstream types, independent of our runtime dispatch.
+                let ciphertext = public
+                    .encrypt(
+                        &mut rng,
+                        rsa::Oaep::<$digest_type, $mgf_type>::new_with_mgf_hash(),
+                        plaintext,
+                    )
+                    .expect("encrypt OAEP");
+                assert_eq!(
+                    keypair
+                        .decrypt_rsa_oaep(&ciphertext, OaepDigest::$digest, OaepDigest::$mgf)
+                        .expect("decrypt matching OAEP/MGF1 pair"),
+                    plaintext,
+                    "OAEP {:?}, MGF1 {:?}",
+                    OaepDigest::$digest,
+                    OaepDigest::$mgf,
+                );
+                let ciphertext = public
+                    .encrypt(
+                        &mut rng,
+                        oaep_padding(OaepDigest::$digest, OaepDigest::$mgf)
+                            .expect("select OAEP parameters"),
+                        plaintext,
+                    )
+                    .expect("encrypt with runtime dispatch");
+                assert_eq!(
+                    private
+                        .decrypt(
+                            rsa::Oaep::<$digest_type, $mgf_type>::new_with_mgf_hash(),
+                            &ciphertext,
+                        )
+                        .expect("decrypt with concrete upstream types"),
+                    plaintext,
+                );
+            }};
+        }
+        macro_rules! check_mgf_hashes {
+            ($digest:ident, $digest_type:ty) => {
+                check_pair!($digest, $digest_type, Sha256, Sha256);
+                check_pair!($digest, $digest_type, Sha384, Sha384);
+                check_pair!($digest, $digest_type, Sha512, Sha512);
+                #[cfg(feature = "weak-algos")]
+                check_pair!($digest, $digest_type, Sha1, sha1::Sha1);
+            };
+        }
+        check_mgf_hashes!(Sha256, Sha256);
+        check_mgf_hashes!(Sha384, Sha384);
+        check_mgf_hashes!(Sha512, Sha512);
+        #[cfg(feature = "weak-algos")]
+        check_mgf_hashes!(Sha1, sha1::Sha1);
+
+        let ciphertext = public
+            .encrypt(
+                &mut rng,
+                rsa::Oaep::<Sha384, Sha512>::new_with_mgf_hash(),
+                plaintext,
+            )
+            .expect("encrypt mixed digest pair");
+        for (digest, mgf) in [
+            (OaepDigest::Sha256, OaepDigest::Sha512),
+            (OaepDigest::Sha384, OaepDigest::Sha256),
+        ] {
+            assert!(matches!(
+                keypair.decrypt_rsa_oaep(&ciphertext, digest, mgf),
+                Err(Error::DecryptFailed {
+                    reason: "key transport"
+                })
+            ));
+        }
     }
 
     #[test]

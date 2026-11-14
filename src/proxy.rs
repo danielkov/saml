@@ -11,7 +11,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
-use rand::RngCore as _;
+use rand::Rng as _;
 use sha2::Sha256;
 
 use crate::attribute::Attribute;
@@ -378,7 +378,7 @@ impl ProxyContextCodec for Aes256GcmCodec {
         // Random 12-byte nonce.
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+        let nonce = &aes_gcm::Nonce::from(nonce_bytes);
 
         let ct_with_tag = cipher
             .encrypt(
@@ -418,7 +418,11 @@ impl ProxyContextCodec for Aes256GcmCodec {
             })?;
         let plaintext = cipher
             .decrypt(
-                aes_gcm::Nonce::from_slice(nonce_bytes),
+                nonce_bytes
+                    .try_into()
+                    .map_err(|_err| Error::DecryptFailed {
+                        reason: "proxy context",
+                    })?,
                 Payload {
                     msg: ct_with_tag,
                     aad: &[],
@@ -1437,7 +1441,7 @@ impl NameIdTransform for PersistentPerSpHmac {
         _upstream_attributes: &[Attribute],
         downstream_sp: &SpDescriptor,
     ) -> Result<NameId, Error> {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.key).map_err(|_err| {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.key).map_err(|_err| {
             Error::InvalidConfiguration {
                 reason: "HMAC-SHA256 key size mismatch",
             }
