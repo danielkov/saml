@@ -13,10 +13,11 @@ use std::time::{Duration, SystemTime};
 #[cfg(test)]
 use crate::authn_context::{AuthnContextClassRef, AuthnContextComparison};
 use crate::authn_context::{ComparatorOutcome, RequestedAuthnContext, StandardComparator};
+use crate::binding::SsoResponseEndpoint;
 #[cfg(any(test, feature = "xmlenc"))]
 use crate::crypto::keypair::KeyPair;
 use crate::crypto::verifier::SignatureVerifier;
-use crate::descriptor::IdpDescriptor;
+use crate::descriptor::{IdpDescriptor, SpDescriptor};
 use crate::dsig::algorithms::PeerCryptoPolicy;
 use crate::dsig::reference::DS_NS;
 use crate::dsig::verify::{VerifiedSignature, verify_signature_with};
@@ -216,9 +217,100 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     )? {
         assertion.subject_name_id = name_id;
     }
-    if assertion.issuer != idp.entity_id {
+    // --- Steps 11b–16: issuer, Conditions window, audience, confirmation ----
+    let windows = check_assertion(
+        &assertion,
+        &AssertionChecks {
+            issuer_entity_id: &idp.entity_id,
+            audience: sp_entity_id,
+            delivery: ConfirmationDelivery::Received {
+                destination: expected_destination,
+                tracker_request_id,
+            },
+            now,
+            clock_skew,
+            holder_of_key_cert,
+        },
+    )?;
+
+    // --- Step 17: AuthnContext non-downgrade ---------------------------------
+    if let Some(req) = requested_authn_context {
+        let first = assertion
+            .authn_statements
+            .first()
+            .ok_or(Error::AuthnContextDowngrade)?;
+        let actual_uri = first
+            .authn_context_class_ref
+            .as_deref()
+            .ok_or(Error::AuthnContextDowngrade)?;
+        check_authn_context(req, actual_uri)?;
+    }
+
+    // --- Step 18: extract Identity -------------------------------------------
+    into_identity(
+        assertion,
+        windows,
+        verified_cert_fingerprint,
+        now,
+        clock_skew,
+    )
+}
+
+// =============================================================================
+// Assertion-level checks shared by the Response path and the issuer path
+// =============================================================================
+
+/// How a `<saml:SubjectConfirmation>`'s delivery constraints are checked.
+#[derive(Clone, Copy)]
+enum ConfirmationDelivery<'a> {
+    /// A relying party consuming the assertion at `destination`: `Recipient`
+    /// must equal it, and `InResponseTo` must correlate with the tracker.
+    Received {
+        destination: &'a str,
+        tracker_request_id: Option<&'a str>,
+    },
+    /// The issuer re-checking an assertion it issued: `Recipient` must be one
+    /// of the audience SP's registered ACS URLs. `InResponseTo` is not
+    /// correlated, because the issuer holds no request tracker.
+    Issued {
+        recipients: &'a [SsoResponseEndpoint],
+    },
+}
+
+struct AssertionChecks<'a> {
+    issuer_entity_id: &'a str,
+    /// Entity ID every `<saml:AudienceRestriction>` must admit.
+    audience: &'a str,
+    delivery: ConfirmationDelivery<'a>,
+    now: SystemTime,
+    clock_skew: Duration,
+    holder_of_key_cert: Option<&'a crate::crypto::cert::X509Certificate>,
+}
+
+/// The two expiry instants [`check_assertion`] established.
+struct AssertionWindows {
+    conditions_not_on_or_after: SystemTime,
+    subject_confirmation_not_on_or_after: SystemTime,
+}
+
+/// Issuer, `Conditions` window, audience, and subject confirmation for an
+/// assertion whose signature has already been verified.
+fn check_assertion(
+    assertion: &ParsedAssertion,
+    checks: &AssertionChecks<'_>,
+) -> Result<AssertionWindows, Error> {
+    let AssertionChecks {
+        issuer_entity_id,
+        audience,
+        delivery,
+        now,
+        clock_skew,
+        holder_of_key_cert,
+    } = *checks;
+
+    if assertion.issuer != issuer_entity_id {
         return Err(Error::IssuerMismatch {
-            expected: idp.entity_id.clone(),
+            expected: issuer_entity_id.to_owned(),
             got: Some(assertion.issuer.clone()),
         });
     }
@@ -243,7 +335,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         return Err(Error::Expired);
     }
 
-    // --- Step 14: every AudienceRestriction MUST admit this SP ---------------
+    // --- Step 14: every AudienceRestriction MUST admit the audience ----------
     // Audiences within one restriction are alternatives (OR), but multiple
     // restrictions are conjunctive (AND), per SAML Core §2.5.1.4. Flattening
     // the groups would accept an assertion that a second restriction excludes.
@@ -253,7 +345,7 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
             .conditions
             .audience_restrictions
             .iter()
-            .any(|restriction| !restriction.iter().any(|audience| audience == sp_entity_id))
+            .any(|restriction| !restriction.iter().any(|candidate| candidate == audience))
     {
         return Err(Error::AudienceMismatch);
     }
@@ -264,32 +356,26 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // bearer confirmation satisfies on its SubjectConfirmationData constraints
     // alone; a Holder-of-Key confirmation additionally requires the presenter
     // key to match its `<ds:KeyInfo>` (SAML V2.0 HoK SSO Profile).
-    let selected_confirmation = find_valid_subject_confirmation(
-        &assertion,
-        expected_destination,
-        tracker_request_id,
-        now,
-        clock_skew,
-        holder_of_key_cert,
-    )?;
+    let selected_confirmation =
+        find_valid_subject_confirmation(assertion, delivery, now, clock_skew, holder_of_key_cert)?;
     let subject_confirmation_not_on_or_after = selected_confirmation
         .not_on_or_after
         .ok_or(Error::Expired)?;
 
-    // --- Step 17: AuthnContext non-downgrade ---------------------------------
-    if let Some(req) = requested_authn_context {
-        let first = assertion
-            .authn_statements
-            .first()
-            .ok_or(Error::AuthnContextDowngrade)?;
-        let actual_uri = first
-            .authn_context_class_ref
-            .as_deref()
-            .ok_or(Error::AuthnContextDowngrade)?;
-        check_authn_context(req, actual_uri)?;
-    }
+    Ok(AssertionWindows {
+        conditions_not_on_or_after,
+        subject_confirmation_not_on_or_after,
+    })
+}
 
-    // --- Step 18: extract Identity -------------------------------------------
+/// Build the [`Identity`] from an assertion that passed [`check_assertion`].
+fn into_identity(
+    assertion: ParsedAssertion,
+    windows: AssertionWindows,
+    verified_cert_fingerprint: [u8; 32],
+    now: SystemTime,
+    clock_skew: Duration,
+) -> Result<Identity, Error> {
     let (session_index, authn_instant, session_not_on_or_after, authn_context_class_ref) =
         match assertion.authn_statements.first() {
             Some(s) => (
@@ -322,14 +408,154 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         session_index,
         authn_instant,
         session_not_on_or_after,
-        subject_confirmation_not_on_or_after,
+        windows.subject_confirmation_not_on_or_after,
         authn_context_class_ref,
         assertion.attributes,
         assertion.id,
-        conditions_not_on_or_after,
+        windows.conditions_not_on_or_after,
         verified_cert_fingerprint,
         assertion.conditions.one_time_use,
     ))
+}
+
+// =============================================================================
+// Issuer-side verification of a standalone assertion (RFC-004 §3.3)
+// =============================================================================
+
+pub(crate) struct ValidateIssuedAssertion<'a> {
+    /// Document whose root is the `<saml:Assertion>`.
+    pub document: &'a Document,
+    /// The issuing IdP's own entity ID.
+    pub issuer_entity_id: &'a str,
+    /// The IdP's own signing certificates: the current one plus any retired
+    /// ones the caller still trusts.
+    pub signing_certs: &'a [crate::crypto::cert::X509Certificate],
+    pub crypto_policy: &'a PeerCryptoPolicy,
+    pub verifier: &'a dyn SignatureVerifier,
+    /// The SP the assertion must have been issued to.
+    pub sp: &'a SpDescriptor,
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+}
+
+/// Verify a standalone `<saml:Assertion>` on behalf of the IdP that issued it.
+///
+/// The same structural rule as the Response path applies: the payload is read
+/// only from `verified.signed_element`, and that element must be the document
+/// root.
+pub(crate) fn validate_issued_assertion(
+    input: ValidateIssuedAssertion<'_>,
+) -> Result<Identity, Error> {
+    let ValidateIssuedAssertion {
+        document,
+        issuer_entity_id,
+        signing_certs,
+        crypto_policy,
+        verifier,
+        sp,
+        now,
+        clock_skew,
+    } = input;
+
+    let root = document.root();
+    if root.qname().namespace() != Some(SAML_NS) || root.qname().local() != "Assertion" {
+        return Err(Error::XmlParse(format!(
+            "expected <saml:Assertion> root, got {{{}}}{}",
+            root.qname().namespace().unwrap_or(""),
+            root.qname().local()
+        )));
+    }
+
+    // The assertion's own signature is the only one this path relies on, so it
+    // is the only one allowed to exist. A second `<ds:Signature>` anywhere
+    // else in the tree is a wrapping attempt.
+    let signature = sole_root_signature(root)?;
+    let verified =
+        verify_signature_with(document, signature, signing_certs, crypto_policy, verifier)?;
+    if verified.signed_element != root.id() {
+        return Err(Error::SignatureVerification {
+            reason: "signature does not cover Assertion",
+        });
+    }
+    let assertion_element =
+        document
+            .element(verified.signed_element)
+            .ok_or(Error::SignatureVerification {
+                reason: "verified assertion element id not resolvable",
+            })?;
+
+    // An `<saml:EncryptedID>` is encrypted to the SP. The issuer holds no key
+    // for it, so the subject cannot be established. Fail rather than return
+    // the parser's placeholder NameID.
+    #[cfg(feature = "xmlenc")]
+    if assertion_element
+        .child_element(Some(SAML_NS), "Subject")
+        .is_some_and(|subject| {
+            subject.child_element(Some(SAML_NS), "NameID").is_none()
+                && subject
+                    .child_element(Some(SAML_NS), "EncryptedID")
+                    .is_some()
+        })
+    {
+        return Err(Error::DecryptFailed {
+            reason: "Subject <saml:EncryptedID> is encrypted to the SP and cannot be read by the issuer",
+        });
+    }
+
+    let assertion = parse_assertion(assertion_element)?;
+    let windows = check_assertion(
+        &assertion,
+        &AssertionChecks {
+            issuer_entity_id,
+            audience: &sp.entity_id,
+            delivery: ConfirmationDelivery::Issued {
+                recipients: &sp.assertion_consumer_services,
+            },
+            now,
+            clock_skew,
+            // Holder-of-Key needs the presenter's TLS certificate, which this
+            // path does not take. Only bearer confirmations are usable.
+            holder_of_key_cert: None,
+        },
+    )?;
+    into_identity(
+        assertion,
+        windows,
+        verified.verifying_cert_fingerprint,
+        now,
+        clock_skew,
+    )
+}
+
+/// Return the root's single `<ds:Signature>` child, rejecting a document that
+/// carries any other `<ds:Signature>`.
+fn sole_root_signature(root: &Element) -> Result<&Element, Error> {
+    fn has_signature_below(element: &Element) -> bool {
+        element.child_elements().any(|child| {
+            let is_signature =
+                child.qname().namespace() == Some(DS_NS) && child.qname().local() == "Signature";
+            is_signature || has_signature_below(child)
+        })
+    }
+
+    let mut signature = None;
+    for child in root.child_elements() {
+        if child.qname().namespace() == Some(DS_NS) && child.qname().local() == "Signature" {
+            if signature.is_some() {
+                return Err(Error::SignatureVerification {
+                    reason: "more than one ds:Signature on Assertion",
+                });
+            }
+            // Not descended into: the signature's own subtree is covered by
+            // signature verification, not by this positional check.
+            signature = Some(child);
+        } else if has_signature_below(child) {
+            return Err(Error::SignatureVerification {
+                reason: "ds:Signature in disallowed position",
+            });
+        }
+    }
+    signature.ok_or(Error::SignatureMissing)
 }
 
 // =============================================================================
@@ -607,8 +833,7 @@ fn handle_encrypted(
 
 fn find_valid_subject_confirmation<'a>(
     assertion: &'a ParsedAssertion,
-    expected_destination: &str,
-    tracker_request_id: Option<&str>,
+    delivery: ConfirmationDelivery<'_>,
     now: SystemTime,
     clock_skew: Duration,
     holder_of_key_cert: Option<&crate::crypto::cert::X509Certificate>,
@@ -664,13 +889,17 @@ fn find_valid_subject_confirmation<'a>(
         .checked_add(clock_skew)
         .ok_or_else(|| Error::XmlParse("now + clock_skew overflows SystemTime".to_string()))?;
     for sc in &candidates {
-        // Recipient must match the expected destination.
-        match sc.recipient.as_deref() {
-            Some(r) if r == expected_destination => {}
-            _ => {
-                last_err = Some(Error::RecipientMismatch);
-                continue;
+        // Recipient must name where the assertion was (or was to be) delivered.
+        let recipient_ok = match (delivery, sc.recipient.as_deref()) {
+            (ConfirmationDelivery::Received { destination, .. }, Some(r)) => r == destination,
+            (ConfirmationDelivery::Issued { recipients }, Some(r)) => {
+                recipients.iter().any(|acs| acs.url == r)
             }
+            (_, None) => false,
+        };
+        if !recipient_ok {
+            last_err = Some(Error::RecipientMismatch);
+            continue;
         }
         // NotOnOrAfter must be present and in the future (within clock_skew).
         match sc.not_on_or_after {
@@ -687,17 +916,23 @@ fn find_valid_subject_confirmation<'a>(
             last_err = Some(Error::NotYetValid);
             continue;
         }
-        // InResponseTo mirrors response-level rule.
-        match (tracker_request_id, sc.in_response_to.as_deref()) {
-            (Some(tracker), Some(in_resp)) if tracker == in_resp => {}
-            (Some(_), _) => {
-                last_err = Some(Error::InResponseToMismatch);
-                continue;
-            }
-            (None, None) => {}
-            (None, Some(_)) => {
-                last_err = Some(Error::UnsolicitedNotAllowed);
-                continue;
+        // InResponseTo mirrors response-level rule. The issuer path skips it:
+        // there is no tracker to correlate against.
+        if let ConfirmationDelivery::Received {
+            tracker_request_id, ..
+        } = delivery
+        {
+            match (tracker_request_id, sc.in_response_to.as_deref()) {
+                (Some(tracker), Some(in_resp)) if tracker == in_resp => {}
+                (Some(_), _) => {
+                    last_err = Some(Error::InResponseToMismatch);
+                    continue;
+                }
+                (None, None) => {}
+                (None, Some(_)) => {
+                    last_err = Some(Error::UnsolicitedNotAllowed);
+                    continue;
+                }
             }
         }
         // Holder-of-Key: the SubjectConfirmationData constraints above are
@@ -1320,6 +1555,91 @@ mod tests {
     }
 
     // ---------- Tests ----------
+
+    /// Sign `assertion_xml` as a standalone document with the test IdP key.
+    #[cfg(feature = "xmlenc")]
+    fn sign_standalone_assertion(assertion_xml: &str) -> Document {
+        let unsigned = Document::parse(assertion_xml.as_bytes()).unwrap();
+        let signed = sign_element(
+            unsigned.root().clone(),
+            &unsigned,
+            SignOptions {
+                signing_key: &rsa_signing_key(),
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .unwrap();
+        let emitted = emit_document(&Document::new(signed).unwrap()).unwrap();
+        Document::parse(emitted.as_bytes()).unwrap()
+    }
+
+    /// The issuer holds no key for an `<saml:EncryptedID>`, so it must refuse
+    /// the assertion rather than surface the parser's placeholder NameID.
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn issued_assertion_with_encrypted_id_subject_is_rejected() {
+        let cleartext = emit_document(
+            &Document::new(build_assertion(&BuildAssertionFixture {
+                id: "_a1",
+                issuer: "https://idp.example.com",
+                recipient: "https://sp.example.com/acs",
+                in_response_to: None,
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T12:00:00Z",
+                not_on_or_after: "2026-05-26T12:10:00Z",
+                sc_not_on_or_after: "2026-05-26T12:05:00Z",
+                authn_context: "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+                name_id_value: "alice@example.com",
+                name_id_format_uri: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let start = cleartext.find("<saml:NameID").unwrap();
+        let close = "</saml:NameID>";
+        let end = cleartext.find(close).unwrap() + close.len();
+        let mut with_encrypted_id = cleartext.clone();
+        with_encrypted_id.replace_range(
+            start..end,
+            r#"<saml:EncryptedID><xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"/></saml:EncryptedID>"#,
+        );
+        let document = sign_standalone_assertion(&with_encrypted_id);
+
+        let sp = SpDescriptor {
+            entity_id: "https://sp.example.com".to_owned(),
+            assertion_consumer_services: vec![SsoResponseEndpoint::post(
+                "https://sp.example.com/acs",
+                0,
+                true,
+            )],
+            single_logout_services: vec![],
+            signing_certs: vec![],
+            encryption_certs: vec![],
+            supported_name_id_formats: vec![],
+            want_assertions_signed: true,
+            authn_requests_signed: false,
+            valid_until: None,
+            cache_duration: None,
+            #[cfg(feature = "idp-disco")]
+            discovery_response_endpoints: vec![],
+        };
+        let err = validate_issued_assertion(ValidateIssuedAssertion {
+            document: &document,
+            issuer_entity_id: "https://idp.example.com",
+            signing_certs: &fixture_idp().signing_certs,
+            crypto_policy: &strong_policy(),
+            verifier: &DefaultVerifier,
+            sp: &sp,
+            now: fixed_now(),
+            clock_skew: Duration::from_mins(2),
+        })
+        .expect_err("EncryptedID subject cannot be read by the issuer");
+        assert!(matches!(err, Error::DecryptFailed { .. }), "{err:?}");
+    }
 
     #[test]
     fn happy_path_validates_signed_assertion() {

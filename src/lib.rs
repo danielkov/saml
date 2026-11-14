@@ -438,7 +438,7 @@ pub use crate::binding::ecp::{
 pub use crate::idp::{
     AcsSelection, ConsumeAuthnRequest, ConsumeAuthnRequestWire, DetachedSignature,
     IdentityProvider, IdentityProviderConfig, IdpAssertionSigning, IssueErrorResponse,
-    IssueResponse, IssueUnsolicited, ParsedAuthnRequest,
+    IssueResponse, IssueUnsolicited, ParsedAuthnRequest, VerifyIssuedAssertion,
 };
 #[cfg(feature = "slo")]
 pub use crate::idp::{
