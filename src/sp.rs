@@ -2971,6 +2971,7 @@ mod tests {
     #[cfg(feature = "xmlenc")]
     #[test]
     fn encrypted_assertion_uses_configured_verifier() {
+        use crate::dsig::reference::DS_NS;
         use crate::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
         let kp = rsa_signing_key();
         let xml = build_signed_response_xml(
