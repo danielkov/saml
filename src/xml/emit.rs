@@ -187,14 +187,49 @@ pub(crate) fn emit_document(doc: &Document) -> Result<String, Error> {
 pub(crate) fn emit_element(element: &Element) -> Result<String, Error> {
     let mut out = String::new();
     let mut ns_stack: Vec<Vec<(Option<String>, String)>> = Vec::new();
-    emit_element_inner(element, &mut out, &mut ns_stack)?;
+    emit_element_inner(element, &mut out, &mut ns_stack, false)?;
     Ok(out)
+}
+
+/// Serialize a parsed element, writing each element and attribute name with
+/// the prefix the source document used.
+///
+/// [`emit_element`] picks any in-scope prefix bound to a name's namespace.
+/// That is well-formed, but when two prefixes are bound to the same namespace
+/// it can differ from the source, and canonicalization is prefix-sensitive:
+/// re-emitting signed XML that way can invalidate its signature. Use this
+/// function for a subtree whose signature has to survive serialization.
+///
+/// A recorded prefix is used only while it is still bound to the name's
+/// namespace. Otherwise, and for programmatically built elements that carry
+/// no prefix hint and no matching default namespace, resolution falls back to
+/// [`emit_element`]'s.
+pub(crate) fn emit_element_preserving_prefixes(element: &Element) -> Result<String, Error> {
+    let mut out = String::new();
+    let mut ns_stack: Vec<Vec<(Option<String>, String)>> = Vec::new();
+    emit_element_inner(element, &mut out, &mut ns_stack, true)?;
+    Ok(out)
+}
+
+/// The namespace `prefix` is bound to at this point in the stack, if any.
+/// `None` asks for the default namespace.
+fn namespace_bound_to<'a>(
+    prefix: Option<&str>,
+    ns_stack: &'a [Vec<(Option<String>, String)>],
+) -> Option<&'a str> {
+    ns_stack
+        .iter()
+        .rev()
+        .flat_map(|layer| layer.iter().rev())
+        .find(|(declared, _)| declared.as_deref() == prefix)
+        .map(|(_, uri)| uri.as_str())
 }
 
 fn emit_element_inner(
     element: &Element,
     out: &mut String,
     ns_stack: &mut Vec<Vec<(Option<String>, String)>>,
+    preserve_source_prefixes: bool,
 ) -> Result<(), Error> {
     // Push this element's namespace declarations onto the in-scope stack so
     // they're visible when resolving the element's own QName + attribute
@@ -203,8 +238,18 @@ fn emit_element_inner(
 
     // Open tag.
     out.push('<');
-    let elem_prefix: Option<String> =
-        resolve_prefix_for_emit(element.qname.namespace.as_deref(), ns_stack)?.map(str::to_owned);
+    let elem_namespace = element.qname.namespace.as_deref();
+    // The source wrote this name with `source_prefix` (`None` = unprefixed,
+    // through the default namespace). Keep that spelling while the binding
+    // still holds.
+    let source_spelling_holds = preserve_source_prefixes
+        && elem_namespace.is_some()
+        && namespace_bound_to(element.source_prefix.as_deref(), ns_stack) == elem_namespace;
+    let elem_prefix: Option<String> = if source_spelling_holds {
+        element.source_prefix.clone()
+    } else {
+        resolve_prefix_for_emit(elem_namespace, ns_stack)?.map(str::to_owned)
+    };
     write_qualified_name(out, elem_prefix.as_deref(), &element.qname.local);
 
     // Namespace declarations, in the order they were recorded.
@@ -225,9 +270,18 @@ fn emit_element_inner(
     // Attributes, in recorded order.
     for attr in &element.attributes {
         out.push(' ');
-        let attr_prefix: Option<String> =
-            resolve_prefix_for_attribute(attr.qname.namespace.as_deref(), ns_stack)?
-                .map(str::to_owned);
+        let attr_namespace = attr.qname.namespace.as_deref();
+        // An unprefixed attribute is in no namespace, so only a named source
+        // prefix can be kept.
+        let attr_source_prefix_holds = preserve_source_prefixes
+            && attr.source_prefix.is_some()
+            && attr_namespace.is_some()
+            && namespace_bound_to(attr.source_prefix.as_deref(), ns_stack) == attr_namespace;
+        let attr_prefix: Option<String> = if attr_source_prefix_holds {
+            attr.source_prefix.clone()
+        } else {
+            resolve_prefix_for_attribute(attr_namespace, ns_stack)?.map(str::to_owned)
+        };
         write_qualified_name(out, attr_prefix.as_deref(), &attr.qname.local);
         out.push_str("=\"");
         push_attr_escaped(out, &attr.value);
@@ -240,7 +294,9 @@ fn emit_element_inner(
         out.push('>');
         for child in &element.children {
             match child {
-                Node::Element(e) => emit_element_inner(e, out, ns_stack)?,
+                Node::Element(e) => {
+                    emit_element_inner(e, out, ns_stack, preserve_source_prefixes)?;
+                }
                 Node::Text(t) => push_text_escaped(out, t),
                 Node::Comment(c) => {
                     if c.contains("--") || c.ends_with('-') {

@@ -27,7 +27,7 @@ use crate::response::parse::{
     AssertionWrapper, ParsedAssertion, ParsedResponse, STATUS_SUCCESS, SUBJECT_CONFIRMATION_BEARER,
     SUBJECT_CONFIRMATION_HOLDER_OF_KEY, SubjectConfirmation, parse_assertion,
 };
-use crate::xml::emit::emit_element;
+use crate::xml::emit::emit_element_preserving_prefixes;
 use crate::xml::parse::{Document, Element, ElementId};
 
 pub(crate) struct ValidateResponse<'a> {
@@ -349,7 +349,9 @@ fn standalone_assertion(
     inherited.append(&mut assertion.namespaces_declared_here);
     assertion.namespaces_declared_here = inherited;
 
-    let xml = emit_element(&assertion).ok()?;
+    // Canonicalization is prefix-sensitive, so every name keeps the prefix the
+    // signer wrote, even where another prefix is bound to the same namespace.
+    let xml = emit_element_preserving_prefixes(&assertion).ok()?;
     let standalone = Document::parse(xml.as_bytes()).ok()?;
     let root = standalone.root();
     let signature = root.child_element(Some(DS_NS), "Signature")?;
@@ -1808,6 +1810,54 @@ mod tests {
         )
         .expect("signature verifies standalone");
         assert_eq!(verified.signed_element, root.id());
+    }
+
+    /// Two prefixes bound to one namespace: the export must keep the prefix
+    /// the signer wrote on every name, or the canonical form — and with it
+    /// the signature — changes.
+    #[test]
+    fn exported_assertion_keeps_source_prefixes_when_a_namespace_has_an_alias() {
+        let kp = rsa_signing_key();
+        let xml = String::from_utf8(build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        }))
+        .expect("utf-8");
+        // An unused second binding for the assertion namespace, declared
+        // after `xmlns:saml` so that "latest matching binding" would pick it.
+        // Exclusive c14n ignores an unused declaration, so the signature
+        // still holds.
+        let declaration = format!(r#" xmlns:saml="{SAML_NS}""#);
+        let (before, assertion_onwards) = xml
+            .split_at_checked(xml.find("<saml:Assertion").expect("assertion start"))
+            .expect("char boundary");
+        assert!(assertion_onwards.contains(&declaration), "fixture shape");
+        let xml = format!(
+            "{before}{}",
+            assertion_onwards.replacen(
+                &declaration,
+                &format!(r#"{declaration} xmlns:alias="{SAML_NS}""#),
+                1,
+            )
+        );
+        let doc = Document::parse(xml.as_bytes()).expect("re-parse");
+        let (parsed, _) = parse_response(&doc).expect("parse");
+        let idp = fixture_idp();
+        let policy = strong_policy();
+
+        let (_, exported) =
+            validate_response_with_assertion(default_input(&doc, parsed, &idp, &policy))
+                .expect("validate");
+        let exported = exported.expect("an aliased namespace must not cost the export");
+
+        assert!(exported.as_xml().starts_with("<saml:Assertion"));
+        assert!(!exported.as_xml().contains("<alias:"));
     }
 
     /// An assertion signature the Response path did not have to check must
