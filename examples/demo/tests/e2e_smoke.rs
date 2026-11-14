@@ -312,8 +312,8 @@ async fn logout_falls_back_when_idp_lacks_slo() {
         .headers()
         .get("location")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
 
     assert!(
         matches!(status, 302 | 303),
