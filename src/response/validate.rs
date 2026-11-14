@@ -19,14 +19,15 @@ use crate::crypto::keypair::KeyPair;
 use crate::crypto::verifier::SignatureVerifier;
 use crate::descriptor::{IdpDescriptor, SpDescriptor};
 use crate::dsig::algorithms::PeerCryptoPolicy;
-use crate::dsig::reference::DS_NS;
+use crate::dsig::reference::{DS_NS, ancestor_chain};
 use crate::dsig::verify::{VerifiedSignature, verify_signature_with};
 use crate::error::Error;
-use crate::response::identity::Identity;
+use crate::response::identity::{Identity, VerifiedAssertion};
 use crate::response::parse::{
     AssertionWrapper, ParsedAssertion, ParsedResponse, STATUS_SUCCESS, SUBJECT_CONFIRMATION_BEARER,
     SUBJECT_CONFIRMATION_HOLDER_OF_KEY, SubjectConfirmation, parse_assertion,
 };
+use crate::xml::emit::emit_element;
 use crate::xml::parse::{Document, Element, ElementId};
 
 pub(crate) struct ValidateResponse<'a> {
@@ -70,6 +71,22 @@ pub(crate) struct ValidateResponse<'a> {
 
 /// Validate a parsed Response and return the extracted `Identity` on success.
 pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity, Error> {
+    validate_response_inner(input, false).map(|(identity, _)| identity)
+}
+
+/// As [`validate_response`], additionally returning the verified assertion as
+/// a standalone document when it carries its own signature and that signature
+/// still verifies on its own. See [`standalone_assertion`].
+pub(crate) fn validate_response_with_assertion(
+    input: ValidateResponse<'_>,
+) -> Result<(Identity, Option<VerifiedAssertion>), Error> {
+    validate_response_inner(input, true)
+}
+
+fn validate_response_inner(
+    input: ValidateResponse<'_>,
+    export_assertion: bool,
+) -> Result<(Identity, Option<VerifiedAssertion>), Error> {
     let ValidateResponse {
         document,
         parsed,
@@ -153,50 +170,58 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
         .ok_or_else(|| Error::XmlParse("Response contains no Assertion".to_string()))?;
 
     // ---- Step 9: handle encryption ----
-    let (verified_cert_fingerprint, assertion_element, _decrypted_doc) = match assertion_wrapper {
-        AssertionWrapper::Cleartext(assertion_id) => {
-            let (verified, assertion_id) =
-                verify_response_and_or_assertion(VerifyResponseSignatures {
-                    document,
-                    response_root_id: response_root_element_id,
-                    assertion_name_lookup_id: *assertion_id,
-                    idp,
-                    policy: peer_crypto_policy,
-                    verifier,
-                    want_response_signed,
-                    want_assertions_signed,
-                })?;
-            let assertion_elem = document
-                .element(assertion_id)
-                .ok_or(Error::SignatureVerification {
-                    reason: "verified assertion element id not resolvable",
-                })?
-                .clone();
-            (
-                verified.verifying_cert_fingerprint,
-                assertion_elem,
-                None::<Document>,
-            )
-        }
-        #[cfg(feature = "xmlenc")]
-        AssertionWrapper::Encrypted(enc_id) => handle_encrypted(HandleEncryptedParams {
-            document,
-            response_root_id: response_root_element_id,
-            encrypted_assertion_id: *enc_id,
-            idp,
-            policy: peer_crypto_policy,
-            verifier,
-            decryption_keys,
-            want_response_signed,
-            want_assertions_signed,
-        })?,
-        #[cfg(not(feature = "xmlenc"))]
-        AssertionWrapper::Encrypted(_enc_id) => {
-            return Err(Error::InvalidConfiguration {
-                reason: "EncryptedAssertion requires the `xmlenc` feature",
-            });
-        }
-    };
+    // `cleartext_assertion_id` locates the assertion in `document`;
+    // `decrypted_doc` holds it when it arrived encrypted. Exactly one is set.
+    let (verified_cert_fingerprint, assertion_element, decrypted_doc, cleartext_assertion_id) =
+        match assertion_wrapper {
+            AssertionWrapper::Cleartext(assertion_id) => {
+                let (verified, assertion_id) =
+                    verify_response_and_or_assertion(VerifyResponseSignatures {
+                        document,
+                        response_root_id: response_root_element_id,
+                        assertion_name_lookup_id: *assertion_id,
+                        idp,
+                        policy: peer_crypto_policy,
+                        verifier,
+                        want_response_signed,
+                        want_assertions_signed,
+                    })?;
+                let assertion_elem = document
+                    .element(assertion_id)
+                    .ok_or(Error::SignatureVerification {
+                        reason: "verified assertion element id not resolvable",
+                    })?
+                    .clone();
+                (
+                    verified.verifying_cert_fingerprint,
+                    assertion_elem,
+                    None::<Document>,
+                    Some(assertion_id),
+                )
+            }
+            #[cfg(feature = "xmlenc")]
+            AssertionWrapper::Encrypted(enc_id) => {
+                let (fingerprint, assertion_elem, decrypted) =
+                    handle_encrypted(HandleEncryptedParams {
+                        document,
+                        response_root_id: response_root_element_id,
+                        encrypted_assertion_id: *enc_id,
+                        idp,
+                        policy: peer_crypto_policy,
+                        verifier,
+                        decryption_keys,
+                        want_response_signed,
+                        want_assertions_signed,
+                    })?;
+                (fingerprint, assertion_elem, decrypted, None::<ElementId>)
+            }
+            #[cfg(not(feature = "xmlenc"))]
+            AssertionWrapper::Encrypted(_enc_id) => {
+                return Err(Error::InvalidConfiguration {
+                    reason: "EncryptedAssertion requires the `xmlenc` feature",
+                });
+            }
+        };
 
     // --- Step 11: re-parse the verified assertion ----------------------------
     #[cfg_attr(
@@ -247,13 +272,90 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     }
 
     // --- Step 18: extract Identity -------------------------------------------
-    into_identity(
+    let identity = into_identity(
         assertion,
         windows,
         verified_cert_fingerprint,
         now,
         clock_skew,
-    )
+    )?;
+
+    // --- Optional: hand back the assertion as its own document ---------------
+    // Runs last, so nothing is exported from a Response that failed a check.
+    let exported = if export_assertion {
+        let source = match (&decrypted_doc, cleartext_assertion_id) {
+            (Some(decrypted), _) => Some((decrypted, decrypted.root().id())),
+            (None, Some(assertion_id)) => Some((document, assertion_id)),
+            (None, None) => None,
+        };
+        source.and_then(|(source_document, assertion_id)| {
+            standalone_assertion(
+                source_document,
+                assertion_id,
+                &idp.signing_certs,
+                peer_crypto_policy,
+                verifier,
+            )
+        })
+    } else {
+        None
+    };
+    Ok((identity, exported))
+}
+
+// =============================================================================
+// Standalone export of the verified assertion (RFC-003 §4.3)
+// =============================================================================
+
+/// Serialize the assertion at `assertion_id` as a document of its own, and
+/// return it only if its signature verifies in that form.
+///
+/// Returns `None` when the assertion has no signature of its own (it was
+/// vouched for by the Response signature, which does not travel with it) or
+/// when its signature does not verify once the assertion stands alone. The
+/// second case covers an assertion signature the Response path never had to
+/// check, and the rare signature that depends on context outside the
+/// assertion.
+///
+/// The output is checked rather than assumed: it is re-parsed and its
+/// signature re-verified, with the signed element required to be the root.
+fn standalone_assertion(
+    document: &Document,
+    assertion_id: ElementId,
+    signing_certs: &[crate::crypto::cert::X509Certificate],
+    policy: &PeerCryptoPolicy,
+    verifier: &dyn SignatureVerifier,
+) -> Option<VerifiedAssertion> {
+    let mut assertion = document.element(assertion_id)?.clone();
+    assertion.child_element(Some(DS_NS), "Signature")?;
+
+    // Namespace declarations the assertion inherited from its ancestors have
+    // to move onto it, or the document would not be well-formed. Inner
+    // declarations shadow outer ones; the assertion's own shadow all of them
+    // and stay last, so prefix resolution keeps preferring them.
+    let mut inherited: Vec<(Option<String>, String)> = Vec::new();
+    for ancestor in ancestor_chain(document, assertion_id)? {
+        for (prefix, uri) in &ancestor.namespaces_declared_here {
+            inherited.retain(|(seen, _)| seen != prefix);
+            inherited.push((prefix.clone(), uri.clone()));
+        }
+    }
+    inherited.retain(|(prefix, _)| {
+        !assertion
+            .namespaces_declared_here
+            .iter()
+            .any(|(own, _)| own == prefix)
+    });
+    inherited.append(&mut assertion.namespaces_declared_here);
+    assertion.namespaces_declared_here = inherited;
+
+    let xml = emit_element(&assertion).ok()?;
+    let standalone = Document::parse(xml.as_bytes()).ok()?;
+    let root = standalone.root();
+    let signature = root.child_element(Some(DS_NS), "Signature")?;
+    let verified =
+        verify_signature_with(&standalone, signature, signing_certs, policy, verifier).ok()?;
+    (verified.signed_element == root.id()).then(|| VerifiedAssertion::new(xml))
 }
 
 // =============================================================================
@@ -1639,6 +1741,123 @@ mod tests {
         })
         .expect_err("EncryptedID subject cannot be read by the issuer");
         assert!(matches!(err, Error::DecryptFailed { .. }), "{err:?}");
+    }
+
+    /// A real IdP usually declares `xmlns:saml` once, on the Response. The
+    /// exported assertion has to carry that declaration itself, and its
+    /// signature has to survive the move.
+    #[test]
+    fn exported_assertion_inherits_namespaces_from_the_response() {
+        let kp = rsa_signing_key();
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
+        // Move the declaration off the assertion. Exclusive c14n renders a
+        // namespace where it is used, not where it is declared, so the
+        // signature is unaffected.
+        let xml = String::from_utf8(xml).expect("utf-8");
+        let declaration = format!(r#" xmlns:saml="{SAML_NS}""#);
+        let (before, assertion_onwards) = xml
+            .split_at_checked(xml.find("<saml:Assertion").expect("assertion start"))
+            .expect("char boundary");
+        let xml = format!(
+            "{before}{}",
+            assertion_onwards.replacen(&declaration, "", 1)
+        );
+        let doc = Document::parse(xml.as_bytes()).expect("re-parse");
+        let in_response = doc
+            .root()
+            .child_element(Some(SAML_NS), "Assertion")
+            .expect("assertion");
+        assert!(
+            in_response
+                .namespaces_declared_here
+                .iter()
+                .all(|(_, uri)| uri != SAML_NS),
+            "fixture must declare the assertion namespace on the Response only",
+        );
+        let (parsed, _) = parse_response(&doc).expect("parse");
+        let idp = fixture_idp();
+        let policy = strong_policy();
+
+        let (identity, exported) =
+            validate_response_with_assertion(default_input(&doc, parsed, &idp, &policy))
+                .expect("validate");
+        let exported = exported.expect("assertion is signed");
+
+        let standalone = Document::parse(exported.as_xml().as_bytes()).expect("well-formed");
+        let root = standalone.root();
+        assert_eq!(root.qname().namespace(), Some(SAML_NS));
+        assert_eq!(root.attribute(None, "ID"), Some(identity.assertion_id()));
+        let signature = root
+            .child_element(Some(DS_NS), "Signature")
+            .expect("signature travels with the assertion");
+        let verified = verify_signature_with(
+            &standalone,
+            signature,
+            &idp.signing_certs,
+            &policy,
+            &DefaultVerifier,
+        )
+        .expect("signature verifies standalone");
+        assert_eq!(verified.signed_element, root.id());
+    }
+
+    /// An assertion signature the Response path did not have to check must
+    /// not be exported on the strength of the Response signature alone.
+    #[test]
+    fn assertion_with_a_broken_signature_is_not_exported() {
+        let kp = rsa_signing_key();
+        let xml = build_and_sign_response(&BuildAndSignResponseFixture {
+            kp: &kp,
+            sign_response: false,
+            sign_assertion: true,
+            in_response_to: Some("_req1"),
+            audience: "https://sp.example.com",
+            recipient: "https://sp.example.com/acs",
+            not_before: "2026-05-26T11:59:00Z",
+            not_on_or_after: "2026-05-26T12:10:00Z",
+        });
+        // Break the assertion's signature, then sign the whole Response. The
+        // Response signature is now the only valid one.
+        let tampered = String::from_utf8(xml)
+            .expect("utf-8")
+            .replace("alice@example.com", "mallory@example.com");
+        let unsigned = Document::parse(tampered.as_bytes()).expect("parse");
+        let response = sign_element(
+            unsigned.root().clone(),
+            &unsigned,
+            SignOptions {
+                signing_key: &kp,
+                sig_alg: SignatureAlgorithm::RsaSha256,
+                digest_alg: DigestAlgorithm::Sha256,
+                c14n_alg: C14nAlgorithm::ExclusiveCanonical,
+                inclusive_namespaces: &[],
+                include_x509_cert: true,
+            },
+        )
+        .expect("sign response");
+        let emitted = emit_document(&Document::new(response).expect("doc")).expect("emit");
+        let doc = Document::parse(emitted.as_bytes()).expect("re-parse");
+        let (parsed, _) = parse_response(&doc).expect("parse");
+        let idp = fixture_idp();
+        let policy = strong_policy();
+        let mut input = default_input(&doc, parsed, &idp, &policy);
+        input.want_response_signed = true;
+        input.want_assertions_signed = false;
+
+        let (identity, exported) =
+            validate_response_with_assertion(input).expect("Response signature vouches");
+
+        assert_eq!(identity.name_id.value, "mallory@example.com");
+        assert!(exported.is_none());
     }
 
     #[test]

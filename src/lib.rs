@@ -409,14 +409,14 @@ pub use crate::metadata::{
     MetadataContact, MetadataContactType, MetadataExtras, MetadataOrganization,
 };
 
-pub use crate::response::Identity;
 pub use crate::response::issue::SamlStatusCode;
+pub use crate::response::{Identity, VerifiedAssertion};
 
 #[cfg(feature = "artifact-binding")]
 pub use crate::sp::{ArtifactBackchannel, ConsumeArtifactResponse};
 pub use crate::sp::{
-    ConsumeResponse, LoginTracker, ServiceProvider, ServiceProviderConfig, SpWantSigned,
-    StartLogin, StartLoginResult,
+    ConsumeResponse, ConsumedResponse, LoginTracker, ServiceProvider, ServiceProviderConfig,
+    SpWantSigned, StartLogin, StartLoginResult,
 };
 #[cfg(feature = "slo")]
 pub use crate::sp::{SpLogoutSigning, SpLogoutWantSigned};

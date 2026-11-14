@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificate (plus caller-listed retired ones), the issuer, the audience, the
   `Recipient` against the SP's registered ACS URLs, and the time windows. See
   RFC-004 §3.3.
+- `ServiceProvider::consume_response_with_assertion` validates a Response as
+  `consume_response` does and also returns the verified assertion as a
+  standalone signed document (`VerifiedAssertion`), for an SP that has to
+  present it again. The export is re-verified before it is returned, and is
+  `None` when the assertion carries no signature of its own. See RFC-003 §4.3.
 
 ## [0.1.0-alpha.2] - 2026-11-14
 

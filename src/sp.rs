@@ -56,9 +56,11 @@ use crate::metadata::MetadataExtras;
 use crate::metadata::emit_sp::{SpMetadataInputs, emit_sp_metadata};
 use crate::nameid::NameIdFormat;
 use crate::replay::{ReplayCache, ReplayEntry, ReplayMode};
-use crate::response::Identity;
 use crate::response::parse::parse_response;
-use crate::response::validate::{ValidateResponse, validate_response};
+use crate::response::validate::{
+    ValidateResponse, validate_response, validate_response_with_assertion,
+};
+use crate::response::{Identity, VerifiedAssertion};
 use crate::xml::emit::emit_document;
 use crate::xml::parse::Document;
 
@@ -730,7 +732,20 @@ fn validate_and_pin_artifact_resolution_services(
 // consume_response
 // =============================================================================
 
-/// Inputs for [`ServiceProvider::consume_response`]. See RFC-003 §4.
+/// Result of [`ServiceProvider::consume_response_with_assertion`]. See
+/// RFC-003 §4.3.
+#[derive(Debug, Clone)]
+pub struct ConsumedResponse {
+    /// What [`ServiceProvider::consume_response`] returns for the same input.
+    pub identity: Identity,
+    /// The assertion `identity` was read from, as a standalone signed
+    /// document. `None` when the assertion carries no signature of its own or
+    /// that signature does not verify outside the Response.
+    pub assertion: Option<VerifiedAssertion>,
+}
+
+/// Inputs for [`ServiceProvider::consume_response`] and
+/// [`ServiceProvider::consume_response_with_assertion`]. See RFC-003 §4.
 pub struct ConsumeResponse<'a> {
     pub idp: &'a IdpDescriptor,
     pub peer_crypto_policy: Option<&'a PeerCryptoPolicy>,
@@ -935,6 +950,42 @@ impl ServiceProvider {
         transaction_replay_entry: Option<ReplayEntry<'_>>,
         replay_error: Error,
     ) -> Result<Identity, Error> {
+        self.consume_response_inner(input, transaction_replay_entry, replay_error, false)
+            .map(|consumed| consumed.identity)
+    }
+
+    /// Validate an inbound `<samlp:Response>` exactly as
+    /// [`ServiceProvider::consume_response`], and also return the verified
+    /// assertion as a standalone signed document. See RFC-003 §4.3.
+    ///
+    /// Use this when the SP has to present the assertion somewhere else
+    /// afterwards, for instance back to the IdP that issued it
+    /// ([`IdentityProvider::verify_issued_assertion`](crate::IdentityProvider::verify_issued_assertion)).
+    /// The checks, their order, the replay-cache behavior, and the returned
+    /// [`Identity`] are the same as `consume_response`.
+    ///
+    /// [`ConsumedResponse::assertion`] is `None` when the assertion cannot
+    /// stand alone: it has no signature of its own (only the Response was
+    /// signed), or its signature does not verify outside the Response. That
+    /// is not an error, because the login itself is valid. An encrypted
+    /// assertion is returned decrypted.
+    ///
+    /// The returned document is a bearer credential. See
+    /// [`VerifiedAssertion`].
+    pub fn consume_response_with_assertion(
+        &self,
+        input: ConsumeResponse<'_>,
+    ) -> Result<ConsumedResponse, Error> {
+        self.consume_response_inner(input, None, Error::AssertionReplay, true)
+    }
+
+    fn consume_response_inner(
+        &self,
+        input: ConsumeResponse<'_>,
+        transaction_replay_entry: Option<ReplayEntry<'_>>,
+        replay_error: Error,
+        export_assertion: bool,
+    ) -> Result<ConsumedResponse, Error> {
         // Steps 3a/3b: registered ACS URL, plus tracker correlation for a
         // solicited flow. Shared with the artifact path, which runs them
         // before it dereferences the artifact.
@@ -983,7 +1034,12 @@ impl ServiceProvider {
         });
         let validation_idp = pinned_idp.as_ref().unwrap_or(input.idp);
 
-        let identity = validate_response(ValidateResponse {
+        let validate = if export_assertion {
+            validate_response_with_assertion
+        } else {
+            |input: ValidateResponse<'_>| validate_response(input).map(|identity| (identity, None))
+        };
+        let (identity, assertion) = validate(ValidateResponse {
             document: &document,
             parsed,
             idp: validation_idp,
@@ -1074,7 +1130,10 @@ impl ServiceProvider {
             }
         }
 
-        Ok(identity)
+        Ok(ConsumedResponse {
+            identity,
+            assertion,
+        })
     }
 
     /// Resolve an inbound `?SAMLart=<artifact>` against the IdP's
