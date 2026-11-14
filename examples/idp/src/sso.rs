@@ -385,8 +385,8 @@ pub async fn handle_sso_continue_get(
     let request_id = raw_query
         .as_deref()
         .and_then(read_request_id_query_param)
-        .map(str::to_owned)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
     finalize_continue(&state, &headers, request_id)
 }
 
