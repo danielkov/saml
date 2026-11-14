@@ -27,18 +27,7 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = [
-    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa`. Accepted
-    # with documented rationale (see SECURITY.md): no fixed release exists (the
-    # mitigation is partial and unreleased in the dragging rsa 0.10 line,
-    # RustCrypto/RSA#390), and pure-Rust RSA has no maintained alternative that
-    # would not pull in a C/asm backend — defeating this crate's no-C-build-chain
-    # premise. The practically-exploitable PKCS#1 v1.5 padding-oracle vector is
-    # gated behind `weak-algos` and refused by default (only RSA-OAEP key
-    # transport is accepted); the residual is generic non-constant-time modexp
-    # timing, and SP-side signature verification (no private key) is unaffected.
-    "RUSTSEC-2023-0071",
-]
+ignore = []
 
 # ---------------------------------------------------------------------------
 # Licenses: allow permissive only. No GPL/AGPL/LGPL/SSPL.
@@ -89,30 +78,8 @@ external-default-features = "allow"
 # the dep graph today via transitive deps and aren't worth blocking releases
 # on. Re-evaluate periodically — ideally this list shrinks.
 skip = [
-    # RSA 0.9 still needs the older RustCrypto stack, while P-256/P-384
-    # 0.14 need the newer stack to fix RUSTSEC-2026-0387 in crypto-bigint.
-    # Keep version-scoped skips until RSA and the encryption/X.509 stack
-    # can migrate together; do not skip entire dependency trees.
-    # Randomness also spans RSA (rand_core 0.6), our rand 0.9 (rand_core
-    # 0.9 / getrandom 0.3), and the new EC stack (rand_core 0.10).
-    { name = "rand", version = "0.8" },
-    { name = "rand_chacha", version = "0.3" },
-    { name = "rand_core", version = "0.6" },
+    # rustls/ring still use getrandom 0.2; our crypto stack uses 0.4.
     { name = "getrandom", version = "0.2" },
-    { name = "getrandom", version = "0.3" },
-    { name = "rand_core", version = "0.9" },
-    { name = "block-buffer", version = "0.10" },
-    { name = "const-oid", version = "0.9" },
-    { name = "cpufeatures", version = "0.2" },
-    { name = "crypto-common", version = "0.1" },
-    { name = "der", version = "0.7" },
-    { name = "digest", version = "0.10" },
-    { name = "hmac", version = "0.12" },
-    { name = "pem-rfc7468", version = "0.7" },
-    { name = "pkcs8", version = "0.10" },
-    { name = "sha2", version = "0.10" },
-    { name = "signature", version = "2" },
-    { name = "spki", version = "0.7" },
 ]
 skip-tree = []
 

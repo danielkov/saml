@@ -46,7 +46,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(feature = "artifact-binding")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 #[cfg(feature = "artifact-binding")]
-use rand::RngCore as _;
+use rand::Rng as _;
 
 use crate::attribute::Attribute;
 use crate::authn::request_parse::parse_authn_request;
@@ -1401,7 +1401,7 @@ impl ArtifactResolveTransaction {
         rand::rng().fill_bytes(&mut nonce_bytes);
         let ciphertext = cipher
             .encrypt(
-                aes_gcm::Nonce::from_slice(&nonce_bytes),
+                &aes_gcm::Nonce::from(nonce_bytes),
                 AeadPayload {
                     msg: &plaintext,
                     aad: b"saml-artifact-resolve-transaction-v1",
@@ -1437,7 +1437,9 @@ impl ArtifactResolveTransaction {
             })?;
         let plaintext = cipher
             .decrypt(
-                aes_gcm::Nonce::from_slice(nonce),
+                nonce.try_into().map_err(|_err| Error::DecryptFailed {
+                    reason: "artifact transaction",
+                })?,
                 AeadPayload {
                     msg: ciphertext,
                     aad: b"saml-artifact-resolve-transaction-v1",

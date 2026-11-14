@@ -10,14 +10,14 @@
 //! Algorithm defaults (RFC-002 §7.2): `Aes256Gcm` + `RsaOaep` with SHA-256.
 //! CBC and MGF1-SHA1 are kept for compatibility but not promoted.
 
-use aes::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use rsa::RsaPublicKey;
+use rand::{TryRng as _, rngs::SysRng};
+use rsa::PublicKey;
 use rsa::pkcs1::DecodeRsaPublicKey as _;
-use rsa::rand_core::{OsRng, RngCore as _};
 #[cfg(feature = "weak-algos")]
 use sha1::Sha1;
 use sha2::Sha256;
@@ -103,32 +103,30 @@ pub(crate) fn encrypt_assertion(
 // Internal helpers
 // =============================================================================
 
-/// Extract an `RsaPublicKey` from an X.509 certificate.
+/// Extract an `PublicKey` from an X.509 certificate.
 ///
 /// Goes via the cert's canonical DER so we don't need access to the cert's
 /// inner `x509_cert::Certificate` (which is private). The cert was already
 /// validated to be RSA in [`encrypt_assertion`].
-fn rsa_public_key_from_cert(cert: &X509Certificate) -> Result<RsaPublicKey, Error> {
+fn rsa_public_key_from_cert(cert: &X509Certificate) -> Result<PublicKey, Error> {
     // Discarded intentionally: the cert was already validated to be RSA by
     // the caller; surfacing the DER-level reason here adds no useful detail.
     let parsed = Certificate::from_der(cert.to_der()).map_err(|_err| Error::X509Parse)?;
     let key_bytes = parsed
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .as_bytes()
         .ok_or(Error::X509Parse)?;
     // The SPKI BIT STRING for RSA wraps a DER-encoded PKCS#1 RSAPublicKey.
     // Discarded intentionally: collapse all DER-level reasons into X509Parse.
-    RsaPublicKey::from_pkcs1_der(key_bytes).map_err(|_err| Error::X509Parse)
+    PublicKey::from_pkcs1_der(key_bytes).map_err(|_err| Error::X509Parse)
 }
 
-/// Fill a buffer with cryptographically random bytes. We use the OS RNG
-/// provided by the `rsa` crate's re-export of `rand_core` (the same RNG type
-/// the RSA encrypt path expects), so the entire encryption pipeline runs
-/// against a single entropy source.
+/// Fill a buffer with cryptographically random bytes from the same fallible
+/// OS RNG used by the RSA encryption path.
 fn fill_random(buf: &mut [u8]) -> Result<(), Error> {
-    let mut rng = OsRng;
+    let mut rng = SysRng;
     // Discarded intentionally: RNG failure detail is platform-specific and
     // not useful to callers; collapse to a generic reason.
     rng.try_fill_bytes(buf)
@@ -159,7 +157,7 @@ fn encrypt_cbc_with_random_iv<C>(
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), Error>
 where
-    C: aes::cipher::BlockCipher + aes::cipher::BlockEncrypt + aes::cipher::KeyInit,
+    C: aes::cipher::BlockCipherEncrypt + aes::cipher::KeyInit,
 {
     let mut iv = vec![0u8; 16];
     fill_random(&mut iv)?;
@@ -179,7 +177,10 @@ where
     })?;
     let ct = cipher
         .encrypt(
-            aes_gcm::Nonce::from_slice(&nonce),
+            nonce
+                .as_slice()
+                .try_into()
+                .map_err(|_err| Error::DecryptFailed { reason: "data" })?,
             Payload {
                 msg: plaintext,
                 aad: &[],
@@ -193,7 +194,7 @@ where
 
 fn encrypt_cbc<C>(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error>
 where
-    C: aes::cipher::BlockCipher + aes::cipher::BlockEncrypt + aes::cipher::KeyInit,
+    C: aes::cipher::BlockCipherEncrypt + aes::cipher::KeyInit,
 {
     // Discarded intentionally: cipher-init detail would leak key shape.
     let encryptor =
@@ -210,7 +211,7 @@ where
             .ok_or(Error::DecryptFailed { reason: "data" })?
     ];
     let written = encryptor
-        .encrypt_padded_b2b_mut::<Pkcs7>(plaintext, &mut out)
+        .encrypt_padded_b2b::<Pkcs7>(plaintext, &mut out)
         // Discarded intentionally: padding-error detail is not actionable.
         .map_err(|_err| Error::DecryptFailed { reason: "data" })?
         .len();
@@ -220,7 +221,7 @@ where
 
 /// Wrap the session key under the recipient's RSA public key.
 ///
-/// `RsaOaep` is the modern XML-Enc 1.1 variant: `rsa::Oaep::new::<Sha256>()`
+/// `RsaOaep` is the modern XML-Enc 1.1 variant: `rsa::Oaep::<Sha256>::new()`
 /// sets *both* the OAEP label hash and the MGF1 hash to SHA-256. The
 /// `<xenc:EncryptionMethod>` emitted by
 /// `build_key_transport_encryption_method` therefore declares SHA-256 as the
@@ -231,14 +232,14 @@ where
 /// algorithm URI fixes only MGF1-SHA1; the explicit `<ds:DigestMethod>`
 /// emitted below selects SHA-1 as this emitter's message digest.
 fn wrap_session_key(
-    public: &RsaPublicKey,
+    public: &PublicKey,
     algorithm: KeyTransportAlgorithm,
     session_key: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let mut rng = OsRng;
+    let mut rng = SysRng;
     match algorithm {
         KeyTransportAlgorithm::RsaOaep => {
-            let padding = rsa::Oaep::new::<Sha256>();
+            let padding = rsa::Oaep::<Sha256>::new();
             public
                 .encrypt(&mut rng, padding, session_key)
                 // Discarded intentionally: RSA encrypt failure detail must not
@@ -254,7 +255,7 @@ fn wrap_session_key(
             // makes the same gating decision.
             #[cfg(feature = "weak-algos")]
             {
-                let padding = rsa::Oaep::new::<Sha1>();
+                let padding = rsa::Oaep::<Sha1>::new();
                 public
                     .encrypt(&mut rng, padding, session_key)
                     // Discarded intentionally: see RsaOaep arm above.
@@ -378,7 +379,7 @@ fn build_key_transport_encryption_method(algorithm: KeyTransportAlgorithm) -> El
         KeyTransportAlgorithm::RsaOaep => {
             // Modern RSA-OAEP: SHA-256 OAEP digest with MGF1-SHA256.
             // `wrap_session_key` below builds the padding with
-            // `rsa::Oaep::new::<Sha256>()`, which sets *both* the OAEP label
+            // `rsa::Oaep::<Sha256>::new()`, which sets *both* the OAEP label
             // hash and the MGF1 hash to SHA-256, so the declaration must say
             // `mgf1sha256`. Declaring `mgf1sha1` (as this did previously)
             // misdescribes the ciphertext: a recipient that reads
@@ -469,8 +470,6 @@ pub(crate) fn encrypt_assertion_with_declared_oaep_params(
     key_transport_algorithm: KeyTransportAlgorithm,
     params: DeclaredOaepParams,
 ) -> Result<Element, Error> {
-    use rsa::traits::PaddingScheme as _;
-
     let rsa_public = rsa_public_key_from_cert(recipient_encryption_cert)?;
     let plaintext = emit_element(assertion)?.into_bytes();
 
@@ -487,9 +486,9 @@ pub(crate) fn encrypt_assertion_with_declared_oaep_params(
     // decrypt side uses, so a round-trip proves both directions agree.
     let padding =
         crate::crypto::keypair::oaep_padding(params.effective_digest(), params.effective_mgf1())?;
-    let mut rng = OsRng;
-    let wrapped_key_bytes = padding
-        .encrypt(&mut rng, &rsa_public, &session_key)
+    let mut rng = SysRng;
+    let wrapped_key_bytes = rsa_public
+        .encrypt(&mut rng, padding, &session_key)
         .map_err(|_err| Error::DecryptFailed {
             reason: "key transport",
         })?;
