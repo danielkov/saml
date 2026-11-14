@@ -154,16 +154,17 @@ pub(crate) fn validate_response(input: ValidateResponse<'_>) -> Result<Identity,
     // ---- Step 9: handle encryption ----
     let (verified_cert_fingerprint, assertion_element, _decrypted_doc) = match assertion_wrapper {
         AssertionWrapper::Cleartext(assertion_id) => {
-            let (verified, assertion_id) = verify_response_and_or_assertion(
-                document,
-                response_root_element_id,
-                *assertion_id,
-                idp,
-                peer_crypto_policy,
-                verifier,
-                want_response_signed,
-                want_assertions_signed,
-            )?;
+            let (verified, assertion_id) =
+                verify_response_and_or_assertion(VerifyResponseSignatures {
+                    document,
+                    response_root_id: response_root_element_id,
+                    assertion_name_lookup_id: *assertion_id,
+                    idp,
+                    policy: peer_crypto_policy,
+                    verifier,
+                    want_response_signed,
+                    want_assertions_signed,
+                })?;
             let assertion_elem = document
                 .element(assertion_id)
                 .ok_or(Error::SignatureVerification {
@@ -388,6 +389,17 @@ fn enforce_signature_positions(document: &Document) -> Result<(), Error> {
 // Signature verification (cleartext path)
 // =============================================================================
 
+struct VerifyResponseSignatures<'a> {
+    document: &'a Document,
+    response_root_id: ElementId,
+    assertion_name_lookup_id: ElementId,
+    idp: &'a IdpDescriptor,
+    policy: &'a PeerCryptoPolicy,
+    verifier: &'a dyn SignatureVerifier,
+    want_response_signed: bool,
+    want_assertions_signed: bool,
+}
+
 /// Run the signature gate for the cleartext Response/Assertion case. Returns
 /// the `VerifiedSignature` from whichever signature was checked and the
 /// `ElementId` of the assertion to validate further.
@@ -396,20 +408,19 @@ fn enforce_signature_positions(document: &Document) -> Result<(), Error> {
 /// `verified.signed_element` when the assertion signature was the one
 /// verified — never via name lookup. That is the structural XSW defense
 /// (RFC-002 §3.2).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one parameter per validation input; the verifier joins the existing peer-policy pair, and a context struct would add indirection for two call sites"
-)]
 fn verify_response_and_or_assertion(
-    document: &Document,
-    response_root_id: ElementId,
-    assertion_name_lookup_id: ElementId,
-    idp: &IdpDescriptor,
-    policy: &PeerCryptoPolicy,
-    verifier: &dyn SignatureVerifier,
-    want_response_signed: bool,
-    want_assertions_signed: bool,
+    input: VerifyResponseSignatures<'_>,
 ) -> Result<(VerifiedSignature, ElementId), Error> {
+    let VerifyResponseSignatures {
+        document,
+        response_root_id,
+        assertion_name_lookup_id,
+        idp,
+        policy,
+        verifier,
+        want_response_signed,
+        want_assertions_signed,
+    } = input;
     let root = document.root();
     let response_signature = root.child_element(Some(DS_NS), "Signature");
 

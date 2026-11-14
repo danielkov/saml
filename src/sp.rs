@@ -139,10 +139,14 @@ pub struct ServiceProviderConfig {
     pub default_peer_crypto_policy: PeerCryptoPolicy,
     /// Optional inbound signature verifier. `None` (the default) uses the
     /// built-in [`DefaultVerifier`] (pure-Rust RSA/ECDSA). Supply a custom
-    /// [`SignatureVerifier`] to route inbound signature verification through
-    /// an external provider (HSM, KMS, or a FIPS-validated module) — see
-    /// RFC-002 §4. Algorithm allow-list policy still comes from the peer
-    /// crypto policy and is enforced before the verifier runs.
+    /// [`SignatureVerifier`] to route this SP's inbound SSO and logout
+    /// signature verification through an external provider (HSM, KMS, or a
+    /// FIPS-validated module) — see RFC-002 §4. This does not replace the
+    /// entire crypto backend: signing and encryption/decryption are unchanged.
+    /// The metadata parser, artifact backchannel client, and independent ECP
+    /// APIs retain the built-in verifier; this configuration does not apply
+    /// to them. Algorithm allow-list policy still comes from the peer crypto
+    /// policy and is enforced before the verifier runs.
     pub verifier: Option<Arc<dyn SignatureVerifier>>,
     /// Outbound signing defaults for AuthnRequest and Logout messages.
     pub outbound_signature_algorithm: SignatureAlgorithm,
@@ -2962,6 +2966,225 @@ mod tests {
                 reason
             } if reason == "injected verifier failure"
         ));
+    }
+
+    #[cfg(feature = "xmlenc")]
+    #[test]
+    fn encrypted_assertion_uses_configured_verifier() {
+        use crate::xmlenc::algorithms::{DataEncryptionAlgorithm, KeyTransportAlgorithm};
+        let kp = rsa_signing_key();
+        let xml = build_signed_response_xml(
+            &kp,
+            None,
+            "https://sp.example.com/acs",
+            "https://sp.example.com",
+            "2026-05-26T11:59:00Z",
+            "2026-05-26T12:10:00Z",
+        );
+        let doc = Document::parse(&xml).unwrap();
+        // Only the encrypted inner assertion is signed, not the Response.
+        assert!(doc.root().child_element(Some(DS_NS), "Signature").is_none());
+        let mut response = doc.root().clone();
+        let assertion = response
+            .children
+            .iter_mut()
+            .find_map(|node| match node {
+                Node::Element(element) if element.qname.local == "Assertion" => Some(element),
+                _ => None,
+            })
+            .unwrap();
+        *assertion = crate::xmlenc::encrypt::encrypt_assertion(
+            assertion,
+            &X509Certificate::from_pem(RSA_CERT_PEM).unwrap(),
+            DataEncryptionAlgorithm::Aes256Gcm,
+            KeyTransportAlgorithm::RsaOaep,
+        )
+        .unwrap();
+        let xml = emit_document(&Document::new(response).unwrap()).unwrap();
+        let idp = fixture_idp();
+        for inject_failure in [false, true] {
+            let mut cfg = fixture_sp_config(None, true, false);
+            cfg.decryption_key = Some(rsa_signing_key());
+            if inject_failure {
+                cfg.verifier = Some(Arc::new(FailingVerifier));
+            }
+            let sp = ServiceProvider::new(cfg).unwrap();
+            let result = sp.consume_response(ConsumeResponse {
+                idp: &idp,
+                peer_crypto_policy: None,
+                saml_response: xml.as_bytes(),
+                binding: SsoResponseBinding::HttpPost,
+                relay_state: None,
+                tracker: None,
+                expected_destination: "https://sp.example.com/acs",
+                now: fixed_now(),
+                clock_skew: Duration::from_secs(30),
+                replay_cache: None,
+                replay_mode: ReplayMode::All,
+                holder_of_key_cert: None,
+            });
+            if inject_failure {
+                assert!(matches!(
+                    result,
+                    Err(Error::SignatureVerification {
+                        reason: "injected verifier failure"
+                    })
+                ));
+            } else {
+                assert_eq!(
+                    result.expect("valid encrypted assertion").assertion_id,
+                    "_a1"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn redirect_logout_uses_configured_verifier() {
+        let destination = "https://sp.example.com/slo";
+        let xml = build_logout_response_xml(&BuildLogoutResponse {
+            id: "_lr-redirect",
+            issue_instant: fixed_now(),
+            issuer_entity_id: "https://idp.example.com",
+            destination: Some(destination),
+            in_response_to: "_req-logout",
+            status: LogoutStatus::Success,
+            status_message: None,
+        })
+        .unwrap();
+        let kp = rsa_signing_key();
+        let Dispatch::Redirect(url) = redirect_encode_signed(
+            &url::Url::parse(destination).unwrap(),
+            RedirectDirection::Response,
+            &xml,
+            Some("logout-state"),
+            SignatureAlgorithm::RsaSha256.uri(),
+            |bytes| sign_detached_query(bytes, &kp, SignatureAlgorithm::RsaSha256),
+        )
+        .unwrap() else {
+            panic!("expected redirect")
+        };
+        let idp = fixture_idp();
+        let tracker = LogoutTracker {
+            request_id: "_req-logout".to_owned(),
+            issued_at: fixed_now(),
+            peer_entity_id: idp.entity_id.clone(),
+        };
+        for inject_failure in [false, true] {
+            let mut cfg = fixture_sp_config(None, false, false);
+            cfg.logout_want_signed.responses = true;
+            if inject_failure {
+                cfg.verifier = Some(Arc::new(FailingVerifier));
+            }
+            let sp = ServiceProvider::new(cfg).unwrap();
+            let result = sp.consume_logout_response(
+                &idp,
+                ConsumeLogoutResponse {
+                    peer_crypto_policy: None,
+                    body: url.query().unwrap().as_bytes(),
+                    binding: Binding::HttpRedirect,
+                    detached_signature: None,
+                    tracker: &tracker,
+                    expected_destination: destination,
+                    now: fixed_now(),
+                    clock_skew: Duration::from_secs(30),
+                },
+            );
+            if inject_failure {
+                assert!(matches!(
+                    result,
+                    Err(Error::SignatureVerification {
+                        reason: "injected verifier failure"
+                    })
+                ));
+            } else {
+                result.expect("valid detached logout signature");
+            }
+        }
+    }
+
+    #[cfg(feature = "slo")]
+    #[tokio::test]
+    async fn soap_logout_response_uses_configured_verifier() {
+        struct LogoutClient;
+        impl HttpClient for LogoutClient {
+            fn send(
+                &self,
+                request: HttpRequest,
+            ) -> impl std::future::Future<
+                Output = Result<
+                    crate::http::HttpResponse,
+                    Box<dyn std::error::Error + Send + Sync>,
+                >,
+            > + Send {
+                let doc = Document::parse(&request.body).unwrap();
+                let request = doc
+                    .find_first(Some(RESPONSE_SAMLP_NS), "LogoutRequest")
+                    .unwrap();
+                let xml = build_logout_response_xml(&BuildLogoutResponse {
+                    id: "_lr-soap",
+                    issue_instant: fixed_now(),
+                    issuer_entity_id: "https://idp.example.com",
+                    destination: None,
+                    in_response_to: request.attribute(None, "ID").unwrap(),
+                    status: LogoutStatus::Success,
+                    status_message: None,
+                })
+                .unwrap();
+                let signer =
+                    ServiceProvider::new(fixture_sp_config(Some(rsa_signing_key()), false, false))
+                        .unwrap();
+                let signed = signer.sign_protocol_xml(&xml).unwrap();
+                let body = crate::binding::soap::wrap(std::str::from_utf8(&signed).unwrap())
+                    .unwrap()
+                    .into_bytes();
+                std::future::ready(Ok(crate::http::HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body,
+                }))
+            }
+        }
+        let mut idp = fixture_idp();
+        idp.slo_endpoints = vec![Endpoint::soap(
+            "https://idp.example.com/slo/soap",
+            None,
+            true,
+        )];
+        let name_id = NameId::email("alice@example.com");
+        for inject_failure in [false, true] {
+            let mut cfg = fixture_sp_config(None, false, false);
+            cfg.logout_want_signed.responses = true;
+            if inject_failure {
+                cfg.verifier = Some(Arc::new(FailingVerifier));
+            }
+            let sp = ServiceProvider::new(cfg).unwrap();
+            let result = sp
+                .send_soap_logout_request(
+                    &LogoutClient,
+                    &idp,
+                    None,
+                    StartLogout {
+                        name_id: &name_id,
+                        session_index: Some("sess-1"),
+                        relay_state: None,
+                        reason: None,
+                        binding: Binding::Soap,
+                    },
+                )
+                .await;
+            if inject_failure {
+                assert!(matches!(
+                    result,
+                    Err(Error::SignatureVerification {
+                        reason: "injected verifier failure"
+                    })
+                ));
+            } else {
+                result.expect("valid signed SOAP logout response");
+            }
+        }
     }
 
     #[test]

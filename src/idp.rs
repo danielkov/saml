@@ -200,6 +200,13 @@ pub struct IdentityProviderConfig {
     /// an external provider (HSM, KMS, or a FIPS-validated module) — see
     /// RFC-002 §4. Algorithm allow-list policy still comes from the peer
     /// crypto policy and is enforced before the verifier runs.
+    ///
+    /// Applies to inbound AuthnRequest, LogoutRequest, LogoutResponse, and
+    /// ArtifactResolve signatures consumed by this IdentityProvider, including
+    /// detached HTTP Redirect signatures. Inbound ArtifactResolve is the SOAP
+    /// request handled here, not an artifact backchannel client operation.
+    /// Metadata parsing and the independent artifact backchannel client and ECP
+    /// APIs do not use this setting; they retain the built-in verifier.
     pub verifier: Option<Arc<dyn SignatureVerifier>>,
     pub outbound_signature_algorithm: SignatureAlgorithm,
     pub outbound_digest_algorithm: DigestAlgorithm,
@@ -1706,16 +1713,16 @@ impl IdentityProvider {
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
         let verifier = self.config.verifier.as_deref().unwrap_or(&DefaultVerifier);
         let signature_required = self.config.logout_want_signed.requests;
-        verify_logout_signature(
-            signature_required,
+        verify_logout_signature(LogoutSignatureInput {
+            required: signature_required,
             binding,
-            &doc,
+            doc: &doc,
             root_id,
-            detached_signature.as_ref(),
-            &sp.signing_certs,
+            detached: detached_signature.as_ref(),
+            candidate_certs: &sp.signing_certs,
             policy,
             verifier,
-        )?;
+        })?;
 
         // EncryptedID (§5.1): now that the request is authenticated, decrypt the
         // subject if the SP encrypted it to our key. Cleartext NameID requests
@@ -1909,16 +1916,16 @@ impl IdentityProvider {
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
         let verifier = self.config.verifier.as_deref().unwrap_or(&DefaultVerifier);
         let signature_required = self.config.logout_want_signed.responses;
-        verify_logout_signature(
-            signature_required,
+        verify_logout_signature(LogoutSignatureInput {
+            required: signature_required,
             binding,
-            &doc,
+            doc: &doc,
             root_id,
-            detached_signature.as_ref(),
-            &sp.signing_certs,
+            detached: detached_signature.as_ref(),
+            candidate_certs: &sp.signing_certs,
             policy,
             verifier,
-        )?;
+        })?;
 
         // InResponseTo match (§5.2 step 6).
         if parsed.in_response_to != tracker.request_id {
@@ -2179,24 +2186,33 @@ pub struct ConsumeLogoutResponseWire<'a> {
     pub clock_skew: Duration,
 }
 
-/// Verify the signature on an inbound SLO message. POST/SOAP get the embedded
-/// XML-DSig path; Redirect goes through detached signature verification using
-/// the (optional) `detached` parameter.
+/// Message and peer trust inputs for inbound SLO signature verification.
 #[cfg(feature = "slo")]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one parameter per signature input; the verifier joins the existing peer-policy pair, and a context struct would add indirection for two call sites"
-)]
-fn verify_logout_signature(
+struct LogoutSignatureInput<'a> {
     required: bool,
     binding: Binding,
-    doc: &Document,
+    doc: &'a Document,
     root_id: crate::xml::parse::ElementId,
-    detached: Option<&DetachedSignature<'_>>,
-    candidate_certs: &[crate::crypto::cert::X509Certificate],
-    policy: &PeerCryptoPolicy,
-    verifier: &dyn SignatureVerifier,
-) -> Result<(), Error> {
+    detached: Option<&'a DetachedSignature<'a>>,
+    candidate_certs: &'a [crate::crypto::cert::X509Certificate],
+    policy: &'a PeerCryptoPolicy,
+    verifier: &'a dyn SignatureVerifier,
+}
+
+/// Verify the signature on an inbound SLO message. POST/SOAP get the embedded
+/// XML-DSig path; Redirect goes through detached signature verification.
+#[cfg(feature = "slo")]
+fn verify_logout_signature(input: LogoutSignatureInput<'_>) -> Result<(), Error> {
+    let LogoutSignatureInput {
+        required,
+        binding,
+        doc,
+        root_id,
+        detached,
+        candidate_certs,
+        policy,
+        verifier,
+    } = input;
     match binding {
         Binding::HttpRedirect => verify_redirect_request_signature(
             required,
@@ -3543,6 +3559,113 @@ mod tests {
         let err = consume_at(&idp, fixed_now(), Duration::from_mins(1))
             .expect_err("the failing verifier must reject a validly signed request");
 
+        assert!(
+            matches!(
+                err,
+                Error::SignatureVerification { reason } if reason == "injected verifier failure"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_authn_request_uses_configured_verifier() {
+        let mut idp = idp_with(true, false);
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_authn_request_raw_query("_verifier-authn");
+        let consume = |idp: &IdentityProvider| {
+            idp.consume_authn_request_wire(ConsumeAuthnRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                max_authn_request_age: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                relay_state: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+        };
+        consume(&idp).expect("valid detached AuthnRequest signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn logout_request_uses_configured_verifier() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.requests = true;
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_logout_request_raw_query("_verifier-logout-request");
+        let consume = |idp: &IdentityProvider| {
+            idp.consume_logout_request_wire(ConsumeLogoutRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+        };
+        consume(&idp).expect("valid detached LogoutRequest signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn logout_response_uses_configured_verifier() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.responses = true;
+        let sp = sp_descriptor(false);
+        let tracker = LogoutTracker {
+            request_id: "_verifier-logout-anchor".to_owned(),
+            issued_at: fixed_now(),
+            peer_entity_id: sp.entity_id.clone(),
+        };
+        let raw_query = build_signed_redirect_logout_response_raw_query(
+            "_verifier-logout-response",
+            &tracker.request_id,
+        );
+        let consume = |idp: &IdentityProvider| {
+            idp.consume_logout_response_wire(ConsumeLogoutResponseWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                tracker: &tracker,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+        };
+        consume(&idp).expect("valid detached LogoutResponse signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    #[cfg(feature = "artifact-binding")]
+    #[test]
+    fn inbound_artifact_resolve_uses_configured_verifier() {
+        let mut idp = artifact_idp();
+        let sp = sp_descriptor(false);
+        let envelope = artifact_resolve_envelope(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            fixed_now(),
+            true,
+        );
+        let consume = |idp: &IdentityProvider| {
+            consume_artifact_resolve(idp, &sp, &envelope, "https://idp.example.com/ars", true)
+        };
+        consume(&idp).expect("valid enveloped ArtifactResolve signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    fn assert_injected_verifier_error(err: Error) {
         assert!(
             matches!(
                 err,
