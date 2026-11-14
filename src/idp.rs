@@ -56,6 +56,7 @@ use crate::authn_context::AuthnContextClassRef;
 #[cfg(any(feature = "slo", test))]
 use crate::binding::Dispatch;
 use crate::binding::{Binding, Endpoint, SsoResponseBinding, SsoResponseDispatch};
+use crate::crypto::cert::X509Certificate;
 #[cfg(all(test, feature = "artifact-binding"))]
 use crate::crypto::cert::certificate_fingerprint_set;
 use crate::crypto::keypair::KeyPair;
@@ -87,10 +88,12 @@ use crate::metadata::emit_idp::{IdpMetadataInputs, emit_idp_metadata};
 use crate::nameid::{NameId, NameIdFormat};
 #[cfg(feature = "artifact-binding")]
 use crate::replay::{ReplayCache, ReplayEntry};
+use crate::response::Identity;
 use crate::response::issue::{
     IssueErrorResponseInputs, IssueResponseInputs, SamlStatusCode, issue_error_response,
     issue_response,
 };
+use crate::response::validate::{ValidateIssuedAssertion, validate_issued_assertion};
 #[cfg(feature = "slo")]
 use crate::xml::emit::emit_document;
 use crate::xml::parse::{Document, Element};
@@ -203,7 +206,8 @@ pub struct IdentityProviderConfig {
     ///
     /// Applies to inbound AuthnRequest, LogoutRequest, LogoutResponse, and
     /// ArtifactResolve signatures consumed by this IdentityProvider, including
-    /// detached HTTP Redirect signatures. Inbound ArtifactResolve is the SOAP
+    /// detached HTTP Redirect signatures, and to
+    /// [`IdentityProvider::verify_issued_assertion`]. Inbound ArtifactResolve is the SOAP
     /// request handled here, not an artifact backchannel client operation.
     /// Metadata parsing and the independent artifact backchannel client and ECP
     /// APIs do not use this setting; they retain the built-in verifier.
@@ -1656,6 +1660,99 @@ fn ensure_name_id_format(name_id: &NameId, expected: &NameIdFormat) -> Result<()
         Err(Error::NameIdFormatMismatch {
             expected: expected.as_uri().to_owned(),
             got: name_id.format.as_uri().to_owned(),
+        })
+    }
+}
+
+// =============================================================================
+// Verify an issued assertion (RFC-004 §3.3)
+// =============================================================================
+
+/// Inputs to [`IdentityProvider::verify_issued_assertion`]. See RFC-004 §3.3.
+pub struct VerifyIssuedAssertion<'a> {
+    /// The SP the assertion must have been issued to. Its `entity_id` is the
+    /// required audience, and its `assertion_consumer_services` are the only
+    /// acceptable `SubjectConfirmationData/@Recipient` values.
+    pub sp: &'a SpDescriptor,
+    /// Algorithm allow-list for the assertion's signature. `None` falls back
+    /// to the IdP's `default_peer_crypto_policy`.
+    pub crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Raw XML bytes of a standalone `<saml:Assertion>` document. Any
+    /// transport encoding (base64, base64url) is the caller's to remove.
+    pub assertion: &'a [u8],
+    /// Signing certificates this IdP used before a key rotation and still
+    /// stands behind. The current `signing_key` certificate is always a
+    /// candidate; an assertion signed under a retired key verifies only if
+    /// its certificate is listed here. The library keeps no key history.
+    pub retired_signing_certs: &'a [X509Certificate],
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+}
+
+impl IdentityProvider {
+    /// Verify a standalone `<saml:Assertion>` that this IdP issued to `sp`,
+    /// and return its [`Identity`]. See RFC-004 §3.3.
+    ///
+    /// This is the issuer-side counterpart of
+    /// [`ServiceProvider::consume_response`](crate::sp::ServiceProvider::consume_response)
+    /// for the case where an assertion comes back to its issuer on its own,
+    /// outside a `<samlp:Response>`. The checks are:
+    ///
+    /// - The root is `<saml:Assertion>` and carries exactly one
+    ///   `<ds:Signature>`, which covers the root. No other signature may
+    ///   appear in the document. An unsigned assertion is rejected even if
+    ///   the Response that delivered it was signed: that signature does not
+    ///   travel with the assertion.
+    /// - The signature verifies against this IdP's own certificate (or a
+    ///   listed retired one), through the configured
+    ///   [`SignatureVerifier`] if any.
+    /// - `Issuer` is this IdP's `entity_id`.
+    /// - The `Conditions` window holds and every `AudienceRestriction` admits
+    ///   `sp.entity_id`.
+    /// - A bearer `SubjectConfirmation` names one of `sp`'s registered ACS
+    ///   URLs as `Recipient` and is still within its `NotOnOrAfter`.
+    ///   `InResponseTo` is not correlated; the IdP holds no request tracker.
+    ///   Holder-of-Key confirmations are not usable here.
+    ///
+    /// Not handled:
+    ///
+    /// - `<saml:EncryptedAssertion>` and `<saml:EncryptedID>`. Both are
+    ///   encrypted to the SP, so the presenter must send the decrypted
+    ///   assertion, and an assertion whose subject is an `EncryptedID` is
+    ///   rejected.
+    /// - Replay. The library is stateless; dedupe on
+    ///   [`Identity::assertion_id`] until [`Identity::not_on_or_after`] if a
+    ///   single presentation is required. `<saml:OneTimeUse>` is surfaced
+    ///   through [`Identity::is_one_time_use`], not enforced.
+    /// - What the presenter is allowed to do with the result. Authenticating
+    ///   the presenter and deciding what a verified assertion entitles it to
+    ///   belong to the caller.
+    pub fn verify_issued_assertion(
+        &self,
+        input: VerifyIssuedAssertion<'_>,
+    ) -> Result<Identity, Error> {
+        let mut signing_certs: Vec<X509Certificate> =
+            Vec::with_capacity(input.retired_signing_certs.len().saturating_add(1));
+        signing_certs.extend(self.config.signing_key.certificate().cloned());
+        signing_certs.extend(input.retired_signing_certs.iter().cloned());
+        if signing_certs.is_empty() {
+            return Err(Error::InvalidConfiguration {
+                reason: "verify_issued_assertion needs a certificate on IdentityProviderConfig.signing_key or in retired_signing_certs",
+            });
+        }
+
+        let document = Document::parse(input.assertion)?;
+        validate_issued_assertion(ValidateIssuedAssertion {
+            document: &document,
+            issuer_entity_id: &self.config.entity_id,
+            signing_certs: &signing_certs,
+            crypto_policy: input
+                .crypto_policy
+                .unwrap_or(&self.config.default_peer_crypto_policy),
+            verifier: self.config.verifier.as_deref().unwrap_or(&DefaultVerifier),
+            sp: input.sp,
+            now: input.now,
+            clock_skew: input.clock_skew,
         })
     }
 }

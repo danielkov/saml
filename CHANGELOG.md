@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `IdentityProvider::verify_issued_assertion` verifies a standalone
+  `<saml:Assertion>` that the IdP issued to a given SP and returns its
+  `Identity`. It checks the assertion's own signature against the IdP's
+  certificate (plus caller-listed retired ones), the issuer, the audience, the
+  `Recipient` against the SP's registered ACS URLs, and the time windows. See
+  RFC-004 §3.3.
+
 ## [0.1.0-alpha.2] - 2026-11-14
 
 ### Added

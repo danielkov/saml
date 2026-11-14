@@ -392,6 +392,58 @@ it never relabels an email address as a persistent identifier.
 A relying party accepts the result only when it has opted in with
 `allow_unsolicited`. The consuming half is unchanged by this addition.
 
+### 3.3 Verifying an issued assertion
+
+`IdentityProvider::verify_issued_assertion` checks a standalone `<saml:Assertion>` that this IdP issued earlier, and returns the same `Identity` the SP side returns.
+
+An assertion is a self-contained signed statement (Core §2), and it can come back to its issuer on its own, outside a `<samlp:Response>`. A party that holds an assertion may present it to the IdP as proof of an earlier sign-on. The IdP then needs to answer one SAML question: is this an assertion I issued to that SP, and is it still valid? `ServiceProvider::consume_response` cannot answer it, because it validates a Response delivered to an ACS endpoint and correlates it with a login tracker.
+
+```rust
+pub struct VerifyIssuedAssertion<'a> {
+    /// The SP the assertion must have been issued to.
+    pub sp: &'a SpDescriptor,
+    /// `None` falls back to the IdP's `default_peer_crypto_policy`.
+    pub crypto_policy: Option<&'a PeerCryptoPolicy>,
+    /// Raw XML bytes of a standalone `<saml:Assertion>` document.
+    pub assertion: &'a [u8],
+    /// Certificates of signing keys retired by rotation that the IdP still stands behind.
+    pub retired_signing_certs: &'a [X509Certificate],
+    pub now: SystemTime,
+    pub clock_skew: Duration,
+}
+
+impl IdentityProvider {
+    pub fn verify_issued_assertion(&self, input: VerifyIssuedAssertion<'_>) -> Result<Identity, Error>;
+}
+```
+
+**Checks, in order:**
+
+1. The document root is `<saml:Assertion>`. A `<samlp:Response>` or `<saml:EncryptedAssertion>` root is `Error::XmlParse`.
+2. The root has exactly one `<ds:Signature>` child, and no other `<ds:Signature>` appears anywhere in the document. A missing signature is `Error::SignatureMissing`; a misplaced or duplicate one is `Error::SignatureVerification`. This runs before any signature is evaluated.
+3. The signature verifies against the certificate on `signing_key` or one in `retired_signing_certs`, under the crypto policy, through the configured `SignatureVerifier` if there is one. The signed element must be the root (RFC-002 §3.2). With no candidate certificate at all, the call fails with `Error::InvalidConfiguration`.
+4. `Issuer` equals the IdP's `entity_id` (`Error::IssuerMismatch`).
+5. The `Conditions` window holds (`Error::NotYetValid`, `Error::Expired`).
+6. Every `AudienceRestriction` admits `sp.entity_id` (`Error::AudienceMismatch`).
+7. A bearer `SubjectConfirmation` names one of `sp.assertion_consumer_services` as `Recipient` (`Error::RecipientMismatch`) and is inside its own `NotBefore` / `NotOnOrAfter` window.
+8. `SessionNotOnOrAfter`, if present, has not passed (`Error::Expired`).
+
+Steps 4 to 8 are the same code the SP path runs on a verified assertion. Only two things differ, both because the IdP is not the party the assertion was delivered to:
+
+- `Recipient` is matched against the SP's registered ACS URLs instead of the URL that received the message.
+- `InResponseTo` is not correlated. The IdP is stateless and holds no request tracker.
+
+**Signature requirement.** The assertion itself must be signed. An assertion that was delivered unsigned inside a signed Response cannot be verified here, because the Response signature does not travel with it. An IdP that wants its assertions to be verifiable later sets `assertion_signing.sign_assertions`.
+
+**Key rotation.** The library keeps no key history. The current `signing_key` certificate is always a candidate. An assertion signed under a retired key verifies only when the caller lists that key's certificate in `retired_signing_certs`.
+
+**Outside this call:**
+
+- **Encrypted content.** `<saml:EncryptedAssertion>` and `<saml:EncryptedID>` are encrypted to the SP, and the IdP holds no key for them. The presenter sends the decrypted assertion. An assertion whose subject is an `EncryptedID` is rejected with `Error::DecryptFailed` (`Error::XmlParse` when the `xmlenc` feature is off).
+- **Holder-of-Key.** Only bearer confirmations are usable. An assertion that offers only a Holder-of-Key confirmation is rejected with `Error::HolderOfKeyConfirmation`.
+- **Replay.** The call is stateless. A caller that needs a single presentation dedupes on `Identity::assertion_id()` until `Identity::not_on_or_after()`. `<saml:OneTimeUse>` is surfaced by `Identity::is_one_time_use()` and not enforced; it is a directive to relying parties, and the issuer is not one.
+- **Everything about the presenter.** Who presented the assertion, how they authenticated, whether they are entitled to act for `sp`, and what a verified assertion earns them are the caller's decisions. The library knows of no protocol that carries the assertion to the IdP, and returns no token, grant, or session.
+
 ---
 
 ---
@@ -604,3 +656,7 @@ The IdP role does the heaviest lifting in security-sensitive validation. Library
 | Emitted AuthnContext satisfies the immutable requested policy | Hard |
 | Encryption certificates match validation-time fingerprints when encryption is selected | Hard |
 | Replay defense on AuthnRequest ID | Caller's job (library exposes `validated_request_id()`) |
+| `verify_issued_assertion`: assertion signature present, sole, and covering the document root | Hard |
+| `verify_issued_assertion`: `Issuer` = own entity ID; audience = SP entity ID; `Recipient` ∈ SP's registered ACS URLs | Hard |
+| `verify_issued_assertion`: `Conditions`, `SubjectConfirmationData`, and session time windows | Hard |
+| `verify_issued_assertion`: replay of a presented assertion | Caller's job (library exposes `Identity::assertion_id()`) |
