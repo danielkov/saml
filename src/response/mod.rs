@@ -7,7 +7,7 @@ pub mod issue;
 pub mod parse;
 pub mod validate;
 
-pub use identity::Identity;
+pub use identity::{Identity, VerifiedAssertion};
 
 pub(crate) const SAMLP_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
 pub(crate) const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";

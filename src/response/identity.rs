@@ -107,6 +107,53 @@ pub struct Identity {
     validated: ValidatedUpstream,
 }
 
+/// A verified `<saml:Assertion>` as a standalone XML document.
+///
+/// Returned by
+/// [`ServiceProvider::consume_response_with_assertion`](crate::ServiceProvider::consume_response_with_assertion).
+/// The document is the assertion the [`Identity`] was read from, with its own
+/// `<ds:Signature>` intact and verified in this exact form.
+///
+/// # This is a credential
+///
+/// A signed bearer assertion can be presented by whoever holds it, until it
+/// expires. Treat the XML like a password: do not log it, and do not keep it
+/// longer than the presentation it is needed for. `Debug` prints no content
+/// for that reason.
+///
+/// It cannot be constructed outside this crate, so holding one is evidence
+/// that the response validator produced it.
+#[derive(Clone)]
+pub struct VerifiedAssertion {
+    xml: String,
+}
+
+impl VerifiedAssertion {
+    /// Crate-internal: only the response validator may vouch for one.
+    pub(crate) fn new(xml: String) -> Self {
+        Self { xml }
+    }
+
+    /// The assertion document. The root element is `<saml:Assertion>`; there
+    /// is no XML declaration.
+    #[must_use]
+    pub fn as_xml(&self) -> &str {
+        &self.xml
+    }
+
+    /// Consume the value and return the assertion document.
+    #[must_use]
+    pub fn into_xml(self) -> String {
+        self.xml
+    }
+}
+
+impl std::fmt::Debug for VerifiedAssertion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedAssertion").finish_non_exhaustive()
+    }
+}
+
 /// Zero-sized proof that an [`Identity`] came from response validation.
 #[derive(Debug, Clone)]
 struct ValidatedUpstream;

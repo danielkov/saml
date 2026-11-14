@@ -499,6 +499,44 @@ mutually authenticated TLS when its `backchannel` field is `None`.
 - **Application session**: create a session keyed off `identity.name_id()` + `identity.session_index()`.
 - **Authorization**: apply policy to `identity.attributes()`.
 
+### 4.3 Keeping the verified assertion
+
+`ServiceProvider::consume_response_with_assertion` validates a Response exactly as `consume_response` does, and also returns the assertion as a standalone signed document. It exists for an SP that has to present the assertion again afterwards, for instance back to the IdP that issued it (RFC-004 §3.3).
+
+```rust
+pub struct ConsumedResponse {
+    pub identity: Identity,
+    /// `None` when the assertion cannot stand alone.
+    pub assertion: Option<VerifiedAssertion>,
+}
+
+impl ServiceProvider {
+    pub fn consume_response_with_assertion(&self, input: ConsumeResponse<'_>) -> Result<ConsumedResponse, Error>;
+}
+
+impl VerifiedAssertion {
+    pub fn as_xml(&self) -> &str;
+    pub fn into_xml(self) -> String;
+}
+```
+
+The input, the validation order (§4.1), the replay-cache behavior, and the `Identity` are those of `consume_response`. The export runs after every check has passed, so a rejected Response exports nothing.
+
+**What is returned.** The document is the element the `Identity` was read from: the one the verified signature covers (RFC-002 §3.2), never one found by name. Namespace declarations it inherited from the Response are moved onto it. An `<saml:EncryptedAssertion>` is returned decrypted, which is the form a later recipient that is not the SP can read.
+
+**The output is checked, not assumed.** Before it is returned, the standalone document is re-parsed and its signature re-verified against the IdP's certificates under the same crypto policy and `SignatureVerifier`, and the signed element must be its root. A `VerifiedAssertion` therefore always verifies as it stands.
+
+**When `assertion` is `None`.** The login is valid in each case; there is only nothing that can stand alone:
+
+- The assertion has no signature of its own. A Response-level signature vouched for it, and that signature does not travel with the assertion.
+- The assertion's signature does not verify on its own. This covers an assertion signature the Response path did not need to check because the Response signature sufficed, and the rare signature that depends on context outside the assertion.
+
+An SP that needs the assertion sets `want_signed.assertions`, so an unsigned assertion is rejected up front rather than accepted without an export.
+
+**It is a credential.** A signed bearer assertion can be presented by whoever holds it until it expires. `consume_response` does not retain it, and `Identity` does not carry it, so only callers that ask for it hold it. `VerifiedAssertion` prints no content through `Debug` and cannot be constructed outside the crate. The caller keeps it out of logs and drops it once it has been presented.
+
+The artifact, ECP, and proxy consume paths do not offer this.
+
 ---
 
 ## 5. SP-initiated logout
