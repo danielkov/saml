@@ -522,7 +522,7 @@ impl VerifiedAssertion {
 
 The input, the validation order (§4.1), the replay-cache behavior, and the `Identity` are those of `consume_response`. The export runs after every check has passed, so a rejected Response exports nothing.
 
-**What is returned.** The document is the element the `Identity` was read from: the one the verified signature covers (RFC-002 §3.2), never one found by name. Namespace declarations it inherited from the Response are moved onto it. An `<saml:EncryptedAssertion>` is returned decrypted, which is the form a later recipient that is not the SP can read.
+**What is returned.** The document is the element the `Identity` was read from: the one the verified signature covers (RFC-002 §3.2), never one found by name. Namespace declarations it inherited from the Response are moved onto it. Every element and attribute name keeps the prefix the signer wrote, because canonicalization is prefix-sensitive and two prefixes may be bound to the same namespace. An `<saml:EncryptedAssertion>` is returned decrypted, which is the form a later recipient that is not the SP can read.
 
 **The output is checked, not assumed.** Before it is returned, the standalone document is re-parsed and its signature re-verified against the IdP's certificates under the same crypto policy and `SignatureVerifier`, and the signed element must be its root. A `VerifiedAssertion` therefore always verifies as it stands.
 
