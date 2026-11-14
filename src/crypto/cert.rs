@@ -26,6 +26,7 @@ use std::fmt;
 use std::time::SystemTime;
 
 use const_oid::db::rfc5912::{ID_EC_PUBLIC_KEY, RSA_ENCRYPTION, SECP_256_R_1, SECP_384_R_1};
+use ecdsa::signature::Verifier as _;
 use rsa::RsaPublicKey;
 use rsa::pkcs1v15::VerifyingKey as RsaPkcs1v15VerifyingKey;
 use signature::Verifier as _;

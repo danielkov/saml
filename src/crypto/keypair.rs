@@ -21,6 +21,7 @@
 //! — SAML deployments in the wild stick to matched pairings, and accepting
 //! mismatches would invite test-coverage gaps.
 
+use p256::pkcs8::DecodePrivateKey as _;
 use pkcs8::DecodePrivateKey;
 use rsa::RsaPrivateKey;
 use sha2::{Sha256, Sha384, Sha512};
@@ -363,7 +364,7 @@ impl KeyPair {
                 sign_rsa::<sha1::Sha1>(&secret.key, signed_bytes)
             }
             (KeyPairInner::EcdsaP256(secret), SignatureAlgorithm::EcdsaSha256) => {
-                use signature::Signer as _;
+                use ecdsa::signature::Signer as _;
                 let sig: p256::ecdsa::Signature =
                     secret.key.try_sign(signed_bytes).map_err(|_e| {
                         Error::SignatureVerification {
@@ -373,7 +374,7 @@ impl KeyPair {
                 Ok(sig.to_bytes().to_vec())
             }
             (KeyPairInner::EcdsaP384(secret), SignatureAlgorithm::EcdsaSha384) => {
-                use signature::Signer as _;
+                use ecdsa::signature::Signer as _;
                 let sig: p384::ecdsa::Signature =
                     secret.key.try_sign(signed_bytes).map_err(|_e| {
                         Error::SignatureVerification {

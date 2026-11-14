@@ -89,19 +89,30 @@ external-default-features = "allow"
 # the dep graph today via transitive deps and aren't worth blocking releases
 # on. Re-evaluate periodically — ideally this list shrinks.
 skip = [
-    # `rand` / `rand_core` / `rand_chacha` / `getrandom` span multiple major
-    # versions across INDEPENDENT transitive chains we don't control:
-    #   - older line: the RustCrypto signature stack (elliptic-curve ->
-    #     rand_core 0.6 -> getrandom 0.2) and rsa (num-bigint-dig -> rand 0.8);
-    #   - newer line: our own rand 0.9 (proxy nonce generation) -> rand_core 0.9
-    #     -> getrandom 0.3.
-    # None are ours to unify; the rsa-side ones clear when rsa migrates off
-    # num-bigint-dig in its 0.10 release (see [advisories] note). Skip the
-    # older versions so the duplicate guard stays active elsewhere.
+    # RSA 0.9 still needs the older RustCrypto stack, while P-256/P-384
+    # 0.14 need the newer stack to fix RUSTSEC-2026-0387 in crypto-bigint.
+    # Keep version-scoped skips until RSA and the encryption/X.509 stack
+    # can migrate together; do not skip entire dependency trees.
+    # Randomness also spans RSA (rand_core 0.6), our rand 0.9 (rand_core
+    # 0.9 / getrandom 0.3), and the new EC stack (rand_core 0.10).
     { name = "rand", version = "0.8" },
     { name = "rand_chacha", version = "0.3" },
     { name = "rand_core", version = "0.6" },
     { name = "getrandom", version = "0.2" },
+    { name = "getrandom", version = "0.3" },
+    { name = "rand_core", version = "0.9" },
+    { name = "block-buffer", version = "0.10" },
+    { name = "const-oid", version = "0.9" },
+    { name = "cpufeatures", version = "0.2" },
+    { name = "crypto-common", version = "0.1" },
+    { name = "der", version = "0.7" },
+    { name = "digest", version = "0.10" },
+    { name = "hmac", version = "0.12" },
+    { name = "pem-rfc7468", version = "0.7" },
+    { name = "pkcs8", version = "0.10" },
+    { name = "sha2", version = "0.10" },
+    { name = "signature", version = "2" },
+    { name = "spki", version = "0.7" },
 ]
 skip-tree = []
 
