@@ -93,9 +93,7 @@ The following are **out of scope** — protect against them at a higher layer:
 
 ## Known Advisories
 
-The dependency audits (`cargo audit` / `cargo deny`) do not ignore any
-advisories. The RSA dependency is on the 0.10 line, which RustSec lists as
-patched for RUSTSEC-2023-0071 (the "Marvin Attack").
+None.
 
 ## Disclosure Timeline
 
