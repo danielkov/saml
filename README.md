@@ -11,7 +11,7 @@ Stateless, async-native SAML 2.0 toolkit with no libxml2 / xmlsec C build chain.
 
 ## Status
 
-Pre-release: **v0.2.0-alpha.1**. The protocol surface described below is implemented and exercised against an interop corpus drawn from Okta, Microsoft Entra ID, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, and Shibboleth fixtures. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
+Pre-release: **v0.1.0-alpha.2**. The protocol surface described below is implemented and exercised against an interop corpus drawn from Okta, Microsoft Entra ID, Auth0, Google Workspace, OneLogin, Keycloak, ADFS, and Shibboleth fixtures. APIs and on-disk fixtures should be considered subject to change until v1.0. No claim of "production ready" or "battle-tested" is made yet.
 
 ## Why this vs. samael
 
@@ -249,7 +249,7 @@ The harnesses reach into `pub mod __fuzz` in `src/lib.rs`, which is gated on `#[
 
 ## Minimum Supported Rust Version
 
-The MSRV is **Rust 1.91.0** — the crate uses `Duration::from_mins` and `Duration::from_hours`, both stabilized in 1.91. CI runs the full test matrix against `stable`, `beta`, and `1.91.0`. Bumping the MSRV is treated as a minor-version change and called out in the release notes.
+The MSRV is **Rust 1.91.0** — the crate uses `Duration::from_mins` and `Duration::from_hours`, both stabilized in 1.91. CI runs the full test matrix against `stable`, `beta`, and `1.91.0`. MSRV changes are called out in the release notes and follow the [release versioning policy](docs/releasing.md).
 
 ## License
 

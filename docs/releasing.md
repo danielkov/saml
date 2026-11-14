@@ -34,9 +34,11 @@ git push origin v0.1.0
 # 4. Approve the `crates-io` deployment in the GitHub Actions UI.
 ```
 
-Version conventions: pre-1.0, breaking API changes bump the minor version;
-an MSRV bump is treated as a minor-version change and called out in the
-release notes (see README).
+Version conventions: while preparing the first stable 0.1.0 release, keep
+alpha releases on the 0.1.0 line and increment the prerelease number
+(`0.1.0-alpha.1`, `0.1.0-alpha.2`, ...), including for breaking API changes.
+Document breaking changes and MSRV changes in the release notes. After a
+stable release, pre-1.0 breaking API or MSRV changes bump the minor version.
 
 ## Bootstrap status
 
