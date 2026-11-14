@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-alpha.1] - 2026-11-14
+
+### Added
+
+- SP and IdP configuration can supply an `Arc<dyn SignatureVerifier>` for
+  inbound SSO, logout, and IdP-side ArtifactResolve signature verification.
+  `None` retains the built-in verifier. Peer algorithm policy remains enforced
+  before the configured verifier runs. Metadata parsing, the artifact
+  backchannel client, and independent ECP APIs retain built-in verification.
+
+### Changed
+
+- **Breaking:** `ServiceProviderConfig` and `IdentityProviderConfig` require a
+  `verifier` field in struct literals; add `verifier: None` to retain existing
+  behavior. Custom `SignatureVerifier` implementations must now implement
+  `Debug`.
+- Migrate RSA, ECDSA, X.509/PKCS formats, symmetric ciphers, hashing, MACs, and
+  randomness to the current RustCrypto stack. Preserve independent OAEP/MGF1
+  digest selection and legacy RSA key rotation under implicit rejection.
+- Pin the development toolchain to Rust 1.100.0. The minimum supported Rust
+  version remains 1.91.0.
+
+### Security
+
+- Upgrade RSA to 0.10 to resolve RUSTSEC-2023-0071 (the Marvin Attack), and
+  remove the advisory exception from both security audit commands.
+- Update crypto-bigint, QUIC/TLS dependencies, Tokio, and rustix to patched
+  versions. Dependency audits no longer ignore any advisories.
+
 ## [0.1.0-alpha.1] - 2026-10-04
 
 ### Added
