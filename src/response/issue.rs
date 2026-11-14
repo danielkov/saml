@@ -766,6 +766,7 @@ mod tests {
     use super::*;
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
+    use crate::crypto::verifier::DefaultVerifier;
     use crate::nameid::NameIdFormat;
     use crate::response::parse::parse_response;
     use crate::response::validate::{ValidateResponse, validate_response};
@@ -904,6 +905,7 @@ mod tests {
             parsed,
             idp: &idp,
             peer_crypto_policy: &policy,
+            verifier: &DefaultVerifier,
             #[cfg(feature = "xmlenc")]
             decryption_keys: &[],
             sp_entity_id: "https://sp.example.com",
@@ -966,6 +968,7 @@ mod tests {
             parsed,
             idp: &idp,
             peer_crypto_policy: &policy,
+            verifier: &DefaultVerifier,
             #[cfg(feature = "xmlenc")]
             decryption_keys: &[],
             sp_entity_id: "https://sp.example.com",

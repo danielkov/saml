@@ -750,6 +750,7 @@ fn run_fixture(fx: &Fixture) -> Result<saml::response::Identity, String> {
         #[cfg(feature = "slo")]
         logout_want_signed: saml::SpLogoutWantSigned::default(),
         default_peer_crypto_policy: policy,
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
     };
@@ -971,6 +972,7 @@ fn attacker_keyinfo_cert_rejected_when_idp_trusts_different_cert() {
         #[cfg(feature = "slo")]
         logout_want_signed: saml::SpLogoutWantSigned::default(),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
     };

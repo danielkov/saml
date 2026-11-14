@@ -165,6 +165,7 @@ pub fn make_idp(entity_id: &str, sso_url: &str) -> TestResult<IdentityProvider> 
         default_session_duration: Duration::from_hours(1),
         max_authn_request_age: saml::IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
         outbound_c14n: C14nAlgorithm::ExclusiveCanonical,
@@ -203,6 +204,7 @@ pub fn make_sp(entity_id: &str, acs_url: &str, signing: bool) -> TestResult<Serv
         #[cfg(feature = "slo")]
         logout_want_signed: saml::SpLogoutWantSigned::default(),
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
     })?)

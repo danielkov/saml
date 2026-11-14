@@ -33,6 +33,7 @@
 //! and RFC-007 §5.1 step 5 — and lets the role layer enforce the
 //! XML-DSig / detached-signature dispatch consistently.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "artifact-binding")]
@@ -58,12 +59,13 @@ use crate::binding::{Binding, Endpoint, SsoResponseBinding, SsoResponseDispatch}
 #[cfg(all(test, feature = "artifact-binding"))]
 use crate::crypto::cert::certificate_fingerprint_set;
 use crate::crypto::keypair::KeyPair;
+use crate::crypto::verifier::{DefaultVerifier, SignatureVerifier};
 use crate::descriptor::SpDescriptor;
 use crate::dsig::algorithms::{
     C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
 };
 use crate::dsig::reference::DS_NS;
-use crate::dsig::verify::{verify_detached_signature, verify_signature};
+use crate::dsig::verify::{verify_detached_signature_with, verify_signature_with};
 use crate::error::Error;
 #[cfg(feature = "slo")]
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
@@ -192,6 +194,20 @@ pub struct IdentityProviderConfig {
     /// this setting exists to close, wearing a different sign.
     pub max_authn_request_age: Duration,
     pub default_peer_crypto_policy: PeerCryptoPolicy,
+    /// Optional inbound signature verifier. `None` (the default) uses the
+    /// built-in [`DefaultVerifier`] (pure-Rust RSA/ECDSA). Supply a custom
+    /// [`SignatureVerifier`] to route inbound signature verification through
+    /// an external provider (HSM, KMS, or a FIPS-validated module) — see
+    /// RFC-002 §4. Algorithm allow-list policy still comes from the peer
+    /// crypto policy and is enforced before the verifier runs.
+    ///
+    /// Applies to inbound AuthnRequest, LogoutRequest, LogoutResponse, and
+    /// ArtifactResolve signatures consumed by this IdentityProvider, including
+    /// detached HTTP Redirect signatures. Inbound ArtifactResolve is the SOAP
+    /// request handled here, not an artifact backchannel client operation.
+    /// Metadata parsing and the independent artifact backchannel client and ECP
+    /// APIs do not use this setting; they retain the built-in verifier.
+    pub verifier: Option<Arc<dyn SignatureVerifier>>,
     pub outbound_signature_algorithm: SignatureAlgorithm,
     pub outbound_digest_algorithm: DigestAlgorithm,
     pub outbound_c14n: C14nAlgorithm,
@@ -385,6 +401,7 @@ impl IdentityProvider {
         let policy = input
             .peer_crypto_policy
             .unwrap_or(&self.config.default_peer_crypto_policy);
+        let verifier = self.config.verifier.as_deref().unwrap_or(&DefaultVerifier);
         let signature_required =
             self.config.want_authn_requests_signed || input.sp.authn_requests_signed;
 
@@ -395,6 +412,7 @@ impl IdentityProvider {
                     input.detached_signature.as_ref(),
                     &input.sp.signing_certs,
                     &policy.allowed_signature_algorithms,
+                    verifier,
                 )?;
                 // Verifying the signature over `raw_query_string` establishes
                 // what the SP signed — not that it is what we just parsed.
@@ -418,6 +436,7 @@ impl IdentityProvider {
                     root_id,
                     &input.sp.signing_certs,
                     policy,
+                    verifier,
                 )?;
             }
             // Artifact inbound AuthnRequest isn't a real binding — the spec
@@ -603,18 +622,20 @@ fn verify_redirect_request_signature(
     detached: Option<&DetachedSignature<'_>>,
     candidate_certs: &[crate::crypto::cert::X509Certificate],
     allowed_algorithms: &[SignatureAlgorithm],
+    verifier: &dyn SignatureVerifier,
 ) -> Result<(), Error> {
     match detached {
         None if required => Err(Error::SignatureMissing),
         None => Ok(()),
         Some(d) => {
             let sig_alg = SignatureAlgorithm::from_uri(d.sig_alg)?;
-            verify_detached_signature(
+            verify_detached_signature_with(
                 d.raw_query_string.as_bytes(),
                 d.signature,
                 sig_alg,
                 candidate_certs,
                 allowed_algorithms,
+                verifier,
             )?;
             Ok(())
         }
@@ -631,13 +652,14 @@ fn verify_envelope_signature(
     root_id: crate::xml::parse::ElementId,
     candidate_certs: &[crate::crypto::cert::X509Certificate],
     policy: &PeerCryptoPolicy,
+    verifier: &dyn SignatureVerifier,
 ) -> Result<(), Error> {
     let sig_elem = root.child_element(Some(DS_NS), "Signature");
     match sig_elem {
         None if required => Err(Error::SignatureMissing),
         None => Ok(()),
         Some(sig) => {
-            let verified = verify_signature(doc, sig, candidate_certs, policy)?;
+            let verified = verify_signature_with(doc, sig, candidate_certs, policy, verifier)?;
             if verified.signed_element != root_id {
                 return Err(Error::SignatureVerification {
                     reason: "signature covers a different element than the message root (XSW)",
@@ -1243,7 +1265,9 @@ impl IdentityProvider {
                 let policy = input
                     .peer_crypto_policy
                     .unwrap_or(&self.config.default_peer_crypto_policy);
-                let verified = verify_signature(document, signature, &pinned_sp_certs, policy)?;
+                let verifier = self.config.verifier.as_deref().unwrap_or(&DefaultVerifier);
+                let verified =
+                    verify_signature_with(document, signature, &pinned_sp_certs, policy, verifier)?;
                 if verified.signed_element != root.id() {
                     return Err(Error::SignatureVerification {
                         reason: "ArtifactResolve signature does not cover the message root",
@@ -1687,16 +1711,18 @@ impl IdentityProvider {
 
         // Signature (§5.1 step 5).
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
+        let verifier = self.config.verifier.as_deref().unwrap_or(&DefaultVerifier);
         let signature_required = self.config.logout_want_signed.requests;
-        verify_logout_signature(
-            signature_required,
+        verify_logout_signature(LogoutSignatureInput {
+            required: signature_required,
             binding,
-            &doc,
+            doc: &doc,
             root_id,
-            detached_signature.as_ref(),
-            &sp.signing_certs,
+            detached: detached_signature.as_ref(),
+            candidate_certs: &sp.signing_certs,
             policy,
-        )?;
+            verifier,
+        })?;
 
         // EncryptedID (§5.1): now that the request is authenticated, decrypt the
         // subject if the SP encrypted it to our key. Cleartext NameID requests
@@ -1888,16 +1914,18 @@ impl IdentityProvider {
 
         // Signature (§5.2 step 5).
         let policy = peer_crypto_policy.unwrap_or(&self.config.default_peer_crypto_policy);
+        let verifier = self.config.verifier.as_deref().unwrap_or(&DefaultVerifier);
         let signature_required = self.config.logout_want_signed.responses;
-        verify_logout_signature(
-            signature_required,
+        verify_logout_signature(LogoutSignatureInput {
+            required: signature_required,
             binding,
-            &doc,
+            doc: &doc,
             root_id,
-            detached_signature.as_ref(),
-            &sp.signing_certs,
+            detached: detached_signature.as_ref(),
+            candidate_certs: &sp.signing_certs,
             policy,
-        )?;
+            verifier,
+        })?;
 
         // InResponseTo match (§5.2 step 6).
         if parsed.in_response_to != tracker.request_id {
@@ -2158,31 +2186,54 @@ pub struct ConsumeLogoutResponseWire<'a> {
     pub clock_skew: Duration,
 }
 
-/// Verify the signature on an inbound SLO message. POST/SOAP get the embedded
-/// XML-DSig path; Redirect goes through detached signature verification using
-/// the (optional) `detached` parameter.
+/// Message and peer trust inputs for inbound SLO signature verification.
 #[cfg(feature = "slo")]
-fn verify_logout_signature(
+struct LogoutSignatureInput<'a> {
     required: bool,
     binding: Binding,
-    doc: &Document,
+    doc: &'a Document,
     root_id: crate::xml::parse::ElementId,
-    detached: Option<&DetachedSignature<'_>>,
-    candidate_certs: &[crate::crypto::cert::X509Certificate],
-    policy: &PeerCryptoPolicy,
-) -> Result<(), Error> {
+    detached: Option<&'a DetachedSignature<'a>>,
+    candidate_certs: &'a [crate::crypto::cert::X509Certificate],
+    policy: &'a PeerCryptoPolicy,
+    verifier: &'a dyn SignatureVerifier,
+}
+
+/// Verify the signature on an inbound SLO message. POST/SOAP get the embedded
+/// XML-DSig path; Redirect goes through detached signature verification.
+#[cfg(feature = "slo")]
+fn verify_logout_signature(input: LogoutSignatureInput<'_>) -> Result<(), Error> {
+    let LogoutSignatureInput {
+        required,
+        binding,
+        doc,
+        root_id,
+        detached,
+        candidate_certs,
+        policy,
+        verifier,
+    } = input;
     match binding {
         Binding::HttpRedirect => verify_redirect_request_signature(
             required,
             detached,
             candidate_certs,
             &policy.allowed_signature_algorithms,
+            verifier,
         ),
         Binding::HttpPost | Binding::Soap => {
             let root = doc.element(root_id).ok_or(Error::SignatureVerification {
                 reason: "could not locate root element for signature check",
             })?;
-            verify_envelope_signature(required, doc, root, root_id, candidate_certs, policy)
+            verify_envelope_signature(
+                required,
+                doc,
+                root,
+                root_id,
+                candidate_certs,
+                policy,
+                verifier,
+            )
         }
         Binding::HttpArtifact => Err(Error::UnsupportedByPeer {
             binding: Binding::HttpArtifact,
@@ -2374,6 +2425,7 @@ mod tests {
     use crate::binding::{Binding, Endpoint, SsoResponseDispatch, SsoResponseEndpoint};
     use crate::crypto::cert::X509Certificate;
     use crate::crypto::cert::test_vectors::{RSA_CERT_PEM, RSA_KEY_PKCS8_PEM};
+    use crate::crypto::verifier::{KeyInfo, VerifyMatch};
     use crate::descriptor::IdpDescriptor;
     use crate::dsig::algorithms::{
         C14nAlgorithm, DigestAlgorithm, PeerCryptoPolicy, SignatureAlgorithm,
@@ -2456,6 +2508,7 @@ mod tests {
             default_session_duration: Duration::from_hours(1),
             max_authn_request_age: IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+            verifier: None,
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
             outbound_c14n: C14nAlgorithm::ExclusiveCanonical,
@@ -2526,6 +2579,7 @@ mod tests {
             #[cfg(feature = "slo")]
             logout_want_signed: crate::sp::SpLogoutWantSigned::default(),
             default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+            verifier: None,
             outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: DigestAlgorithm::Sha256,
         }
@@ -3072,7 +3126,7 @@ mod tests {
         let signature = response
             .child_element(Some(DS_NS), "Signature")
             .expect("outer ArtifactResponse signature");
-        let verified = verify_signature(
+        let verified = crate::dsig::verify::verify_signature(
             body.document_ref(),
             signature,
             &[rsa_cert()],
@@ -3474,6 +3528,151 @@ mod tests {
             "https://sp.example.com/acs"
         );
         assert_eq!(parsed.relay_state.as_deref(), Some("opaque-state"));
+    }
+
+    /// Verifier that always fails — proves the IdP path (redirect + enveloped
+    /// free functions) runs the configured verifier, not just the SP path.
+    #[derive(Debug, Default)]
+    struct FailingVerifier;
+
+    impl SignatureVerifier for FailingVerifier {
+        fn verify(
+            &self,
+            _algorithm: SignatureAlgorithm,
+            _signed_bytes: &[u8],
+            _signature_bytes: &[u8],
+            _candidate_certs: &[X509Certificate],
+            _allowed_algorithms: &[SignatureAlgorithm],
+            _key_info: &KeyInfo,
+        ) -> Result<VerifyMatch, Error> {
+            Err(Error::SignatureVerification {
+                reason: "injected verifier failure",
+            })
+        }
+    }
+
+    #[test]
+    fn consume_authn_request_surfaces_the_configured_verifier_error() {
+        let mut idp = idp_with(true, false);
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+
+        let err = consume_at(&idp, fixed_now(), Duration::from_mins(1))
+            .expect_err("the failing verifier must reject a validly signed request");
+
+        assert!(
+            matches!(
+                err,
+                Error::SignatureVerification { reason } if reason == "injected verifier failure"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_authn_request_uses_configured_verifier() {
+        let mut idp = idp_with(true, false);
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_authn_request_raw_query("_verifier-authn");
+        let consume = |idp: &IdentityProvider| {
+            idp.consume_authn_request_wire(ConsumeAuthnRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                max_authn_request_age: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                relay_state: None,
+                expected_destination: "https://idp.example.com/sso",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+        };
+        consume(&idp).expect("valid detached AuthnRequest signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn logout_request_uses_configured_verifier() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.requests = true;
+        let sp = sp_descriptor(false);
+        let raw_query = build_signed_redirect_logout_request_raw_query("_verifier-logout-request");
+        let consume = |idp: &IdentityProvider| {
+            idp.consume_logout_request_wire(ConsumeLogoutRequestWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+        };
+        consume(&idp).expect("valid detached LogoutRequest signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    #[cfg(feature = "slo")]
+    #[test]
+    fn logout_response_uses_configured_verifier() {
+        let mut idp = idp_with(false, false);
+        idp.config.logout_want_signed.responses = true;
+        let sp = sp_descriptor(false);
+        let tracker = LogoutTracker {
+            request_id: "_verifier-logout-anchor".to_owned(),
+            issued_at: fixed_now(),
+            peer_entity_id: sp.entity_id.clone(),
+        };
+        let raw_query = build_signed_redirect_logout_response_raw_query(
+            "_verifier-logout-response",
+            &tracker.request_id,
+        );
+        let consume = |idp: &IdentityProvider| {
+            idp.consume_logout_response_wire(ConsumeLogoutResponseWire {
+                sp: &sp,
+                peer_crypto_policy: None,
+                wire_body: raw_query.as_bytes(),
+                binding: Binding::HttpRedirect,
+                tracker: &tracker,
+                expected_destination: "https://idp.example.com/slo",
+                now: fixed_now(),
+                clock_skew: Duration::from_mins(1),
+            })
+        };
+        consume(&idp).expect("valid detached LogoutResponse signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    #[cfg(feature = "artifact-binding")]
+    #[test]
+    fn inbound_artifact_resolve_uses_configured_verifier() {
+        let mut idp = artifact_idp();
+        let sp = sp_descriptor(false);
+        let envelope = artifact_resolve_envelope(
+            &sp.entity_id,
+            "https://idp.example.com/ars",
+            fixed_now(),
+            true,
+        );
+        let consume = |idp: &IdentityProvider| {
+            consume_artifact_resolve(idp, &sp, &envelope, "https://idp.example.com/ars", true)
+        };
+        consume(&idp).expect("valid enveloped ArtifactResolve signature");
+        idp.config.verifier = Some(Arc::new(FailingVerifier));
+        assert_injected_verifier_error(consume(&idp).expect_err("configured verifier must run"));
+    }
+
+    fn assert_injected_verifier_error(err: Error) {
+        assert!(
+            matches!(
+                err,
+                Error::SignatureVerification { reason } if reason == "injected verifier failure"
+            ),
+            "got {err:?}"
+        );
     }
 
     // ---------- AuthnRequest freshness ----------

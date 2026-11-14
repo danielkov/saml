@@ -684,6 +684,7 @@ pub fn build_identity_provider(config: &AppConfig) -> Result<IdentityProvider, s
         default_session_duration: Duration::from_hours(8),
         max_authn_request_age: saml::IdentityProviderConfig::DEFAULT_MAX_AUTHN_REQUEST_AGE,
         default_peer_crypto_policy: PeerCryptoPolicy::strong_defaults(),
+        verifier: None,
         outbound_signature_algorithm: SignatureAlgorithm::RsaSha256,
         outbound_digest_algorithm: DigestAlgorithm::Sha256,
         outbound_c14n: C14nAlgorithm::ExclusiveCanonical,
@@ -994,6 +995,7 @@ mod tests {
             logout_signing: saml::SpLogoutSigning::default(),
             logout_want_signed: saml::SpLogoutWantSigned::default(),
             default_peer_crypto_policy: saml::PeerCryptoPolicy::strong_defaults(),
+            verifier: None,
             outbound_signature_algorithm: saml::SignatureAlgorithm::RsaSha256,
             outbound_digest_algorithm: saml::DigestAlgorithm::Sha256,
         })

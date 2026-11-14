@@ -140,23 +140,6 @@ pub(crate) fn verify_signature_with(
 /// the binding layer (`binding::redirect::decode`) returned in
 /// `DecodedRedirect::signed_query_string`. It is the bytes the verifier
 /// hashes — NOT the decoded XML.
-pub(crate) fn verify_detached_signature(
-    signed_query_string: &[u8],
-    signature_bytes: &[u8],
-    sig_alg: SignatureAlgorithm,
-    candidate_certs: &[X509Certificate],
-    allowed_algorithms: &[SignatureAlgorithm],
-) -> Result<VerifyMatch, Error> {
-    verify_detached_signature_with(
-        signed_query_string,
-        signature_bytes,
-        sig_alg,
-        candidate_certs,
-        allowed_algorithms,
-        &DefaultVerifier,
-    )
-}
-
 pub(crate) fn verify_detached_signature_with(
     signed_query_string: &[u8],
     signature_bytes: &[u8],
@@ -678,12 +661,13 @@ mod tests {
         let qs = b"SAMLRequest=abc&RelayState=xyz&SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23rsa-sha256";
         let sig = kp.sign(SignatureAlgorithm::RsaSha256, qs).unwrap();
 
-        let m = verify_detached_signature(
+        let m = verify_detached_signature_with(
             qs,
             &sig,
             SignatureAlgorithm::RsaSha256,
             std::slice::from_ref(&cert),
             &[SignatureAlgorithm::RsaSha256],
+            &DefaultVerifier,
         )
         .expect("detached signature should verify");
         assert_eq!(m.cert_fingerprint, cert.fingerprint_sha256());
@@ -698,12 +682,13 @@ mod tests {
         let mut sig = kp.sign(SignatureAlgorithm::RsaSha256, qs).unwrap();
         sig[0] ^= 0x01;
 
-        let err = verify_detached_signature(
+        let err = verify_detached_signature_with(
             qs,
             &sig,
             SignatureAlgorithm::RsaSha256,
             &[cert],
             &[SignatureAlgorithm::RsaSha256],
+            &DefaultVerifier,
         )
         .expect_err("tampered signature must be rejected");
         assert!(matches!(
@@ -721,13 +706,14 @@ mod tests {
         let qs = b"SAMLRequest=abc";
         let sig = kp.sign(SignatureAlgorithm::RsaSha256, qs).unwrap();
 
-        let err = verify_detached_signature(
+        let err = verify_detached_signature_with(
             qs,
             &sig,
             SignatureAlgorithm::RsaSha256,
             &[cert],
             // Allow only RsaSha512 — signing alg not allowed.
             &[SignatureAlgorithm::RsaSha512],
+            &DefaultVerifier,
         )
         .expect_err("disallowed algorithm must be rejected");
         assert!(matches!(err, Error::DisallowedAlgorithm { .. }));
@@ -740,12 +726,13 @@ mod tests {
         let qs_signed = b"SAMLRequest=abc&SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23rsa-sha256";
         let qs_tampered = b"SAMLRequest=XYZ&SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23rsa-sha256";
         let sig = kp.sign(SignatureAlgorithm::RsaSha256, qs_signed).unwrap();
-        let err = verify_detached_signature(
+        let err = verify_detached_signature_with(
             qs_tampered,
             &sig,
             SignatureAlgorithm::RsaSha256,
             &[cert],
             &[SignatureAlgorithm::RsaSha256],
+            &DefaultVerifier,
         )
         .expect_err("query string tampering must be rejected");
         assert!(matches!(
