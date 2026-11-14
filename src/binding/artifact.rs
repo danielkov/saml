@@ -37,7 +37,7 @@ use std::time::SystemTime;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rsa::rand_core::{OsRng, RngCore as _};
+use rand::{TryRng as _, rngs::SysRng};
 use sha1::{Digest as _, Sha1};
 use url::Url;
 
@@ -146,7 +146,7 @@ pub fn make_artifact(issuer_entity_id: &str, endpoint_index: u16) -> Result<Stri
     // Bytes 4..24: SourceID = SHA-1(entity_id).
     buf[4..24].copy_from_slice(&source_id(issuer_entity_id));
     // Bytes 24..44: MessageHandle = 20 random bytes.
-    OsRng
+    SysRng
         .try_fill_bytes(&mut buf[24..44])
         .map_err(|_err| Error::InvalidConfiguration {
             reason: "RNG failure generating artifact MessageHandle",

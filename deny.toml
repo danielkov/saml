@@ -27,18 +27,7 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = [
-    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa`. Accepted
-    # with documented rationale (see SECURITY.md): no fixed release exists (the
-    # mitigation is partial and unreleased in the dragging rsa 0.10 line,
-    # RustCrypto/RSA#390), and pure-Rust RSA has no maintained alternative that
-    # would not pull in a C/asm backend — defeating this crate's no-C-build-chain
-    # premise. The practically-exploitable PKCS#1 v1.5 padding-oracle vector is
-    # gated behind `weak-algos` and refused by default (only RSA-OAEP key
-    # transport is accepted); the residual is generic non-constant-time modexp
-    # timing, and SP-side signature verification (no private key) is unaffected.
-    "RUSTSEC-2023-0071",
-]
+ignore = []
 
 # ---------------------------------------------------------------------------
 # Licenses: allow permissive only. No GPL/AGPL/LGPL/SSPL.
@@ -89,18 +78,7 @@ external-default-features = "allow"
 # the dep graph today via transitive deps and aren't worth blocking releases
 # on. Re-evaluate periodically — ideally this list shrinks.
 skip = [
-    # `rand` / `rand_core` / `rand_chacha` / `getrandom` span multiple major
-    # versions across INDEPENDENT transitive chains we don't control:
-    #   - older line: the RustCrypto signature stack (elliptic-curve ->
-    #     rand_core 0.6 -> getrandom 0.2) and rsa (num-bigint-dig -> rand 0.8);
-    #   - newer line: our own rand 0.9 (proxy nonce generation) -> rand_core 0.9
-    #     -> getrandom 0.3.
-    # None are ours to unify; the rsa-side ones clear when rsa migrates off
-    # num-bigint-dig in its 0.10 release (see [advisories] note). Skip the
-    # older versions so the duplicate guard stays active elsewhere.
-    { name = "rand", version = "0.8" },
-    { name = "rand_chacha", version = "0.3" },
-    { name = "rand_core", version = "0.6" },
+    # rustls/ring still use getrandom 0.2; our crypto stack uses 0.4.
     { name = "getrandom", version = "0.2" },
 ]
 skip-tree = []

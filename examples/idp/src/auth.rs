@@ -7,8 +7,7 @@
 
 use std::collections::HashMap;
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHashString, PasswordHasher, SaltString};
+use argon2::password_hash::{PasswordHasher, phc::PasswordHash};
 use argon2::{Argon2, PasswordVerifier};
 use serde::Deserialize;
 
@@ -38,7 +37,7 @@ impl UsersFile {
 }
 
 /// One user, ready for authentication. Cleartext password from
-/// `users.toml` has been hashed; only the [`PasswordHashString`] is kept
+/// `users.toml` has been hashed; only the PHC-encoded hash string is kept
 /// in memory.
 #[derive(Debug, Clone)]
 pub struct StoredUser {
@@ -47,7 +46,7 @@ pub struct StoredUser {
     pub first_name: String,
     pub last_name: String,
     pub department: Option<String>,
-    pub password_hash: PasswordHashString,
+    pub password_hash: String,
 }
 
 impl StoredUser {
@@ -80,11 +79,10 @@ impl UserStore {
         let mut by_email = HashMap::with_capacity(file.user.len());
         let argon = Argon2::default();
         for u in &file.user {
-            let salt = SaltString::generate(&mut OsRng);
             let hash = argon
-                .hash_password(u.password.as_bytes(), &salt)
+                .hash_password(u.password.as_bytes())
                 .map_err(AuthError::Argon2)?
-                .serialize();
+                .to_string();
             let stored = StoredUser {
                 id: u.id.clone(),
                 email: u.email.clone(),

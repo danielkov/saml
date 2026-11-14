@@ -18,7 +18,7 @@
 # Pin to a concrete stable release rather than the floating `stable` channel so
 # builds — and `cargo fmt` output — are byte-reproducible across contributors
 # and CI. Must stay at or above the crate MSRV (1.91.0).
-rust = "1.95.0"
+rust = "1.100.0"
 # Coverage-guided fuzzing harnesses (`cargo fuzz run …`). Requires a nightly
 # toolchain at run time, which it picks up from rustup.
 "cargo:cargo-fuzz" = "0.13.1"

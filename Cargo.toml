@@ -33,25 +33,25 @@ exclude = [
 quick-xml = "0.41"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 base64 = "0.22"
-rsa = { version = "0.9", features = ["sha2"] }
-ecdsa = "0.16"
-p256 = { version = "0.13", features = ["ecdsa", "pem"] }
-p384 = { version = "0.13", features = ["ecdsa", "pem"] }
-sha1 = { version = "0.10", optional = true, features = ["oid"] }
-sha2 = { version = "0.10", features = ["oid"] }
-rand = "0.9"
-x509-cert = { version = "0.2", features = ["pem"] }
-spki = "0.7"
-const-oid = "0.9"
-pkcs8 = { version = "0.10", features = ["pem"] }
-pkcs1 = { version = "0.7", features = ["pem"] }
-aes = "0.8"
-cbc = "0.1"
-aes-gcm = "0.10"
-ctr = "0.9"
-hmac = "0.12"
-digest = "0.10"
-signature = "2"
+rsa = { version = "0.10", features = ["pkcs1v15"] }
+ecdsa = "0.17"
+p256 = { version = "0.14", features = ["ecdsa", "pem"] }
+p384 = { version = "0.14", features = ["ecdsa", "pem"] }
+sha1 = { version = "0.11", optional = true, features = ["oid"] }
+sha2 = { version = "0.11", features = ["oid"] }
+rand = "0.10"
+x509-cert = { version = "0.3", features = ["pem"] }
+spki = "0.8"
+const-oid = "0.10"
+pkcs8 = { version = "0.11", features = ["pem"] }
+pkcs1 = { version = "0.8", features = ["pem"] }
+aes = "0.9"
+cbc = "0.2"
+aes-gcm = "0.11"
+ctr = "0.10"
+hmac = "0.13"
+digest = "0.11"
+signature = "3"
 thiserror = "2"
 http = "1"
 url = "2"

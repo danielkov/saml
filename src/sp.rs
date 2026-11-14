@@ -9,7 +9,7 @@ use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::RngCore as _;
+use rand::Rng as _;
 
 use crate::authn::request_build::{AcsRequest, BuildAuthnRequest, build_authn_request_xml};
 use crate::authn_context::RequestedAuthnContext;
@@ -333,7 +333,7 @@ impl LoginTrackerPayload {
         rand::rng().fill_bytes(&mut nonce_bytes);
         let ct = cipher
             .encrypt(
-                aes_gcm::Nonce::from_slice(&nonce_bytes),
+                &aes_gcm::Nonce::from(nonce_bytes),
                 aes_gcm::aead::Payload {
                     msg: &plaintext,
                     aad: &[],
@@ -434,7 +434,11 @@ impl LoginTracker {
             })?;
         let plaintext = cipher
             .decrypt(
-                aes_gcm::Nonce::from_slice(nonce_bytes),
+                nonce_bytes
+                    .try_into()
+                    .map_err(|_err| Error::DecryptFailed {
+                        reason: "login tracker",
+                    })?,
                 aes_gcm::aead::Payload { msg: ct, aad: &[] },
             )
             .map_err(|_err| Error::DecryptFailed {
