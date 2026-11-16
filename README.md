@@ -156,6 +156,35 @@ let identity = sp.consume_response(ConsumeResponse {
 
 The cache is consulted AFTER signature verification and all other spec checks succeed, so forged or malformed responses never pollute the store. A duplicate `assertion_id` within the validity window surfaces as `Error::AssertionReplay`. Passing `None` skips optional deduplication only for ordinary assertions; it cannot override `<OneTimeUse>`.
 
+When the shared store is reached through an async client (an async SQL pool, a
+Redis client), implement `AsyncReplayCache` and call
+`ServiceProvider::consume_response_async` (or
+`consume_response_with_assertion_async`): validation is the same, and the
+reservation is awaited instead of blocking a runtime thread. `InlineReplayCache`
+adapts a synchronous cache that answers without I/O, such as
+`InMemoryReplayCache`, to the async API.
+
+```rust
+use saml::{AsyncReplayCache, ReplayEntry, Error};
+use std::time::SystemTime;
+
+struct SqlReplayStore { /* an async pool */ }
+
+impl AsyncReplayCache for SqlReplayStore {
+    async fn check_and_insert(
+        &self,
+        entries: &[ReplayEntry<'_>],
+        now: SystemTime,
+    ) -> Result<bool, Error> {
+        // One transaction: INSERT ... ON CONFLICT DO NOTHING on a unique
+        // (namespace, id) key; true only if every row was inserted.
+        todo!()
+    }
+}
+
+let identity = sp.consume_response_async(input, Some(&store)).await?;
+```
+
 For multi-instance deployments, implement `ReplayCache` against a shared backend (a Redis transaction/Lua script, or a SQL transaction with unique constraints). `check_and_insert` must atomically reserve its complete namespaced batch using the supplied validation clock, so concurrent duplicate presentations have exactly one winner and a backend failure cannot partially consume a login. The proxy reserves one transaction tombstone (bound to the validated assertion through `InResponseTo`), preventing a second valid Response with a fresh assertion ID from reusing one login.
 
 ## Implementation status

@@ -55,7 +55,7 @@ use crate::logout::{
 use crate::metadata::MetadataExtras;
 use crate::metadata::emit_sp::{SpMetadataInputs, emit_sp_metadata};
 use crate::nameid::NameIdFormat;
-use crate::replay::{ReplayCache, ReplayEntry, ReplayMode};
+use crate::replay::{AsyncReplayCache, ReplayCache, ReplayEntry, ReplayMode, ReplayNamespace};
 use crate::response::parse::parse_response;
 use crate::response::validate::{
     ValidateResponse, validate_response, validate_response_with_assertion,
@@ -744,6 +744,34 @@ pub struct ConsumedResponse {
     pub assertion: Option<VerifiedAssertion>,
 }
 
+/// The replay tombstone a validated Response still has to reserve, owned so
+/// the async path can hold it across an await.
+struct PendingReplay {
+    namespace: ReplayNamespace,
+    id: String,
+    expires_at: SystemTime,
+}
+
+impl PendingReplay {
+    fn entry(&self) -> ReplayEntry<'_> {
+        ReplayEntry {
+            namespace: self.namespace,
+            id: &self.id,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+impl From<&ReplayEntry<'_>> for PendingReplay {
+    fn from(entry: &ReplayEntry<'_>) -> Self {
+        Self {
+            namespace: entry.namespace,
+            id: entry.id.to_owned(),
+            expires_at: entry.expires_at,
+        }
+    }
+}
+
 /// Inputs for [`ServiceProvider::consume_response`] and
 /// [`ServiceProvider::consume_response_with_assertion`]. See RFC-003 §4.
 pub struct ConsumeResponse<'a> {
@@ -986,6 +1014,95 @@ impl ServiceProvider {
         replay_error: Error,
         export_assertion: bool,
     ) -> Result<ConsumedResponse, Error> {
+        let cache = input.replay_cache;
+        let now = input.now;
+        let (consumed, pending) = self.validate_response(
+            input,
+            cache.is_some(),
+            transaction_replay_entry,
+            export_assertion,
+        )?;
+        if let (Some(cache), Some(pending)) = (cache, pending)
+            && !cache.check_and_insert(&[pending.entry()], now)?
+        {
+            return Err(replay_error);
+        }
+        Ok(consumed)
+    }
+
+    /// Validate an inbound `<samlp:Response>` exactly as
+    /// [`ServiceProvider::consume_response`], reserving the assertion through
+    /// an [`AsyncReplayCache`] instead of a synchronous [`ReplayCache`]. See
+    /// RFC-003 §4.
+    ///
+    /// Use this when the replay store is reached through an async client,
+    /// such as a SQL pool shared by several instances: the reservation is
+    /// awaited rather than blocking a runtime thread. Validation, its order,
+    /// the replay policy ([`ConsumeResponse::replay_mode`]), the
+    /// `<OneTimeUse>` rule and the result are the same as the synchronous
+    /// method; the cache is consulted only after every other check passed.
+    ///
+    /// The cache is passed here, not in [`ConsumeResponse::replay_cache`],
+    /// which must be `None`: giving both is
+    /// [`Error::InvalidConfiguration`], since only one store can decide.
+    pub async fn consume_response_async<C: AsyncReplayCache>(
+        &self,
+        input: ConsumeResponse<'_>,
+        replay_cache: Option<&C>,
+    ) -> Result<Identity, Error> {
+        self.consume_response_inner_async(input, replay_cache, false)
+            .await
+            .map(|consumed| consumed.identity)
+    }
+
+    /// [`ServiceProvider::consume_response_with_assertion`] with an
+    /// [`AsyncReplayCache`]; see [`ServiceProvider::consume_response_async`].
+    pub async fn consume_response_with_assertion_async<C: AsyncReplayCache>(
+        &self,
+        input: ConsumeResponse<'_>,
+        replay_cache: Option<&C>,
+    ) -> Result<ConsumedResponse, Error> {
+        self.consume_response_inner_async(input, replay_cache, true)
+            .await
+    }
+
+    async fn consume_response_inner_async<C: AsyncReplayCache>(
+        &self,
+        input: ConsumeResponse<'_>,
+        replay_cache: Option<&C>,
+        export_assertion: bool,
+    ) -> Result<ConsumedResponse, Error> {
+        if input.replay_cache.is_some() {
+            return Err(Error::InvalidConfiguration {
+                reason: "the async consume methods take their replay cache as an argument; \
+                         ConsumeResponse::replay_cache must be None",
+            });
+        }
+        let now = input.now;
+        // Validation is synchronous and borrows nothing past this call, so
+        // the returned future holds only owned data across the await.
+        let (consumed, pending) =
+            self.validate_response(input, replay_cache.is_some(), None, export_assertion)?;
+        if let (Some(cache), Some(pending)) = (replay_cache, pending)
+            && !cache.check_and_insert(&[pending.entry()], now).await?
+        {
+            return Err(Error::AssertionReplay);
+        }
+        Ok(consumed)
+    }
+
+    /// Every check of [`ServiceProvider::consume_response`] except the
+    /// replay reservation itself, which the caller makes with the returned
+    /// entry (synchronously or asynchronously). `cache_present` says whether
+    /// the caller has a replay store: without one, a `<OneTimeUse>`
+    /// assertion is unenforceable and rejected here.
+    fn validate_response(
+        &self,
+        input: ConsumeResponse<'_>,
+        cache_present: bool,
+        transaction_replay_entry: Option<ReplayEntry<'_>>,
+        export_assertion: bool,
+    ) -> Result<(ConsumedResponse, Option<PendingReplay>), Error> {
         // Steps 3a/3b: registered ACS URL, plus tracker correlation for a
         // solicited flow. Shared with the artifact path, which runs them
         // before it dereferences the artifact.
@@ -1105,35 +1222,40 @@ impl ServiceProvider {
         // — silently ignores that, which is the one case where failing closed
         // is not a judgement call. Other assertions keep the opt-in policy,
         // where the spec recommends rather than mandates replay defence.
-        if identity.is_one_time_use()
-            && (input.replay_cache.is_none() || input.replay_mode == ReplayMode::Off)
-        {
+        if identity.is_one_time_use() && (!cache_present || input.replay_mode == ReplayMode::Off) {
             return Err(Error::OneTimeUseUnenforceable);
         }
 
-        if let Some(cache) = input.replay_cache
+        let pending = if cache_present
             && (replay_check_needed(input.replay_mode, identity.is_one_time_use())
                 || transaction_replay_entry.is_some())
         {
             // The tombstone must outlive every instant at which the assertion
             // would still validate — see `replay_expires_at`.
             let expires_at = replay_expires_at(identity.not_on_or_after, input.clock_skew)?;
-            let assertion_entry = ReplayEntry::assertion(&identity.assertion_id, expires_at);
             // The proxy substitutes its transaction tombstone for the raw
             // assertion ID. `InResponseTo` binds the assertion to that exact
             // transaction, so one namespaced key enforces both assertion and
             // transaction single-use while needing only one cache slot.
-            let entry = transaction_replay_entry.unwrap_or(assertion_entry);
-            let fresh = cache.check_and_insert(&[entry], input.now)?;
-            if !fresh {
-                return Err(replay_error);
-            }
-        }
+            Some(match transaction_replay_entry {
+                Some(entry) => PendingReplay::from(&entry),
+                None => PendingReplay {
+                    namespace: ReplayNamespace::Assertion,
+                    id: identity.assertion_id.clone(),
+                    expires_at,
+                },
+            })
+        } else {
+            None
+        };
 
-        Ok(ConsumedResponse {
-            identity,
-            assertion,
-        })
+        Ok((
+            ConsumedResponse {
+                identity,
+                assertion,
+            },
+            pending,
+        ))
     }
 
     /// Resolve an inbound `?SAMLart=<artifact>` against the IdP's
@@ -3940,6 +4062,192 @@ mod tests {
         );
         // Cache size unchanged — replay path doesn't double-insert.
         assert_eq!(cache.len(), 1, "cache size unchanged after replay");
+    }
+
+    // ---------- async replay cache ----------
+
+    /// An [`AsyncReplayCache`] that really suspends before it reserves, as a
+    /// network store would, and can be made to fail like one.
+    #[derive(Default)]
+    struct YieldingReplayStore {
+        seen: std::sync::Mutex<std::collections::HashSet<(ReplayNamespace, String)>>,
+        fail: bool,
+    }
+
+    impl AsyncReplayCache for YieldingReplayStore {
+        async fn check_and_insert(
+            &self,
+            entries: &[ReplayEntry<'_>],
+            _now: SystemTime,
+        ) -> Result<bool, Error> {
+            tokio::task::yield_now().await;
+            if self.fail {
+                return Err(Error::ReplayCache {
+                    reason: "store unavailable",
+                });
+            }
+            let mut seen = self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if entries
+                .iter()
+                .any(|e| seen.contains(&(e.namespace, e.id.to_owned())))
+            {
+                return Ok(false);
+            }
+            seen.extend(entries.iter().map(|e| (e.namespace, e.id.to_owned())));
+            Ok(true)
+        }
+    }
+
+    /// One signed Response, its tracker, and the SP and IdP to consume it with.
+    fn async_replay_fixture(
+        request_id: &str,
+        one_time_use: bool,
+    ) -> (ServiceProvider, IdpDescriptor, LoginTracker, Vec<u8>) {
+        let kp = rsa_signing_key();
+        let sp = ServiceProvider::new(fixture_sp_config(None, false, false)).unwrap();
+        let idp = fixture_idp();
+        let tracker = LoginTracker {
+            request_id: request_id.to_owned(),
+            issued_at: fixed_now(),
+            idp_entity_id: idp.entity_id.clone(),
+            acs_endpoint: sp.config.acs[0].clone(),
+            requested_authn_context: None,
+            requested_name_id_format: None,
+            idp_signing_cert_fingerprints: certificate_fingerprint_set(&idp.signing_certs),
+            idp_artifact_resolution_services: vec![],
+        };
+        let xml = build_signed_response_xml_with_options(
+            &kp,
+            &ResponseFixtureOptions {
+                in_response_to: Some(request_id),
+                recipient_url: "https://sp.example.com/acs",
+                audience: "https://sp.example.com",
+                not_before: "2026-05-26T11:59:00Z",
+                not_on_or_after: "2099-05-26T12:10:00Z",
+                assertion_id: "_a-async",
+                one_time_use,
+                name_id_format: NameIdFormat::EmailAddress,
+                sp_name_qualifier: None,
+            },
+        );
+        (sp, idp, tracker, xml)
+    }
+
+    fn async_input<'a>(
+        idp: &'a IdpDescriptor,
+        tracker: &'a LoginTracker,
+        xml: &'a [u8],
+    ) -> ConsumeResponse<'a> {
+        ConsumeResponse {
+            idp,
+            peer_crypto_policy: None,
+            saml_response: xml,
+            binding: SsoResponseBinding::HttpPost,
+            relay_state: None,
+            tracker: Some(tracker),
+            expected_destination: "https://sp.example.com/acs",
+            now: fixed_now(),
+            clock_skew: Duration::from_secs(30),
+            replay_cache: None,
+            replay_mode: ReplayMode::All,
+            holder_of_key_cert: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn consume_response_async_reserves_through_an_async_store() {
+        let (sp, idp, tracker, xml) = async_replay_fixture("_req-async-1", false);
+        let store = YieldingReplayStore::default();
+
+        let identity = sp
+            .consume_response_async(async_input(&idp, &tracker, &xml), Some(&store))
+            .await
+            .expect("first consume succeeds");
+        assert_eq!(identity.assertion_id, "_a-async");
+
+        let err = sp
+            .consume_response_async(async_input(&idp, &tracker, &xml), Some(&store))
+            .await
+            .expect_err("second consume is a replay");
+        assert!(matches!(err, Error::AssertionReplay), "got {err:?}");
+
+        // A synchronous in-memory cache serves the async API through the
+        // inline adapter, and stays usable synchronously.
+        let cache = crate::replay::InMemoryReplayCache::new(8);
+        let inline = crate::replay::InlineReplayCache(&cache);
+        let consumed = sp
+            .consume_response_with_assertion_async(async_input(&idp, &tracker, &xml), Some(&inline))
+            .await
+            .expect("a fresh cache has not seen it");
+        assert_eq!(consumed.identity.assertion_id, "_a-async");
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn consume_response_async_keeps_one_time_use_and_store_failures_closed() {
+        let (sp, idp, tracker, xml) = async_replay_fixture("_req-async-otu", true);
+
+        // No store: a OneTimeUse assertion cannot be enforced, so it is refused.
+        let err = sp
+            .consume_response_async::<YieldingReplayStore>(async_input(&idp, &tracker, &xml), None)
+            .await
+            .expect_err("OneTimeUse without a store");
+        assert!(matches!(err, Error::OneTimeUseUnenforceable), "got {err:?}");
+
+        // A failing store fails the login, never waves it through.
+        let failing = YieldingReplayStore {
+            fail: true,
+            ..YieldingReplayStore::default()
+        };
+        let err = sp
+            .consume_response_async(async_input(&idp, &tracker, &xml), Some(&failing))
+            .await
+            .expect_err("store failure");
+        assert!(matches!(err, Error::ReplayCache { .. }), "got {err:?}");
+
+        let store = YieldingReplayStore::default();
+        sp.consume_response_async(async_input(&idp, &tracker, &xml), Some(&store))
+            .await
+            .expect("first use");
+        let err = sp
+            .consume_response_async(async_input(&idp, &tracker, &xml), Some(&store))
+            .await
+            .expect_err("OneTimeUse used twice");
+        assert!(matches!(err, Error::AssertionReplay), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn consume_response_async_refuses_two_replay_caches() {
+        let (sp, idp, tracker, xml) = async_replay_fixture("_req-async-both", false);
+        let sync_cache = crate::replay::InMemoryReplayCache::new(8);
+        let store = YieldingReplayStore::default();
+        let mut input = async_input(&idp, &tracker, &xml);
+        input.replay_cache = Some(&sync_cache);
+        let err = sp
+            .consume_response_async(input, Some(&store))
+            .await
+            .expect_err("two caches");
+        assert!(
+            matches!(err, Error::InvalidConfiguration { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(sync_cache.len(), 0);
+    }
+
+    /// The futures can be spawned onto a multi-threaded runtime.
+    #[test]
+    fn consume_response_async_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let (sp, idp, tracker, xml) = async_replay_fixture("_req-async-send", false);
+        let store = YieldingReplayStore::default();
+        let future = sp.consume_response_async(async_input(&idp, &tracker, &xml), Some(&store));
+        assert_send(&future);
+        let future = sp
+            .consume_response_with_assertion_async(async_input(&idp, &tracker, &xml), Some(&store));
+        assert_send(&future);
     }
 
     /// `ReplayMode::OneTimeUseOnly` must accept a replayed assertion that
