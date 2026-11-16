@@ -1071,6 +1071,7 @@ static SHAPE_AUTHN_REQUEST: ElementShape = ElementShape {
 };
 
 // ---- samlp:SessionIndex (request-side; distinct local from any other use) ----
+#[cfg(feature = "slo")]
 static SHAPE_SESSION_INDEX: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "SessionIndex",
@@ -1089,6 +1090,7 @@ static SHAPE_SESSION_INDEX: ElementShape = ElementShape {
 //     <xs:choice>(BaseID|NameID|EncryptedID)</xs:choice>
 //     <samlp:SessionIndex minOccurs="0" maxOccurs="unbounded"/>
 //   </xs:sequence>
+#[cfg(feature = "slo")]
 static SHAPE_LOGOUT_REQUEST: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "LogoutRequest",
@@ -1177,6 +1179,7 @@ static SHAPE_LOGOUT_REQUEST: ElementShape = ElementShape {
 //     <samlp:Extensions minOccurs="0"/>
 //     <samlp:Status/>
 //   </xs:sequence>
+#[cfg(feature = "slo")]
 static SHAPE_LOGOUT_RESPONSE: ElementShape = ElementShape {
     namespace: Some(SAMLP_NS),
     local: "LogoutResponse",
