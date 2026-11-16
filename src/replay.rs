@@ -129,6 +129,40 @@ pub trait ReplayCache: Send + Sync {
     -> Result<bool, Error>;
 }
 
+/// Asynchronous counterpart of [`ReplayCache`], for stores reached through an
+/// async client: an async SQL pool, a Redis client, an HTTP key-value
+/// service.
+///
+/// [`ReplayCache::check_and_insert`] is synchronous and is called in the
+/// middle of [`ServiceProvider::consume_response`](crate::sp::ServiceProvider::consume_response),
+/// so an async backend would have to block a runtime thread on its network
+/// round trip (or cannot run at all on a current-thread runtime).
+/// [`ServiceProvider::consume_response_async`](crate::sp::ServiceProvider::consume_response_async)
+/// and [`ServiceProvider::consume_response_with_assertion_async`](crate::sp::ServiceProvider::consume_response_with_assertion_async)
+/// run the same validation and await this trait instead.
+///
+/// # Contract
+///
+/// Identical to [`ReplayCache`]: an atomic, linearizable
+/// insert-if-all-absent of the whole batch, `Ok(true)` only when every entry
+/// was fresh, entries retained until their `expires_at`, expiry judged
+/// against the supplied `now`, and backend failures returned as [`Error`]
+/// (typically [`Error::ReplayCache`]). For a SQL store, an `INSERT ... ON
+/// CONFLICT DO NOTHING` on a unique `(namespace, id)` key inside one
+/// transaction, checking that every row was inserted, satisfies it.
+///
+/// The library awaits the returned future after all signature and spec
+/// checks have passed, exactly where the synchronous API consults
+/// [`ReplayCache`].
+pub trait AsyncReplayCache: Send + Sync {
+    /// Atomically reserve all `entries`; see [`ReplayCache::check_and_insert`].
+    fn check_and_insert(
+        &self,
+        entries: &[ReplayEntry<'_>],
+        now: SystemTime,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
+}
+
 /// Default in-memory [`ReplayCache`] implementation backed by a
 /// `Mutex<HashMap<(ReplayNamespace, String), SystemTime>>`.
 ///
@@ -240,6 +274,29 @@ pub enum ReplayMode {
     /// explicitly accepts the residual replay risk. Misusing this knob
     /// re-opens the SAML 2.0 replay attack surface in full.
     Off,
+}
+
+/// Lets a synchronous [`ReplayCache`] serve the async API.
+///
+/// Its check runs inline, on the polling thread, so use it only with a
+/// cache that answers without I/O, such as [`InMemoryReplayCache`] in a
+/// single-process deployment or a test. A store reached over the network
+/// should implement [`AsyncReplayCache`] itself.
+///
+/// It wraps a reference, so the same cache can keep serving the synchronous
+/// API. (A blanket implementation for every [`ReplayCache`] would make
+/// `check_and_insert` ambiguous wherever both traits are in scope.)
+#[derive(Clone, Copy)]
+pub struct InlineReplayCache<'a>(pub &'a dyn ReplayCache);
+
+impl AsyncReplayCache for InlineReplayCache<'_> {
+    fn check_and_insert(
+        &self,
+        entries: &[ReplayEntry<'_>],
+        now: SystemTime,
+    ) -> impl Future<Output = Result<bool, Error>> + Send {
+        std::future::ready(self.0.check_and_insert(entries, now))
+    }
 }
 
 impl ReplayCache for InMemoryReplayCache {

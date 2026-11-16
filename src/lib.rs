@@ -360,7 +360,8 @@ pub mod sp;
 pub use crate::error::Error;
 pub use crate::http::{HttpClient, HttpRequest, HttpResponse};
 pub use crate::replay::{
-    InMemoryReplayCache, ReplayCache, ReplayEntry, ReplayMode, ReplayNamespace,
+    AsyncReplayCache, InMemoryReplayCache, InlineReplayCache, ReplayCache, ReplayEntry, ReplayMode,
+    ReplayNamespace,
 };
 pub use crate::time::{format_xs_datetime, parse_xs_datetime};
 
