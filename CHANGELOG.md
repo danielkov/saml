@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InlineReplayCache` adapts a synchronous `ReplayCache` that answers without
   I/O, such as `InMemoryReplayCache`, to the async API.
 
+### Fixed
+
+- Building with `xsd-validate` but without `slo` no longer warns about
+  unused logout schema shapes.
+
 ## [0.1.0-alpha.3] - 2026-11-14
 
 ### Added
