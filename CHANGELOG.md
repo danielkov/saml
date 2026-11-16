@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-11-16
+
+### Added
+
+- `AsyncReplayCache`, the asynchronous counterpart of `ReplayCache` for
+  replay stores reached through an async client (an async SQL pool, Redis).
+  It has the same contract and returns `impl Future + Send`.
+- `ServiceProvider::consume_response_async` and
+  `ServiceProvider::consume_response_with_assertion_async` validate a
+  Response exactly as their synchronous counterparts and await the replay
+  reservation instead of blocking a runtime thread. The cache is passed as an
+  argument; setting `ConsumeResponse::replay_cache` as well is
+  `Error::InvalidConfiguration`.
+- `InlineReplayCache` adapts a synchronous `ReplayCache` that answers without
+  I/O, such as `InMemoryReplayCache`, to the async API.
+
 ## [0.1.0-alpha.3] - 2026-11-14
 
 ### Added
