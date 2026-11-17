@@ -121,6 +121,16 @@ pub(crate) enum ChildModel {
     /// `<saml:SubjectConfirmation>`. We model the "one of the IDs" via Choice
     /// and let Sequence carry the SubjectConfirmations.
     Choice(&'static [ChildShape]),
+    /// Children follow `sequence` as in [`ChildModel::Sequence`], then any
+    /// number of `choice` children in any order. Models an `xs:sequence`
+    /// ending in an unbounded `xs:choice`, such as `<saml:Assertion>`'s
+    /// statements: identity providers order `<saml:AuthnStatement>` and
+    /// `<saml:AttributeStatement>` either way (Google Workspace puts the
+    /// attributes first).
+    SequenceThenChoice {
+        sequence: &'static [ChildShape],
+        choice: &'static [ChildShape],
+    },
     /// No child constraints; any element-or-text content is accepted. Used
     /// for opaque payload containers like `<saml:AttributeValue>` (which
     /// holds arbitrary XML / text per xs:anyType).
@@ -708,56 +718,59 @@ static SHAPE_ASSERTION: ElementShape = ElementShape {
             presence: AttrPresence::Required,
         },
     ],
-    children: ChildModel::Sequence(&[
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "Issuer",
-            min_occurs: 1,
-            shape: Some(&SHAPE_ISSUER),
-        },
-        ChildShape {
-            namespace: Some(DS_NS),
-            local: "Signature",
-            min_occurs: 0,
-            shape: None,
-        },
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "Subject",
-            min_occurs: 0,
-            shape: Some(&SHAPE_SUBJECT),
-        },
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "Conditions",
-            min_occurs: 0,
-            shape: Some(&SHAPE_CONDITIONS),
-        },
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "Advice",
-            min_occurs: 0,
-            shape: None,
-        },
-        // The OASIS schema's xs:choice over Statement variants is encoded
-        // here as a flat sequence of optionals; min_occurs=0 on every slot
-        // means we accept any subset in any spec-permitted order. The
-        // crate-level parser walks `<saml:AuthnStatement>` and
+    children: ChildModel::SequenceThenChoice {
+        sequence: &[
+            ChildShape {
+                namespace: Some(SAML_NS),
+                local: "Issuer",
+                min_occurs: 1,
+                shape: Some(&SHAPE_ISSUER),
+            },
+            ChildShape {
+                namespace: Some(DS_NS),
+                local: "Signature",
+                min_occurs: 0,
+                shape: None,
+            },
+            ChildShape {
+                namespace: Some(SAML_NS),
+                local: "Subject",
+                min_occurs: 0,
+                shape: Some(&SHAPE_SUBJECT),
+            },
+            ChildShape {
+                namespace: Some(SAML_NS),
+                local: "Conditions",
+                min_occurs: 0,
+                shape: Some(&SHAPE_CONDITIONS),
+            },
+            ChildShape {
+                namespace: Some(SAML_NS),
+                local: "Advice",
+                min_occurs: 0,
+                shape: None,
+            },
+        ],
+        // The OASIS schema ends the sequence with an unbounded xs:choice over
+        // the Statement variants, so they may repeat and appear in any
+        // order. The crate-level parser walks `<saml:AuthnStatement>` and
         // `<saml:AttributeStatement>` specifically; other statement variants
         // are admitted via the SAML_NS wildcard below.
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "AuthnStatement",
-            min_occurs: 0,
-            shape: Some(&SHAPE_AUTHN_STATEMENT),
-        },
-        ChildShape {
-            namespace: Some(SAML_NS),
-            local: "AttributeStatement",
-            min_occurs: 0,
-            shape: Some(&SHAPE_ATTRIBUTE_STATEMENT),
-        },
-    ]),
+        choice: &[
+            ChildShape {
+                namespace: Some(SAML_NS),
+                local: "AuthnStatement",
+                min_occurs: 0,
+                shape: Some(&SHAPE_AUTHN_STATEMENT),
+            },
+            ChildShape {
+                namespace: Some(SAML_NS),
+                local: "AttributeStatement",
+                min_occurs: 0,
+                shape: Some(&SHAPE_ATTRIBUTE_STATEMENT),
+            },
+        ],
+    },
     // `<saml:Advice>` carries arbitrary SAML-namespace children (Assertion,
     // AssertionIDRef, AssertionURIRef, EncryptedAssertion + xs:any in
     // SAML_NS). `<saml:AuthzDecisionStatement>` plus future
@@ -1326,6 +1339,9 @@ fn validate_against_shape(element: &Element, shape: &ElementShape) -> Result<(),
         ChildModel::Any => Ok(()),
         ChildModel::Sequence(slots) => walk_sequence(element, slots, shape.wildcard_namespaces),
         ChildModel::Choice(slots) => walk_choice(element, slots, shape.wildcard_namespaces),
+        ChildModel::SequenceThenChoice { sequence, choice } => {
+            walk_sequence_then_choice(element, sequence, choice, shape.wildcard_namespaces)
+        }
     }
 }
 
@@ -1391,6 +1407,71 @@ fn walk_sequence(
 
     // 4. min_occurs check.
     for (slot, count) in slots.iter().zip(counts.iter()) {
+        if *count < slot.min_occurs {
+            return Err(Error::SchemaViolation {
+                element: qname_string(parent.qname()),
+                reason: missing_child_reason(slot.local),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Walk children against a Sequence followed by an unbounded, unordered
+/// Choice. Sequence children keep their order and minimums, and none may
+/// follow the first choice child.
+fn walk_sequence_then_choice(
+    parent: &Element,
+    sequence: &[ChildShape],
+    choice: &[ChildShape],
+    wildcard_namespaces: &[&str],
+) -> Result<(), Error> {
+    let mut cursor: usize = 0;
+    let mut counts: Vec<u32> = vec![0; sequence.len()];
+    let mut in_choice = false;
+    for child in parent.child_elements() {
+        let cq = child.qname();
+        if let Some(slot) = choice.iter().find(|s| matches(cq, s.namespace, s.local)) {
+            in_choice = true;
+            if let Some(sub_shape) = slot.shape {
+                validate_against_shape(child, sub_shape)?;
+            }
+            continue;
+        }
+        match sequence
+            .iter()
+            .enumerate()
+            .find(|(_, s)| matches(cq, s.namespace, s.local))
+        {
+            Some((idx, slot)) => {
+                if in_choice || idx < cursor {
+                    return Err(Error::SchemaViolation {
+                        element: qname_string(parent.qname()),
+                        reason: "child element appears out of schema order",
+                    });
+                }
+                cursor = idx;
+                if let Some(inc) = counts.get_mut(idx) {
+                    *inc = inc.saturating_add(1);
+                }
+                if let Some(sub_shape) = slot.shape {
+                    validate_against_shape(child, sub_shape)?;
+                }
+            }
+            None => {
+                let allow_wildcard = cq
+                    .namespace()
+                    .is_some_and(|n| wildcard_namespaces.contains(&n));
+                if !allow_wildcard {
+                    return Err(Error::SchemaViolation {
+                        element: qname_string(parent.qname()),
+                        reason: "unexpected child element for SAML schema shape",
+                    });
+                }
+            }
+        }
+    }
+    for (slot, count) in sequence.iter().zip(counts.iter()) {
         if *count < slot.min_occurs {
             return Err(Error::SchemaViolation {
                 element: qname_string(parent.qname()),
@@ -1626,6 +1707,50 @@ mod tests {
         let doc = parse(xml);
         let err = validate_assertion(doc.root()).unwrap_err();
         match err {
+            Error::SchemaViolation { reason, .. } => {
+                assert!(reason.contains("out of schema order"), "got: {reason}");
+            }
+            other => panic!("expected SchemaViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assertion_statements_in_any_order_pass() {
+        // Google Workspace emits AttributeStatement before AuthnStatement;
+        // the schema's unbounded choice over statements allows either order
+        // and repeats.
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+            ID="_a" Version="2.0" IssueInstant="2026-05-26T12:00:00Z">
+          <saml:Issuer>idp</saml:Issuer>
+          <saml:Subject><saml:NameID>u</saml:NameID></saml:Subject>
+          <saml:Conditions NotBefore="2026-05-26T11:59:00Z" NotOnOrAfter="2026-05-26T12:05:00Z"/>
+          <saml:AttributeStatement>
+            <saml:Attribute Name="email"><saml:AttributeValue>u@example.com</saml:AttributeValue></saml:Attribute>
+          </saml:AttributeStatement>
+          <saml:AuthnStatement AuthnInstant="2026-05-26T12:00:00Z">
+            <saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified</saml:AuthnContextClassRef></saml:AuthnContext>
+          </saml:AuthnStatement>
+          <saml:AttributeStatement>
+            <saml:Attribute Name="group"><saml:AttributeValue>eng</saml:AttributeValue></saml:Attribute>
+          </saml:AttributeStatement>
+        </saml:Assertion>"#;
+        let doc = parse(xml);
+        validate_assertion(doc.root()).unwrap();
+    }
+
+    #[test]
+    fn assertion_sequence_child_after_a_statement_rejected() {
+        // Statements end the assertion: a Subject after one is out of order.
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+            ID="_a" Version="2.0" IssueInstant="2026-05-26T12:00:00Z">
+          <saml:Issuer>idp</saml:Issuer>
+          <saml:AuthnStatement AuthnInstant="2026-05-26T12:00:00Z">
+            <saml:AuthnContext><saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified</saml:AuthnContextClassRef></saml:AuthnContext>
+          </saml:AuthnStatement>
+          <saml:Subject><saml:NameID>u</saml:NameID></saml:Subject>
+        </saml:Assertion>"#;
+        let doc = parse(xml);
+        match validate_assertion(doc.root()).unwrap_err() {
             Error::SchemaViolation { reason, .. } => {
                 assert!(reason.contains("out of schema order"), "got: {reason}");
             }
