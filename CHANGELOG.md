@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-alpha.5] - 2026-11-17
+
+### Fixed
+
+- `<saml:Assertion>` statements are accepted in any order and repeated, as
+  the schema's unbounded choice allows. Google Workspace sends
+  `<saml:AttributeStatement>` before `<saml:AuthnStatement>`, which was
+  rejected as "child element appears out of schema order". Elements of the
+  assertion's leading sequence (`Issuer` through `Advice`) still may not
+  follow a statement.
+
 ## [0.1.0-alpha.4] - 2026-11-16
 
 ### Added
